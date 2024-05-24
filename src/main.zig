@@ -1,24 +1,57 @@
 const std = @import("std");
+const buffer_size = 1024;
+const max_args = 128;
 
 pub fn main() !void {
-    // Prints to stderr (it's a shortcut based on `std.io.getStdErr()`)
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
+    var buffered_reader = std.io.bufferedReader(std.io.getStdIn().reader());
+    var buffered_writer = std.io.bufferedWriter(std.io.getStdOut().writer());
+    const stdin = buffered_reader.reader();
+    const stdout = buffered_writer.writer();
 
-    // stdout is for the actual output of your application, for example if you
-    // are implementing gzip, then only the compressed bytes should be sent to
-    // stdout, not any debugging messages.
-    const stdout_file = std.io.getStdOut().writer();
-    var bw = std.io.bufferedWriter(stdout_file);
-    const stdout = bw.writer();
+    var buffer: [buffer_size]u8 = undefined;
+    while (true) {
+        try stdout.print("> ", .{});
+        try buffered_writer.flush();
+        const input = (try stdin.readUntilDelimiterOrEof(&buffer, '\n')) orelse {
+            try stdout.print("\n", .{});
+            try buffered_writer.flush();
+            return;
+        };
+        if (input.len == 0) {
+            continue;
+        }
 
-    try stdout.print("Run `zig build test` to run the tests.\n", .{});
+        var args_ptrs: [max_args:null]?[*:0]u8 = undefined;
 
-    try bw.flush(); // don't forget to flush!
-}
+        var n: usize = 0;
+        var ofs: usize = 0;
+        for (0..input.len + 1) |i| {
+            if (std.ascii.isWhitespace(buffer[i])) {
+                buffer[i] = 0;
+                args_ptrs[n] = @as(*align(1) const [*:0]u8, @ptrCast(&buffer[ofs..i :0])).*;
+                n += 1;
+                ofs = i + 1;
+            }
+        }
+        args_ptrs[n] = null;
 
-test "simple test" {
-    var list = std.ArrayList(i32).init(std.testing.allocator);
-    defer list.deinit(); // try commenting this out and see if zig detects the memory leak!
-    try list.append(42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
+        const fork_pid = try std.posix.fork();
+        if (fork_pid == 0) {
+            // child
+            const env = [_:null]?[*:0]u8{null};
+
+            const result = std.posix.execvpeZ(args_ptrs[0].?, &args_ptrs, &env);
+
+            try stdout.print("ERROR: {}\n", .{result});
+            return;
+        } else {
+            // parent
+            const wait_result = std.posix.waitpid(fork_pid, 0);
+
+            if (wait_result.status != 0) {
+                try stdout.print("Command returned {}.\n", .{wait_result.status});
+                try buffered_writer.flush();
+            }
+        }
+    }
 }
