@@ -3,36 +3,8 @@ const buffer_size = 1024;
 const max_args = 128;
 
 const builtins = struct {
-    pub fn cd(argv_ptr: [*:null]const ?[*:0]const u8) !void {
-        std.debug.print("change directory\n", .{});
-        const argc = std.mem.len(argv_ptr);
-        if (argc == 1) {
-            std.debug.print("to ~\n", .{});
-        } else if (argc == 2) {
-            const target = std.mem.span(argv_ptr[1].?);
-            std.debug.print("to {s}\n", .{target});
-            try std.posix.chdirZ(target);
-        } else {
-            std.debug.print("cd: too many arguments\n", .{});
-            return error.TooManyArguments;
-        }
-    }
-    pub fn exit(argv_ptr: [*:null]const ?[*:0]const u8) !void {
-        std.debug.print("exit\n", .{});
-        const argc = std.mem.len(argv_ptr);
-        if (argc == 1) {
-            std.debug.print("exit code: {}\n", .{0});
-            std.posix.exit(0);
-        } else if (argc == 2) {
-            const buf = std.mem.span(argv_ptr[1].?);
-            const code = try std.fmt.parseInt(u8, buf, 10);
-            std.debug.print("exit code: {}\n", .{code});
-            std.posix.exit(code);
-        } else {
-            std.debug.print("exit: too many arguments\n", .{});
-            return error.TooManyArguments;
-        }
-    }
+    usingnamespace @import("builtins/cd.zig");
+    usingnamespace @import("builtins/exit.zig");
 };
 
 pub fn main() !void {
