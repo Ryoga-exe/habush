@@ -1,5 +1,5 @@
 const std = @import("std");
-const buffer_size = 1024;
+const buffer_initial_size = 1024;
 const max_args = 128;
 
 const builtins = struct {
@@ -16,7 +16,8 @@ pub fn main() !void {
     const stdin = buffered_reader.reader();
     const stdout = buffered_writer.writer();
 
-    var buffer: [buffer_size]u8 = undefined;
+    var buffer = try std.ArrayList(u8).initCapacity(allocator, buffer_initial_size);
+    defer buffer.deinit();
 
     var builtinCommands = std.StringHashMap(*const fn ([*:null]const ?[*:0]const u8) anyerror!void).init(allocator);
     defer builtinCommands.deinit();
@@ -25,13 +26,32 @@ pub fn main() !void {
     try builtinCommands.put("exit", builtins.exit);
 
     while (true) {
+        // print prompt
         try stdout.print("> ", .{});
         try buffered_writer.flush();
-        const input = (try stdin.readUntilDelimiterOrEof(&buffer, '\n')) orelse {
-            try stdout.print("\n", .{});
-            try buffered_writer.flush();
-            return;
+
+        buffer.clearRetainingCapacity();
+        if (buffer.items.len > buffer_initial_size) {
+            buffer.shrinkAndFree(buffer_initial_size);
+        }
+
+        const input = input: {
+            stdin.streamUntilDelimiter(buffer.writer(), '\n', null) catch |err| switch (err) {
+                error.EndOfStream => if (buffer.items.len == 0) {
+                    // EOF
+                    try stdout.print("\n", .{});
+                    try buffered_writer.flush();
+                    return;
+                },
+                else => |e| {
+                    return e;
+                },
+            };
+            const length = buffer.items.len;
+            try buffer.append(0);
+            break :input buffer.items[0..length];
         };
+
         if (input.len == 0) {
             continue;
         }
@@ -41,9 +61,9 @@ pub fn main() !void {
         var n: usize = 0;
         var ofs: usize = 0;
         for (0..input.len + 1) |i| {
-            if (std.ascii.isWhitespace(buffer[i])) {
-                buffer[i] = 0;
-                args_ptrs[n] = @as(*align(1) const [*:0]u8, @ptrCast(&buffer[ofs..i :0])).*;
+            if (buffer.items[i] == 0 or std.ascii.isWhitespace(buffer.items[i])) {
+                buffer.items[i] = 0;
+                args_ptrs[n] = @as(*align(1) const [*:0]u8, @ptrCast(&buffer.items[ofs..i :0])).*;
                 n += 1;
                 ofs = i + 1;
             }
