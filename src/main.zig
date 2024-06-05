@@ -9,6 +9,7 @@ const builtins = struct {
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer std.debug.assert(gpa.deinit() == .ok);
     const allocator = gpa.allocator();
 
     var buffered_reader = std.io.bufferedReader(std.io.getStdIn().reader());
