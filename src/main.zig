@@ -23,7 +23,7 @@ const Lexer = struct {
             .position = 0,
             .read_position = 0,
             .ch = 0,
-            .buffer = try std.ArrayList(u8).initCapacity(allocator, input.len),
+            .buffer = try std.ArrayList(u8).initCapacity(allocator, input.len + 1),
         };
         self.readChar();
         return self;
@@ -141,7 +141,6 @@ pub fn main() !void {
                 },
             };
             const length = buffer.items.len;
-            try buffer.append(0);
             break :input buffer.items[0..length];
         };
 
@@ -149,19 +148,10 @@ pub fn main() !void {
             continue;
         }
 
-        var args_ptrs: [max_args:null]?[*:0]u8 = undefined;
+        var lexer = try Lexer.init(input, allocator);
+        defer lexer.deinit();
 
-        var n: usize = 0;
-        var ofs: usize = 0;
-        for (0..input.len + 1) |i| {
-            if (buffer.items[i] == 0 or std.ascii.isWhitespace(buffer.items[i])) {
-                buffer.items[i] = 0;
-                args_ptrs[n] = @as(*align(1) const [*:0]u8, @ptrCast(&buffer.items[ofs..i :0])).*;
-                n += 1;
-                ofs = i + 1;
-            }
-        }
-        args_ptrs[n] = null;
+        const args_ptrs = try lexer.lex();
 
         const command = std.mem.span(args_ptrs[0].?);
         if (builtinCommands.get(command)) |builtin_command| {
