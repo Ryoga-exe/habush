@@ -39,8 +39,6 @@ const Lexer = struct {
             self.skipWhitespace();
 
             switch (self.ch) {
-                '\'' => {},
-                '\"' => {},
                 0 => {},
                 else => {
                     const begin = self.buffer.items.len;
@@ -89,6 +87,8 @@ const Lexer = struct {
                         try self.buffer.append(self.ch);
                     }
                 },
+                '\'' => try self.lexSingleQuote(),
+                '\"' => try self.lexDoubleQuote(),
                 0 => {},
                 else => {
                     try self.buffer.append(self.ch);
@@ -96,6 +96,42 @@ const Lexer = struct {
             }
             self.readChar();
         }
+    }
+    fn lexSingleQuote(self: *Self) !void {
+        self.readChar();
+        while (self.ch != 0 and self.ch != '\'') {
+            switch (self.ch) {
+                '\\' => {
+                    if (self.peekChar() == 0) {
+                        // Error
+                    } else {
+                        try self.buffer.append(self.ch);
+                    }
+                },
+                0 => {},
+                else => try self.buffer.append(self.ch),
+            }
+            self.readChar();
+        }
+        self.readChar();
+    }
+    fn lexDoubleQuote(self: *Self) !void {
+        self.readChar();
+        while (self.ch != 0 and self.ch != '\"') {
+            switch (self.ch) {
+                '\\' => {
+                    if (self.peekChar() == 0) {
+                        // Error
+                    } else {
+                        try self.buffer.append(self.ch);
+                    }
+                },
+                0 => {},
+                else => try self.buffer.append(self.ch),
+            }
+            self.readChar();
+        }
+        self.readChar();
     }
 };
 
