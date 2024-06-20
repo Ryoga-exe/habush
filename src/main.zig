@@ -76,16 +76,20 @@ const Lexer = struct {
             self.readChar();
         }
     }
+    fn readEscapedChar(self: *Self) u8 {
+        if (self.peekChar() == 0) {
+            // Error
+            return 0;
+        } else {
+            self.readChar();
+            return self.ch;
+        }
+    }
     fn lexToken(self: *Self) !void {
         while (self.ch != 0 and !std.ascii.isWhitespace(self.ch)) {
             switch (self.ch) {
                 '\\' => {
-                    if (self.peekChar() == 0) {
-                        // Error
-                    } else {
-                        self.readChar();
-                        try self.buffer.append(self.ch);
-                    }
+                    try self.buffer.append(self.readEscapedChar());
                 },
                 '\'' => try self.lexSingleQuote(),
                 '\"' => try self.lexDoubleQuote(),
@@ -102,11 +106,7 @@ const Lexer = struct {
         while (self.ch != 0 and self.ch != '\'') {
             switch (self.ch) {
                 '\\' => {
-                    if (self.peekChar() == 0) {
-                        // Error
-                    } else {
-                        try self.buffer.append(self.ch);
-                    }
+                    try self.buffer.append(self.readEscapedChar());
                 },
                 0 => {},
                 else => try self.buffer.append(self.ch),
@@ -120,11 +120,7 @@ const Lexer = struct {
         while (self.ch != 0 and self.ch != '\"') {
             switch (self.ch) {
                 '\\' => {
-                    if (self.peekChar() == 0) {
-                        // Error
-                    } else {
-                        try self.buffer.append(self.ch);
-                    }
+                    try self.buffer.append(self.readEscapedChar());
                 },
                 0 => {},
                 else => try self.buffer.append(self.ch),
