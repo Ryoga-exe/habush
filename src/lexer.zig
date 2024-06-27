@@ -1,5 +1,5 @@
 const std = @import("std");
-const Allocator = std.meta.Allocator;
+const Allocator = std.mem.Allocator;
 const max_args = 128;
 
 const Self = @This();
