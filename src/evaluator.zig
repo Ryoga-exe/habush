@@ -25,10 +25,12 @@ pub fn eval(allocator: Allocator, lexer: *Lexer) Error!u32 {
     var buffer = std.ArrayList(u8).initCapacity(allocator, initial_buffer_size) catch |err| {
         return err;
     };
+    defer buffer.deinit();
     const Position = struct { begin: usize, len: usize };
     var positions = std.ArrayList(Position).initCapacity(allocator, initial_args_size) catch |err| {
         return err;
     };
+    defer positions.deinit();
 
     while (true) {
         var token = try lexer.nextToken(allocator);
