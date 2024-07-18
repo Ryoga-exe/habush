@@ -2,11 +2,7 @@ const std = @import("std");
 const buffer_initial_size = 1024;
 
 const Lexer = @import("lexer.zig");
-
-const builtins = struct {
-    usingnamespace @import("builtins/cd.zig");
-    usingnamespace @import("builtins/exit.zig");
-};
+const Evaluator = @import("evaluator.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -20,12 +16,6 @@ pub fn main() !void {
 
     var buffer = try std.ArrayList(u8).initCapacity(allocator, buffer_initial_size);
     defer buffer.deinit();
-
-    var builtinCommands = std.StringHashMap(*const fn ([*:null]const ?[*:0]const u8) anyerror!void).init(allocator);
-    defer builtinCommands.deinit();
-
-    try builtinCommands.put("cd", builtins.cd);
-    try builtinCommands.put("exit", builtins.exit);
 
     while (true) {
         // print prompt
@@ -57,37 +47,17 @@ pub fn main() !void {
             continue;
         }
 
-        var lexer = try Lexer.init(input, allocator);
-        defer lexer.deinit();
+        var lexer = Lexer.init(input);
 
-        const args_ptrs = try lexer.lex();
-
-        const command = std.mem.span(args_ptrs[0].?);
-        if (builtinCommands.get(command)) |builtin_command| {
-            builtin_command(&args_ptrs) catch |err| {
-                try stdout.print("ERROR: {}\n", .{err});
-            };
-            continue;
-        }
-
-        const fork_pid = try std.posix.fork();
-        if (fork_pid == 0) {
-            // child
-            const env = [_:null]?[*:0]u8{null};
-
-            const result = std.posix.execvpeZ(args_ptrs[0].?, &args_ptrs, &env);
-
-            try stdout.print("ERROR: {}\n", .{result});
+        const status = Evaluator.eval(allocator, &lexer) catch |err| {
+            try stdout.print("ERROR: {}\n", .{err});
             try buffered_writer.flush();
-            return;
-        } else {
-            // parent
-            const wait_result = std.posix.waitpid(fork_pid, 0);
+            continue;
+        };
 
-            if (wait_result.status != 0) {
-                try stdout.print("Command returned {}.\n", .{wait_result.status});
-                try buffered_writer.flush();
-            }
+        if (status != 0) {
+            try stdout.print("Command returned {}.\n", .{status});
+            try buffered_writer.flush();
         }
     }
 }
