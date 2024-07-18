@@ -52,7 +52,7 @@ pub fn main() !void {
         const status = Evaluator.eval(allocator, &lexer) catch |err| {
             try stdout.print("ERROR: {}\n", .{err});
             try buffered_writer.flush();
-            continue;
+            return;
         };
 
         if (status != 0) {
