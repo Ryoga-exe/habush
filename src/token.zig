@@ -18,6 +18,7 @@ pub const TokenType = enum {
     redirection_input,
     redirection_output,
     redirection_output_append,
+    redirection_output_force,
     redirection_heredocument,
     quoted_single,
     quoted_double,

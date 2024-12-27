@@ -54,8 +54,40 @@ pub fn next(self: *Lexer) Token {
             self.lexQuotedDouble();
             token.loc.end = self.position - 1;
         },
-        '<' => {},
-        '>' => {},
+        '<' => {
+            self.readChar();
+            switch (self.ch) {
+                '<' => {
+                    self.readChar();
+                    // if (self.ch == '-') {}
+                    token.token_type = .redirection_heredocument;
+                },
+                '&' => {},
+                '>' => {},
+                else => {
+                    token.token_type = .redirection_input;
+                },
+            }
+            token.loc.end = self.position;
+        },
+        '>' => {
+            self.readChar();
+            switch (self.ch) {
+                '>' => {
+                    self.readChar();
+                    token.token_type = .redirection_output_append;
+                },
+                '&' => {},
+                '|' => {
+                    self.readChar();
+                    token.token_type = .redirection_output_force;
+                },
+                else => {
+                    token.token_type = .redirection_output;
+                },
+            }
+            token.loc.end = self.position;
+        },
         else => {
             token = self.lexWord();
         },
@@ -235,6 +267,35 @@ test Lexer {
                 .{ .word, "hello\\ world" },
                 .{ .whitespace, " " },
                 .{ .number, "123" },
+                .{ .eof, "" },
+            },
+        },
+        .{
+            .input =
+            \\echo hello 1>hello.txt
+            ,
+            .expects = &[_]ExpectsToken{
+                .{ .word, "echo" },
+                .{ .whitespace, " " },
+                .{ .word, "hello" },
+                .{ .whitespace, " " },
+                .{ .number, "1" },
+                .{ .redirection_output, ">" },
+                .{ .word, "hello.txt" },
+                .{ .eof, "" },
+            },
+        },
+        .{
+            .input =
+            \\echo hello >>hello.txt
+            ,
+            .expects = &[_]ExpectsToken{
+                .{ .word, "echo" },
+                .{ .whitespace, " " },
+                .{ .word, "hello" },
+                .{ .whitespace, " " },
+                .{ .redirection_output_append, ">>" },
+                .{ .word, "hello.txt" },
                 .{ .eof, "" },
             },
         },
