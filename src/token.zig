@@ -1,30 +1,25 @@
 const std = @import("std");
-const Allocator = std.mem.Allocator;
 const Token = @This();
 
-allocator: Allocator,
 token_type: TokenType,
-literal: ?[]const u8,
+loc: Loc,
 
-pub const TokenType = enum {
-    illegal,
-    word,
-    pipe,
-    redirection,
-    semicolon,
-    eof,
+pub const Loc = struct {
+    start: usize,
+    end: usize,
 };
 
-pub fn init(allocator: Allocator, token_type: TokenType, literal: ?[]const u8) !Token {
-    return Token{
-        .allocator = allocator,
-        .token_type = token_type,
-        .literal = if (literal) |lit| try allocator.dupe(u8, lit) else null,
-    };
-}
-
-pub fn deinit(self: *Token) void {
-    if (self.literal) |lit| {
-        self.allocator.free(lit);
-    }
-}
+pub const TokenType = enum {
+    invalid,
+    word,
+    pipe,
+    redirection_input,
+    redirection_output,
+    redirection_output_append,
+    redirection_heredocument,
+    quoted_double,
+    quoted_single,
+    semicolon,
+    whitespace,
+    eof,
+};
