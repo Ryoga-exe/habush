@@ -9,16 +9,18 @@ pub const Loc = struct {
     end: usize,
 };
 
+// TODO: remove quoted_*, and add expandable for improve parsing speed
 pub const TokenType = enum {
     invalid,
     word,
+    number,
     pipe,
     redirection_input,
     redirection_output,
     redirection_output_append,
     redirection_heredocument,
-    quoted_double,
     quoted_single,
+    quoted_double,
     semicolon,
     whitespace,
     eof,

@@ -42,28 +42,30 @@ pub fn next(self: *Lexer) Token {
             self.skipWhitespace();
             token.loc.end = self.position;
         },
-        '\\' => {},
+        '\'' => {
+            token.token_type = .quoted_single;
+            token.loc.start = self.position + 1;
+            self.lexQuotedSingle();
+            token.loc.end = self.position - 1;
+        },
         '\"' => {
             token.token_type = .quoted_double;
+            token.loc.start = self.position + 1;
             self.lexQuotedDouble();
-            token.loc.end = self.position;
+            token.loc.end = self.position - 1;
         },
-        '\'' => {
-            token.token_type = .quoted_double;
-            self.lexQuotedSingle();
-            token.loc.end = self.position;
-        },
+        '<' => {},
         '>' => {},
         else => {
-            token.token_type = .word;
-            self.lexWord();
-            token.loc.end = self.position;
+            token = self.lexWord();
         },
     }
     return token;
 }
 
-fn lexWord(self: *Lexer) void {
+fn lexWord(self: *Lexer) Token {
+    const start_position = self.position;
+    var is_number = true;
     while (true) : (self.readChar()) {
         switch (self.ch) {
             0 => {
@@ -78,19 +80,58 @@ fn lexWord(self: *Lexer) void {
             '\"', '\'' => {
                 break;
             },
-            '>' => {},
-            '<' => {},
-            else => {},
+            '<', '>' => {
+                break;
+            },
+            else => {
+                if (!std.ascii.isDigit(self.ch)) {
+                    is_number = false;
+                }
+            },
         }
     }
-}
-
-fn lexQuotedDouble(self: *Lexer) void {
-    _ = self; // autofix
+    return Token{
+        .token_type = if (is_number) .number else .word,
+        .loc = .{
+            .start = start_position,
+            .end = self.position,
+        },
+    };
 }
 
 fn lexQuotedSingle(self: *Lexer) void {
-    _ = self; // autofix
+    self.readChar(); // consume '
+    while (true) : (self.readChar()) {
+        switch (self.ch) {
+            0 => {
+                // TODO: Error or Continuation Prompt
+            },
+            '\'' => {
+                break;
+            },
+            else => {},
+        }
+    }
+    self.readChar(); // consume '
+}
+
+fn lexQuotedDouble(self: *Lexer) void {
+    self.readChar(); // consume "
+    while (true) : (self.readChar()) {
+        switch (self.ch) {
+            0 => {
+                // TODO: Error or Continuation Prompt
+            },
+            '\\' => {
+                self.lexEscapedChar();
+            },
+            '\"' => {
+                break;
+            },
+            else => {},
+        }
+    }
+    self.readChar(); // consume "
 }
 
 fn lexEscapedChar(self: *Lexer) void {
@@ -157,6 +198,43 @@ test Lexer {
                 .{ .word, "hello" },
                 .{ .whitespace, " \t " },
                 .{ .word, "world" },
+                .{ .eof, "" },
+            },
+        },
+        .{
+            .input =
+            \\echo 'hello world'
+            ,
+            .expects = &[_]ExpectsToken{
+                .{ .word, "echo" },
+                .{ .whitespace, " " },
+                .{ .quoted_single, "hello world" },
+                .{ .eof, "" },
+            },
+        },
+        .{
+            .input =
+            \\echo "hello world"
+            ,
+            .expects = &[_]ExpectsToken{
+                .{ .word, "echo" },
+                .{ .whitespace, " " },
+                .{ .quoted_double, "hello world" },
+                .{ .eof, "" },
+            },
+        },
+        .{
+            .input =
+            \\echo "hello\" world" hello\ world 123
+            ,
+            .expects = &[_]ExpectsToken{
+                .{ .word, "echo" },
+                .{ .whitespace, " " },
+                .{ .quoted_double, "hello\\\" world" },
+                .{ .whitespace, " " },
+                .{ .word, "hello\\ world" },
+                .{ .whitespace, " " },
+                .{ .number, "123" },
                 .{ .eof, "" },
             },
         },
