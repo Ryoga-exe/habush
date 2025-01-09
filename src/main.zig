@@ -1,7 +1,7 @@
 const std = @import("std");
 const buffer_initial_size = 1024;
 
-const Lexer = @import("lexer.zig");
+const Ast = @import("ast.zig");
 const Evaluator = @import("evaluator.zig");
 
 pub fn main() !void {
@@ -16,6 +16,8 @@ pub fn main() !void {
 
     var buffer = try std.ArrayList(u8).initCapacity(allocator, buffer_initial_size);
     defer buffer.deinit();
+
+    var evaluator = Evaluator.init(allocator);
 
     while (true) {
         // print prompt
@@ -47,9 +49,9 @@ pub fn main() !void {
             continue;
         }
 
-        var lexer = Lexer.init(input);
+        var ast = try Ast.parse(allocator, input);
 
-        const status = Evaluator.eval(allocator, &lexer) catch |err| {
+        const status = evaluator.eval(&ast) catch |err| {
             try stdout.print("ERROR: {}\n", .{err});
             try buffered_writer.flush();
             return;
