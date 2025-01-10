@@ -21,7 +21,7 @@ pub fn main() !void {
 
     while (true) {
         // print prompt
-        try stdout.print("> ", .{});
+        try stdout.print("habush> ", .{});
         try buffered_writer.flush();
 
         buffer.clearRetainingCapacity();
@@ -50,6 +50,7 @@ pub fn main() !void {
         }
 
         var ast = try Ast.parse(allocator, input);
+        defer ast.deinit(allocator);
 
         const status = evaluator.eval(&ast) catch |err| {
             try stdout.print("ERROR: {}\n", .{err});

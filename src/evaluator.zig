@@ -46,21 +46,16 @@ pub fn eval(self: *Evaluator, tree: *Ast) Evaluator.Error!u32 {
     };
     defer positions.deinit();
 
+    const writer = buffer.writer();
+
     // TODO:
-    // for (tree.root.commands.items) |command| {
-    // }
+    // for (tree.root.commands.items) |command| {}
     const command = tree.root.commands.items[0];
     for (command.argv.items) |arg| {
         const pos_start = buffer.items.len;
-        const start = tree.tokens.items(.start)[arg];
-        for (start..tree.source.len) |i| {
-            if (std.ascii.isWhitespace(tree.source[i])) {
-                break;
-            }
-            try buffer.append(tree.source[i]);
-        }
+        try writeWord(tree, arg, writer);
         try positions.append(.{ .start = pos_start, .end = buffer.items.len });
-        try buffer.append(0);
+        try writer.writeByte(0);
     }
 
     const args_len = positions.items.len;
@@ -80,6 +75,50 @@ pub fn eval(self: *Evaluator, tree: *Ast) Evaluator.Error!u32 {
         return 0;
     }
 
+    const stdout_backup = backup: {
+        if (command.redirection.items.len > 0) {
+            break :backup std.posix.dup(std.posix.STDOUT_FILENO) catch |err| return err;
+        } else {
+            break :backup null;
+        }
+    };
+    defer {
+        if (stdout_backup) |backup| {
+            std.posix.close(backup);
+        }
+    }
+
+    if (command.redirection.items.len > 0) {
+        // TODO:
+        // for (command.redirection.items) |redirection| {}
+        const redirection = command.redirection.items[0];
+        switch (redirection) {
+            .out => |out| {
+                var output_buffer = try std.ArrayList(u8).initCapacity(self.allocator, 64);
+                defer output_buffer.deinit();
+
+                const output_buffer_writer = output_buffer.writer();
+                try writeWord(tree, out.target, output_buffer_writer);
+
+                const target_fd = std.posix.STDOUT_FILENO;
+                const output_fd = std.posix.open(output_buffer.items, .{
+                    .ACCMODE = .WRONLY,
+                    .CREAT = true,
+                    .TRUNC = true,
+                }, 0o644) catch |err| {
+                    return err;
+                };
+                defer std.posix.close(output_fd);
+                std.posix.dup2(output_fd, target_fd) catch |err| {
+                    return err;
+                };
+            },
+            else => {
+                // not implemented yet.
+            },
+        }
+    }
+
     const fork_pid = std.posix.fork() catch |err| {
         return err;
     };
@@ -95,6 +134,22 @@ pub fn eval(self: *Evaluator, tree: *Ast) Evaluator.Error!u32 {
         // parent
         const wait_result = std.posix.waitpid(fork_pid, 0);
 
+        if (stdout_backup) |backup| {
+            std.posix.dup2(backup, std.posix.STDOUT_FILENO) catch |err| {
+                return err;
+            };
+        }
+
         return wait_result.status;
+    }
+}
+
+fn writeWord(tree: *Ast, token_index: Ast.TokenIndex, writer: anytype) !void {
+    const start = tree.tokens.items(.start)[token_index];
+    for (start..tree.source.len) |i| {
+        if (std.ascii.isWhitespace(tree.source[i])) {
+            break;
+        }
+        try writer.writeByte(tree.source[i]);
     }
 }

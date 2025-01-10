@@ -17,6 +17,7 @@ pub const ByteOffset = u32;
 pub const TokenList = std.MultiArrayList(struct {
     token_type: Token.TokenType,
     start: ByteOffset,
+    end: ByteOffset,
 });
 
 pub const Root = struct {
@@ -51,7 +52,7 @@ pub const Command = struct {
     }
 };
 
-pub const Redirection = union {
+pub const Redirection = union(enum) {
     in: struct {
         fd: ?Index,
         target: Index,
@@ -75,7 +76,8 @@ pub fn parse(allocator: Allocator, source: []const u8) Allocator.Error!Ast {
         const token = lexer.next();
         try tokens.append(allocator, .{
             .token_type = token.token_type,
-            .start = @as(u32, @intCast(token.loc.start)),
+            .start = @as(ByteOffset, @intCast(token.loc.start)),
+            .end = @as(ByteOffset, @intCast(token.loc.end)),
         });
         if (token.token_type == .eof) {
             break;
@@ -87,6 +89,22 @@ pub fn parse(allocator: Allocator, source: []const u8) Allocator.Error!Ast {
         switch (tokens.items(.token_type)[i]) {
             .word => {
                 try command.argv.append(@intCast(i));
+                // TODO: skip word after word, quotes
+            },
+            .number => {
+                const has_redirection = has: {
+                    if (i + 1 >= tokens.len) {
+                        break :has false;
+                    }
+                    break :has switch (tokens.items(.token_type)[i + 1]) {
+                        // NOTE: using meta programming?
+                        .redirection_output => true,
+                        else => false,
+                    };
+                };
+                if (!has_redirection) {
+                    try command.argv.append(@intCast(i));
+                }
             },
             .redirection_output => {
                 if (i + 1 >= tokens.len) {
