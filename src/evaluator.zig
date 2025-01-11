@@ -105,7 +105,7 @@ pub fn eval(self: *Evaluator, tree: *Ast) Evaluator.Error!u32 {
                     .ACCMODE = .WRONLY,
                     .CREAT = true,
                     .TRUNC = true,
-                }, 0o644) catch |err| {
+                }, 0o666) catch |err| {
                     return err;
                 };
                 defer std.posix.close(output_fd);
