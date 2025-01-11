@@ -1,132 +1,315 @@
+// TODO: support multibyte charactor
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const max_args = 128;
+const Token = @import("token.zig");
 
-const Self = @This();
+const Lexer = @This();
 
-input: []const u8,
+buffer: []const u8,
 position: usize,
 read_position: usize,
 ch: u8,
-buffer: std.ArrayList(u8),
 
-pub fn init(input: []const u8, allocator: Allocator) !Self {
-    var self = Self{
-        .input = input,
+pub fn init(buffer: []const u8) Lexer {
+    var self = Lexer{
+        .buffer = buffer,
         .position = 0,
         .read_position = 0,
         .ch = 0,
-        .buffer = try std.ArrayList(u8).initCapacity(allocator, input.len + 1),
     };
     self.readChar();
     return self;
 }
 
-pub fn deinit(self: *Self) void {
-    self.buffer.deinit();
+pub fn next(self: *Lexer) Token {
+    var token = Token{
+        .token_type = .eof,
+        .loc = .{
+            .start = self.position,
+            .end = self.buffer.len,
+        },
+    };
+    switch (self.ch) {
+        0 => {
+            if (self.read_position < self.buffer.len) {
+                token.token_type = .invalid;
+                token.loc.end = self.position;
+                self.readChar();
+            }
+        },
+        ' ', '\n', '\t', '\r' => {
+            token.token_type = .whitespace;
+            self.skipWhitespace();
+            token.loc.end = self.position;
+        },
+        '\'' => {
+            token.token_type = .quoted_single;
+            token.loc.start = self.position + 1;
+            self.lexQuotedSingle();
+            token.loc.end = self.position - 1;
+        },
+        '\"' => {
+            token.token_type = .quoted_double;
+            token.loc.start = self.position + 1;
+            self.lexQuotedDouble();
+            token.loc.end = self.position - 1;
+        },
+        '<' => {
+            self.readChar();
+            switch (self.ch) {
+                '<' => {
+                    self.readChar();
+                    // if (self.ch == '-') {}
+                    token.token_type = .redirection_heredocument;
+                },
+                '&' => {},
+                '>' => {},
+                else => {
+                    token.token_type = .redirection_input;
+                },
+            }
+            token.loc.end = self.position;
+        },
+        '>' => {
+            self.readChar();
+            switch (self.ch) {
+                '>' => {
+                    self.readChar();
+                    token.token_type = .redirection_output_append;
+                },
+                '&' => {},
+                '|' => {
+                    self.readChar();
+                    token.token_type = .redirection_output_force;
+                },
+                else => {
+                    token.token_type = .redirection_output;
+                },
+            }
+            token.loc.end = self.position;
+        },
+        else => {
+            token = self.lexWord();
+        },
+    }
+    return token;
 }
 
-pub fn lex(self: *Self) ![max_args:null]?[*:0]u8 {
-    var index: usize = 0;
-    var args_ptrs: [max_args:null]?[*:0]u8 = undefined;
-
-    while (self.ch != 0) {
-        self.skipWhitespace();
-
+fn lexWord(self: *Lexer) Token {
+    const start_position = self.position;
+    var is_number = true;
+    while (true) : (self.readChar()) {
         switch (self.ch) {
-            0 => {},
+            0 => {
+                break;
+            },
+            '\\' => {
+                self.lexEscapedChar();
+            },
+            ' ', '\n', '\t', '\r' => {
+                break;
+            },
+            '\"', '\'' => {
+                break;
+            },
+            '<', '>' => {
+                break;
+            },
             else => {
-                const begin = self.buffer.items.len;
-                try self.lexToken();
-                try self.buffer.append(0);
-                const end = self.buffer.items.len - 1;
-                args_ptrs[index] = @as(*align(1) const [*:0]u8, @ptrCast(&self.buffer.items[begin..end :0])).*;
+                if (!std.ascii.isDigit(self.ch)) {
+                    is_number = false;
+                }
             },
         }
-        self.readChar();
-        index += 1;
     }
-    args_ptrs[index] = null;
-    return args_ptrs;
+    return Token{
+        .token_type = if (is_number) .number else .word,
+        .loc = .{
+            .start = start_position,
+            .end = self.position,
+        },
+    };
 }
 
-fn readChar(self: *Self) void {
-    if (self.read_position < self.input.len) {
-        self.ch = self.input[self.read_position];
+fn lexQuotedSingle(self: *Lexer) void {
+    self.readChar(); // consume '
+    while (true) : (self.readChar()) {
+        switch (self.ch) {
+            0 => {
+                // TODO: Error or Continuation Prompt
+            },
+            '\'' => {
+                break;
+            },
+            else => {},
+        }
+    }
+    self.readChar(); // consume '
+}
+
+fn lexQuotedDouble(self: *Lexer) void {
+    self.readChar(); // consume "
+    while (true) : (self.readChar()) {
+        switch (self.ch) {
+            0 => {
+                // TODO: Error or Continuation Prompt
+            },
+            '\\' => {
+                self.lexEscapedChar();
+            },
+            '\"' => {
+                break;
+            },
+            else => {},
+        }
+    }
+    self.readChar(); // consume "
+}
+
+fn lexEscapedChar(self: *Lexer) void {
+    if (self.peekChar() == 0) {
+        // TODO: Error or Continuation Prompt
+    } else {
+        self.readChar();
+    }
+}
+
+fn skipWhitespace(self: *Lexer) void {
+    while (true) : (self.readChar()) {
+        switch (self.ch) {
+            ' ', '\n', '\t', '\r' => {
+                continue;
+            },
+            else => {
+                break;
+            },
+        }
+    }
+}
+
+fn readChar(self: *Lexer) void {
+    if (self.read_position < self.buffer.len) {
+        self.ch = self.buffer[self.read_position];
+        self.position = self.read_position;
+        self.read_position += 1;
     } else {
         self.ch = 0;
+        self.position = self.buffer.len;
     }
-    self.position = self.read_position;
-    self.read_position += 1;
 }
 
-fn peekChar(self: Self) u8 {
-    if (self.read_position < self.input.len) {
-        return self.input[self.read_position];
+fn peekChar(self: Lexer) u8 {
+    if (self.read_position < self.buffer.len) {
+        return self.buffer[self.read_position];
     } else {
         return 0;
     }
 }
 
-fn skipWhitespace(self: *Self) void {
-    while (std.ascii.isWhitespace(self.ch)) {
-        self.readChar();
-    }
-}
+test Lexer {
+    const ExpectsToken = struct { Token.TokenType, []const u8 };
 
-fn readEscapedChar(self: *Self) u8 {
-    if (self.peekChar() == 0) {
-        // Error
-        return 0;
-    } else {
-        self.readChar();
-        return self.ch;
-    }
-}
+    const tests = [_]struct {
+        input: []const u8,
+        expects: []const ExpectsToken,
+    }{
+        .{
+            .input = "echo hello",
+            .expects = &[_]ExpectsToken{
+                .{ .word, "echo" },
+                .{ .whitespace, " " },
+                .{ .word, "hello" },
+                .{ .eof, "" },
+            },
+        },
+        .{
+            .input = "echo  hello \t world",
+            .expects = &[_]ExpectsToken{
+                .{ .word, "echo" },
+                .{ .whitespace, "  " },
+                .{ .word, "hello" },
+                .{ .whitespace, " \t " },
+                .{ .word, "world" },
+                .{ .eof, "" },
+            },
+        },
+        .{
+            .input =
+            \\echo 'hello world'
+            ,
+            .expects = &[_]ExpectsToken{
+                .{ .word, "echo" },
+                .{ .whitespace, " " },
+                .{ .quoted_single, "hello world" },
+                .{ .eof, "" },
+            },
+        },
+        .{
+            .input =
+            \\echo "hello world"
+            ,
+            .expects = &[_]ExpectsToken{
+                .{ .word, "echo" },
+                .{ .whitespace, " " },
+                .{ .quoted_double, "hello world" },
+                .{ .eof, "" },
+            },
+        },
+        .{
+            .input =
+            \\echo "hello\" world" hello\ world 123
+            ,
+            .expects = &[_]ExpectsToken{
+                .{ .word, "echo" },
+                .{ .whitespace, " " },
+                .{ .quoted_double, "hello\\\" world" },
+                .{ .whitespace, " " },
+                .{ .word, "hello\\ world" },
+                .{ .whitespace, " " },
+                .{ .number, "123" },
+                .{ .eof, "" },
+            },
+        },
+        .{
+            .input =
+            \\echo hello 1>hello.txt
+            ,
+            .expects = &[_]ExpectsToken{
+                .{ .word, "echo" },
+                .{ .whitespace, " " },
+                .{ .word, "hello" },
+                .{ .whitespace, " " },
+                .{ .number, "1" },
+                .{ .redirection_output, ">" },
+                .{ .word, "hello.txt" },
+                .{ .eof, "" },
+            },
+        },
+        .{
+            .input =
+            \\echo hello >>hello.txt
+            ,
+            .expects = &[_]ExpectsToken{
+                .{ .word, "echo" },
+                .{ .whitespace, " " },
+                .{ .word, "hello" },
+                .{ .whitespace, " " },
+                .{ .redirection_output_append, ">>" },
+                .{ .word, "hello.txt" },
+                .{ .eof, "" },
+            },
+        },
+    };
 
-fn lexToken(self: *Self) !void {
-    while (self.ch != 0 and !std.ascii.isWhitespace(self.ch)) {
-        switch (self.ch) {
-            '\\' => {
-                try self.buffer.append(self.readEscapedChar());
-            },
-            '\'' => try self.lexSingleQuote(),
-            '\"' => try self.lexDoubleQuote(),
-            0 => {},
-            else => {
-                try self.buffer.append(self.ch);
-            },
+    for (tests) |t| {
+        var lexer = init(t.input);
+        for (t.expects) |expected| {
+            const token_type, const literal = expected;
+            const actual = lexer.next();
+            const actual_literal = t.input[actual.loc.start..actual.loc.end];
+
+            try std.testing.expectEqual(token_type, actual.token_type);
+            try std.testing.expectEqualSlices(u8, literal, actual_literal);
         }
-        self.readChar();
     }
-}
-
-fn lexSingleQuote(self: *Self) !void {
-    self.readChar();
-    while (self.ch != 0 and self.ch != '\'') {
-        switch (self.ch) {
-            '\\' => {
-                try self.buffer.append(self.readEscapedChar());
-            },
-            0 => {},
-            else => try self.buffer.append(self.ch),
-        }
-        self.readChar();
-    }
-    self.readChar();
-}
-
-fn lexDoubleQuote(self: *Self) !void {
-    self.readChar();
-    while (self.ch != 0 and self.ch != '\"') {
-        switch (self.ch) {
-            '\\' => {
-                try self.buffer.append(self.readEscapedChar());
-            },
-            0 => {},
-            else => try self.buffer.append(self.ch),
-        }
-        self.readChar();
-    }
-    self.readChar();
 }
