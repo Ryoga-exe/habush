@@ -117,8 +117,7 @@ pub fn parse(allocator: Allocator, source: []const u8) Allocator.Error!Ast {
                         break;
                     },
                     else => {
-                        // not implemented yet
-                        unreachable;
+                        std.debug.panic("not implemented", .{});
                     },
                 }
             },
@@ -141,8 +140,7 @@ pub fn parse(allocator: Allocator, source: []const u8) Allocator.Error!Ast {
                         break;
                     },
                     else => {
-                        // not implemented yet
-                        unreachable;
+                        std.debug.panic("not implemented", .{});
                     },
                 }
             },
@@ -170,8 +168,7 @@ pub fn parse(allocator: Allocator, source: []const u8) Allocator.Error!Ast {
                         break;
                     },
                     else => {
-                        // not implemented yet
-                        unreachable;
+                        std.debug.panic("not implemented", .{});
                     },
                 }
             },
@@ -201,8 +198,7 @@ pub fn parse(allocator: Allocator, source: []const u8) Allocator.Error!Ast {
                         unreachable;
                     },
                     else => {
-                        // not implemented yet
-                        unreachable;
+                        std.debug.panic("not implemented", .{});
                     },
                 }
             },

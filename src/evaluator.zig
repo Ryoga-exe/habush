@@ -115,6 +115,7 @@ pub fn eval(self: *Evaluator, tree: *Ast) Evaluator.Error!u32 {
             },
             else => {
                 // not implemented yet.
+                std.debug.panic("not implemented", .{});
             },
         }
     }
