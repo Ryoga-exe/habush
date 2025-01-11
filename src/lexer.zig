@@ -104,6 +104,7 @@ fn lexWord(self: *Lexer) Token {
                 break;
             },
             '\\' => {
+                is_number = false;
                 self.lexEscapedChar();
             },
             ' ', '\n', '\t', '\r' => {
