@@ -84,43 +84,128 @@ pub fn parse(allocator: Allocator, source: []const u8) Allocator.Error!Ast {
         }
     }
 
-    var i: usize = 0;
-    while (i < tokens.len) : (i += 1) {
-        switch (tokens.items(.token_type)[i]) {
-            .word,
-            .quoted_double,
-            .quoted_single,
-            => {
-                try command.argv.append(@intCast(i));
-                // TODO: skip word after word, quotes
+    var state: enum {
+        start,
+        word,
+        number,
+        redirection_output,
+    } = .start;
+    var pending: ?Index = null;
+    for (0..tokens.len) |i| {
+        const token_type = tokens.items(.token_type)[i];
+        switch (state) {
+            .start => {
+                switch (token_type) {
+                    .word,
+                    .quoted_single,
+                    .quoted_double,
+                    => {
+                        try command.argv.append(@intCast(i));
+                        state = .word;
+                    },
+                    .number => {
+                        state = .number;
+                        pending = @intCast(i);
+                    },
+                    .whitespace => {
+                        continue;
+                    },
+                    .redirection_output => {
+                        state = .redirection_output;
+                    },
+                    .eof => {
+                        break;
+                    },
+                    else => {
+                        // not implemented yet
+                        unreachable;
+                    },
+                }
+            },
+            .word => {
+                switch (token_type) {
+                    .word,
+                    .quoted_single,
+                    .quoted_double,
+                    .number,
+                    => {
+                        continue;
+                    },
+                    .whitespace => {
+                        state = .start;
+                    },
+                    .redirection_output => {
+                        state = .redirection_output;
+                    },
+                    .eof => {
+                        break;
+                    },
+                    else => {
+                        // not implemented yet
+                        unreachable;
+                    },
+                }
             },
             .number => {
-                const has_redirection = has: {
-                    if (i + 1 >= tokens.len) {
-                        break :has false;
-                    }
-                    break :has switch (tokens.items(.token_type)[i + 1]) {
-                        // NOTE: using meta programming?
-                        .redirection_output => true,
-                        else => false,
-                    };
-                };
-                if (!has_redirection) {
-                    try command.argv.append(@intCast(i));
+                switch (token_type) {
+                    .word,
+                    .quoted_single,
+                    .quoted_double,
+                    .number,
+                    => {
+                        try command.argv.append(@intCast(pending.?));
+                        pending = null;
+                        state = .word;
+                    },
+                    .whitespace => {
+                        try command.argv.append(@intCast(pending.?));
+                        pending = null;
+                        state = .start;
+                    },
+                    .redirection_output => {
+                        state = .redirection_output;
+                    },
+                    .eof => {
+                        try command.argv.append(@intCast(pending.?));
+                        break;
+                    },
+                    else => {
+                        // not implemented yet
+                        unreachable;
+                    },
                 }
             },
             .redirection_output => {
-                if (i + 1 >= tokens.len) {
-                    // error
-                } else {
-                    if (tokens.items(.token_type)[i + 1] == .word) {
-                        try command.redirection.append(Redirection{ .out = .{ .fd = null, .target = @intCast(i + 1) } });
-                        i += 1;
+                switch (token_type) {
+                    .word,
+                    .quoted_single,
+                    .quoted_double,
+                    .number,
+                    => {
+                        try command.redirection.append(Redirection{ .out = .{
+                            .fd = pending,
+                            .target = @intCast(i),
+                        } });
+                        pending = null;
+                        state = .word;
+                    },
+                    .whitespace => {
                         continue;
-                    }
+                    },
+                    .redirection_output => {
+                        // error
+                        unreachable;
+                    },
+                    .eof => {
+                        // error
+                        unreachable;
+                    },
+                    else => {
+                        // not implemented yet
+                        unreachable;
+                    },
                 }
             },
-            else => {},
         }
     }
 
