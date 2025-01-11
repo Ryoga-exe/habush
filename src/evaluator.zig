@@ -145,11 +145,38 @@ pub fn eval(self: *Evaluator, tree: *Ast) Evaluator.Error!u32 {
 }
 
 fn writeWord(tree: *Ast, token_index: Ast.TokenIndex, writer: anytype) !void {
-    const start = tree.tokens.items(.start)[token_index];
-    for (start..tree.source.len) |i| {
-        if (std.ascii.isWhitespace(tree.source[i])) {
-            break;
+    for (token_index..tree.tokens.len) |index| {
+        const start = tree.tokens.items(.start)[index];
+        const end = tree.tokens.items(.end)[index];
+        switch (tree.tokens.items(.token_type)[index]) {
+            .word,
+            .number,
+            .quoted_double,
+            => {
+                var state: enum {
+                    start,
+                    backslash,
+                } = .start;
+                for (tree.source[start..end]) |c| {
+                    switch (state) {
+                        .start => {
+                            if (c == '\\') {
+                                state = .backslash;
+                                continue;
+                            }
+                            try writer.writeByte(c);
+                        },
+                        .backslash => {
+                            try writer.writeByte(c);
+                            state = .start;
+                        },
+                    }
+                }
+            },
+            .quoted_single => {
+                try writer.writeAll(tree.source[start..end]);
+            },
+            else => break,
         }
-        try writer.writeByte(tree.source[i]);
     }
 }
