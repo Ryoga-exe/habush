@@ -61,6 +61,10 @@ pub const Redirection = union(enum) {
         fd: ?Index,
         target: Index,
     },
+    out_append: struct {
+        fd: ?Index,
+        target: Index,
+    },
 };
 
 pub fn parse(allocator: Allocator, source: []const u8) Allocator.Error!Ast {
@@ -88,7 +92,9 @@ pub fn parse(allocator: Allocator, source: []const u8) Allocator.Error!Ast {
         start,
         word,
         number,
+        redirection_input,
         redirection_output,
+        redirection_output_append,
     } = .start;
     var pending: ?Index = null;
     for (0..tokens.len) |i| {
@@ -110,8 +116,14 @@ pub fn parse(allocator: Allocator, source: []const u8) Allocator.Error!Ast {
                     .whitespace => {
                         continue;
                     },
+                    .redirection_input => {
+                        state = .redirection_input;
+                    },
                     .redirection_output => {
                         state = .redirection_output;
+                    },
+                    .redirection_output_append => {
+                        state = .redirection_output_append;
                     },
                     .eof => {
                         break;
@@ -133,8 +145,14 @@ pub fn parse(allocator: Allocator, source: []const u8) Allocator.Error!Ast {
                     .whitespace => {
                         state = .start;
                     },
+                    .redirection_input => {
+                        state = .redirection_input;
+                    },
                     .redirection_output => {
                         state = .redirection_output;
+                    },
+                    .redirection_output_append => {
+                        state = .redirection_output_append;
                     },
                     .eof => {
                         break;
@@ -160,12 +178,51 @@ pub fn parse(allocator: Allocator, source: []const u8) Allocator.Error!Ast {
                         pending = null;
                         state = .start;
                     },
+                    .redirection_input => {
+                        state = .redirection_input;
+                    },
                     .redirection_output => {
                         state = .redirection_output;
+                    },
+                    .redirection_output_append => {
+                        state = .redirection_output_append;
                     },
                     .eof => {
                         try command.argv.append(@intCast(pending.?));
                         break;
+                    },
+                    else => {
+                        std.debug.panic("not implemented", .{});
+                    },
+                }
+            },
+            .redirection_input => {
+                switch (token_type) {
+                    .word,
+                    .quoted_single,
+                    .quoted_double,
+                    .number,
+                    => {
+                        try command.redirection.append(Redirection{ .in = .{
+                            .fd = pending,
+                            .target = @intCast(i),
+                        } });
+                        pending = null;
+                        state = .word;
+                    },
+                    .whitespace => {
+                        continue;
+                    },
+                    .redirection_input,
+                    .redirection_output,
+                    .redirection_output_append,
+                    => {
+                        // error
+                        unreachable;
+                    },
+                    .eof => {
+                        // error
+                        unreachable;
                     },
                     else => {
                         std.debug.panic("not implemented", .{});
@@ -189,7 +246,43 @@ pub fn parse(allocator: Allocator, source: []const u8) Allocator.Error!Ast {
                     .whitespace => {
                         continue;
                     },
-                    .redirection_output => {
+                    .redirection_input,
+                    .redirection_output,
+                    .redirection_output_append,
+                    => {
+                        // error
+                        unreachable;
+                    },
+                    .eof => {
+                        // error
+                        unreachable;
+                    },
+                    else => {
+                        std.debug.panic("not implemented", .{});
+                    },
+                }
+            },
+            .redirection_output_append => {
+                switch (token_type) {
+                    .word,
+                    .quoted_single,
+                    .quoted_double,
+                    .number,
+                    => {
+                        try command.redirection.append(Redirection{ .out_append = .{
+                            .fd = pending,
+                            .target = @intCast(i),
+                        } });
+                        pending = null;
+                        state = .word;
+                    },
+                    .whitespace => {
+                        continue;
+                    },
+                    .redirection_input,
+                    .redirection_output,
+                    .redirection_output_append,
+                    => {
                         // error
                         unreachable;
                     },

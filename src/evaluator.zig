@@ -88,11 +88,42 @@ pub fn eval(self: *Evaluator, tree: *Ast) Evaluator.Error!u32 {
         }
     }
 
+    const stdin_backup = backup: {
+        if (command.redirection.items.len > 0) {
+            break :backup std.posix.dup(std.posix.STDIN_FILENO) catch |err| return err;
+        } else {
+            break :backup null;
+        }
+    };
+    defer {
+        if (stdin_backup) |backup| {
+            std.posix.close(backup);
+        }
+    }
+
     if (command.redirection.items.len > 0) {
         // TODO:
         // for (command.redirection.items) |redirection| {}
         const redirection = command.redirection.items[0];
         switch (redirection) {
+            .in => |in| {
+                var input_buffer = try std.ArrayList(u8).initCapacity(self.allocator, 64);
+                defer input_buffer.deinit();
+
+                const input_buffer_writer = input_buffer.writer();
+                try writeWord(tree, in.target, input_buffer_writer);
+
+                const target_fd = std.posix.STDIN_FILENO;
+                const input_fd = std.posix.open(input_buffer.items, .{
+                    .ACCMODE = .RDONLY,
+                }, 0o666) catch |err| {
+                    return err;
+                };
+                defer std.posix.close(input_fd);
+                std.posix.dup2(input_fd, target_fd) catch |err| {
+                    return err;
+                };
+            },
             .out => |out| {
                 var output_buffer = try std.ArrayList(u8).initCapacity(self.allocator, 64);
                 defer output_buffer.deinit();
@@ -113,10 +144,30 @@ pub fn eval(self: *Evaluator, tree: *Ast) Evaluator.Error!u32 {
                     return err;
                 };
             },
-            else => {
-                // not implemented yet.
-                std.debug.panic("not implemented", .{});
+            .out_append => |out_append| {
+                var output_buffer = try std.ArrayList(u8).initCapacity(self.allocator, 64);
+                defer output_buffer.deinit();
+
+                const output_buffer_writer = output_buffer.writer();
+                try writeWord(tree, out_append.target, output_buffer_writer);
+
+                const target_fd = std.posix.STDOUT_FILENO;
+                const output_fd = std.posix.open(output_buffer.items, .{
+                    .ACCMODE = .WRONLY,
+                    .CREAT = true,
+                    .APPEND = true,
+                }, 0o666) catch |err| {
+                    return err;
+                };
+                defer std.posix.close(output_fd);
+                std.posix.dup2(output_fd, target_fd) catch |err| {
+                    return err;
+                };
             },
+            // else => {
+            //     // not implemented yet.
+            //     std.debug.panic("not implemented", .{});
+            // },
         }
     }
 
@@ -137,6 +188,11 @@ pub fn eval(self: *Evaluator, tree: *Ast) Evaluator.Error!u32 {
 
         if (stdout_backup) |backup| {
             std.posix.dup2(backup, std.posix.STDOUT_FILENO) catch |err| {
+                return err;
+            };
+        }
+        if (stdin_backup) |backup| {
+            std.posix.dup2(backup, std.posix.STDIN_FILENO) catch |err| {
                 return err;
             };
         }
