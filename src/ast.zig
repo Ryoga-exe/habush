@@ -87,7 +87,10 @@ pub fn parse(allocator: Allocator, source: []const u8) Allocator.Error!Ast {
     var i: usize = 0;
     while (i < tokens.len) : (i += 1) {
         switch (tokens.items(.token_type)[i]) {
-            .word => {
+            .word,
+            .quoted_double,
+            .quoted_single,
+            => {
                 try command.argv.append(@intCast(i));
                 // TODO: skip word after word, quotes
             },
