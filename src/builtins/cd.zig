@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub fn cd(argv_ptr: [*:null]const ?[*:0]const u8) !void {
+pub fn cd(argv_ptr: [*:null]const ?[*:0]const u8, _: u8) !void {
     const argc = std.mem.len(argv_ptr);
     if (argc == 1) {
         const HOME = std.posix.getenvZ("HOME") orelse {

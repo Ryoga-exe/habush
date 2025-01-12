@@ -14,7 +14,7 @@ const builtins = struct {
 // TODO: change anyerror to builtins.Error
 const Error = anyerror || Allocator.Error || std.posix.ForkError || std.posix.ExecveError;
 
-const BuiltinComandFunc = *const fn ([*:null]const ?[*:0]const u8) anyerror!void;
+const BuiltinComandFunc = *const fn ([*:null]const ?[*:0]const u8, u8) anyerror!void;
 
 const builtinCommands = std.StaticStringMap(BuiltinComandFunc).initComptime([_]struct {
     []const u8,
@@ -25,14 +25,16 @@ const builtinCommands = std.StaticStringMap(BuiltinComandFunc).initComptime([_]s
 });
 
 allocator: Allocator,
+last_status: u8,
 
 pub fn init(allocator: Allocator) Evaluator {
     return Evaluator{
         .allocator = allocator,
+        .last_status = 0,
     };
 }
 
-pub fn eval(self: *Evaluator, tree: *Ast) Evaluator.Error!u32 {
+pub fn eval(self: *Evaluator, tree: *Ast) Evaluator.Error!u8 {
     var buffer = std.ArrayList(u8).initCapacity(self.allocator, initial_buffer_size) catch |err| {
         return err;
     };
@@ -67,9 +69,11 @@ pub fn eval(self: *Evaluator, tree: *Ast) Evaluator.Error!u32 {
     }
     args_ptrs[args_len] = null;
 
+    // FIX: panic if args_ptrs[0] is not exist
     const cmd = std.mem.span(args_ptrs[0].?);
     if (builtinCommands.get(cmd)) |builtin_command| {
-        builtin_command(args_ptrs) catch |err| {
+        builtin_command(args_ptrs, self.last_status) catch |err| {
+            // TODO: return status code depends on the err type
             return err;
         };
         return 0;
@@ -197,8 +201,10 @@ pub fn eval(self: *Evaluator, tree: *Ast) Evaluator.Error!u32 {
             };
         }
 
-        return wait_result.status;
+        self.last_status = std.posix.W.EXITSTATUS(wait_result.status);
     }
+
+    return self.last_status;
 }
 
 fn writeWord(tree: *Ast, token_index: Ast.TokenIndex, writer: anytype) !void {
