@@ -37,6 +37,11 @@ pub fn next(self: *Lexer) Token {
                 self.readChar();
             }
         },
+        ';' => {
+            self.readChar();
+            token.token_type = .semicolon;
+            token.loc.end = self.position;
+        },
         ' ', '\n', '\t', '\r' => {
             token.token_type = .whitespace;
             self.skipWhitespace();
@@ -101,6 +106,9 @@ fn lexWord(self: *Lexer) Token {
     while (true) : (self.readChar()) {
         switch (self.ch) {
             0 => {
+                break;
+            },
+            ';' => {
                 break;
             },
             '\\' => {
@@ -288,7 +296,7 @@ test Lexer {
         },
         .{
             .input =
-            \\echo hello >>hello.txt
+            \\echo hello >>hello.txt; echo \;;
             ,
             .expects = &[_]ExpectsToken{
                 .{ .word, "echo" },
@@ -297,6 +305,12 @@ test Lexer {
                 .{ .whitespace, " " },
                 .{ .redirection_output_append, ">>" },
                 .{ .word, "hello.txt" },
+                .{ .semicolon, ";" },
+                .{ .whitespace, " " },
+                .{ .word, "echo" },
+                .{ .whitespace, " " },
+                .{ .word, "\\;" },
+                .{ .semicolon, ";" },
                 .{ .eof, "" },
             },
         },

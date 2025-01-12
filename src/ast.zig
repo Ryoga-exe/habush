@@ -74,6 +74,8 @@ pub fn parse(allocator: Allocator, source: []const u8) Allocator.Error!Ast {
     try tokens.ensureTotalCapacity(allocator, 128);
     var root = Root.init(allocator);
     var command = Command.init(allocator);
+    errdefer root.deinit();
+    errdefer command.deinit();
 
     var lexer = Lexer.init(source);
     while (true) {
@@ -125,8 +127,12 @@ pub fn parse(allocator: Allocator, source: []const u8) Allocator.Error!Ast {
                     .redirection_output_append => {
                         state = .redirection_output_append;
                     },
+                    .semicolon => {
+                        try root.commands.append(command);
+                        command = Command.init(allocator);
+                    },
                     .eof => {
-                        break;
+                        try root.commands.append(command);
                     },
                     else => {
                         std.debug.panic("not implemented", .{});
@@ -154,8 +160,12 @@ pub fn parse(allocator: Allocator, source: []const u8) Allocator.Error!Ast {
                     .redirection_output_append => {
                         state = .redirection_output_append;
                     },
+                    .semicolon => {
+                        try root.commands.append(command);
+                        command = Command.init(allocator);
+                    },
                     .eof => {
-                        break;
+                        try root.commands.append(command);
                     },
                     else => {
                         std.debug.panic("not implemented", .{});
@@ -187,9 +197,14 @@ pub fn parse(allocator: Allocator, source: []const u8) Allocator.Error!Ast {
                     .redirection_output_append => {
                         state = .redirection_output_append;
                     },
+                    .semicolon => {
+                        try command.argv.append(@intCast(pending.?));
+                        try root.commands.append(command);
+                        command = Command.init(allocator);
+                    },
                     .eof => {
                         try command.argv.append(@intCast(pending.?));
-                        break;
+                        try root.commands.append(command);
                     },
                     else => {
                         std.debug.panic("not implemented", .{});
@@ -220,7 +235,9 @@ pub fn parse(allocator: Allocator, source: []const u8) Allocator.Error!Ast {
                         // error
                         unreachable;
                     },
-                    .eof => {
+                    .semicolon,
+                    .eof,
+                    => {
                         // error
                         unreachable;
                     },
@@ -253,7 +270,9 @@ pub fn parse(allocator: Allocator, source: []const u8) Allocator.Error!Ast {
                         // error
                         unreachable;
                     },
-                    .eof => {
+                    .semicolon,
+                    .eof,
+                    => {
                         // error
                         unreachable;
                     },
@@ -286,7 +305,9 @@ pub fn parse(allocator: Allocator, source: []const u8) Allocator.Error!Ast {
                         // error
                         unreachable;
                     },
-                    .eof => {
+                    .semicolon,
+                    .eof,
+                    => {
                         // error
                         unreachable;
                     },
@@ -297,8 +318,6 @@ pub fn parse(allocator: Allocator, source: []const u8) Allocator.Error!Ast {
             },
         }
     }
-
-    try root.commands.append(command);
 
     return Ast{
         .source = source,

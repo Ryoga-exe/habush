@@ -50,145 +50,146 @@ pub fn eval(self: *Evaluator, tree: *Ast) Evaluator.Error!u8 {
 
     const writer = buffer.writer();
 
-    // TODO:
-    // for (tree.root.commands.items) |command| {}
-    const command = tree.root.commands.items[0];
-    for (command.argv.items) |arg| {
-        const pos_start = buffer.items.len;
-        try writeWord(tree, arg, writer);
-        try positions.append(.{ .start = pos_start, .end = buffer.items.len });
-        try writer.writeByte(0);
-    }
+    for (tree.root.commands.items) |command| {
+        for (command.argv.items) |arg| {
+            const pos_start = buffer.items.len;
+            try writeWord(tree, arg, writer);
+            try positions.append(.{ .start = pos_start, .end = buffer.items.len });
+            try writer.writeByte(0);
+        }
 
-    const args_len = positions.items.len;
-    var args_ptrs = try self.allocator.allocSentinel(?[*:0]u8, args_len + 1, null);
-    defer self.allocator.free(args_ptrs);
+        const args_len = positions.items.len;
+        var args_ptrs = try self.allocator.allocSentinel(?[*:0]u8, args_len + 1, null);
+        defer self.allocator.free(args_ptrs);
 
-    for (positions.items, 0..) |pos, index| {
-        args_ptrs[index] = @as(*align(1) const [*:0]u8, @ptrCast(&buffer.items[pos.start..pos.end :0])).*;
-    }
-    args_ptrs[args_len] = null;
+        for (positions.items, 0..) |pos, index| {
+            args_ptrs[index] = @as(*align(1) const [*:0]u8, @ptrCast(&buffer.items[pos.start..pos.end :0])).*;
+        }
+        args_ptrs[args_len] = null;
 
-    // FIX: panic if args_ptrs[0] is not exist
-    const cmd = std.mem.span(args_ptrs[0].?);
-    if (builtinCommands.get(cmd)) |builtin_command| {
-        builtin_command(args_ptrs, self.last_status) catch |err| {
-            // TODO: return status code depends on the err type
+        // FIX: panic if args_ptrs[0] is not exist
+        const cmd = std.mem.span(args_ptrs[0].?);
+        if (builtinCommands.get(cmd)) |builtin_command| {
+            builtin_command(args_ptrs, self.last_status) catch |err| {
+                // TODO: return status code depends on the err type
+                return err;
+            };
+            return 0;
+        }
+
+        const stdout_backup = backup: {
+            if (command.redirection.items.len > 0) {
+                break :backup std.posix.dup(std.posix.STDOUT_FILENO) catch |err| return err;
+            } else {
+                break :backup null;
+            }
+        };
+        defer {
+            if (stdout_backup) |backup| {
+                std.posix.close(backup);
+            }
+        }
+
+        const stdin_backup = backup: {
+            if (command.redirection.items.len > 0) {
+                break :backup std.posix.dup(std.posix.STDIN_FILENO) catch |err| return err;
+            } else {
+                break :backup null;
+            }
+        };
+        defer {
+            if (stdin_backup) |backup| {
+                std.posix.close(backup);
+            }
+        }
+
+        if (command.redirection.items.len > 0) {
+            // TODO:
+            // for (command.redirection.items) |redirection| {}
+            const redirection = command.redirection.items[0];
+            switch (redirection) {
+                .in => |in| {
+                    var input_buffer = try std.ArrayList(u8).initCapacity(self.allocator, 64);
+                    defer input_buffer.deinit();
+
+                    const input_buffer_writer = input_buffer.writer();
+                    try writeWord(tree, in.target, input_buffer_writer);
+
+                    const target_fd = std.posix.STDIN_FILENO;
+                    const input_fd = std.posix.open(input_buffer.items, .{
+                        .ACCMODE = .RDONLY,
+                    }, 0o666) catch |err| {
+                        return err;
+                    };
+                    defer std.posix.close(input_fd);
+                    std.posix.dup2(input_fd, target_fd) catch |err| {
+                        return err;
+                    };
+                },
+                .out => |out| {
+                    var output_buffer = try std.ArrayList(u8).initCapacity(self.allocator, 64);
+                    defer output_buffer.deinit();
+
+                    const output_buffer_writer = output_buffer.writer();
+                    try writeWord(tree, out.target, output_buffer_writer);
+
+                    const target_fd = std.posix.STDOUT_FILENO;
+                    const output_fd = std.posix.open(output_buffer.items, .{
+                        .ACCMODE = .WRONLY,
+                        .CREAT = true,
+                        .TRUNC = true,
+                    }, 0o666) catch |err| {
+                        return err;
+                    };
+                    defer std.posix.close(output_fd);
+                    std.posix.dup2(output_fd, target_fd) catch |err| {
+                        return err;
+                    };
+                },
+                .out_append => |out_append| {
+                    var output_buffer = try std.ArrayList(u8).initCapacity(self.allocator, 64);
+                    defer output_buffer.deinit();
+
+                    const output_buffer_writer = output_buffer.writer();
+                    try writeWord(tree, out_append.target, output_buffer_writer);
+
+                    const target_fd = std.posix.STDOUT_FILENO;
+                    const output_fd = std.posix.open(output_buffer.items, .{
+                        .ACCMODE = .WRONLY,
+                        .CREAT = true,
+                        .APPEND = true,
+                    }, 0o666) catch |err| {
+                        return err;
+                    };
+                    defer std.posix.close(output_fd);
+                    std.posix.dup2(output_fd, target_fd) catch |err| {
+                        return err;
+                    };
+                },
+                // else => {
+                //     // not implemented yet.
+                //     std.debug.panic("not implemented", .{});
+                // },
+            }
+        }
+
+        const fork_pid = std.posix.fork() catch |err| {
             return err;
         };
-        return 0;
-    }
 
-    const stdout_backup = backup: {
-        if (command.redirection.items.len > 0) {
-            break :backup std.posix.dup(std.posix.STDOUT_FILENO) catch |err| return err;
+        if (fork_pid == 0) {
+            // child
+            const env = [_:null]?[*:0]u8{null};
+
+            const result = std.posix.execvpeZ(args_ptrs[0].?, args_ptrs, &env);
+
+            return result;
         } else {
-            break :backup null;
+            // parent
+            const wait_result = std.posix.waitpid(fork_pid, 0);
+
+            self.last_status = std.posix.W.EXITSTATUS(wait_result.status);
         }
-    };
-    defer {
-        if (stdout_backup) |backup| {
-            std.posix.close(backup);
-        }
-    }
-
-    const stdin_backup = backup: {
-        if (command.redirection.items.len > 0) {
-            break :backup std.posix.dup(std.posix.STDIN_FILENO) catch |err| return err;
-        } else {
-            break :backup null;
-        }
-    };
-    defer {
-        if (stdin_backup) |backup| {
-            std.posix.close(backup);
-        }
-    }
-
-    if (command.redirection.items.len > 0) {
-        // TODO:
-        // for (command.redirection.items) |redirection| {}
-        const redirection = command.redirection.items[0];
-        switch (redirection) {
-            .in => |in| {
-                var input_buffer = try std.ArrayList(u8).initCapacity(self.allocator, 64);
-                defer input_buffer.deinit();
-
-                const input_buffer_writer = input_buffer.writer();
-                try writeWord(tree, in.target, input_buffer_writer);
-
-                const target_fd = std.posix.STDIN_FILENO;
-                const input_fd = std.posix.open(input_buffer.items, .{
-                    .ACCMODE = .RDONLY,
-                }, 0o666) catch |err| {
-                    return err;
-                };
-                defer std.posix.close(input_fd);
-                std.posix.dup2(input_fd, target_fd) catch |err| {
-                    return err;
-                };
-            },
-            .out => |out| {
-                var output_buffer = try std.ArrayList(u8).initCapacity(self.allocator, 64);
-                defer output_buffer.deinit();
-
-                const output_buffer_writer = output_buffer.writer();
-                try writeWord(tree, out.target, output_buffer_writer);
-
-                const target_fd = std.posix.STDOUT_FILENO;
-                const output_fd = std.posix.open(output_buffer.items, .{
-                    .ACCMODE = .WRONLY,
-                    .CREAT = true,
-                    .TRUNC = true,
-                }, 0o666) catch |err| {
-                    return err;
-                };
-                defer std.posix.close(output_fd);
-                std.posix.dup2(output_fd, target_fd) catch |err| {
-                    return err;
-                };
-            },
-            .out_append => |out_append| {
-                var output_buffer = try std.ArrayList(u8).initCapacity(self.allocator, 64);
-                defer output_buffer.deinit();
-
-                const output_buffer_writer = output_buffer.writer();
-                try writeWord(tree, out_append.target, output_buffer_writer);
-
-                const target_fd = std.posix.STDOUT_FILENO;
-                const output_fd = std.posix.open(output_buffer.items, .{
-                    .ACCMODE = .WRONLY,
-                    .CREAT = true,
-                    .APPEND = true,
-                }, 0o666) catch |err| {
-                    return err;
-                };
-                defer std.posix.close(output_fd);
-                std.posix.dup2(output_fd, target_fd) catch |err| {
-                    return err;
-                };
-            },
-            // else => {
-            //     // not implemented yet.
-            //     std.debug.panic("not implemented", .{});
-            // },
-        }
-    }
-
-    const fork_pid = std.posix.fork() catch |err| {
-        return err;
-    };
-
-    if (fork_pid == 0) {
-        // child
-        const env = [_:null]?[*:0]u8{null};
-
-        const result = std.posix.execvpeZ(args_ptrs[0].?, args_ptrs, &env);
-
-        return result;
-    } else {
-        // parent
-        const wait_result = std.posix.waitpid(fork_pid, 0);
 
         if (stdout_backup) |backup| {
             std.posix.dup2(backup, std.posix.STDOUT_FILENO) catch |err| {
@@ -201,7 +202,8 @@ pub fn eval(self: *Evaluator, tree: *Ast) Evaluator.Error!u8 {
             };
         }
 
-        self.last_status = std.posix.W.EXITSTATUS(wait_result.status);
+        buffer.clearRetainingCapacity();
+        positions.clearRetainingCapacity();
     }
 
     return self.last_status;
