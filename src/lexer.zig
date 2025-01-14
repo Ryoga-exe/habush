@@ -93,6 +93,12 @@ pub fn next(self: *Lexer) Token {
             }
             token.loc.end = self.position;
         },
+        '|' => {
+            // TODO: check ||
+            self.readChar();
+            token.token_type = .pipe;
+            token.loc.end = self.position;
+        },
         else => {
             token = self.lexWord();
         },

@@ -39,11 +39,13 @@ pub const Root = struct {
 pub const Command = struct {
     argv: std.ArrayList(Index),
     redirection: std.ArrayList(Redirection),
+    pipe_next: bool,
 
     pub fn init(allocator: Allocator) Command {
         return Command{
             .argv = std.ArrayList(Index).init(allocator),
             .redirection = std.ArrayList(Redirection).init(allocator),
+            .pipe_next = false,
         };
     }
     pub fn deinit(self: Command) void {
@@ -127,6 +129,11 @@ pub fn parse(allocator: Allocator, source: []const u8) Allocator.Error!Ast {
                     .redirection_output_append => {
                         state = .redirection_output_append;
                     },
+                    .pipe => {
+                        command.pipe_next = true;
+                        try root.commands.append(command);
+                        command = Command.init(allocator);
+                    },
                     .semicolon => {
                         try root.commands.append(command);
                         command = Command.init(allocator);
@@ -159,6 +166,11 @@ pub fn parse(allocator: Allocator, source: []const u8) Allocator.Error!Ast {
                     },
                     .redirection_output_append => {
                         state = .redirection_output_append;
+                    },
+                    .pipe => {
+                        command.pipe_next = true;
+                        try root.commands.append(command);
+                        command = Command.init(allocator);
                     },
                     .semicolon => {
                         try root.commands.append(command);
@@ -196,6 +208,12 @@ pub fn parse(allocator: Allocator, source: []const u8) Allocator.Error!Ast {
                     },
                     .redirection_output_append => {
                         state = .redirection_output_append;
+                    },
+                    .pipe => {
+                        command.pipe_next = true;
+                        try command.argv.append(@intCast(pending.?));
+                        try root.commands.append(command);
+                        command = Command.init(allocator);
                     },
                     .semicolon => {
                         try command.argv.append(@intCast(pending.?));
@@ -235,6 +253,7 @@ pub fn parse(allocator: Allocator, source: []const u8) Allocator.Error!Ast {
                         // error
                         unreachable;
                     },
+                    .pipe,
                     .semicolon,
                     .eof,
                     => {
@@ -270,6 +289,7 @@ pub fn parse(allocator: Allocator, source: []const u8) Allocator.Error!Ast {
                         // error
                         unreachable;
                     },
+                    .pipe,
                     .semicolon,
                     .eof,
                     => {
@@ -305,6 +325,7 @@ pub fn parse(allocator: Allocator, source: []const u8) Allocator.Error!Ast {
                         // error
                         unreachable;
                     },
+                    .pipe,
                     .semicolon,
                     .eof,
                     => {

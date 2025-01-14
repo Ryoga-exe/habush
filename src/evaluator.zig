@@ -125,6 +125,8 @@ pub fn eval(self: *Evaluator, tree: *Ast) Evaluator.Error!u8 {
 
     const writer = buffer.writer();
 
+    var prev_pipe_fd = [_]?std.posix.fd_t{ null, null };
+
     for (tree.root.commands.items) |command| {
         for (command.argv.items) |arg| {
             const pos_start = buffer.items.len;
@@ -155,6 +157,8 @@ pub fn eval(self: *Evaluator, tree: *Ast) Evaluator.Error!u8 {
             return 0;
         }
 
+        const pipe_fd = if (command.pipe_next) try std.posix.pipe() else null;
+
         const fork_pid = try std.posix.fork();
 
         if (fork_pid == 0) {
@@ -162,6 +166,16 @@ pub fn eval(self: *Evaluator, tree: *Ast) Evaluator.Error!u8 {
             var manager = FdManager.init();
             for (command.redirection.items) |redirection| {
                 try manager.redirect(self.allocator, tree, redirection);
+            }
+
+            if (prev_pipe_fd[0]) |prev| {
+                try std.posix.dup2(prev, std.posix.STDIN_FILENO);
+                std.posix.close(prev);
+            }
+
+            if (command.pipe_next) {
+                try std.posix.dup2(pipe_fd.?[1], std.posix.STDOUT_FILENO);
+                std.posix.close(pipe_fd.?[1]);
             }
 
             const env = [_:null]?[*:0]u8{null};
@@ -176,8 +190,19 @@ pub fn eval(self: *Evaluator, tree: *Ast) Evaluator.Error!u8 {
             self.last_status = std.posix.W.EXITSTATUS(wait_result.status);
         }
 
+        if (pipe_fd) |fd| {
+            prev_pipe_fd[0] = fd[0];
+            std.posix.close(fd[1]);
+        }
+
         buffer.clearRetainingCapacity();
         positions.clearRetainingCapacity();
+    }
+
+    for (prev_pipe_fd) |prev| {
+        if (prev) |fd| {
+            std.posix.close(fd);
+        }
     }
 
     return self.last_status;
