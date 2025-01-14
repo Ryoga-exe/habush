@@ -114,17 +114,13 @@ pub fn init(allocator: Allocator) Evaluator {
 }
 
 pub fn eval(self: *Evaluator, tree: *Ast) Evaluator.Error!u8 {
-    var buffer = std.ArrayList(u8).initCapacity(self.allocator, initial_buffer_size) catch |err| {
-        return err;
-    };
+    var buffer = try std.ArrayList(u8).initCapacity(self.allocator, initial_buffer_size);
     defer buffer.deinit();
     const Position = struct {
         start: usize,
         end: usize,
     };
-    var positions = std.ArrayList(Position).initCapacity(self.allocator, initial_args_size) catch |err| {
-        return err;
-    };
+    var positions = try std.ArrayList(Position).initCapacity(self.allocator, initial_args_size);
     defer positions.deinit();
 
     const writer = buffer.writer();
@@ -159,9 +155,7 @@ pub fn eval(self: *Evaluator, tree: *Ast) Evaluator.Error!u8 {
             return 0;
         }
 
-        const fork_pid = std.posix.fork() catch |err| {
-            return err;
-        };
+        const fork_pid = try std.posix.fork();
 
         if (fork_pid == 0) {
             // child
