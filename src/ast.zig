@@ -22,17 +22,19 @@ pub const TokenList = std.MultiArrayList(struct {
 
 pub const Root = struct {
     commands: std.ArrayList(Command),
+    allocator: Allocator,
 
     pub fn init(allocator: Allocator) Root {
         return Root{
-            .commands = std.ArrayList(Command).init(allocator),
+            .commands = .empty,
+            .allocator = allocator,
         };
     }
-    pub fn deinit(self: Root) void {
-        for (self.commands.items) |c| {
+    pub fn deinit(self: *Root) void {
+        for (self.commands.items) |*c| {
             c.deinit();
         }
-        self.commands.deinit();
+        self.commands.deinit(self.allocator);
     }
 };
 
@@ -40,17 +42,19 @@ pub const Command = struct {
     argv: std.ArrayList(Index),
     redirection: std.ArrayList(Redirection),
     pipe_next: bool,
+    allocator: Allocator,
 
     pub fn init(allocator: Allocator) Command {
         return Command{
-            .argv = std.ArrayList(Index).init(allocator),
-            .redirection = std.ArrayList(Redirection).init(allocator),
+            .argv = .empty,
+            .redirection = .empty,
             .pipe_next = false,
+            .allocator = allocator,
         };
     }
-    pub fn deinit(self: Command) void {
-        self.argv.deinit();
-        self.redirection.deinit();
+    pub fn deinit(self: *Command) void {
+        self.argv.deinit(self.allocator);
+        self.redirection.deinit(self.allocator);
     }
 };
 
@@ -110,7 +114,7 @@ pub fn parse(allocator: Allocator, source: []const u8) Allocator.Error!Ast {
                     .quoted_single,
                     .quoted_double,
                     => {
-                        try command.argv.append(@intCast(i));
+                        try command.argv.append(allocator, @intCast(i));
                         state = .word;
                     },
                     .number => {
@@ -131,15 +135,15 @@ pub fn parse(allocator: Allocator, source: []const u8) Allocator.Error!Ast {
                     },
                     .pipe => {
                         command.pipe_next = true;
-                        try root.commands.append(command);
+                        try root.commands.append(allocator, command);
                         command = Command.init(allocator);
                     },
                     .semicolon => {
-                        try root.commands.append(command);
+                        try root.commands.append(allocator, command);
                         command = Command.init(allocator);
                     },
                     .eof => {
-                        try root.commands.append(command);
+                        try root.commands.append(allocator, command);
                     },
                     else => {
                         std.debug.panic("not implemented", .{});
@@ -169,15 +173,15 @@ pub fn parse(allocator: Allocator, source: []const u8) Allocator.Error!Ast {
                     },
                     .pipe => {
                         command.pipe_next = true;
-                        try root.commands.append(command);
+                        try root.commands.append(allocator, command);
                         command = Command.init(allocator);
                     },
                     .semicolon => {
-                        try root.commands.append(command);
+                        try root.commands.append(allocator, command);
                         command = Command.init(allocator);
                     },
                     .eof => {
-                        try root.commands.append(command);
+                        try root.commands.append(allocator, command);
                     },
                     else => {
                         std.debug.panic("not implemented", .{});
@@ -191,12 +195,12 @@ pub fn parse(allocator: Allocator, source: []const u8) Allocator.Error!Ast {
                     .quoted_double,
                     .number,
                     => {
-                        try command.argv.append(@intCast(pending.?));
+                        try command.argv.append(allocator, @intCast(pending.?));
                         pending = null;
                         state = .word;
                     },
                     .whitespace => {
-                        try command.argv.append(@intCast(pending.?));
+                        try command.argv.append(allocator, @intCast(pending.?));
                         pending = null;
                         state = .start;
                     },
@@ -211,18 +215,18 @@ pub fn parse(allocator: Allocator, source: []const u8) Allocator.Error!Ast {
                     },
                     .pipe => {
                         command.pipe_next = true;
-                        try command.argv.append(@intCast(pending.?));
-                        try root.commands.append(command);
+                        try command.argv.append(allocator, @intCast(pending.?));
+                        try root.commands.append(allocator, command);
                         command = Command.init(allocator);
                     },
                     .semicolon => {
-                        try command.argv.append(@intCast(pending.?));
-                        try root.commands.append(command);
+                        try command.argv.append(allocator, @intCast(pending.?));
+                        try root.commands.append(allocator, command);
                         command = Command.init(allocator);
                     },
                     .eof => {
-                        try command.argv.append(@intCast(pending.?));
-                        try root.commands.append(command);
+                        try command.argv.append(allocator, @intCast(pending.?));
+                        try root.commands.append(allocator, command);
                     },
                     else => {
                         std.debug.panic("not implemented", .{});
@@ -236,7 +240,7 @@ pub fn parse(allocator: Allocator, source: []const u8) Allocator.Error!Ast {
                     .quoted_double,
                     .number,
                     => {
-                        try command.redirection.append(Redirection{ .in = .{
+                        try command.redirection.append(allocator, Redirection{ .in = .{
                             .fd = pending,
                             .target = @intCast(i),
                         } });
@@ -272,7 +276,7 @@ pub fn parse(allocator: Allocator, source: []const u8) Allocator.Error!Ast {
                     .quoted_double,
                     .number,
                     => {
-                        try command.redirection.append(Redirection{ .out = .{
+                        try command.redirection.append(allocator, Redirection{ .out = .{
                             .fd = pending,
                             .target = @intCast(i),
                         } });
@@ -308,7 +312,7 @@ pub fn parse(allocator: Allocator, source: []const u8) Allocator.Error!Ast {
                     .quoted_double,
                     .number,
                     => {
-                        try command.redirection.append(Redirection{ .out_append = .{
+                        try command.redirection.append(allocator, Redirection{ .out_append = .{
                             .fd = pending,
                             .target = @intCast(i),
                         } });

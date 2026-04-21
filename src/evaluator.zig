@@ -7,12 +7,40 @@ const Ast = @import("ast.zig");
 const Evaluator = @This();
 
 const builtins = struct {
-    usingnamespace @import("builtins/cd.zig");
-    usingnamespace @import("builtins/exit.zig");
+    pub fn cd(argv_ptr: [*:null]const ?[*:0]const u8, _: u8) !void {
+        const argc = std.mem.len(argv_ptr);
+        if (argc == 1) {
+            const HOME = std.posix.getenvZ("HOME") orelse {
+                return error.HOMENotDefined;
+            };
+            return std.posix.chdirZ(HOME);
+        } else if (argc == 2) {
+            const target = std.mem.span(argv_ptr[1].?);
+            return std.posix.chdirZ(target);
+        } else {
+            std.debug.print("cd: too many arguments\n", .{});
+            return error.TooManyArguments;
+        }
+    }
+
+    pub fn exit(argv_ptr: [*:null]const ?[*:0]const u8, last_status: u8) !void {
+        const argc = std.mem.len(argv_ptr);
+        if (argc == 1) {
+            std.posix.exit(last_status);
+        } else if (argc == 2) {
+            const buf = std.mem.span(argv_ptr[1].?);
+            const code = std.fmt.parseInt(u32, buf, 10) catch |err| {
+                return err;
+            };
+            std.posix.exit(@truncate(code));
+        } else {
+            return error.TooManyArguments;
+        }
+    }
 };
 
 // TODO: change anyerror to builtins.Error
-const Error = anyerror || Allocator.Error || std.posix.ForkError || std.posix.ExecveError;
+const Error = anyerror || Allocator.Error;
 
 const BuiltinComandFunc = *const fn ([*:null]const ?[*:0]const u8, u8) anyerror!void;
 
@@ -114,24 +142,24 @@ pub fn init(allocator: Allocator) Evaluator {
 }
 
 pub fn eval(self: *Evaluator, tree: *Ast) Evaluator.Error!u8 {
-    var buffer = try std.ArrayList(u8).initCapacity(self.allocator, initial_buffer_size);
+    var buffer = try std.Io.Writer.Allocating.initCapacity(self.allocator, initial_buffer_size);
     defer buffer.deinit();
+    const writer = &buffer.writer;
+
     const Position = struct {
         start: usize,
         end: usize,
     };
     var positions = try std.ArrayList(Position).initCapacity(self.allocator, initial_args_size);
-    defer positions.deinit();
-
-    const writer = buffer.writer();
+    defer positions.deinit(self.allocator);
 
     var prev_pipe_fd = [_]?std.posix.fd_t{ null, null };
 
     for (tree.root.commands.items) |command| {
         for (command.argv.items) |arg| {
-            const pos_start = buffer.items.len;
+            const pos_start = buffer.written().len;
             try writeWord(tree, arg, writer);
-            try positions.append(.{ .start = pos_start, .end = buffer.items.len });
+            try positions.append(self.allocator, .{ .start = pos_start, .end = buffer.written().len });
             try writer.writeByte(0);
         }
 
@@ -140,7 +168,7 @@ pub fn eval(self: *Evaluator, tree: *Ast) Evaluator.Error!u8 {
         defer self.allocator.free(args_ptrs);
 
         for (positions.items, 0..) |pos, index| {
-            args_ptrs[index] = @as(*align(1) const [*:0]u8, @ptrCast(&buffer.items[pos.start..pos.end :0])).*;
+            args_ptrs[index] = @as(*align(1) const [*:0]u8, @ptrCast(&buffer.written()[pos.start..pos.end :0])).*;
         }
         args_ptrs[args_len] = null;
 
@@ -196,7 +224,7 @@ pub fn eval(self: *Evaluator, tree: *Ast) Evaluator.Error!u8 {
         }
 
         buffer.clearRetainingCapacity();
-        positions.clearRetainingCapacity();
+        positions.clearRetainingCapacity(self.allocator);
     }
 
     for (prev_pipe_fd) |prev| {
