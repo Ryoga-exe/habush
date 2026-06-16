@@ -11,40 +11,79 @@ pub fn main(init: std.process.Init) !void {
         std.log.info("arg: {s}", .{arg});
     }
 
+    const io = init.io;
+    const interactive = try Io.File.stdin().isTty(io) and try Io.File.stderr().isTty(io);
+    std.log.info("interactive: {}", .{interactive});
+
+    ignoreSigint();
+
+    var stdin_buffer: [4096]u8 = undefined;
+    var stdin_file_reader: Io.File.Reader = .initStreaming(.stdin(), io, &stdin_buffer);
+
+    var shell: Shell = .{
+        .io = io,
+        .allocator = gpa,
+        .stdin = &stdin_file_reader.interface,
+    };
+
+    try shell.run();
+}
+
+const Shell = struct {
+    io: Io,
+    allocator: std.mem.Allocator,
+    stdin: *Io.Reader,
+
+    const LoopAction = enum {
+        @"continue",
+        exit,
+    };
+
+    fn run(self: *Shell) !void {
+        while (true) {
+            try self.printPrompt();
+
+            const line = try readLineAlloc(self.stdin, self.allocator) orelse {
+                try Io.File.stderr().writeStreamingAll(self.io, "\n");
+                break;
+            };
+            defer self.allocator.free(line);
+
+            const input = std.mem.trim(u8, line, &std.ascii.whitespace);
+            if (input.len == 0) {
+                continue;
+            }
+
+            switch (try self.handleInput(input)) {
+                .@"continue" => continue,
+                .exit => break,
+            }
+        }
+    }
+
+    fn printPrompt(self: *Shell) !void {
+        try Io.File.stderr().writeStreamingAll(self.io, "habush> ");
+    }
+
+    fn handleInput(self: *Shell, input: []const u8) !LoopAction {
+        _ = self;
+
+        if (std.mem.eql(u8, input, "exit")) {
+            return .exit;
+        }
+
+        std.log.info("input: {s}", .{input});
+        return .@"continue";
+    }
+};
+
+fn ignoreSigint() void {
     const sigint_ignore: posix.Sigaction = .{
         .handler = .{ .handler = posix.SIG.IGN },
         .mask = posix.sigemptyset(),
         .flags = 0,
     };
     posix.sigaction(posix.SIG.INT, &sigint_ignore, null);
-
-    const io = init.io;
-
-    var stdin_buffer: [4096]u8 = undefined;
-    var stdin_file_reader: Io.File.Reader = .initStreaming(.stdin(), io, &stdin_buffer);
-    const stdin_reader = &stdin_file_reader.interface;
-
-    while (true) {
-        try Io.File.stderr().writeStreamingAll(io, "habush> ");
-
-        const line = try readLineAlloc(stdin_reader, gpa) orelse {
-            try Io.File.stderr().writeStreamingAll(io, "\n");
-            break;
-        };
-        defer gpa.free(line);
-
-        const input = std.mem.trim(u8, line, &std.ascii.whitespace);
-
-        if (input.len == 0) {
-            continue;
-        }
-
-        if (std.mem.eql(u8, input, "exit")) {
-            break;
-        }
-
-        std.log.info("input: {s}", .{input});
-    }
 }
 
 fn readLineAlloc(reader: *Io.Reader, allocator: std.mem.Allocator) !?[]u8 {
