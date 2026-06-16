@@ -5,17 +5,18 @@ const posix = std.posix;
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const gpa = init.gpa;
+    const io = init.io;
 
     const args = try init.minimal.args.toSlice(arena);
     for (args) |arg| {
         std.log.info("arg: {s}", .{arg});
     }
 
-    const io = init.io;
     const interactive = try Io.File.stdin().isTty(io) and try Io.File.stderr().isTty(io);
-    std.log.info("interactive: {}", .{interactive});
 
-    ignoreSigint();
+    if (interactive) {
+        ignoreSigint();
+    }
 
     var stdin_buffer: [4096]u8 = undefined;
     var stdin_file_reader: Io.File.Reader = .initStreaming(.stdin(), io, &stdin_buffer);
@@ -24,6 +25,7 @@ pub fn main(init: std.process.Init) !void {
         .io = io,
         .allocator = gpa,
         .stdin = &stdin_file_reader.interface,
+        .interactive = interactive,
     };
 
     try shell.run();
@@ -33,6 +35,7 @@ const Shell = struct {
     io: Io,
     allocator: std.mem.Allocator,
     stdin: *Io.Reader,
+    interactive: bool,
 
     const LoopAction = enum {
         @"continue",
@@ -41,10 +44,14 @@ const Shell = struct {
 
     fn run(self: *Shell) !void {
         while (true) {
-            try self.printPrompt();
+            if (self.interactive) {
+                try self.printPrompt();
+            }
 
             const line = try readLineAlloc(self.stdin, self.allocator) orelse {
-                try Io.File.stderr().writeStreamingAll(self.io, "\n");
+                if (self.interactive) {
+                    try Io.File.stderr().writeStreamingAll(self.io, "\n");
+                }
                 break;
             };
             defer self.allocator.free(line);
