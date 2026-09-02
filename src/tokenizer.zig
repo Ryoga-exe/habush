@@ -68,9 +68,9 @@ pub const Token = struct {
             .unterminated_single_quote,
             .unterminated_double_quote,
             .unterminated_escape,
+            .newline,
             => null,
 
-            .newline => "\n",
             .semicolon => ";",
             .semicolon_semicolon => ";;",
             .semicolon_ampersand => ";&",
@@ -98,7 +98,7 @@ pub const Token = struct {
     }
 
     pub fn symbol(tag: Tag) []const u8 {
-        return tag.lexeme() orelse switch (tag) {
+        return lexeme(tag) orelse switch (tag) {
             .invalid => "invalid token",
             .eof => "EOF",
             .word => "a word",
@@ -106,6 +106,7 @@ pub const Token = struct {
             .unterminated_single_quote => "UNTERMINATED (')",
             .unterminated_double_quote => "UNTERMINATED (\")",
             .unterminated_escape => "UNTERMINATED (\\)",
+            .newline => "newline",
             else => unreachable,
         };
     }
@@ -131,12 +132,11 @@ pub const Tokenizer = struct {
     const State = enum {
         start,
         comment,
-        int,
         word,
-        // word_escape,
-        // single_quote,
-        // double_quote,
-        // double_quote_escape,
+        word_escape,
+        single_quote,
+        double_quote,
+        double_quote_escape,
         semicolon,
         semicolon_semicolon,
         ampersand,
@@ -156,12 +156,15 @@ pub const Tokenizer = struct {
                 .end = undefined,
             },
         };
+        var quote_start: usize = undefined;
+        var escape_start: usize = undefined;
         state: switch (State.start) {
             .start => switch (self.buffer[self.index]) {
                 0 => {
                     if (self.index != self.buffer.len) {
                         continue :state .invalid;
-                    } else return .{
+                    }
+                    return .{
                         .tag = .eof,
                         .loc = .{
                             .start = self.index,
@@ -183,6 +186,7 @@ pub const Tokenizer = struct {
                         result.tag = .newline;
                         self.index += 2;
                     } else {
+                        result.tag = .word;
                         continue :state .word;
                     }
                 },
@@ -202,7 +206,7 @@ pub const Tokenizer = struct {
                 '>' => continue :state .gt,
                 '0'...'9' => {
                     result.tag = .digits;
-                    continue :state .int;
+                    continue :state .word;
                 },
                 else => {
                     result.tag = .word;
@@ -213,9 +217,11 @@ pub const Tokenizer = struct {
                 self.index += 1;
                 switch (self.buffer[self.index]) {
                     0 => {
-                        if (self.index == self.buffer.len) {
+                        if (self.index != self.buffer.len) {
+                            result.loc.start = self.index;
                             continue :state .invalid;
-                        } else return .{
+                        }
+                        return .{
                             .tag = .eof,
                             .loc = .{
                                 .start = self.index,
@@ -223,50 +229,178 @@ pub const Tokenizer = struct {
                             },
                         };
                     },
-                    '\n' => continue :state .start,
+                    '\n' => {
+                        result.loc.start = self.index;
+                        continue :state .start;
+                    },
+                    '\r' => {
+                        if (self.buffer[self.index + 1] == '\n') {
+                            result.loc.start = self.index;
+                            continue :state .start;
+                        }
+                        continue :state .comment;
+                    },
                     else => continue :state .comment,
                 }
             },
-            .int => {
-                self.index += 1;
-                switch (self.buffer[self.index]) {
-                    0 => {
-                        if (self.index != self.buffer.len) {
-                            continue :state .invalid;
-                        }
-                    },
-                    '0'...'9' => continue :state .int,
-                    ' ', '\t', '\n', ';', '&', '|', '(', ')', '<', '>' => {},
-                    '\r' => {
-                        if (self.buffer[self.index + 1] != '\n') {
-                            result.tag = .word;
-                            self.index += 1;
-                            continue :state .word;
-                        }
-                    },
-                    else => {
+            .word => switch (self.buffer[self.index]) {
+                0 => {
+                    if (self.index != self.buffer.len) {
+                        result.loc.start = self.index;
+                        continue :state .invalid;
+                    }
+                },
+                ' ', '\t', '\n', ';', '&', '|', '(', ')', '<', '>' => {},
+                '\r' => {
+                    if (self.buffer[self.index + 1] != '\n') {
                         result.tag = .word;
+                        self.index += 1;
                         continue :state .word;
-                    },
-                }
+                    }
+                },
+                '0'...'9' => {
+                    self.index += 1;
+                    continue :state .word;
+                },
+                '\'' => {
+                    result.tag = .word;
+                    quote_start = self.index;
+                    self.index += 1;
+                    continue :state .single_quote;
+                },
+                '"' => {
+                    result.tag = .word;
+                    quote_start = self.index;
+                    self.index += 1;
+                    continue :state .double_quote;
+                },
+                '\\' => {
+                    escape_start = self.index;
+                    self.index += 1;
+                    continue :state .word_escape;
+                },
+                else => {
+                    result.tag = .word;
+                    self.index += 1;
+                    continue :state .word;
+                },
             },
-            .word => {
-                self.index += 1;
-                switch (self.buffer[self.index]) {
-                    0 => {
-                        if (self.index != self.buffer.len) {
-                            continue :state .invalid;
-                        }
-                    },
-                    ' ', '\t', '\n', ';', '&', '|', '(', ')', '<', '>' => {},
-                    '\r' => {
-                        if (self.buffer[self.index + 1] != '\n') {
-                            self.index += 1;
+            .word_escape => switch (self.buffer[self.index]) {
+                0 => {
+                    if (self.index != self.buffer.len) {
+                        result.loc.start = self.index;
+                        continue :state .invalid;
+                    }
+                    result.tag = .unterminated_escape;
+                    result.loc.start = escape_start;
+                },
+                '\n' => {
+                    self.index += 1;
+                    if (self.index == self.buffer.len) {
+                        result.tag = .unterminated_escape;
+                        result.loc.start = escape_start;
+                    } else {
+                        continue :state .word;
+                    }
+                },
+                '\r' => {
+                    if (self.buffer[self.index + 1] == '\n') {
+                        self.index += 2;
+                        if (self.index == self.buffer.len) {
+                            result.tag = .unterminated_escape;
+                            result.loc.start = escape_start;
+                        } else {
                             continue :state .word;
                         }
-                    },
-                    else => continue :state .word,
-                }
+                    } else {
+                        result.tag = .word;
+                        self.index += 1;
+                        continue :state .word;
+                    }
+                },
+                else => {
+                    result.tag = .word;
+                    self.index += 1;
+                    continue :state .word;
+                },
+            },
+            .single_quote => switch (self.buffer[self.index]) {
+                0 => {
+                    if (self.index != self.buffer.len) {
+                        result.loc.start = self.index;
+                        continue :state .invalid;
+                    }
+                    result.tag = .unterminated_single_quote;
+                    result.loc.start = quote_start;
+                },
+                '\'' => {
+                    self.index += 1;
+                    continue :state .word;
+                },
+                else => {
+                    self.index += 1;
+                    continue :state .single_quote;
+                },
+            },
+            .double_quote => switch (self.buffer[self.index]) {
+                0 => {
+                    if (self.index != self.buffer.len) {
+                        result.loc.start = self.index;
+                        continue :state .invalid;
+                    }
+                    result.tag = .unterminated_double_quote;
+                    result.loc.start = quote_start;
+                },
+                '"' => {
+                    self.index += 1;
+                    continue :state .word;
+                },
+                '\\' => {
+                    escape_start = self.index;
+                    self.index += 1;
+                    continue :state .double_quote_escape;
+                },
+                else => {
+                    self.index += 1;
+                    continue :state .double_quote;
+                },
+            },
+            .double_quote_escape => switch (self.buffer[self.index]) {
+                0 => {
+                    if (self.index != self.buffer.len) {
+                        result.loc.start = self.index;
+                        continue :state .invalid;
+                    }
+                    result.tag = .unterminated_escape;
+                    result.loc.start = escape_start;
+                },
+                '\n' => {
+                    self.index += 1;
+                    if (self.index == self.buffer.len) {
+                        result.tag = .unterminated_escape;
+                        result.loc.start = escape_start;
+                    } else {
+                        continue :state .double_quote;
+                    }
+                },
+                '\r' => {
+                    if (self.buffer[self.index + 1] == '\n') {
+                        self.index += 2;
+                        if (self.index == self.buffer.len) {
+                            result.tag = .unterminated_escape;
+                            result.loc.start = escape_start;
+                        } else {
+                            continue :state .double_quote;
+                        }
+                    } else {
+                        self.index += 1;
+                        continue :state .double_quote;
+                    }
+                },
+                else => {
+                    self.index += 1;
+                    continue :state .double_quote;
+                },
             },
             .semicolon => {
                 self.index += 1;
@@ -438,6 +572,86 @@ test "words, digits and operators" {
         .newline,
         .eof,
     });
+}
+
+test "comments end at LF or CRLF and preserve newline locations" {
+    try testTokenize("# comment", &.{.eof});
+    try testTokenize("# comment\nnext", &.{ .newline, .word, .eof });
+
+    const source = "# comment\r\nnext";
+    var tokenizer = Tokenizer.init(source);
+    const newline = tokenizer.next();
+    try std.testing.expectEqual(Token.Tag.newline, newline.tag);
+    try std.testing.expectEqual(@as(usize, 9), newline.loc.start);
+    try std.testing.expectEqual(@as(usize, 11), newline.loc.end);
+    try std.testing.expectEqual(Token.Tag.word, tokenizer.next().tag);
+    try std.testing.expectEqual(Token.Tag.eof, tokenizer.next().tag);
+}
+
+test "lone CR is part of a word while CRLF is a newline" {
+    const lone_cr = "12\r>";
+    var lone_cr_tokenizer = Tokenizer.init(lone_cr);
+    const word = lone_cr_tokenizer.next();
+    try std.testing.expectEqual(Token.Tag.word, word.tag);
+    try std.testing.expectEqualStrings("12\r", lone_cr[word.loc.start..word.loc.end]);
+    try std.testing.expectEqual(Token.Tag.gt, lone_cr_tokenizer.next().tag);
+    try std.testing.expectEqual(Token.Tag.eof, lone_cr_tokenizer.next().tag);
+
+    try testTokenize("foo\r\nbar", &.{ .word, .newline, .word, .eof });
+}
+
+test "quoted and escaped text stays in one word" {
+    try testTokenize(
+        \\echo "hello world" 'single quoted' escaped\ space
+    ,
+        &.{ .word, .word, .word, .word, .eof },
+    );
+}
+
+test "unterminated quotes and escapes report their opening location" {
+    var single = Tokenizer.init("prefix'hello");
+    const single_issue = single.next();
+    try std.testing.expectEqual(Token.Tag.unterminated_single_quote, single_issue.tag);
+    try std.testing.expectEqual(@as(usize, 6), single_issue.loc.start);
+    try std.testing.expectEqual(@as(usize, 12), single_issue.loc.end);
+
+    var double = Tokenizer.init("prefix\"hello");
+    const double_issue = double.next();
+    try std.testing.expectEqual(Token.Tag.unterminated_double_quote, double_issue.tag);
+    try std.testing.expectEqual(@as(usize, 6), double_issue.loc.start);
+    try std.testing.expectEqual(@as(usize, 12), double_issue.loc.end);
+
+    var escape = Tokenizer.init("foo\\");
+    const escape_issue = escape.next();
+    try std.testing.expectEqual(Token.Tag.unterminated_escape, escape_issue.tag);
+    try std.testing.expectEqual(@as(usize, 3), escape_issue.loc.start);
+    try std.testing.expectEqual(@as(usize, 4), escape_issue.loc.end);
+}
+
+test "LF and CRLF line continuations preserve a digits token" {
+    try testTokenize("12\\\n34", &.{ .digits, .eof });
+    try testTokenize("12\\\r\n34", &.{ .digits, .eof });
+}
+
+test "an internal NUL is invalid and points at the byte" {
+    const source = "foo\x00bar";
+    var tokenizer = Tokenizer.init(source);
+    const invalid = tokenizer.next();
+    try std.testing.expectEqual(Token.Tag.invalid, invalid.tag);
+    try std.testing.expectEqual(@as(usize, 3), invalid.loc.start);
+    try std.testing.expectEqual(@as(usize, 4), invalid.loc.end);
+
+    const comment_source = "# comment\x00after";
+    var comment_tokenizer = Tokenizer.init(comment_source);
+    const invalid_comment = comment_tokenizer.next();
+    try std.testing.expectEqual(Token.Tag.invalid, invalid_comment.tag);
+    try std.testing.expectEqual(@as(usize, 9), invalid_comment.loc.start);
+    try std.testing.expectEqual(@as(usize, 10), invalid_comment.loc.end);
+}
+
+test "newline has no unique fixed lexeme" {
+    try std.testing.expectEqual(@as(?[]const u8, null), Token.lexeme(.newline));
+    try std.testing.expectEqualStrings("newline", Token.symbol(.newline));
 }
 
 fn testTokenize(source: [:0]const u8, expected_token_tags: []const Token.Tag) !void {
