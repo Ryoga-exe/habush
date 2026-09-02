@@ -1,4 +1,4 @@
-//! Tokenizer for habush source
+//! Tokenizer for habush source.
 //! Based on  https://codeberg.org/ziglang/zig/src/branch/master/lib/std/zig/tokenizer.zig
 
 const std = @import("std");
