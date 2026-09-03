@@ -928,6 +928,45 @@ test "locates and renders parse errors" {
     );
 }
 
+test "dumps the structured AST" {
+    var tree = try Ast.parse(std.testing.allocator, "! echo pre'$name' | consume >out");
+    defer tree.deinit(std.testing.allocator);
+
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try tree.dump(&output.writer);
+
+    try std.testing.expectEqualStrings(
+        \\root
+        \\  body:
+        \\    list
+        \\      item:
+        \\        negated_pipeline "!"
+        \\          pipeline:
+        \\            pipe "|"
+        \\              lhs:
+        \\                simple_command
+        \\                  part:
+        \\                    word "echo"
+        \\                      literal "echo"
+        \\                  part:
+        \\                    word "pre'$name'"
+        \\                      literal "pre"
+        \\                      single_quoted "$name"
+        \\              rhs:
+        \\                simple_command
+        \\                  part:
+        \\                    word "consume"
+        \\                      literal "consume"
+        \\                  part:
+        \\                    redirect ">"
+        \\                      target:
+        \\                        word "out"
+        \\                          literal "out"
+        \\
+    , output.written());
+}
+
 fn expectCompoundContinuation(
     source: [:0]const u8,
     kind: Ast.CompoundContinuation.Kind,

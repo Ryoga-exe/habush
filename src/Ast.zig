@@ -9,6 +9,7 @@ const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
 const Ast = @This();
 const Parse = @import("Parse.zig");
+const debug = @import("Ast/debug.zig");
 const heredoc = @import("heredoc.zig");
 const tokenizer = @import("tokenizer.zig");
 const word = @import("word.zig");
@@ -277,6 +278,10 @@ pub fn renderError(tree: *const Ast, parse_error: Error, writer: *Writer) Writer
             "collected here-document does not match its parsed delimiter",
         ),
     }
+}
+
+pub fn dump(tree: *const Ast, writer: *Writer) Writer.Error!void {
+    return debug.render(tree, writer);
 }
 
 pub fn nodeTag(tree: *const Ast, index: Node.Index) Node.Tag {
