@@ -97,6 +97,7 @@ pub const Continuation = union(enum) {
     command_after: TokenIndex,
     redirect_target: TokenIndex,
     closing_paren: TokenIndex,
+    closing_brace: TokenIndex,
     compound: CompoundContinuation,
 };
 
@@ -278,6 +279,11 @@ pub fn subshell(tree: *const Ast, index: Node.Index) Node.Subshell {
     return tree.extraData(tree.nodeData(index).extra, Node.Subshell);
 }
 
+pub fn braceGroup(tree: *const Ast, index: Node.Index) Node.BraceGroup {
+    std.debug.assert(tree.nodeTag(index) == .brace_group);
+    return tree.extraData(tree.nodeData(index).extra, Node.BraceGroup);
+}
+
 pub fn ifClause(tree: *const Ast, index: Node.Index) Node.If {
     std.debug.assert(tree.nodeTag(index) == .if_clause);
     return tree.extraData(tree.nodeData(index).extra, Node.If);
@@ -427,6 +433,9 @@ pub const Node = struct {
         /// `data.extra`: encoded `Subshell` data.
         subshell,
 
+        /// `data.extra`: encoded `BraceGroup` data.
+        brace_group,
+
         /// `data.extra`: encoded `If` data.
         if_clause,
 
@@ -467,6 +476,13 @@ pub const Node = struct {
     };
 
     pub const Subshell = struct {
+        body: OptionalIndex,
+        close_token: TokenIndex,
+        redirects_start: ExtraIndex,
+        redirects_end: ExtraIndex,
+    };
+
+    pub const BraceGroup = struct {
         body: OptionalIndex,
         close_token: TokenIndex,
         redirects_start: ExtraIndex,

@@ -506,6 +506,73 @@ test "rejects an empty subshell" {
     try std.testing.expectEqual(Token.Tag.r_paren, tree.tokenTag(tree.errors[0].token));
 }
 
+test "parses a brace group body and trailing redirection" {
+    var tree = try Ast.parse(std.testing.allocator, "{ echo; cat; } 2>log");
+    defer tree.deinit(std.testing.allocator);
+
+    const group_node = firstCommand(&tree);
+    try std.testing.expectEqual(Node.Tag.brace_group, tree.nodeTag(group_node));
+
+    const group = tree.braceGroup(group_node);
+    try std.testing.expectEqualStrings("}", tree.tokenSlice(group.close_token));
+    const body = group.body.unwrap().?;
+    try std.testing.expectEqual(@as(usize, 2), tree.listItemCount(body));
+
+    const redirects = tree.extraDataSlice(.{
+        .start = group.redirects_start,
+        .end = group.redirects_end,
+    }, Node.Index);
+    try std.testing.expectEqual(@as(usize, 1), redirects.len);
+    try std.testing.expectEqual(Node.Tag.redirect, tree.nodeTag(redirects[0]));
+}
+
+test "does not recognize a brace group close in argument position" {
+    var tree = try Ast.parse(std.testing.allocator, "{ echo }");
+    defer tree.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+    try std.testing.expect(tree.status == .incomplete);
+    try std.testing.expect(tree.status.incomplete == .closing_brace);
+
+    const group = tree.braceGroup(firstCommand(&tree));
+    const command = tree.listItem(group.body.unwrap().?, 0).command;
+    const parts = tree.simpleCommandParts(command);
+    try std.testing.expectEqual(@as(usize, 2), parts.len);
+    try std.testing.expectEqualStrings("}", tree.tokenSlice(tree.nodeMainToken(parts[1])));
+}
+
+test "requests continuation for an unclosed brace group" {
+    var tree = try Ast.parse(std.testing.allocator, "{ echo;");
+    defer tree.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+    try std.testing.expect(tree.status == .incomplete);
+    try std.testing.expect(tree.status.incomplete == .closing_brace);
+    try std.testing.expectEqualStrings(
+        "{",
+        tree.tokenSlice(tree.status.incomplete.closing_brace),
+    );
+}
+
+test "rejects an empty brace group" {
+    var tree = try Ast.parse(std.testing.allocator, "{ }");
+    defer tree.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), tree.errors.len);
+    try std.testing.expectEqual(Ast.Error.Tag.expected_command, tree.errors[0].tag);
+    try std.testing.expectEqual(Token.Tag.keyword_r_brace, tree.tokenTag(tree.errors[0].token));
+}
+
+test "treats brace reserved words as ordinary command arguments" {
+    var tree = try Ast.parse(std.testing.allocator, "echo { }");
+    defer tree.deinit(std.testing.allocator);
+
+    const parts = tree.simpleCommandParts(firstCommand(&tree));
+    try std.testing.expectEqual(@as(usize, 3), parts.len);
+    try std.testing.expectEqualStrings("{", tree.tokenSlice(tree.nodeMainToken(parts[1])));
+    try std.testing.expectEqualStrings("}", tree.tokenSlice(tree.nodeMainToken(parts[2])));
+}
+
 test "parses if elif else and trailing redirection" {
     const source =
         \\if test -f file; then

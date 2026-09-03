@@ -352,6 +352,7 @@ fn parseCommand(parser: *Parse) Ast.ParseError!Node.Index {
         .keyword_while => parser.parseLoopClause(.while_clause),
         .keyword_until => parser.parseLoopClause(.until_clause),
         .keyword_for => parser.parseForClause(),
+        .keyword_l_brace => parser.parseBraceGroup(),
         .l_paren => parser.parseSubshell(),
         else => parser.parseSimpleCommand(),
     };
@@ -891,6 +892,49 @@ fn parseSubshell(parser: *Parse) Ast.ParseError!Node.Index {
     });
 }
 
+fn parseBraceGroup(parser: *Parse) Ast.ParseError!Node.Index {
+    const open = parser.nextToken();
+    const body = try parser.parseList(.{ .reserved_words = &.{.keyword_r_brace} });
+
+    var close_token = parser.tok_i;
+    if (parser.tokenTag(parser.tok_i) == .keyword_r_brace) {
+        if (body == null) {
+            try parser.warn(.{
+                .tag = .expected_command,
+                .token = parser.tok_i,
+            });
+        }
+        close_token = parser.nextToken();
+    } else if (parser.tokenTag(parser.tok_i) == .eof) {
+        parser.setIncomplete(.{ .closing_brace = open });
+    } else {
+        try parser.warn(.{
+            .tag = .expected_token,
+            .token = parser.tok_i,
+            .extra = .{ .expected_tag = .keyword_r_brace },
+        });
+    }
+
+    const scratch_start = parser.scratch.items.len;
+    defer parser.scratch.shrinkRetainingCapacity(scratch_start);
+    while (parser.startsRedirect()) {
+        try parser.scratch.append(parser.gpa, try parser.parseRedirect());
+    }
+    const redirects = try parser.listToSpan(parser.scratch.items[scratch_start..]);
+
+    const extra = try parser.addExtra(Node.BraceGroup{
+        .body = Node.OptionalIndex.fromOptional(body),
+        .close_token = close_token,
+        .redirects_start = redirects.start,
+        .redirects_end = redirects.end,
+    });
+    return parser.addNode(.{
+        .tag = .brace_group,
+        .main_token = open,
+        .data = .{ .extra = extra },
+    });
+}
+
 fn parseSimpleCommand(parser: *Parse) Ast.ParseError!Node.Index {
     const scratch_start = parser.scratch.items.len;
     defer parser.scratch.shrinkRetainingCapacity(scratch_start);
@@ -1201,7 +1245,7 @@ fn canStartCommand(parser: *const Parse) bool {
     const tag = parser.tokenTag(parser.tok_i);
     if (isReservedWord(tag)) {
         return tag == .keyword_if or tag == .keyword_while or tag == .keyword_until or
-            tag == .keyword_for;
+            tag == .keyword_for or tag == .keyword_l_brace;
     }
     return tag == .l_paren or isWord(tag) or parser.startsRedirect();
 }
@@ -1306,6 +1350,8 @@ fn isReservedWord(tag: Token.Tag) bool {
         .keyword_done,
         .keyword_for,
         .keyword_in,
+        .keyword_l_brace,
+        .keyword_r_brace,
         => true,
         else => false,
     };
