@@ -284,6 +284,11 @@ pub fn braceGroup(tree: *const Ast, index: Node.Index) Node.BraceGroup {
     return tree.extraData(tree.nodeData(index).extra, Node.BraceGroup);
 }
 
+pub fn negatedPipeline(tree: *const Ast, index: Node.Index) ?Node.Index {
+    std.debug.assert(tree.nodeTag(index) == .negated_pipeline);
+    return tree.nodeData(index).opt_node.unwrap();
+}
+
 pub fn ifClause(tree: *const Ast, index: Node.Index) Node.If {
     std.debug.assert(tree.nodeTag(index) == .if_clause);
     return tree.extraData(tree.nodeData(index).extra, Node.If);
@@ -426,6 +431,9 @@ pub const Node = struct {
         or_if,
         pipe,
         pipe_and,
+
+        /// `data.opt_node`: the pipeline following `!`, if present.
+        negated_pipeline,
 
         /// `data.extra_range`: `Node.Index` values in source order.
         simple_command,

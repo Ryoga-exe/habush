@@ -209,7 +209,7 @@ fn parseList(
     parser.skipNewlines();
     if (parser.atListEnd(stop)) return null;
 
-    if (!parser.canStartCommand()) {
+    if (!parser.canStartPipeline()) {
         try parser.warn(.{
             .tag = .expected_command,
             .token = parser.tok_i,
@@ -261,7 +261,7 @@ fn parseList(
             });
             break;
         }
-        if (!parser.canStartCommand()) {
+        if (!parser.canStartPipeline()) {
             try parser.warn(.{
                 .tag = .expected_command,
                 .token = parser.tok_i,
@@ -285,7 +285,7 @@ fn parseAndOr(parser: *Parse) Ast.ParseError!Node.Index {
         const operator = parser.nextToken();
         parser.skipNewlines();
 
-        if (!parser.canStartCommand()) {
+        if (!parser.canStartPipeline()) {
             if (parser.tokenTag(parser.tok_i) == .eof) {
                 parser.setIncomplete(.{ .command_after = operator });
             } else {
@@ -313,6 +313,31 @@ fn parseAndOr(parser: *Parse) Ast.ParseError!Node.Index {
 }
 
 fn parsePipeline(parser: *Parse) Ast.ParseError!Node.Index {
+    if (parser.tokenTag(parser.tok_i) == .keyword_bang) {
+        const bang = parser.nextToken();
+        parser.skipNewlines();
+
+        var child: Node.OptionalIndex = .none;
+        if (!parser.canStartPipeline()) {
+            if (parser.tokenTag(parser.tok_i) == .eof) {
+                parser.setIncomplete(.{ .command_after = bang });
+            } else {
+                try parser.warn(.{
+                    .tag = .expected_command,
+                    .token = parser.tok_i,
+                });
+            }
+        } else {
+            child = (try parser.parsePipeline()).toOptional();
+        }
+
+        return parser.addNode(.{
+            .tag = .negated_pipeline,
+            .main_token = bang,
+            .data = .{ .opt_node = child },
+        });
+    }
+
     var lhs = try parser.parseCommand();
 
     while (isPipe(parser.tokenTag(parser.tok_i))) {
@@ -1250,6 +1275,10 @@ fn canStartCommand(parser: *const Parse) bool {
     return tag == .l_paren or isWord(tag) or parser.startsRedirect();
 }
 
+fn canStartPipeline(parser: *const Parse) bool {
+    return parser.tokenTag(parser.tok_i) == .keyword_bang or parser.canStartCommand();
+}
+
 fn atListEnd(parser: *const Parse, stop: StopSet) bool {
     const tag = parser.tokenTag(parser.tok_i);
     return tag == .eof or stop.matches(parser);
@@ -1352,6 +1381,7 @@ fn isReservedWord(tag: Token.Tag) bool {
         .keyword_in,
         .keyword_l_brace,
         .keyword_r_brace,
+        .keyword_bang,
         => true,
         else => false,
     };

@@ -402,6 +402,69 @@ test "records a repeated pipe once" {
     try std.testing.expectEqual(Token.Tag.pipe, tree.tokenTag(tree.errors[0].token));
 }
 
+test "negates a complete pipeline" {
+    var tree = try Ast.parse(std.testing.allocator, "! producer | consumer");
+    defer tree.deinit(std.testing.allocator);
+
+    const negation = firstCommand(&tree);
+    try std.testing.expectEqual(Node.Tag.negated_pipeline, tree.nodeTag(negation));
+    try std.testing.expectEqualStrings("!", tree.tokenSlice(tree.nodeMainToken(negation)));
+    try std.testing.expectEqual(Node.Tag.pipe, tree.nodeTag(tree.negatedPipeline(negation).?));
+}
+
+test "parses nested pipeline negation" {
+    var tree = try Ast.parse(std.testing.allocator, "! ! command");
+    defer tree.deinit(std.testing.allocator);
+
+    const outer = firstCommand(&tree);
+    const inner = tree.negatedPipeline(outer).?;
+    try std.testing.expectEqual(Node.Tag.negated_pipeline, tree.nodeTag(inner));
+    try std.testing.expectEqual(Node.Tag.simple_command, tree.nodeTag(tree.negatedPipeline(inner).?));
+}
+
+test "pipeline negation binds before and-or" {
+    var tree = try Ast.parse(std.testing.allocator, "! a | b && c");
+    defer tree.deinit(std.testing.allocator);
+
+    const and_if = firstCommand(&tree);
+    try std.testing.expectEqual(Node.Tag.and_if, tree.nodeTag(and_if));
+    const children = tree.nodeData(and_if).node_and_node;
+    try std.testing.expectEqual(Node.Tag.negated_pipeline, tree.nodeTag(children[0]));
+    try std.testing.expectEqual(Node.Tag.pipe, tree.nodeTag(tree.negatedPipeline(children[0]).?));
+}
+
+test "requests continuation after pipeline negation" {
+    var tree = try Ast.parse(std.testing.allocator, "!");
+    defer tree.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+    try std.testing.expect(tree.status == .incomplete);
+    try std.testing.expect(tree.status.incomplete == .command_after);
+    try std.testing.expectEqualStrings(
+        "!",
+        tree.tokenSlice(tree.status.incomplete.command_after),
+    );
+    try std.testing.expect(tree.negatedPipeline(firstCommand(&tree)) == null);
+}
+
+test "rejects pipeline negation after a pipe operator" {
+    var tree = try Ast.parse(std.testing.allocator, "a | ! b");
+    defer tree.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), tree.errors.len);
+    try std.testing.expectEqual(Ast.Error.Tag.expected_command, tree.errors[0].tag);
+    try std.testing.expectEqual(Token.Tag.keyword_bang, tree.tokenTag(tree.errors[0].token));
+}
+
+test "treats pipeline negation as an ordinary command argument" {
+    var tree = try Ast.parse(std.testing.allocator, "echo !");
+    defer tree.deinit(std.testing.allocator);
+
+    const parts = tree.simpleCommandParts(firstCommand(&tree));
+    try std.testing.expectEqual(@as(usize, 2), parts.len);
+    try std.testing.expectEqualStrings("!", tree.tokenSlice(tree.nodeMainToken(parts[1])));
+}
+
 test "parses and-or after pipelines with the correct precedence" {
     var tree = try Ast.parse(std.testing.allocator, "a | b && c || d | e");
     defer tree.deinit(std.testing.allocator);
