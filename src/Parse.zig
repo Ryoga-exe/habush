@@ -7,6 +7,7 @@ const Node = Ast.Node;
 const heredoc = @import("heredoc.zig");
 const Token = @import("tokenizer.zig").Token;
 const Tokenizer = @import("tokenizer.zig").Tokenizer;
+const word = @import("word.zig");
 const Parse = @This();
 
 const StopSet = struct {
@@ -64,6 +65,7 @@ errors: std.ArrayList(Ast.Error) = .empty,
 status: Ast.Status = .complete,
 nodes: Ast.NodeList = .empty,
 extra_data: std.ArrayList(u32) = .empty,
+word_parts: Ast.WordPartList = .empty,
 here_documents: Ast.HereDocumentList = .empty,
 here_document_data: std.ArrayList(u8) = .empty,
 ready_here_document_count: u32 = 0,
@@ -109,6 +111,7 @@ pub fn parseWithOptions(
             .unterminated_single_quote,
             .unterminated_double_quote,
             .unterminated_escape,
+            .unterminated_parameter_expansion,
             => status = .{ .incomplete = .{ .lexical = token_index } },
             else => {},
         }
@@ -131,6 +134,7 @@ pub fn parseWithOptions(
     defer parser.errors.deinit(gpa);
     defer parser.nodes.deinit(gpa);
     defer parser.extra_data.deinit(gpa);
+    defer parser.word_parts.deinit(gpa);
     defer parser.here_documents.deinit(gpa);
     defer parser.here_document_data.deinit(gpa);
     defer parser.scratch.deinit(gpa);
@@ -141,6 +145,8 @@ pub fn parseWithOptions(
 
     const extra_data = try parser.extra_data.toOwnedSlice(gpa);
     errdefer gpa.free(extra_data);
+    var word_parts = parser.word_parts.toOwnedSlice();
+    errdefer word_parts.deinit(gpa);
     var here_documents = parser.here_documents.toOwnedSlice();
     errdefer here_documents.deinit(gpa);
     const here_document_data = try parser.here_document_data.toOwnedSlice(gpa);
@@ -153,6 +159,7 @@ pub fn parseWithOptions(
         .tokens = token_slice,
         .nodes = parser.nodes.toOwnedSlice(),
         .extra_data = extra_data,
+        .word_parts = word_parts,
         .here_documents = here_documents,
         .here_document_data = here_document_data,
         .ready_here_document_count = parser.ready_here_document_count,
@@ -738,10 +745,26 @@ fn parseSimpleCommand(parser: *Parse) Ast.ParseError!Node.Index {
 
 fn parseWord(parser: *Parse) Ast.ParseError!Node.Index {
     const word_token = parser.nextToken();
+    const part_start = std.math.cast(u32, parser.word_parts.len) orelse
+        return error.SourceTooLarge;
+    var iterator = word.Iterator.init(
+        parser.rawTokenSlice(word_token),
+        parser.tokens.items(.start)[word_token],
+    );
+    while (iterator.next()) |part| {
+        try parser.word_parts.append(parser.gpa, part);
+    }
+    std.debug.assert(iterator.status == .complete);
+    const part_end = std.math.cast(u32, parser.word_parts.len) orelse
+        return error.SourceTooLarge;
+
     return parser.addNode(.{
         .tag = .word,
         .main_token = word_token,
-        .data = .{ .none = {} },
+        .data = .{ .word_parts = .{
+            .start = @enumFromInt(part_start),
+            .end = @enumFromInt(part_end),
+        } },
     });
 }
 
@@ -752,23 +775,24 @@ fn parseRedirect(parser: *Parse) Ast.ParseError!Node.Index {
     }
 
     const operator = parser.nextToken();
-    const target = parser.tok_i;
-    const has_target = isWord(parser.tokenTag(target));
+    const target_token = parser.tok_i;
+    const has_target = isWord(parser.tokenTag(target_token));
+    var target: Node.OptionalIndex = .none;
     if (!has_target) {
-        if (parser.tokenTag(target) == .eof) {
+        if (parser.tokenTag(target_token) == .eof) {
             parser.setIncomplete(.{ .redirect_target = operator });
         } else {
             try parser.warn(.{
                 .tag = .expected_redirect_target,
-                .token = target,
+                .token = target_token,
             });
         }
     } else {
-        _ = parser.nextToken();
+        target = (try parser.parseWord()).toOptional();
     }
 
     const document = if (has_target and isHereDocument(parser.tokenTag(operator)))
-        try parser.prepareHereDocument(operator, target)
+        try parser.prepareHereDocument(operator, target_token)
     else
         null;
     const redirect_extra = try parser.addExtra(Node.Redirect{

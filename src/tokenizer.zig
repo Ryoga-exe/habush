@@ -47,6 +47,7 @@ pub const Token = struct {
         unterminated_single_quote,
         unterminated_double_quote,
         unterminated_escape,
+        unterminated_parameter_expansion,
 
         newline,
 
@@ -88,6 +89,7 @@ pub const Token = struct {
             .unterminated_single_quote,
             .unterminated_double_quote,
             .unterminated_escape,
+            .unterminated_parameter_expansion,
             .newline,
             => null,
 
@@ -136,6 +138,7 @@ pub const Token = struct {
             .unterminated_single_quote => "UNTERMINATED (')",
             .unterminated_double_quote => "UNTERMINATED (\")",
             .unterminated_escape => "UNTERMINATED (\\)",
+            .unterminated_parameter_expansion => "UNTERMINATED (${...})",
             .newline => "newline",
             else => unreachable,
         };
@@ -167,6 +170,7 @@ pub const Tokenizer = struct {
         single_quote,
         double_quote,
         double_quote_escape,
+        parameter_expansion,
         semicolon,
         semicolon_semicolon,
         ampersand,
@@ -188,6 +192,9 @@ pub const Tokenizer = struct {
         };
         var quote_start: usize = undefined;
         var escape_start: usize = undefined;
+        var parameter_start: usize = undefined;
+        var parameter_depth: u32 = 0;
+        var parameter_return_state: State = undefined;
         state: switch (State.start) {
             .start => switch (self.buffer[self.index]) {
                 0 => {
@@ -309,6 +316,18 @@ pub const Tokenizer = struct {
                     self.index += 1;
                     continue :state .word_escape;
                 },
+                '$' => {
+                    result.tag = .word;
+                    if (self.buffer[self.index + 1] == '{') {
+                        parameter_start = self.index;
+                        parameter_depth = 1;
+                        parameter_return_state = .word;
+                        self.index += 2;
+                        continue :state .parameter_expansion;
+                    }
+                    self.index += 1;
+                    continue :state .word;
+                },
                 else => {
                     result.tag = .word;
                     self.index += 1;
@@ -390,6 +409,17 @@ pub const Tokenizer = struct {
                     self.index += 1;
                     continue :state .double_quote_escape;
                 },
+                '$' => {
+                    if (self.buffer[self.index + 1] == '{') {
+                        parameter_start = self.index;
+                        parameter_depth = 1;
+                        parameter_return_state = .double_quote;
+                        self.index += 2;
+                        continue :state .parameter_expansion;
+                    }
+                    self.index += 1;
+                    continue :state .double_quote;
+                },
                 else => {
                     self.index += 1;
                     continue :state .double_quote;
@@ -430,6 +460,42 @@ pub const Tokenizer = struct {
                 else => {
                     self.index += 1;
                     continue :state .double_quote;
+                },
+            },
+            .parameter_expansion => switch (self.buffer[self.index]) {
+                0 => {
+                    if (self.index != self.buffer.len) {
+                        result.loc.start = self.index;
+                        continue :state .invalid;
+                    }
+                    result.tag = .unterminated_parameter_expansion;
+                    result.loc.start = parameter_start;
+                },
+                '$' => {
+                    if (self.buffer[self.index + 1] == '{') {
+                        parameter_depth += 1;
+                        self.index += 2;
+                    } else {
+                        self.index += 1;
+                    }
+                    continue :state .parameter_expansion;
+                },
+                '}' => {
+                    self.index += 1;
+                    parameter_depth -= 1;
+                    if (parameter_depth == 0) {
+                        continue :state parameter_return_state;
+                    }
+                    continue :state .parameter_expansion;
+                },
+                '\\' => {
+                    self.index += 1;
+                    if (self.buffer[self.index] != 0) self.index += 1;
+                    continue :state .parameter_expansion;
+                },
+                else => {
+                    self.index += 1;
+                    continue :state .parameter_expansion;
                 },
             },
             .semicolon => {
@@ -664,6 +730,22 @@ test "quoted and escaped text stays in one word" {
     ,
         &.{ .word, .word, .word, .word, .eof },
     );
+}
+
+test "parameter expansions stay inside their word" {
+    try testTokenize(
+        \\echo pre${name} "${other}" ${value:-${fallback}}
+    ,
+        &.{ .word, .word, .word, .word, .eof },
+    );
+}
+
+test "unterminated parameter expansion reports its opening location" {
+    var tokenizer = Tokenizer.init("prefix${name\nnext");
+    const issue = tokenizer.next();
+    try std.testing.expectEqual(Token.Tag.unterminated_parameter_expansion, issue.tag);
+    try std.testing.expectEqual(@as(usize, 6), issue.loc.start);
+    try std.testing.expectEqual(@as(usize, 17), issue.loc.end);
 }
 
 test "unterminated quotes and escapes report their opening location" {

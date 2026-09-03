@@ -10,6 +10,7 @@ const Ast = @This();
 const Parse = @import("Parse.zig");
 const heredoc = @import("heredoc.zig");
 const tokenizer = @import("tokenizer.zig");
+const word = @import("word.zig");
 const Token = tokenizer.Token;
 
 /// Reference to externally-owned data.
@@ -18,6 +19,7 @@ source: [:0]const u8,
 tokens: TokenList.Slice,
 nodes: NodeList.Slice,
 extra_data: []u32,
+word_parts: WordPartList.Slice,
 here_documents: HereDocumentList.Slice,
 here_document_data: []u8,
 ready_here_document_count: u32,
@@ -31,6 +33,7 @@ pub const TokenList = std.MultiArrayList(struct {
     start: ByteOffset,
 });
 pub const NodeList = std.MultiArrayList(Node);
+pub const WordPartList = std.MultiArrayList(word.Part);
 pub const HereDocumentList = std.MultiArrayList(struct {
     redirect: Node.Index,
     delimiter_start: u32,
@@ -42,6 +45,16 @@ pub const HereDocumentList = std.MultiArrayList(struct {
 
 pub const TokenIndex = u32;
 pub const ParseError = Allocator.Error || error{SourceTooLarge};
+pub const WordPart = word.Part;
+
+pub const WordPartIndex = enum(u32) {
+    _,
+};
+
+pub const WordPartRange = struct {
+    start: WordPartIndex,
+    end: WordPartIndex,
+};
 pub const ParseOptions = struct {
     /// The AST borrows the bodies for its lifetime.
     collected_here_documents: []const heredoc.Collected = &.{},
@@ -154,6 +167,7 @@ pub fn deinit(tree: *Ast, allocator: Allocator) void {
     tree.tokens.deinit(allocator);
     tree.nodes.deinit(allocator);
     allocator.free(tree.extra_data);
+    tree.word_parts.deinit(allocator);
     tree.here_documents.deinit(allocator);
     allocator.free(tree.here_document_data);
     allocator.free(tree.errors);
@@ -196,6 +210,23 @@ pub fn nodeData(tree: *const Ast, index: Node.Index) Node.Data {
 pub fn simpleCommandParts(tree: *const Ast, index: Node.Index) []const Node.Index {
     std.debug.assert(tree.nodeTag(index) == .simple_command);
     return tree.extraDataSlice(tree.nodeData(index).extra_range, Node.Index);
+}
+
+pub fn wordPartCount(tree: *const Ast, index: Node.Index) usize {
+    std.debug.assert(tree.nodeTag(index) == .word);
+    const range = tree.nodeData(index).word_parts;
+    return @intFromEnum(range.end) - @intFromEnum(range.start);
+}
+
+pub fn wordPart(tree: *const Ast, index: Node.Index, part_index: usize) WordPart {
+    std.debug.assert(part_index < tree.wordPartCount(index));
+    const range = tree.nodeData(index).word_parts;
+    const absolute_index = @intFromEnum(range.start) + part_index;
+    return .{
+        .tag = tree.word_parts.items(.tag)[absolute_index],
+        .start = tree.word_parts.items(.start)[absolute_index],
+        .end = tree.word_parts.items(.end)[absolute_index],
+    };
 }
 
 pub fn listItemCount(tree: *const Ast, index: Node.Index) usize {
@@ -363,7 +394,7 @@ pub const Node = struct {
         while_clause,
         until_clause,
 
-        /// `main_token` identifies the word; `data.none`.
+        /// `main_token` identifies the word; `data.word_parts` indexes its parts.
         word,
 
         /// `main_token` identifies the operator; `data.extra` encodes `Redirect`.
@@ -376,6 +407,7 @@ pub const Node = struct {
         node_and_node: struct { Index, Index },
         extra: ExtraIndex,
         extra_range: SubRange,
+        word_parts: WordPartRange,
     };
 
     pub const SubRange = struct {
@@ -426,7 +458,7 @@ pub const Node = struct {
 
     pub const Redirect = struct {
         io_number: OptionalTokenIndex,
-        target: TokenIndex,
+        target: OptionalIndex,
         here_document: HereDocumentIndex.Optional,
     };
 };
@@ -464,6 +496,8 @@ test "MultiArrayList stores node fields and index relationships" {
     errdefer allocator.free(errors);
     var here_documents: HereDocumentList = .empty;
     errdefer here_documents.deinit(allocator);
+    var word_parts: WordPartList = .empty;
+    errdefer word_parts.deinit(allocator);
     const here_document_data = try allocator.alloc(u8, 0);
     errdefer allocator.free(here_document_data);
 
@@ -472,6 +506,7 @@ test "MultiArrayList stores node fields and index relationships" {
         .tokens = tokens.toOwnedSlice(),
         .nodes = nodes.toOwnedSlice(),
         .extra_data = extra_data,
+        .word_parts = word_parts.toOwnedSlice(),
         .here_documents = here_documents.toOwnedSlice(),
         .here_document_data = here_document_data,
         .ready_here_document_count = 0,

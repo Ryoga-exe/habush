@@ -227,21 +227,41 @@ pub const Iterator = struct {
         if (iterator.index + 1 == iterator.source.len) return null;
 
         if (iterator.source[iterator.index + 1] == '{') {
-            const name_start = iterator.index + 2;
-            iterator.index = name_start;
-            while (iterator.index < iterator.source.len and
-                iterator.source[iterator.index] != '}')
-            {
-                iterator.index += 1;
+            const content_start = iterator.index + 2;
+            iterator.index = content_start;
+            var depth: u32 = 1;
+            while (iterator.index < iterator.source.len) {
+                switch (iterator.source[iterator.index]) {
+                    '$' => {
+                        if (iterator.index + 1 < iterator.source.len and
+                            iterator.source[iterator.index + 1] == '{')
+                        {
+                            depth += 1;
+                            iterator.index += 2;
+                        } else {
+                            iterator.index += 1;
+                        }
+                    },
+                    '}' => {
+                        depth -= 1;
+                        if (depth == 0) break;
+                        iterator.index += 1;
+                    },
+                    '\\' => {
+                        iterator.index += 1;
+                        if (iterator.index < iterator.source.len) iterator.index += 1;
+                    },
+                    else => iterator.index += 1,
+                }
             }
             if (iterator.index == iterator.source.len) {
                 iterator.setIncomplete(.parameter_brace, dollar);
                 return null;
             }
 
-            const name_end = iterator.index;
+            const content_end = iterator.index;
             iterator.index += 1;
-            return iterator.part(braced_parameter_tag, name_start, name_end);
+            return iterator.part(braced_parameter_tag, content_start, content_end);
         }
 
         if (!isNameStart(iterator.source[iterator.index + 1])) return null;

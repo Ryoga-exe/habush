@@ -34,6 +34,69 @@ test "parses a simple command into indexed nodes" {
     try std.testing.expectEqualStrings("hello", tree.tokenSlice(tree.nodeMainToken(parts[1])));
 }
 
+test "stores structured parts for command and redirect words" {
+    const source = "echo pre'raw'\"$name\"${other}\\ value >\"$output\"";
+    var tree = try Ast.parse(std.testing.allocator, source);
+    defer tree.deinit(std.testing.allocator);
+
+    const command = firstCommand(&tree);
+    const command_parts = tree.simpleCommandParts(command);
+    const argument = command_parts[1];
+    try std.testing.expectEqual(@as(usize, 6), tree.wordPartCount(argument));
+    try expectWordPart(&tree, argument, 0, .literal, "pre");
+    try expectWordPart(&tree, argument, 1, .single_quoted, "raw");
+    try expectWordPart(&tree, argument, 2, .double_quoted_parameter, "name");
+    try expectWordPart(&tree, argument, 3, .braced_parameter, "other");
+    try expectWordPart(&tree, argument, 4, .escaped, " ");
+    try expectWordPart(&tree, argument, 5, .literal, "value");
+
+    const redirect = tree.redirect(command_parts[2]);
+    const target = redirect.target.unwrap().?;
+    try std.testing.expectEqual(@as(usize, 1), tree.wordPartCount(target));
+    try expectWordPart(&tree, target, 0, .double_quoted_parameter, "output");
+}
+
+test "stores empty quoted word parts" {
+    var tree = try Ast.parse(std.testing.allocator, "echo '' \"\"");
+    defer tree.deinit(std.testing.allocator);
+
+    const parts = tree.simpleCommandParts(firstCommand(&tree));
+    const single = tree.wordPart(parts[1], 0);
+    try std.testing.expectEqual(Ast.WordPart.Tag.single_quoted, single.tag);
+    try std.testing.expectEqual(single.start, single.end);
+    const double = tree.wordPart(parts[2], 0);
+    try std.testing.expectEqual(Ast.WordPart.Tag.double_quoted, double.tag);
+    try std.testing.expectEqual(double.start, double.end);
+}
+
+test "stores a nested braced parameter as one part" {
+    const source = "echo ${value:-${fallback}}";
+    var tree = try Ast.parse(std.testing.allocator, source);
+    defer tree.deinit(std.testing.allocator);
+
+    const argument = tree.simpleCommandParts(firstCommand(&tree))[1];
+    try std.testing.expectEqual(@as(usize, 1), tree.wordPartCount(argument));
+    try expectWordPart(
+        &tree,
+        argument,
+        0,
+        .braced_parameter,
+        "value:-${fallback}",
+    );
+}
+
+fn expectWordPart(
+    tree: *const Ast,
+    word_node: Node.Index,
+    part_index: usize,
+    tag: Ast.WordPart.Tag,
+    expected_source: []const u8,
+) !void {
+    const part = tree.wordPart(word_node, part_index);
+    try std.testing.expectEqual(tag, part.tag);
+    try std.testing.expectEqualStrings(expected_source, tree.source[part.start..part.end]);
+}
+
 test "records an unexpected leading operator" {
     var tree = try Ast.parse(std.testing.allocator, "|");
     defer tree.deinit(std.testing.allocator);
@@ -57,6 +120,19 @@ test "preserves an unfinished lexical token as a continuation" {
     try std.testing.expect(tree.nodeData(.root).opt_node.unwrap() == null);
 }
 
+test "preserves an unfinished parameter expansion as a continuation" {
+    var tree = try Ast.parse(std.testing.allocator, "echo ${name\nnext");
+    defer tree.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+    try std.testing.expect(tree.status == .incomplete);
+    try std.testing.expect(tree.status.incomplete == .lexical);
+    try std.testing.expectEqual(
+        Token.Tag.unterminated_parameter_expansion,
+        tree.tokenTag(tree.status.incomplete.lexical),
+    );
+}
+
 test "parses redirections in simple command source order" {
     var tree = try Ast.parse(std.testing.allocator, "echo 2>>error.log <input");
     defer tree.deinit(std.testing.allocator);
@@ -69,12 +145,18 @@ test "parses redirections in simple command source order" {
     const output = tree.redirect(parts[1]);
     try std.testing.expectEqualStrings("2", tree.tokenSlice(output.io_number.unwrap().?));
     try std.testing.expectEqualStrings(">>", tree.tokenSlice(tree.nodeMainToken(parts[1])));
-    try std.testing.expectEqualStrings("error.log", tree.tokenSlice(output.target));
+    try std.testing.expectEqualStrings(
+        "error.log",
+        tree.tokenSlice(tree.nodeMainToken(output.target.unwrap().?)),
+    );
 
     const input = tree.redirect(parts[2]);
     try std.testing.expect(input.io_number.unwrap() == null);
     try std.testing.expectEqualStrings("<", tree.tokenSlice(tree.nodeMainToken(parts[2])));
-    try std.testing.expectEqualStrings("input", tree.tokenSlice(input.target));
+    try std.testing.expectEqualStrings(
+        "input",
+        tree.tokenSlice(tree.nodeMainToken(input.target.unwrap().?)),
+    );
 }
 
 test "digits separated from redirect remain a word" {
