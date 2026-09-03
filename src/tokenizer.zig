@@ -22,6 +22,8 @@ pub const Token = struct {
         .{ "until", .keyword_until },
         .{ "do", .keyword_do },
         .{ "done", .keyword_done },
+        .{ "for", .keyword_for },
+        .{ "in", .keyword_in },
     });
 
     pub fn getKeyword(bytes: []const u8) ?Tag {
@@ -43,6 +45,8 @@ pub const Token = struct {
         keyword_until,
         keyword_do,
         keyword_done,
+        keyword_for,
+        keyword_in,
 
         unterminated_single_quote,
         unterminated_double_quote,
@@ -102,6 +106,8 @@ pub const Token = struct {
             .keyword_until => "until",
             .keyword_do => "do",
             .keyword_done => "done",
+            .keyword_for => "for",
+            .keyword_in => "in",
 
             .semicolon => ";",
             .semicolon_semicolon => ";;",
@@ -619,7 +625,7 @@ pub const Tokenizer = struct {
 
 test "keywords" {
     try testTokenize(
-        \\if then elif else fi while until do done 'if' "then" i\f
+        \\if then elif else fi while until do done for in 'if' "then" i\f
     ,
         &.{
             .keyword_if,
@@ -631,6 +637,8 @@ test "keywords" {
             .keyword_until,
             .keyword_do,
             .keyword_done,
+            .keyword_for,
+            .keyword_in,
             .word,
             .word,
             .word,

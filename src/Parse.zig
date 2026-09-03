@@ -48,6 +48,17 @@ const LoopBuilder = struct {
     redirects: ?Node.SubRange = null,
 };
 
+const ForBuilder = struct {
+    name_token: Node.OptionalTokenIndex = .none,
+    in_token: Node.OptionalTokenIndex = .none,
+    words: ?Node.SubRange = null,
+    separator_token: Node.OptionalTokenIndex = .none,
+    do_token: Node.OptionalTokenIndex = .none,
+    body: Node.OptionalIndex = .none,
+    done_token: Node.OptionalTokenIndex = .none,
+    redirects: ?Node.SubRange = null,
+};
+
 const HereDocumentBuilder = struct {
     index: Ast.HereDocumentIndex,
     delimiter_start: u32,
@@ -340,6 +351,7 @@ fn parseCommand(parser: *Parse) Ast.ParseError!Node.Index {
         .keyword_if => parser.parseIfClause(),
         .keyword_while => parser.parseLoopClause(.while_clause),
         .keyword_until => parser.parseLoopClause(.until_clause),
+        .keyword_for => parser.parseForClause(),
         .l_paren => parser.parseSubshell(),
         else => parser.parseSimpleCommand(),
     };
@@ -673,6 +685,165 @@ fn finishLoop(
     return parser.addNode(.{
         .tag = node_tag,
         .main_token = open_token,
+        .data = .{ .extra = extra },
+    });
+}
+
+fn parseForClause(parser: *Parse) Ast.ParseError!Node.Index {
+    const for_token = parser.nextToken();
+    var builder: ForBuilder = .{};
+
+    parser.skipNewlines();
+    if (parser.tokenTag(parser.tok_i) == .eof) {
+        parser.setCompoundIncomplete(.for_clause, .name, for_token);
+        return parser.finishFor(for_token, builder);
+    }
+    if (!isWord(parser.tokenTag(parser.tok_i)) or
+        !isValidName(parser.rawTokenSlice(parser.tok_i)))
+    {
+        try parser.warn(.{
+            .tag = .expected_name,
+            .token = parser.tok_i,
+        });
+        return parser.finishFor(for_token, builder);
+    }
+    builder.name_token = Node.OptionalTokenIndex.fromOptional(parser.nextToken());
+
+    if (parser.tokenTag(parser.tok_i) == .keyword_in) {
+        builder.in_token = Node.OptionalTokenIndex.fromOptional(parser.nextToken());
+        const word_start = parser.scratch.items.len;
+        defer parser.scratch.shrinkRetainingCapacity(word_start);
+        while (isWord(parser.tokenTag(parser.tok_i))) {
+            try parser.scratch.append(parser.gpa, try parser.parseWord());
+        }
+        builder.words = try parser.listToSpan(parser.scratch.items[word_start..]);
+
+        switch (parser.tokenTag(parser.tok_i)) {
+            .semicolon => {
+                builder.separator_token = Node.OptionalTokenIndex.fromOptional(parser.nextToken());
+                parser.skipNewlines();
+            },
+            .newline => {
+                builder.separator_token = Node.OptionalTokenIndex.fromOptional(parser.consumeNewline());
+                parser.skipNewlines();
+            },
+            .eof => {
+                parser.setCompoundIncomplete(.for_clause, .do_keyword, for_token);
+                return parser.finishFor(for_token, builder);
+            },
+            else => {
+                try parser.warn(.{
+                    .tag = .expected_separator,
+                    .token = parser.tok_i,
+                });
+                return parser.finishFor(for_token, builder);
+            },
+        }
+    } else switch (parser.tokenTag(parser.tok_i)) {
+        .semicolon => {
+            builder.separator_token = Node.OptionalTokenIndex.fromOptional(parser.nextToken());
+            parser.skipNewlines();
+        },
+        .newline => {
+            builder.separator_token = Node.OptionalTokenIndex.fromOptional(parser.consumeNewline());
+            parser.skipNewlines();
+        },
+        .keyword_do => {},
+        .eof => {
+            parser.setCompoundIncomplete(.for_clause, .in_or_do_keyword, for_token);
+            return parser.finishFor(for_token, builder);
+        },
+        else => {
+            try parser.warn(.{
+                .tag = .expected_do_keyword,
+                .token = parser.tok_i,
+            });
+            return parser.finishFor(for_token, builder);
+        },
+    }
+
+    if (parser.tokenTag(parser.tok_i) == .eof) {
+        parser.setCompoundIncomplete(.for_clause, .do_keyword, for_token);
+        return parser.finishFor(for_token, builder);
+    }
+    if (parser.tokenTag(parser.tok_i) != .keyword_do) {
+        try parser.warn(.{
+            .tag = .expected_do_keyword,
+            .token = parser.tok_i,
+        });
+        return parser.finishFor(for_token, builder);
+    }
+
+    const do_token = parser.nextToken();
+    builder.do_token = Node.OptionalTokenIndex.fromOptional(do_token);
+    parser.skipNewlines();
+    if (parser.tokenTag(parser.tok_i) == .eof) {
+        parser.setCompoundIncomplete(.for_clause, .body, do_token);
+        return parser.finishFor(for_token, builder);
+    }
+
+    const body_errors = parser.errors.items.len;
+    const body = try parser.parseList(.{
+        .reserved_words = &.{.keyword_done},
+    });
+    if (body) |node| {
+        builder.body = node.toOptional();
+    } else {
+        try parser.warn(.{
+            .tag = .expected_command,
+            .token = parser.tok_i,
+        });
+        return parser.finishFor(for_token, builder);
+    }
+    if (parser.failedSince(body_errors)) {
+        return parser.finishFor(for_token, builder);
+    }
+
+    if (parser.tokenTag(parser.tok_i) == .eof) {
+        parser.setCompoundIncomplete(.for_clause, .done_keyword, for_token);
+        return parser.finishFor(for_token, builder);
+    }
+    if (parser.tokenTag(parser.tok_i) != .keyword_done) {
+        try parser.warn(.{
+            .tag = .expected_done_keyword,
+            .token = parser.tok_i,
+        });
+        return parser.finishFor(for_token, builder);
+    }
+    builder.done_token = Node.OptionalTokenIndex.fromOptional(parser.nextToken());
+
+    const redirect_start = parser.scratch.items.len;
+    defer parser.scratch.shrinkRetainingCapacity(redirect_start);
+    while (parser.startsRedirect()) {
+        try parser.scratch.append(parser.gpa, try parser.parseRedirect());
+    }
+    builder.redirects = try parser.listToSpan(parser.scratch.items[redirect_start..]);
+
+    return parser.finishFor(for_token, builder);
+}
+
+fn finishFor(
+    parser: *Parse,
+    for_token: Ast.TokenIndex,
+    builder: ForBuilder,
+) Ast.ParseError!Node.Index {
+    const words = builder.words orelse try parser.emptySpan();
+    const redirects = builder.redirects orelse try parser.emptySpan();
+    const extra = try parser.addExtra(Node.For{
+        .name_token = builder.name_token,
+        .in_token = builder.in_token,
+        .words_start = words.start,
+        .words_end = words.end,
+        .separator_token = builder.separator_token,
+        .do_token = builder.do_token,
+        .body = builder.body,
+        .done_token = builder.done_token,
+        .redirects_start = redirects.start,
+        .redirects_end = redirects.end,
+    });
+    return parser.addNode(.{
+        .tag = .for_clause,
+        .main_token = for_token,
         .data = .{ .extra = extra },
     });
 }
@@ -1029,7 +1200,8 @@ fn nextToken(parser: *Parse) Ast.TokenIndex {
 fn canStartCommand(parser: *const Parse) bool {
     const tag = parser.tokenTag(parser.tok_i);
     if (isReservedWord(tag)) {
-        return tag == .keyword_if or tag == .keyword_while or tag == .keyword_until;
+        return tag == .keyword_if or tag == .keyword_while or tag == .keyword_until or
+            tag == .keyword_for;
     }
     return tag == .l_paren or isWord(tag) or parser.startsRedirect();
 }
@@ -1109,6 +1281,14 @@ fn isNameContinue(byte: u8) bool {
     return isNameStart(byte) or std.ascii.isDigit(byte);
 }
 
+fn isValidName(raw: []const u8) bool {
+    if (raw.len == 0 or !isNameStart(raw[0])) return false;
+    for (raw[1..]) |byte| {
+        if (!isNameContinue(byte)) return false;
+    }
+    return true;
+}
+
 fn isWord(tag: Token.Tag) bool {
     return tag == .word or tag == .digits or isReservedWord(tag);
 }
@@ -1124,6 +1304,8 @@ fn isReservedWord(tag: Token.Tag) bool {
         .keyword_until,
         .keyword_do,
         .keyword_done,
+        .keyword_for,
+        .keyword_in,
         => true,
         else => false,
     };

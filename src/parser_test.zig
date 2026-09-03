@@ -545,13 +545,13 @@ test "parses if elif else and trailing redirection" {
 test "keyword candidates remain words in argument position" {
     var tree = try Ast.parse(
         std.testing.allocator,
-        "echo if then elif else fi while until do done",
+        "echo if then elif else fi while until do done for in",
     );
     defer tree.deinit(std.testing.allocator);
 
     const command = firstCommand(&tree);
     const parts = tree.simpleCommandParts(command);
-    try std.testing.expectEqual(@as(usize, 10), parts.len);
+    try std.testing.expectEqual(@as(usize, 12), parts.len);
     for (parts) |part| {
         try std.testing.expectEqual(Node.Tag.word, tree.nodeTag(part));
     }
@@ -696,6 +696,84 @@ test "makes a loop here-document ready before syntax continuation" {
         Ast.CompoundContinuation.Expected.do_keyword,
         tree.status.incomplete.compound.expected,
     );
+}
+
+test "parses a for clause with structured words" {
+    const source = "for item in one \"$two\"; do consume $item; done >log";
+    var tree = try Ast.parse(std.testing.allocator, source);
+    defer tree.deinit(std.testing.allocator);
+
+    const for_node = firstCommand(&tree);
+    try std.testing.expectEqual(Node.Tag.for_clause, tree.nodeTag(for_node));
+    const clause = tree.forClause(for_node);
+    try std.testing.expectEqualStrings("item", tree.tokenSlice(clause.name_token.unwrap().?));
+    try std.testing.expectEqualStrings("in", tree.tokenSlice(clause.in_token.unwrap().?));
+    try std.testing.expectEqualStrings("do", tree.tokenSlice(clause.do_token.unwrap().?));
+    try std.testing.expectEqualStrings("done", tree.tokenSlice(clause.done_token.unwrap().?));
+
+    const words = tree.forWords(clause);
+    try std.testing.expectEqual(@as(usize, 2), words.len);
+    try expectWordPart(&tree, words[0], 0, .literal, "one");
+    try expectWordPart(&tree, words[1], 0, .double_quoted_parameter, "two");
+
+    const redirects = tree.extraDataSlice(.{
+        .start = clause.redirects_start,
+        .end = clause.redirects_end,
+    }, Node.Index);
+    try std.testing.expectEqual(@as(usize, 1), redirects.len);
+    try std.testing.expectEqual(Node.Tag.redirect, tree.nodeTag(redirects[0]));
+}
+
+test "parses for clauses without an explicit word list" {
+    var direct = try Ast.parse(std.testing.allocator, "for item do consume; done");
+    defer direct.deinit(std.testing.allocator);
+    const direct_clause = direct.forClause(firstCommand(&direct));
+    try std.testing.expect(direct_clause.in_token.unwrap() == null);
+    try std.testing.expectEqual(@as(usize, 0), direct.forWords(direct_clause).len);
+
+    var separated = try Ast.parse(std.testing.allocator, "for item; do consume; done");
+    defer separated.deinit(std.testing.allocator);
+    const separated_clause = separated.forClause(firstCommand(&separated));
+    try std.testing.expectEqual(
+        Token.Tag.semicolon,
+        separated.tokenTag(separated_clause.separator_token.unwrap().?),
+    );
+
+    var empty = try Ast.parse(std.testing.allocator, "for item in; do consume; done");
+    defer empty.deinit(std.testing.allocator);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        empty.forWords(empty.forClause(firstCommand(&empty))).len,
+    );
+}
+
+test "recognizes for and in contextually" {
+    var tree = try Ast.parse(std.testing.allocator, "for in in for do; do consume; done");
+    defer tree.deinit(std.testing.allocator);
+
+    const clause = tree.forClause(firstCommand(&tree));
+    try std.testing.expectEqualStrings("in", tree.tokenSlice(clause.name_token.unwrap().?));
+    const words = tree.forWords(clause);
+    try std.testing.expectEqual(@as(usize, 2), words.len);
+    try std.testing.expectEqualStrings("for", tree.tokenSlice(tree.nodeMainToken(words[0])));
+    try std.testing.expectEqualStrings("do", tree.tokenSlice(tree.nodeMainToken(words[1])));
+}
+
+test "reports each incomplete for stage" {
+    try expectCompoundContinuation("for", .for_clause, .name);
+    try expectCompoundContinuation("for item", .for_clause, .in_or_do_keyword);
+    try expectCompoundContinuation("for item in one", .for_clause, .do_keyword);
+    try expectCompoundContinuation("for item;", .for_clause, .do_keyword);
+    try expectCompoundContinuation("for item; do", .for_clause, .body);
+    try expectCompoundContinuation("for item; do consume", .for_clause, .done_keyword);
+}
+
+test "rejects an invalid for variable name" {
+    var tree = try Ast.parse(std.testing.allocator, "for bad-name in value; do consume; done");
+    defer tree.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), tree.errors.len);
+    try std.testing.expectEqual(Ast.Error.Tag.expected_name, tree.errors[0].tag);
 }
 
 fn expectCompoundContinuation(

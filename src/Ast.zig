@@ -111,11 +111,14 @@ pub const CompoundContinuation = struct {
         else_clause,
         while_clause,
         until_clause,
+        for_clause,
     };
 
     pub const Expected = enum {
         condition,
+        name,
         then_keyword,
+        in_or_do_keyword,
         do_keyword,
         body,
         fi_keyword,
@@ -147,6 +150,7 @@ pub const Error = struct {
         expected_fi_keyword,
         expected_do_keyword,
         expected_done_keyword,
+        expected_name,
         here_document_mismatch,
     };
 };
@@ -285,6 +289,18 @@ pub fn loopClause(tree: *const Ast, index: Node.Index) Node.Loop {
     return tree.extraData(tree.nodeData(index).extra, Node.Loop);
 }
 
+pub fn forClause(tree: *const Ast, index: Node.Index) Node.For {
+    std.debug.assert(tree.nodeTag(index) == .for_clause);
+    return tree.extraData(tree.nodeData(index).extra, Node.For);
+}
+
+pub fn forWords(tree: *const Ast, clause: Node.For) []const Node.Index {
+    return tree.extraDataSlice(.{
+        .start = clause.words_start,
+        .end = clause.words_end,
+    }, Node.Index);
+}
+
 pub fn redirect(tree: *const Ast, index: Node.Index) Node.Redirect {
     std.debug.assert(tree.nodeTag(index) == .redirect);
     return tree.extraData(tree.nodeData(index).extra, Node.Redirect);
@@ -418,6 +434,9 @@ pub const Node = struct {
         while_clause,
         until_clause,
 
+        /// `data.extra`: encoded `For` data.
+        for_clause,
+
         /// `main_token` identifies the word; `data.word_parts` indexes its parts.
         word,
 
@@ -476,6 +495,19 @@ pub const Node = struct {
 
     pub const Loop = struct {
         condition: OptionalIndex,
+        do_token: OptionalTokenIndex,
+        body: OptionalIndex,
+        done_token: OptionalTokenIndex,
+        redirects_start: ExtraIndex,
+        redirects_end: ExtraIndex,
+    };
+
+    pub const For = struct {
+        name_token: OptionalTokenIndex,
+        in_token: OptionalTokenIndex,
+        words_start: ExtraIndex,
+        words_end: ExtraIndex,
+        separator_token: OptionalTokenIndex,
         do_token: OptionalTokenIndex,
         body: OptionalIndex,
         done_token: OptionalTokenIndex,
