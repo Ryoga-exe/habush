@@ -725,13 +725,19 @@ fn parseSimpleCommand(parser: *Parse) Ast.ParseError!Node.Index {
     defer parser.scratch.shrinkRetainingCapacity(scratch_start);
 
     const main_token = parser.tok_i;
+    var command_word_seen = false;
     while (true) {
         const part = if (parser.startsRedirect())
             try parser.parseRedirect()
-        else if (isWord(parser.tokenTag(parser.tok_i)))
-            try parser.parseWord()
-        else
-            break;
+        else if (isWord(parser.tokenTag(parser.tok_i))) word: {
+            if (!command_word_seen) {
+                if (parser.assignmentNameEnd(parser.tok_i)) |name_end| {
+                    break :word try parser.parseAssignment(name_end);
+                }
+            }
+            command_word_seen = true;
+            break :word try parser.parseWord();
+        } else break;
         try parser.scratch.append(parser.gpa, part);
     }
 
@@ -745,12 +751,50 @@ fn parseSimpleCommand(parser: *Parse) Ast.ParseError!Node.Index {
 
 fn parseWord(parser: *Parse) Ast.ParseError!Node.Index {
     const word_token = parser.nextToken();
-    const part_start = std.math.cast(u32, parser.word_parts.len) orelse
-        return error.SourceTooLarge;
-    var iterator = word.Iterator.init(
+    const parts = try parser.parseWordParts(
         parser.rawTokenSlice(word_token),
         parser.tokens.items(.start)[word_token],
     );
+
+    return parser.addNode(.{
+        .tag = .word,
+        .main_token = word_token,
+        .data = .{ .word_parts = parts },
+    });
+}
+
+fn parseAssignment(
+    parser: *Parse,
+    name_end: Ast.ByteOffset,
+) Ast.ParseError!Node.Index {
+    const word_token = parser.nextToken();
+    const value_start = name_end + 1;
+    const token_end: Ast.ByteOffset = @intCast(parser.tokenEnd(word_token));
+    const value_parts = try parser.parseWordParts(
+        parser.source[value_start..token_end],
+        value_start,
+    );
+    const extra = try parser.addExtra(Node.Assignment{
+        .name_end = name_end,
+        .value_start = value_parts.start,
+        .value_end = value_parts.end,
+    });
+
+    return parser.addNode(.{
+        .tag = .assignment,
+        .main_token = word_token,
+        .data = .{ .extra = extra },
+    });
+}
+
+fn parseWordParts(
+    parser: *Parse,
+    source: []const u8,
+    source_start: Ast.ByteOffset,
+) Ast.ParseError!Ast.WordPartRange {
+    const part_start = std.math.cast(u32, parser.word_parts.len) orelse
+        return error.SourceTooLarge;
+    var iterator = word.Iterator.init(source, source_start);
     while (iterator.next()) |part| {
         try parser.word_parts.append(parser.gpa, part);
     }
@@ -758,14 +802,10 @@ fn parseWord(parser: *Parse) Ast.ParseError!Node.Index {
     const part_end = std.math.cast(u32, parser.word_parts.len) orelse
         return error.SourceTooLarge;
 
-    return parser.addNode(.{
-        .tag = .word,
-        .main_token = word_token,
-        .data = .{ .word_parts = .{
-            .start = @enumFromInt(part_start),
-            .end = @enumFromInt(part_end),
-        } },
-    });
+    return .{
+        .start = @enumFromInt(part_start),
+        .end = @enumFromInt(part_end),
+    };
 }
 
 fn parseRedirect(parser: *Parse) Ast.ParseError!Node.Index {
@@ -931,6 +971,7 @@ fn addExtra(parser: *Parse, extra: anytype) Ast.ParseError!Ast.ExtraIndex {
             Node.OptionalIndex,
             Node.OptionalTokenIndex,
             Ast.HereDocumentIndex.Optional,
+            Ast.WordPartIndex,
             Ast.ExtraIndex,
             => @intFromEnum(value),
             Ast.TokenIndex => value,
@@ -1045,6 +1086,27 @@ fn tokenEnd(parser: *const Parse, token_index: Ast.TokenIndex) usize {
 fn rawTokenSlice(parser: *const Parse, token_index: Ast.TokenIndex) []const u8 {
     const start = parser.tokens.items(.start)[token_index];
     return parser.source[start..parser.tokenEnd(token_index)];
+}
+
+fn assignmentNameEnd(
+    parser: *const Parse,
+    token_index: Ast.TokenIndex,
+) ?Ast.ByteOffset {
+    const raw = parser.rawTokenSlice(token_index);
+    if (raw.len == 0 or !isNameStart(raw[0])) return null;
+
+    var index: usize = 1;
+    while (index < raw.len and isNameContinue(raw[index])) index += 1;
+    if (index == raw.len or raw[index] != '=') return null;
+    return parser.tokens.items(.start)[token_index] + @as(Ast.ByteOffset, @intCast(index));
+}
+
+fn isNameStart(byte: u8) bool {
+    return std.ascii.isAlphabetic(byte) or byte == '_';
+}
+
+fn isNameContinue(byte: u8) bool {
+    return isNameStart(byte) or std.ascii.isDigit(byte);
 }
 
 fn isWord(tag: Token.Tag) bool {

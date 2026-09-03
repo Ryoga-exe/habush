@@ -213,19 +213,42 @@ pub fn simpleCommandParts(tree: *const Ast, index: Node.Index) []const Node.Inde
 }
 
 pub fn wordPartCount(tree: *const Ast, index: Node.Index) usize {
-    std.debug.assert(tree.nodeTag(index) == .word);
-    const range = tree.nodeData(index).word_parts;
+    const range = tree.wordPartRange(index);
     return @intFromEnum(range.end) - @intFromEnum(range.start);
 }
 
 pub fn wordPart(tree: *const Ast, index: Node.Index, part_index: usize) WordPart {
     std.debug.assert(part_index < tree.wordPartCount(index));
-    const range = tree.nodeData(index).word_parts;
+    const range = tree.wordPartRange(index);
     const absolute_index = @intFromEnum(range.start) + part_index;
     return .{
         .tag = tree.word_parts.items(.tag)[absolute_index],
         .start = tree.word_parts.items(.start)[absolute_index],
         .end = tree.word_parts.items(.end)[absolute_index],
+    };
+}
+
+pub fn assignment(tree: *const Ast, index: Node.Index) Node.Assignment {
+    std.debug.assert(tree.nodeTag(index) == .assignment);
+    return tree.extraData(tree.nodeData(index).extra, Node.Assignment);
+}
+
+pub fn assignmentName(tree: *const Ast, index: Node.Index) []const u8 {
+    const info = tree.assignment(index);
+    return tree.source[tree.tokenStart(tree.nodeMainToken(index))..info.name_end];
+}
+
+fn wordPartRange(tree: *const Ast, index: Node.Index) WordPartRange {
+    return switch (tree.nodeTag(index)) {
+        .word => tree.nodeData(index).word_parts,
+        .assignment => blk: {
+            const info = tree.assignment(index);
+            break :blk .{
+                .start = info.value_start,
+                .end = info.value_end,
+            };
+        },
+        else => unreachable,
     };
 }
 
@@ -315,6 +338,7 @@ pub fn extraData(tree: *const Ast, index: ExtraIndex, comptime T: type) T {
             Node.OptionalIndex,
             Node.OptionalTokenIndex,
             HereDocumentIndex.Optional,
+            WordPartIndex,
             ExtraIndex,
             => @enumFromInt(tree.extra_data[@intFromEnum(index) + offset]),
             TokenIndex => tree.extra_data[@intFromEnum(index) + offset],
@@ -397,6 +421,9 @@ pub const Node = struct {
         /// `main_token` identifies the word; `data.word_parts` indexes its parts.
         word,
 
+        /// `main_token` identifies `NAME=value`; `data.extra` encodes `Assignment`.
+        assignment,
+
         /// `main_token` identifies the operator; `data.extra` encodes `Redirect`.
         redirect,
     };
@@ -460,6 +487,12 @@ pub const Node = struct {
         io_number: OptionalTokenIndex,
         target: OptionalIndex,
         here_document: HereDocumentIndex.Optional,
+    };
+
+    pub const Assignment = struct {
+        name_end: ByteOffset,
+        value_start: WordPartIndex,
+        value_end: WordPartIndex,
     };
 };
 

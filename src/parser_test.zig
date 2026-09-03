@@ -85,6 +85,55 @@ test "stores a nested braced parameter as one part" {
     );
 }
 
+test "classifies assignment words before the command name" {
+    const source = "A=1 B=\"$value\" >out command C=3";
+    var tree = try Ast.parse(std.testing.allocator, source);
+    defer tree.deinit(std.testing.allocator);
+
+    const parts = tree.simpleCommandParts(firstCommand(&tree));
+    try std.testing.expectEqual(Node.Tag.assignment, tree.nodeTag(parts[0]));
+    try std.testing.expectEqualStrings("A", tree.assignmentName(parts[0]));
+    try expectWordPart(&tree, parts[0], 0, .literal, "1");
+
+    try std.testing.expectEqual(Node.Tag.assignment, tree.nodeTag(parts[1]));
+    try std.testing.expectEqualStrings("B", tree.assignmentName(parts[1]));
+    try expectWordPart(&tree, parts[1], 0, .double_quoted_parameter, "value");
+
+    try std.testing.expectEqual(Node.Tag.redirect, tree.nodeTag(parts[2]));
+    try std.testing.expectEqual(Node.Tag.word, tree.nodeTag(parts[3]));
+    try std.testing.expectEqual(Node.Tag.word, tree.nodeTag(parts[4]));
+}
+
+test "allows redirects before assignment words" {
+    var tree = try Ast.parse(std.testing.allocator, ">out A=1 command");
+    defer tree.deinit(std.testing.allocator);
+
+    const parts = tree.simpleCommandParts(firstCommand(&tree));
+    try std.testing.expectEqual(Node.Tag.redirect, tree.nodeTag(parts[0]));
+    try std.testing.expectEqual(Node.Tag.assignment, tree.nodeTag(parts[1]));
+    try std.testing.expectEqual(Node.Tag.word, tree.nodeTag(parts[2]));
+}
+
+test "preserves an empty assignment value" {
+    var tree = try Ast.parse(std.testing.allocator, "EMPTY=");
+    defer tree.deinit(std.testing.allocator);
+
+    const assignment = tree.simpleCommandParts(firstCommand(&tree))[0];
+    try std.testing.expectEqual(Node.Tag.assignment, tree.nodeTag(assignment));
+    try std.testing.expectEqualStrings("EMPTY", tree.assignmentName(assignment));
+    try std.testing.expectEqual(@as(usize, 0), tree.wordPartCount(assignment));
+}
+
+test "rejects quoted and invalid assignment names" {
+    var tree = try Ast.parse(std.testing.allocator, "1A=x A\\=x A-B=x command");
+    defer tree.deinit(std.testing.allocator);
+
+    const parts = tree.simpleCommandParts(firstCommand(&tree));
+    for (parts) |part| {
+        try std.testing.expectEqual(Node.Tag.word, tree.nodeTag(part));
+    }
+}
+
 fn expectWordPart(
     tree: *const Ast,
     word_node: Node.Index,
