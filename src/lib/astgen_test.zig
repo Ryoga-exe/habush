@@ -306,19 +306,49 @@ test "distinguishes implicit parameters from an explicit empty for list" {
     try std.testing.expectEqual(@as(usize, 0), empty.words.len);
 }
 
-test "rejects invalid and unsupported ASTs" {
+test "generates function definitions with compound bodies" {
+    const source =
+        \\build() { produce | consume; } >log
+        \\check()
+        \\(verify)
+        \\
+    ;
+    var tree = try Ast.parse(std.testing.allocator, source);
+    defer tree.deinit(std.testing.allocator);
+
+    var hir = try AstGen.generate(std.testing.allocator, tree);
+    defer hir.deinit(std.testing.allocator);
+
+    const root_list = hir.root().?;
+    try std.testing.expectEqual(@as(usize, 2), hir.listItemCount(root_list));
+
+    const build_index = hir.listItem(root_list, 0).command;
+    try std.testing.expectEqual(
+        Hir.Inst.Tag.function_definition,
+        hir.instructionTag(build_index),
+    );
+    const build = hir.functionDefinition(build_index);
+    try std.testing.expectEqualStrings("build", build.name);
+    try std.testing.expectEqual(Hir.Inst.Tag.brace_group, hir.instructionTag(build.body));
+    const build_body = hir.groupedCommand(build.body);
+    try std.testing.expectEqual(@as(usize, 1), build_body.redirects.len);
+    try std.testing.expectEqualStrings(
+        "log",
+        firstWordPart(hir, hir.redirect(build_body.redirects[0]).target),
+    );
+
+    const check_index = hir.listItem(root_list, 1).command;
+    const check = hir.functionDefinition(check_index);
+    try std.testing.expectEqualStrings("check", check.name);
+    try std.testing.expectEqual(Hir.Inst.Tag.subshell, hir.instructionTag(check.body));
+}
+
+test "rejects invalid ASTs" {
     var invalid = try Ast.parse(std.testing.allocator, "echo |");
     defer invalid.deinit(std.testing.allocator);
     try std.testing.expectError(
         error.InvalidAst,
         AstGen.generate(std.testing.allocator, invalid),
-    );
-
-    var unsupported = try Ast.parse(std.testing.allocator, "build() { run; }");
-    defer unsupported.deinit(std.testing.allocator);
-    try std.testing.expectError(
-        error.UnsupportedSyntax,
-        AstGen.generate(std.testing.allocator, unsupported),
     );
 }
 
@@ -326,7 +356,7 @@ test "AST generation handles every allocation failure" {
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         generateWithAllocator,
-        .{"for item in first \"$second\"; do while check; do use $item; done; done >log &"},
+        .{"build() { for item in first \"$second\"; do use $item; done; } >log"},
     );
 }
 

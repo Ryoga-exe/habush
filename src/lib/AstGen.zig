@@ -11,7 +11,6 @@ const Token = @import("tokenizer.zig").Token;
 pub const Error = Allocator.Error || error{
     SourceTooLarge,
     InvalidAst,
-    UnsupportedSyntax,
 };
 
 gpa: Allocator,
@@ -114,8 +113,37 @@ fn command(astgen: *AstGen, node: Ast.Node.Index) Error!Hir.Inst.Index {
         .if_clause => astgen.ifClause(node),
         .while_clause, .until_clause => astgen.loopClause(node),
         .for_clause => astgen.forClause(node),
-        else => error.UnsupportedSyntax,
+        .function_definition => astgen.functionDefinition(node),
+        .root, .list, .word, .assignment, .redirect => error.InvalidAst,
     };
+}
+
+fn functionDefinition(astgen: *AstGen, node: Ast.Node.Index) Error!Hir.Inst.Index {
+    const definition = astgen.tree.functionDefinition(node);
+    const body_node = definition.body.unwrap() orelse return error.InvalidAst;
+    const body = switch (astgen.tree.nodeTag(body_node)) {
+        .subshell,
+        .brace_group,
+        .if_clause,
+        .while_clause,
+        .until_clause,
+        .for_clause,
+        => try astgen.command(body_node),
+        else => return error.InvalidAst,
+    };
+    const name = try astgen.addString(astgen.tree.tokenSlice(astgen.tree.nodeMainToken(node)));
+    const payload_index = try astgen.addExtra(Hir.Function{
+        .name_start = name.start,
+        .name_len = name.len,
+        .body = body,
+    });
+    return astgen.addInstruction(.{
+        .tag = .function_definition,
+        .data = .{ .pl = .{
+            .src_start = astgen.sourceStart(node),
+            .payload_index = payload_index,
+        } },
+    });
 }
 
 fn forClause(astgen: *AstGen, node: Ast.Node.Index) Error!Hir.Inst.Index {

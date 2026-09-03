@@ -155,6 +155,18 @@ pub fn forClause(hir: Hir, index: Inst.Index) For.Value {
     };
 }
 
+pub fn functionDefinition(hir: Hir, index: Inst.Index) Function.Value {
+    std.debug.assert(hir.instructionTag(index) == .function_definition);
+    const payload = hir.extraData(Function, hir.instructionData(index).pl.payload_index).data;
+    return .{
+        .name = (String{
+            .start = payload.name_start,
+            .len = payload.name_len,
+        }).get(hir),
+        .body = payload.body,
+    };
+}
+
 pub fn extraData(hir: Hir, comptime T: type, index: ExtraIndex) ExtraData(T) {
     const fields = std.meta.fields(T);
     var result: T = undefined;
@@ -300,6 +312,9 @@ pub const Inst = struct {
         /// `data.pl`: `For`, followed by word and redirect `Inst.Index` values.
         for_clause,
 
+        /// `data.pl`: `Function`.
+        function_definition,
+
         /// `data.str`: the bytes represented by this word part.
         literal,
         escaped,
@@ -420,6 +435,17 @@ pub const For = struct {
         words: []const Inst.Index,
         implicit_positional_parameters: bool,
         redirects: []const Inst.Index,
+    };
+};
+
+pub const Function = struct {
+    name_start: StringIndex,
+    name_len: u32,
+    body: Inst.Index,
+
+    pub const Value = struct {
+        name: []const u8,
+        body: Inst.Index,
     };
 };
 
