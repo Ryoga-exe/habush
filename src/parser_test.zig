@@ -581,3 +581,54 @@ fn expectCompoundContinuation(
     try std.testing.expectEqual(kind, tree.status.incomplete.compound.kind);
     try std.testing.expectEqual(expected, tree.status.incomplete.compound.expected);
 }
+
+test "parser handles every allocation failure" {
+    const source =
+        \\if probe <<'INPUT'; then
+        \\  while check; do
+        \\    produce | consume
+        \\  done
+        \\else
+        \\  fallback >result
+        \\fi
+        \\
+    ;
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        parseWithAllocator,
+        .{source},
+    );
+}
+
+fn parseWithAllocator(allocator: std.mem.Allocator, source: [:0]const u8) !void {
+    var tree = try Ast.parse(allocator, source);
+    defer tree.deinit(allocator);
+}
+
+test "fuzz parser" {
+    try std.testing.fuzz({}, fuzzParse, .{});
+}
+
+fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
+    @disableInstrumentation();
+
+    var source_buffer: [512]u8 = undefined;
+    const len = smith.sliceWeightedBytes(source_buffer[0 .. source_buffer.len - 1], &.{
+        .rangeAtMost(u8, 0x00, 0xff, 1),
+        .rangeAtMost(u8, 0x20, 0x7e, 5),
+        .value(u8, 0, 2),
+        .value(u8, ' ', 4),
+        .rangeAtMost(u8, '\t', '\n', 4),
+        .value(u8, '\r', 2),
+    });
+    source_buffer[len] = 0;
+
+    var tree = try Ast.parse(std.testing.allocator, source_buffer[0..len :0]);
+    defer tree.deinit(std.testing.allocator);
+
+    try std.testing.expect(tree.tokens.len != 0);
+    try std.testing.expectEqual(Token.Tag.eof, tree.tokenTag(@intCast(tree.tokens.len - 1)));
+    try std.testing.expect(tree.nodes.len != 0);
+    try std.testing.expectEqual(Node.Tag.root, tree.nodeTag(.root));
+    try std.testing.expect(tree.ready_here_document_count <= tree.here_documents.len);
+}
