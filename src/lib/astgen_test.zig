@@ -91,6 +91,27 @@ test "generates pipelines and pipeline negation" {
     );
 }
 
+test "generates and-or commands with pipeline precedence" {
+    var tree = try Ast.parse(std.testing.allocator, "a | b && c || d | e");
+    defer tree.deinit(std.testing.allocator);
+
+    var hir = try AstGen.generate(std.testing.allocator, tree);
+    defer hir.deinit(std.testing.allocator);
+
+    const outer = hir.root().?;
+    try std.testing.expectEqual(Hir.Inst.Tag.or_if, hir.instructionTag(outer));
+    const outer_operands = hir.andOr(outer);
+    try std.testing.expectEqual(Hir.Inst.Tag.and_if, hir.instructionTag(outer_operands.lhs));
+    try std.testing.expectEqual(Hir.Inst.Tag.pipe, hir.instructionTag(outer_operands.rhs));
+
+    const and_operands = hir.andOr(outer_operands.lhs);
+    try std.testing.expectEqual(Hir.Inst.Tag.pipe, hir.instructionTag(and_operands.lhs));
+    try std.testing.expectEqual(
+        Hir.Inst.Tag.simple_command,
+        hir.instructionTag(and_operands.rhs),
+    );
+}
+
 test "rejects invalid and unsupported ASTs" {
     var invalid = try Ast.parse(std.testing.allocator, "echo |");
     defer invalid.deinit(std.testing.allocator);
@@ -99,7 +120,7 @@ test "rejects invalid and unsupported ASTs" {
         AstGen.generate(std.testing.allocator, invalid),
     );
 
-    var unsupported = try Ast.parse(std.testing.allocator, "first && second");
+    var unsupported = try Ast.parse(std.testing.allocator, "first; second");
     defer unsupported.deinit(std.testing.allocator);
     try std.testing.expectError(
         error.UnsupportedSyntax,
@@ -111,7 +132,7 @@ test "AST generation handles every allocation failure" {
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         generateWithAllocator,
-        .{"! A=value command 2>>log | consume"},
+        .{"! A=value command 2>>log | consume && fallback"},
     );
 }
 

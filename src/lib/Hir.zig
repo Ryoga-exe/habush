@@ -82,6 +82,12 @@ pub fn pipeline(hir: Hir, index: Inst.Index) Inst.Bin {
     return hir.instructionData(index).bin;
 }
 
+pub fn andOr(hir: Hir, index: Inst.Index) Inst.Bin {
+    const tag = hir.instructionTag(index);
+    std.debug.assert(tag == .and_if or tag == .or_if);
+    return hir.instructionData(index).bin;
+}
+
 pub fn negatedPipeline(hir: Hir, index: Inst.Index) Inst.Index {
     std.debug.assert(hir.instructionTag(index) == .negated_pipeline);
     return hir.instructionData(index).un.operand.unwrap().?;
@@ -210,6 +216,10 @@ pub const Inst = struct {
         pipe_and,
         /// `data.un`: the pipeline following `!`.
         negated_pipeline,
+
+        /// `data.bin`: short-circuiting left- and right-hand commands.
+        and_if,
+        or_if,
 
         /// `data.str`: the bytes represented by this word part.
         literal,

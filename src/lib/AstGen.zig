@@ -81,19 +81,21 @@ fn finish(astgen: *AstGen) Error!Hir {
 fn command(astgen: *AstGen, node: Ast.Node.Index) Error!Hir.Inst.Index {
     return switch (astgen.tree.nodeTag(node)) {
         .simple_command => astgen.simpleCommand(node),
-        .pipe, .pipe_and => astgen.pipeline(node),
+        .pipe, .pipe_and, .and_if, .or_if => astgen.binaryCommand(node),
         .negated_pipeline => astgen.negatedPipeline(node),
         else => error.UnsupportedSyntax,
     };
 }
 
-fn pipeline(astgen: *AstGen, node: Ast.Node.Index) Error!Hir.Inst.Index {
+fn binaryCommand(astgen: *AstGen, node: Ast.Node.Index) Error!Hir.Inst.Index {
     const tag = astgen.tree.nodeTag(node);
     const operands = astgen.tree.nodeData(node).node_and_node;
     return astgen.addInstruction(.{
         .tag = switch (tag) {
             .pipe => .pipe,
             .pipe_and => .pipe_and,
+            .and_if => .and_if,
+            .or_if => .or_if,
             else => unreachable,
         },
         .data = .{ .bin = .{
