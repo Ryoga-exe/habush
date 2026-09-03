@@ -13,9 +13,11 @@ source: [:0]const u8,
 tokens: Ast.TokenList.Slice,
 tok_i: Ast.TokenIndex = 0,
 errors: std.ArrayList(Ast.Error) = .empty,
+status: Ast.Status = .complete,
 nodes: Ast.NodeList = .empty,
 extra_data: std.ArrayList(u32) = .empty,
 scratch: std.ArrayList(Node.Index) = .empty,
+list_scratch: std.ArrayList(Node.ListItem) = .empty,
 
 pub fn parse(gpa: Allocator, source: [:0]const u8) Ast.ParseError!Ast {
     if (source.len > std.math.maxInt(Ast.ByteOffset)) return error.SourceTooLarge;
@@ -25,6 +27,7 @@ pub fn parse(gpa: Allocator, source: [:0]const u8) Ast.ParseError!Ast {
 
     var errors: std.ArrayList(Ast.Error) = .empty;
     defer errors.deinit(gpa);
+    var status: Ast.Status = .complete;
 
     var scanner = Tokenizer.init(source);
     while (true) {
@@ -38,14 +41,14 @@ pub fn parse(gpa: Allocator, source: [:0]const u8) Ast.ParseError!Ast {
         });
 
         switch (item.tag) {
-            .invalid,
-            .unterminated_single_quote,
-            .unterminated_double_quote,
-            .unterminated_escape,
-            => try errors.append(gpa, .{
+            .invalid => try errors.append(gpa, .{
                 .tag = .invalid_token,
                 .token = token_index,
             }),
+            .unterminated_single_quote,
+            .unterminated_double_quote,
+            .unterminated_escape,
+            => status = .{ .incomplete = .{ .lexical = token_index } },
             else => {},
         }
 
@@ -60,12 +63,14 @@ pub fn parse(gpa: Allocator, source: [:0]const u8) Ast.ParseError!Ast {
         .source = source,
         .tokens = token_slice,
         .errors = errors,
+        .status = status,
     };
     errors = .empty;
     defer parser.errors.deinit(gpa);
     defer parser.nodes.deinit(gpa);
     defer parser.extra_data.deinit(gpa);
     defer parser.scratch.deinit(gpa);
+    defer parser.list_scratch.deinit(gpa);
 
     try parser.parseRoot();
 
@@ -80,6 +85,7 @@ pub fn parse(gpa: Allocator, source: [:0]const u8) Ast.ParseError!Ast {
         .nodes = parser.nodes.toOwnedSlice(),
         .extra_data = extra_data,
         .errors = parse_errors,
+        .status = parser.status,
     };
 }
 
@@ -90,58 +96,88 @@ fn parseRoot(parser: *Parse) Ast.ParseError!void {
         .data = .{ .opt_node = .none },
     });
 
-    // Lexical errors already identify the offending token. Syntax parsing is
-    // deferred until the input can be tokenized without loss.
-    if (parser.errors.items.len != 0) return;
+    // Invalid or incomplete lexical input cannot be parsed without losing
+    // source structure.
+    if (parser.errors.items.len != 0 or parser.status == .incomplete) return;
 
-    parser.skipNewlines();
-    if (parser.tokenTag(parser.tok_i) == .eof) return;
-
-    if (!parser.canStartSimpleCommand()) {
-        try parser.warn(.{
-            .tag = .expected_command,
-            .token = parser.tok_i,
-        });
-        return;
-    }
-
-    const errors_before_command = parser.errors.items.len;
-    const command = try parser.parseAndOr();
-
-    var separator: Node.OptionalTokenIndex = .none;
-    if (parser.tokenTag(parser.tok_i) == .newline) {
-        separator = Node.OptionalTokenIndex.fromOptional(parser.nextToken());
-        parser.skipNewlines();
-    }
-
-    if (parser.tokenTag(parser.tok_i) != .eof and parser.errors.items.len == errors_before_command) {
-        try parser.warn(.{
-            .tag = .unexpected_token,
-            .token = parser.tok_i,
-        });
-    }
-
-    const list_start = try parser.addListItem(.{
-        .command = command,
-        .separator = separator,
-    });
-    const list_end_value = std.math.cast(u32, parser.extra_data.items.len) orelse
-        return error.SourceTooLarge;
-    const list_end: Ast.ExtraIndex = @enumFromInt(list_end_value);
-    const list = try parser.addNode(.{
-        .tag = .list,
-        .main_token = parser.nodeMainToken(command),
-        .data = .{ .extra_range = .{
-            .start = list_start,
-            .end = list_end,
-        } },
-    });
+    const list = try parser.parseList(null) orelse return;
 
     parser.nodes.set(@intFromEnum(Node.Index.root), .{
         .tag = .root,
         .main_token = parser.nodeMainToken(list),
         .data = .{ .opt_node = list.toOptional() },
     });
+}
+
+fn parseList(
+    parser: *Parse,
+    stop_tag: ?Token.Tag,
+) Ast.ParseError!?Node.Index {
+    const scratch_start = parser.list_scratch.items.len;
+    defer parser.list_scratch.shrinkRetainingCapacity(scratch_start);
+
+    parser.skipNewlines();
+    if (parser.atListEnd(stop_tag)) return null;
+
+    if (!parser.canStartCommand()) {
+        try parser.warn(.{
+            .tag = .expected_command,
+            .token = parser.tok_i,
+        });
+        return null;
+    }
+
+    const main_token = parser.tok_i;
+    while (true) {
+        const errors_before_command = parser.errors.items.len;
+        const command = try parser.parseAndOr();
+
+        var separator: Node.OptionalTokenIndex = .none;
+        switch (parser.tokenTag(parser.tok_i)) {
+            .semicolon, .ampersand => {
+                separator = Node.OptionalTokenIndex.fromOptional(parser.nextToken());
+                parser.skipNewlines();
+            },
+            .newline => {
+                separator = Node.OptionalTokenIndex.fromOptional(parser.nextToken());
+                parser.skipNewlines();
+            },
+            else => {},
+        }
+
+        try parser.list_scratch.append(parser.gpa, .{
+            .command = command,
+            .separator = separator,
+        });
+
+        if (parser.atListEnd(stop_tag)) break;
+        if (parser.errors.items.len != errors_before_command or
+            parser.status == .incomplete)
+        {
+            break;
+        }
+        if (separator == .none) {
+            try parser.warn(.{
+                .tag = .unexpected_token,
+                .token = parser.tok_i,
+            });
+            break;
+        }
+        if (!parser.canStartCommand()) {
+            try parser.warn(.{
+                .tag = .expected_command,
+                .token = parser.tok_i,
+            });
+            break;
+        }
+    }
+
+    const items = try parser.addListItems(parser.list_scratch.items[scratch_start..]);
+    return @as(?Node.Index, try parser.addNode(.{
+        .tag = .list,
+        .main_token = main_token,
+        .data = .{ .extra_range = items },
+    }));
 }
 
 fn parseAndOr(parser: *Parse) Ast.ParseError!Node.Index {
@@ -151,11 +187,15 @@ fn parseAndOr(parser: *Parse) Ast.ParseError!Node.Index {
         const operator = parser.nextToken();
         parser.skipNewlines();
 
-        if (!parser.canStartSimpleCommand()) {
-            try parser.warn(.{
-                .tag = .expected_command,
-                .token = parser.tok_i,
-            });
+        if (!parser.canStartCommand()) {
+            if (parser.tokenTag(parser.tok_i) == .eof) {
+                parser.setIncomplete(.{ .command_after = operator });
+            } else {
+                try parser.warn(.{
+                    .tag = .expected_command,
+                    .token = parser.tok_i,
+                });
+            }
             return lhs;
         }
 
@@ -175,21 +215,25 @@ fn parseAndOr(parser: *Parse) Ast.ParseError!Node.Index {
 }
 
 fn parsePipeline(parser: *Parse) Ast.ParseError!Node.Index {
-    var lhs = try parser.parseSimpleCommand();
+    var lhs = try parser.parseCommand();
 
     while (isPipe(parser.tokenTag(parser.tok_i))) {
         const operator = parser.nextToken();
         parser.skipNewlines();
 
-        if (!parser.canStartSimpleCommand()) {
-            try parser.warn(.{
-                .tag = .expected_command,
-                .token = parser.tok_i,
-            });
+        if (!parser.canStartCommand()) {
+            if (parser.tokenTag(parser.tok_i) == .eof) {
+                parser.setIncomplete(.{ .command_after = operator });
+            } else {
+                try parser.warn(.{
+                    .tag = .expected_command,
+                    .token = parser.tok_i,
+                });
+            }
             return lhs;
         }
 
-        const rhs = try parser.parseSimpleCommand();
+        const rhs = try parser.parseCommand();
         lhs = try parser.addNode(.{
             .tag = switch (parser.tokenTag(operator)) {
                 .pipe => .pipe,
@@ -202,6 +246,56 @@ fn parsePipeline(parser: *Parse) Ast.ParseError!Node.Index {
     }
 
     return lhs;
+}
+
+fn parseCommand(parser: *Parse) Ast.ParseError!Node.Index {
+    return switch (parser.tokenTag(parser.tok_i)) {
+        .l_paren => parser.parseSubshell(),
+        else => parser.parseSimpleCommand(),
+    };
+}
+
+fn parseSubshell(parser: *Parse) Ast.ParseError!Node.Index {
+    const open = parser.nextToken();
+    const body = try parser.parseList(.r_paren);
+
+    var close_token = parser.tok_i;
+    if (parser.tokenTag(parser.tok_i) == .r_paren) {
+        if (body == null) {
+            try parser.warn(.{
+                .tag = .expected_command,
+                .token = parser.tok_i,
+            });
+        }
+        close_token = parser.nextToken();
+    } else if (parser.tokenTag(parser.tok_i) == .eof) {
+        parser.setIncomplete(.{ .closing_paren = open });
+    } else {
+        try parser.warn(.{
+            .tag = .expected_token,
+            .token = parser.tok_i,
+            .extra = .{ .expected_tag = .r_paren },
+        });
+    }
+
+    const scratch_start = parser.scratch.items.len;
+    defer parser.scratch.shrinkRetainingCapacity(scratch_start);
+    while (parser.startsRedirect()) {
+        try parser.scratch.append(parser.gpa, try parser.parseRedirect());
+    }
+    const redirects = try parser.listToSpan(parser.scratch.items[scratch_start..]);
+
+    const extra = try parser.addSubshell(.{
+        .body = Node.OptionalIndex.fromOptional(body),
+        .close_token = close_token,
+        .redirects_start = redirects.start,
+        .redirects_end = redirects.end,
+    });
+    return parser.addNode(.{
+        .tag = .subshell,
+        .main_token = open,
+        .data = .{ .extra = extra },
+    });
 }
 
 fn parseSimpleCommand(parser: *Parse) Ast.ParseError!Node.Index {
@@ -245,10 +339,14 @@ fn parseRedirect(parser: *Parse) Ast.ParseError!Node.Index {
     const operator = parser.nextToken();
     const target = parser.tok_i;
     if (!isWord(parser.tokenTag(target))) {
-        try parser.warn(.{
-            .tag = .expected_redirect_target,
-            .token = target,
-        });
+        if (parser.tokenTag(target) == .eof) {
+            parser.setIncomplete(.{ .redirect_target = operator });
+        } else {
+            try parser.warn(.{
+                .tag = .expected_redirect_target,
+                .token = target,
+            });
+        }
     } else {
         _ = parser.nextToken();
     }
@@ -277,14 +375,34 @@ fn listToSpan(
     };
 }
 
-fn addListItem(
+fn addListItems(
     parser: *Parse,
-    item: Node.ListItem,
+    items: []const Node.ListItem,
+) Ast.ParseError!Node.SubRange {
+    const start = std.math.cast(u32, parser.extra_data.items.len) orelse
+        return error.SourceTooLarge;
+    for (items) |item| {
+        try parser.extra_data.append(parser.gpa, @intFromEnum(item.command));
+        try parser.extra_data.append(parser.gpa, @intFromEnum(item.separator));
+    }
+    const end = std.math.cast(u32, parser.extra_data.items.len) orelse
+        return error.SourceTooLarge;
+    return .{
+        .start = @enumFromInt(start),
+        .end = @enumFromInt(end),
+    };
+}
+
+fn addSubshell(
+    parser: *Parse,
+    subshell: Node.Subshell,
 ) Ast.ParseError!Ast.ExtraIndex {
     const start = std.math.cast(u32, parser.extra_data.items.len) orelse
         return error.SourceTooLarge;
-    try parser.extra_data.append(parser.gpa, @intFromEnum(item.command));
-    try parser.extra_data.append(parser.gpa, @intFromEnum(item.separator));
+    try parser.extra_data.append(parser.gpa, @intFromEnum(subshell.body));
+    try parser.extra_data.append(parser.gpa, subshell.close_token);
+    try parser.extra_data.append(parser.gpa, @intFromEnum(subshell.redirects_start));
+    try parser.extra_data.append(parser.gpa, @intFromEnum(subshell.redirects_end));
     return @enumFromInt(start);
 }
 
@@ -317,8 +435,20 @@ fn nextToken(parser: *Parse) Ast.TokenIndex {
     return result;
 }
 
-fn canStartSimpleCommand(parser: *const Parse) bool {
-    return isWord(parser.tokenTag(parser.tok_i)) or parser.startsRedirect();
+fn canStartCommand(parser: *const Parse) bool {
+    const tag = parser.tokenTag(parser.tok_i);
+    return tag == .l_paren or isWord(tag) or parser.startsRedirect();
+}
+
+fn atListEnd(parser: *const Parse, stop_tag: ?Token.Tag) bool {
+    const tag = parser.tokenTag(parser.tok_i);
+    return tag == .eof or (stop_tag != null and tag == stop_tag.?);
+}
+
+fn setIncomplete(parser: *Parse, continuation: Ast.Continuation) void {
+    if (parser.status == .complete) {
+        parser.status = .{ .incomplete = continuation };
+    }
 }
 
 fn startsRedirect(parser: *const Parse) bool {
@@ -416,13 +546,17 @@ test "records an unexpected leading operator" {
     try std.testing.expectEqual(@as(Ast.TokenIndex, 0), tree.errors[0].token);
 }
 
-test "preserves a tokenizer issue as an AST error" {
+test "preserves an unfinished lexical token as a continuation" {
     var tree = try Ast.parse(std.testing.allocator, "echo 'open");
     defer tree.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 1), tree.errors.len);
-    try std.testing.expectEqual(Ast.Error.Tag.invalid_token, tree.errors[0].tag);
-    try std.testing.expectEqual(Token.Tag.unterminated_single_quote, tree.tokenTag(tree.errors[0].token));
+    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+    try std.testing.expect(tree.status == .incomplete);
+    try std.testing.expect(tree.status.incomplete == .lexical);
+    try std.testing.expectEqual(
+        Token.Tag.unterminated_single_quote,
+        tree.tokenTag(tree.status.incomplete.lexical),
+    );
     try std.testing.expect(tree.nodeData(.root).opt_node.unwrap() == null);
 }
 
@@ -470,19 +604,31 @@ test "digits before a both-stream redirect remain a word" {
     try std.testing.expect(redirect[0].unwrap() == null);
 }
 
-test "records a missing redirection target" {
+test "requests continuation for a missing redirection target at EOF" {
     var tree = try Ast.parse(std.testing.allocator, "echo >");
+    defer tree.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+    try std.testing.expect(tree.status == .incomplete);
+    try std.testing.expect(tree.status.incomplete == .redirect_target);
+    try std.testing.expectEqualStrings(
+        ">",
+        tree.tokenSlice(tree.status.incomplete.redirect_target),
+    );
+}
+
+test "records a missing redirection target before a newline" {
+    var tree = try Ast.parse(std.testing.allocator, "echo >\n");
     defer tree.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 1), tree.errors.len);
     try std.testing.expectEqual(Ast.Error.Tag.expected_redirect_target, tree.errors[0].tag);
-    try std.testing.expectEqual(Token.Tag.eof, tree.tokenTag(tree.errors[0].token));
+    try std.testing.expectEqual(Token.Tag.newline, tree.tokenTag(tree.errors[0].token));
 }
 
 fn firstCommand(tree: *const Ast) Node.Index {
     const list = tree.nodeData(.root).opt_node.unwrap().?;
-    const range = tree.nodeData(list).extra_range;
-    return tree.extraData(range.start, Node.ListItem).command;
+    return tree.listItem(list, 0).command;
 }
 
 test "parses pipe and pipe-and left associatively" {
@@ -510,13 +656,17 @@ test "allows newlines after a pipe operator" {
     try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
 }
 
-test "records a missing pipeline command once" {
+test "requests continuation for a missing pipeline command" {
     var tree = try Ast.parse(std.testing.allocator, "echo hi |");
     defer tree.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 1), tree.errors.len);
-    try std.testing.expectEqual(Ast.Error.Tag.expected_command, tree.errors[0].tag);
-    try std.testing.expectEqual(Token.Tag.eof, tree.tokenTag(tree.errors[0].token));
+    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+    try std.testing.expect(tree.status == .incomplete);
+    try std.testing.expect(tree.status.incomplete == .command_after);
+    try std.testing.expectEqualStrings(
+        "|",
+        tree.tokenSlice(tree.status.incomplete.command_after),
+    );
 }
 
 test "records a repeated pipe once" {
@@ -552,11 +702,82 @@ test "allows newlines after an and-or operator" {
     try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
 }
 
-test "records a missing and-or command once" {
+test "requests continuation for a missing and-or command" {
     var tree = try Ast.parse(std.testing.allocator, "first ||");
+    defer tree.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+    try std.testing.expect(tree.status == .incomplete);
+    try std.testing.expect(tree.status.incomplete == .command_after);
+    try std.testing.expectEqualStrings(
+        "||",
+        tree.tokenSlice(tree.status.incomplete.command_after),
+    );
+}
+
+test "parses semicolon newline and background list separators" {
+    var tree = try Ast.parse(std.testing.allocator, "first; second\nthird &");
+    defer tree.deinit(std.testing.allocator);
+
+    const list = tree.nodeData(.root).opt_node.unwrap().?;
+    try std.testing.expectEqual(@as(usize, 3), tree.listItemCount(list));
+
+    const first = tree.listItem(list, 0);
+    const second = tree.listItem(list, 1);
+    const third = tree.listItem(list, 2);
+    try std.testing.expectEqual(Token.Tag.semicolon, tree.tokenTag(first.separator.unwrap().?));
+    try std.testing.expectEqual(Token.Tag.newline, tree.tokenTag(second.separator.unwrap().?));
+    try std.testing.expectEqual(Token.Tag.ampersand, tree.tokenTag(third.separator.unwrap().?));
+}
+
+test "parses a subshell body and trailing redirection" {
+    var tree = try Ast.parse(std.testing.allocator, "(echo; cat) 2>log");
+    defer tree.deinit(std.testing.allocator);
+
+    const subshell_node = firstCommand(&tree);
+    try std.testing.expectEqual(Node.Tag.subshell, tree.nodeTag(subshell_node));
+
+    const subshell = tree.subshell(subshell_node);
+    try std.testing.expectEqualStrings(")", tree.tokenSlice(subshell.close_token));
+    const body = subshell.body.unwrap().?;
+    try std.testing.expectEqual(@as(usize, 2), tree.listItemCount(body));
+
+    const redirects = tree.extraDataSlice(.{
+        .start = subshell.redirects_start,
+        .end = subshell.redirects_end,
+    }, Node.Index);
+    try std.testing.expectEqual(@as(usize, 1), redirects.len);
+    try std.testing.expectEqual(Node.Tag.redirect, tree.nodeTag(redirects[0]));
+}
+
+test "parses a subshell as a pipeline command" {
+    var tree = try Ast.parse(std.testing.allocator, "producer | (filter; sink)");
+    defer tree.deinit(std.testing.allocator);
+
+    const pipeline = firstCommand(&tree);
+    const children = tree.nodeData(pipeline).node_and_node;
+    try std.testing.expectEqual(Node.Tag.simple_command, tree.nodeTag(children[0]));
+    try std.testing.expectEqual(Node.Tag.subshell, tree.nodeTag(children[1]));
+}
+
+test "requests continuation for an unclosed subshell" {
+    var tree = try Ast.parse(std.testing.allocator, "(echo; cat");
+    defer tree.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+    try std.testing.expect(tree.status == .incomplete);
+    try std.testing.expect(tree.status.incomplete == .closing_paren);
+    try std.testing.expectEqualStrings(
+        "(",
+        tree.tokenSlice(tree.status.incomplete.closing_paren),
+    );
+}
+
+test "rejects an empty subshell" {
+    var tree = try Ast.parse(std.testing.allocator, "()");
     defer tree.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 1), tree.errors.len);
     try std.testing.expectEqual(Ast.Error.Tag.expected_command, tree.errors[0].tag);
-    try std.testing.expectEqual(Token.Tag.eof, tree.tokenTag(tree.errors[0].token));
+    try std.testing.expectEqual(Token.Tag.r_paren, tree.tokenTag(tree.errors[0].token));
 }

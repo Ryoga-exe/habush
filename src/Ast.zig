@@ -18,6 +18,7 @@ tokens: TokenList.Slice,
 nodes: NodeList.Slice,
 extra_data: []u32,
 errors: []const Error,
+status: Status,
 
 pub const ByteOffset = u32;
 
@@ -29,6 +30,18 @@ pub const NodeList = std.MultiArrayList(Node);
 
 pub const TokenIndex = u32;
 pub const ParseError = Allocator.Error || error{SourceTooLarge};
+
+pub const Status = union(enum) {
+    complete,
+    incomplete: Continuation,
+};
+
+pub const Continuation = union(enum) {
+    lexical: TokenIndex,
+    command_after: TokenIndex,
+    redirect_target: TokenIndex,
+    closing_paren: TokenIndex,
+};
 
 /// Index into `extra_data`.
 pub const ExtraIndex = enum(u32) {
@@ -95,6 +108,33 @@ pub fn nodeMainToken(tree: *const Ast, index: Node.Index) TokenIndex {
 
 pub fn nodeData(tree: *const Ast, index: Node.Index) Node.Data {
     return tree.nodes.items(.data)[@intFromEnum(index)];
+}
+
+pub fn simpleCommandParts(tree: *const Ast, index: Node.Index) []const Node.Index {
+    std.debug.assert(tree.nodeTag(index) == .simple_command);
+    return tree.extraDataSlice(tree.nodeData(index).extra_range, Node.Index);
+}
+
+pub fn listItemCount(tree: *const Ast, index: Node.Index) usize {
+    std.debug.assert(tree.nodeTag(index) == .list);
+    const range = tree.nodeData(index).extra_range;
+    const raw_len = @intFromEnum(range.end) - @intFromEnum(range.start);
+    const width = std.meta.fields(Node.ListItem).len;
+    std.debug.assert(raw_len % width == 0);
+    return raw_len / width;
+}
+
+pub fn listItem(tree: *const Ast, index: Node.Index, item_index: usize) Node.ListItem {
+    std.debug.assert(item_index < tree.listItemCount(index));
+    const range = tree.nodeData(index).extra_range;
+    const width = std.meta.fields(Node.ListItem).len;
+    const offset = @intFromEnum(range.start) + item_index * width;
+    return tree.extraData(@enumFromInt(offset), Node.ListItem);
+}
+
+pub fn subshell(tree: *const Ast, index: Node.Index) Node.Subshell {
+    std.debug.assert(tree.nodeTag(index) == .subshell);
+    return tree.extraData(tree.nodeData(index).extra, Node.Subshell);
 }
 
 pub fn extraDataSlice(
@@ -183,6 +223,9 @@ pub const Node = struct {
         /// `data.extra_range`: `Node.Index` values in source order.
         simple_command,
 
+        /// `data.extra`: encoded `Subshell` data.
+        subshell,
+
         /// `main_token` identifies the word; `data.none`.
         word,
 
@@ -195,6 +238,7 @@ pub const Node = struct {
         none: void,
         opt_node: OptionalIndex,
         node_and_node: struct { Index, Index },
+        extra: ExtraIndex,
         extra_range: SubRange,
         opt_token_and_token: struct { OptionalTokenIndex, TokenIndex },
     };
@@ -207,6 +251,13 @@ pub const Node = struct {
     pub const ListItem = struct {
         command: Index,
         separator: OptionalTokenIndex,
+    };
+
+    pub const Subshell = struct {
+        body: OptionalIndex,
+        close_token: TokenIndex,
+        redirects_start: ExtraIndex,
+        redirects_end: ExtraIndex,
     };
 };
 
@@ -248,6 +299,7 @@ test "MultiArrayList stores node fields and index relationships" {
         .nodes = nodes.toOwnedSlice(),
         .extra_data = extra_data,
         .errors = errors,
+        .status = .complete,
     };
     defer tree.deinit(allocator);
 
