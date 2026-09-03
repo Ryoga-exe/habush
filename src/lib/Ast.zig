@@ -749,3 +749,7 @@ test "MultiArrayList stores node fields and index relationships" {
     try std.testing.expectEqual(@as(ByteOffset, 0), tree.tokenStart(0));
     try std.testing.expectEqualStrings("echo", tree.tokenSlice(0));
 }
+
+test {
+    _ = Parse;
+}
