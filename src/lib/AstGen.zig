@@ -113,8 +113,49 @@ fn command(astgen: *AstGen, node: Ast.Node.Index) Error!Hir.Inst.Index {
         .subshell, .brace_group => astgen.groupedCommand(node),
         .if_clause => astgen.ifClause(node),
         .while_clause, .until_clause => astgen.loopClause(node),
+        .for_clause => astgen.forClause(node),
         else => error.UnsupportedSyntax,
     };
+}
+
+fn forClause(astgen: *AstGen, node: Ast.Node.Index) Error!Hir.Inst.Index {
+    const clause = astgen.tree.forClause(node);
+    const name_token = clause.name_token.unwrap() orelse return error.InvalidAst;
+    const body_node = clause.body.unwrap() orelse return error.InvalidAst;
+    const name = try astgen.addString(astgen.tree.tokenSlice(name_token));
+
+    const scratch_top = astgen.scratch.items.len;
+    defer astgen.scratch.items.len = scratch_top;
+    const ast_words = astgen.tree.forWords(clause);
+    for (ast_words) |word_node| {
+        if (astgen.tree.nodeTag(word_node) != .word) return error.InvalidAst;
+        try astgen.scratch.append(astgen.gpa, @intFromEnum(try astgen.word(word_node)));
+    }
+    const body = try astgen.list(body_node);
+    const redirects_len = try astgen.appendRedirects(
+        clause.redirects_start,
+        clause.redirects_end,
+    );
+
+    const payload_index = try astgen.addExtra(Hir.For{
+        .name_start = name.start,
+        .name_len = name.len,
+        .body = body,
+        .words_len = try index(u32, ast_words.len),
+        .redirects_len = redirects_len,
+        .flags = .{
+            .implicit_positional_parameters = clause.in_token.unwrap() == null,
+        },
+    });
+    try astgen.extra.appendSlice(astgen.gpa, astgen.scratch.items[scratch_top..]);
+
+    return astgen.addInstruction(.{
+        .tag = .for_clause,
+        .data = .{ .pl = .{
+            .src_start = astgen.sourceStart(node),
+            .payload_index = payload_index,
+        } },
+    });
 }
 
 fn loopClause(astgen: *AstGen, node: Ast.Node.Index) Error!Hir.Inst.Index {

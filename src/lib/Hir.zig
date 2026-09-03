@@ -138,6 +138,23 @@ pub fn loopClause(hir: Hir, index: Inst.Index) Loop.Value {
     };
 }
 
+pub fn forClause(hir: Hir, index: Inst.Index) For.Value {
+    std.debug.assert(hir.instructionTag(index) == .for_clause);
+    const payload = hir.extraData(For, hir.instructionData(index).pl.payload_index);
+    const words = hir.instructionSlice(payload.end, payload.data.words_len);
+    const redirects_start = payload.end + payload.data.words_len;
+    return .{
+        .name = (String{
+            .start = payload.data.name_start,
+            .len = payload.data.name_len,
+        }).get(hir),
+        .body = payload.data.body,
+        .words = words,
+        .implicit_positional_parameters = payload.data.flags.implicit_positional_parameters,
+        .redirects = hir.instructionSlice(redirects_start, payload.data.redirects_len),
+    };
+}
+
 pub fn extraData(hir: Hir, comptime T: type, index: ExtraIndex) ExtraData(T) {
     const fields = std.meta.fields(T);
     var result: T = undefined;
@@ -280,6 +297,9 @@ pub const Inst = struct {
         while_clause,
         until_clause,
 
+        /// `data.pl`: `For`, followed by word and redirect `Inst.Index` values.
+        for_clause,
+
         /// `data.str`: the bytes represented by this word part.
         literal,
         escaped,
@@ -377,6 +397,28 @@ pub const Loop = struct {
     pub const Value = struct {
         condition: Inst.Index,
         body: Inst.Index,
+        redirects: []const Inst.Index,
+    };
+};
+
+pub const For = struct {
+    name_start: StringIndex,
+    name_len: u32,
+    body: Inst.Index,
+    words_len: u32,
+    redirects_len: u32,
+    flags: Flags,
+
+    pub const Flags = packed struct(u32) {
+        implicit_positional_parameters: bool,
+        _: u31 = 0,
+    };
+
+    pub const Value = struct {
+        name: []const u8,
+        body: Inst.Index,
+        words: []const Inst.Index,
+        implicit_positional_parameters: bool,
         redirects: []const Inst.Index,
     };
 };

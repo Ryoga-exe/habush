@@ -249,6 +249,63 @@ test "generates while and until clauses" {
     try std.testing.expectEqual(@as(usize, 0), inner.redirects.len);
 }
 
+test "generates for clause words, body, and redirects" {
+    var tree = try Ast.parse(
+        std.testing.allocator,
+        "for item in one \"$two\"; do consume $item; done >log",
+    );
+    defer tree.deinit(std.testing.allocator);
+
+    var hir = try AstGen.generate(std.testing.allocator, tree);
+    defer hir.deinit(std.testing.allocator);
+
+    const for_index = firstCommand(hir);
+    try std.testing.expectEqual(Hir.Inst.Tag.for_clause, hir.instructionTag(for_index));
+    const clause = hir.forClause(for_index);
+    try std.testing.expectEqualStrings("item", clause.name);
+    try std.testing.expect(!clause.implicit_positional_parameters);
+    try std.testing.expectEqual(@as(usize, 2), clause.words.len);
+    try std.testing.expectEqualStrings("one", firstWordPart(hir, clause.words[0]));
+    const quoted_part = hir.wordParts(clause.words[1])[0];
+    try std.testing.expectEqual(
+        Hir.Inst.Tag.double_quoted_parameter,
+        hir.instructionTag(quoted_part),
+    );
+    try std.testing.expectEqualStrings("two", hir.wordPart(quoted_part));
+    try std.testing.expectEqual(Hir.Inst.Tag.list, hir.instructionTag(clause.body));
+    try std.testing.expectEqual(@as(usize, 1), clause.redirects.len);
+    try std.testing.expectEqualStrings(
+        "log",
+        firstWordPart(hir, hir.redirect(clause.redirects[0]).target),
+    );
+}
+
+test "distinguishes implicit parameters from an explicit empty for list" {
+    var implicit_tree = try Ast.parse(
+        std.testing.allocator,
+        "for item; do consume $item; done",
+    );
+    defer implicit_tree.deinit(std.testing.allocator);
+    var implicit_hir = try AstGen.generate(std.testing.allocator, implicit_tree);
+    defer implicit_hir.deinit(std.testing.allocator);
+
+    const implicit = implicit_hir.forClause(firstCommand(implicit_hir));
+    try std.testing.expect(implicit.implicit_positional_parameters);
+    try std.testing.expectEqual(@as(usize, 0), implicit.words.len);
+
+    var empty_tree = try Ast.parse(
+        std.testing.allocator,
+        "for item in; do consume $item; done",
+    );
+    defer empty_tree.deinit(std.testing.allocator);
+    var empty_hir = try AstGen.generate(std.testing.allocator, empty_tree);
+    defer empty_hir.deinit(std.testing.allocator);
+
+    const empty = empty_hir.forClause(firstCommand(empty_hir));
+    try std.testing.expect(!empty.implicit_positional_parameters);
+    try std.testing.expectEqual(@as(usize, 0), empty.words.len);
+}
+
 test "rejects invalid and unsupported ASTs" {
     var invalid = try Ast.parse(std.testing.allocator, "echo |");
     defer invalid.deinit(std.testing.allocator);
@@ -257,10 +314,7 @@ test "rejects invalid and unsupported ASTs" {
         AstGen.generate(std.testing.allocator, invalid),
     );
 
-    var unsupported = try Ast.parse(
-        std.testing.allocator,
-        "for item in first second; do use $item; done",
-    );
+    var unsupported = try Ast.parse(std.testing.allocator, "build() { run; }");
     defer unsupported.deinit(std.testing.allocator);
     try std.testing.expectError(
         error.UnsupportedSyntax,
@@ -272,7 +326,7 @@ test "AST generation handles every allocation failure" {
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         generateWithAllocator,
-        .{"while check; do if ready; then run; else wait; fi; done >log &"},
+        .{"for item in first \"$second\"; do while check; do use $item; done; done >log &"},
     );
 }
 
