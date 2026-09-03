@@ -110,8 +110,69 @@ fn command(astgen: *AstGen, node: Ast.Node.Index) Error!Hir.Inst.Index {
         .simple_command => astgen.simpleCommand(node),
         .pipe, .pipe_and, .and_if, .or_if => astgen.binaryCommand(node),
         .negated_pipeline => astgen.negatedPipeline(node),
+        .subshell, .brace_group => astgen.groupedCommand(node),
         else => error.UnsupportedSyntax,
     };
+}
+
+fn groupedCommand(astgen: *AstGen, node: Ast.Node.Index) Error!Hir.Inst.Index {
+    const AstGroup = struct {
+        body: Ast.Node.OptionalIndex,
+        redirects_start: Ast.ExtraIndex,
+        redirects_end: Ast.ExtraIndex,
+    };
+
+    const tag = astgen.tree.nodeTag(node);
+    const group: AstGroup = switch (tag) {
+        .subshell => blk: {
+            const subshell = astgen.tree.subshell(node);
+            break :blk .{
+                .body = subshell.body,
+                .redirects_start = subshell.redirects_start,
+                .redirects_end = subshell.redirects_end,
+            };
+        },
+        .brace_group => blk: {
+            const brace_group = astgen.tree.braceGroup(node);
+            break :blk .{
+                .body = brace_group.body,
+                .redirects_start = brace_group.redirects_start,
+                .redirects_end = brace_group.redirects_end,
+            };
+        },
+        else => unreachable,
+    };
+    const body_node = group.body.unwrap() orelse return error.InvalidAst;
+    const body = try astgen.list(body_node);
+
+    const scratch_top = astgen.scratch.items.len;
+    defer astgen.scratch.items.len = scratch_top;
+    const redirects = astgen.tree.extraDataSlice(.{
+        .start = group.redirects_start,
+        .end = group.redirects_end,
+    }, Ast.Node.Index);
+    for (redirects) |redirect_node| {
+        try astgen.scratch.append(astgen.gpa, @intFromEnum(try astgen.redirect(redirect_node)));
+    }
+
+    const redirect_instructions = astgen.scratch.items[scratch_top..];
+    const payload_index = try astgen.addExtra(Hir.Group{
+        .body = body,
+        .redirects_len = try index(u32, redirect_instructions.len),
+    });
+    try astgen.extra.appendSlice(astgen.gpa, redirect_instructions);
+
+    return astgen.addInstruction(.{
+        .tag = switch (tag) {
+            .subshell => .subshell,
+            .brace_group => .brace_group,
+            else => unreachable,
+        },
+        .data = .{ .pl = .{
+            .src_start = astgen.sourceStart(node),
+            .payload_index = payload_index,
+        } },
+    });
 }
 
 fn binaryCommand(astgen: *AstGen, node: Ast.Node.Index) Error!Hir.Inst.Index {

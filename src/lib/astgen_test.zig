@@ -144,6 +144,38 @@ test "normalizes list separators" {
     );
 }
 
+test "generates subshell and brace group bodies with redirects" {
+    var tree = try Ast.parse(
+        std.testing.allocator,
+        "(prepare; run) 2>log | { consume; finish; } >out",
+    );
+    defer tree.deinit(std.testing.allocator);
+
+    var hir = try AstGen.generate(std.testing.allocator, tree);
+    defer hir.deinit(std.testing.allocator);
+
+    const operands = hir.pipeline(firstCommand(hir));
+    try std.testing.expectEqual(Hir.Inst.Tag.subshell, hir.instructionTag(operands.lhs));
+    try std.testing.expectEqual(Hir.Inst.Tag.brace_group, hir.instructionTag(operands.rhs));
+
+    const subshell = hir.groupedCommand(operands.lhs);
+    try std.testing.expectEqual(@as(usize, 2), hir.listItemCount(subshell.body));
+    try std.testing.expectEqual(@as(usize, 1), subshell.redirects.len);
+    const subshell_redirect = hir.redirect(subshell.redirects[0]);
+    try std.testing.expectEqualStrings("2", subshell_redirect.io_number.?);
+    try std.testing.expectEqualStrings("log", firstWordPart(hir, subshell_redirect.target));
+
+    const brace_group = hir.groupedCommand(operands.rhs);
+    try std.testing.expectEqual(@as(usize, 2), hir.listItemCount(brace_group.body));
+    try std.testing.expectEqual(
+        Hir.List.Item.Separator.sequential,
+        hir.listItem(brace_group.body, 1).separator,
+    );
+    try std.testing.expectEqual(@as(usize, 1), brace_group.redirects.len);
+    const brace_redirect = hir.redirect(brace_group.redirects[0]);
+    try std.testing.expectEqualStrings("out", firstWordPart(hir, brace_redirect.target));
+}
+
 test "rejects invalid and unsupported ASTs" {
     var invalid = try Ast.parse(std.testing.allocator, "echo |");
     defer invalid.deinit(std.testing.allocator);
@@ -152,7 +184,7 @@ test "rejects invalid and unsupported ASTs" {
         AstGen.generate(std.testing.allocator, invalid),
     );
 
-    var unsupported = try Ast.parse(std.testing.allocator, "(echo)");
+    var unsupported = try Ast.parse(std.testing.allocator, "if condition; then result; fi");
     defer unsupported.deinit(std.testing.allocator);
     try std.testing.expectError(
         error.UnsupportedSyntax,
@@ -164,7 +196,7 @@ test "AST generation handles every allocation failure" {
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         generateWithAllocator,
-        .{"! A=value command 2>>log | consume && fallback; notify &"},
+        .{"! (A=value command 2>>log; notify) | { consume && fallback; } &"},
     );
 }
 
@@ -198,4 +230,8 @@ fn generateWithAllocator(gpa: std.mem.Allocator, source: [:0]const u8) !void {
 fn firstCommand(hir: Hir) Hir.Inst.Index {
     const list = hir.root().?;
     return hir.listItem(list, 0).command;
+}
+
+fn firstWordPart(hir: Hir, word: Hir.Inst.Index) []const u8 {
+    return hir.wordPart(hir.wordParts(word)[0]);
 }

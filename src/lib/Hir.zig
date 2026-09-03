@@ -106,6 +106,16 @@ pub fn negatedPipeline(hir: Hir, index: Inst.Index) Inst.Index {
     return hir.instructionData(index).un.operand.unwrap().?;
 }
 
+pub fn groupedCommand(hir: Hir, index: Inst.Index) Group.Value {
+    const tag = hir.instructionTag(index);
+    std.debug.assert(tag == .subshell or tag == .brace_group);
+    const payload = hir.extraData(Group, hir.instructionData(index).pl.payload_index);
+    return .{
+        .body = payload.data.body,
+        .redirects = hir.instructionSlice(payload.end, payload.data.redirects_len),
+    };
+}
+
 pub fn extraData(hir: Hir, comptime T: type, index: ExtraIndex) ExtraData(T) {
     const fields = std.meta.fields(T);
     var result: T = undefined;
@@ -236,6 +246,10 @@ pub const Inst = struct {
         and_if,
         or_if,
 
+        /// `data.pl`: `Group`, followed by redirect `Inst.Index` values.
+        subshell,
+        brace_group,
+
         /// `data.str`: the bytes represented by this word part.
         literal,
         escaped,
@@ -298,6 +312,16 @@ pub const List = struct {
             sequential,
             background,
         };
+    };
+};
+
+pub const Group = struct {
+    body: Inst.Index,
+    redirects_len: u32,
+
+    pub const Value = struct {
+        body: Inst.Index,
+        redirects: []const Inst.Index,
     };
 };
 
