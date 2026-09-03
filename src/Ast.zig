@@ -96,13 +96,17 @@ pub const CompoundContinuation = struct {
         if_clause,
         elif_clause,
         else_clause,
+        while_clause,
+        until_clause,
     };
 
     pub const Expected = enum {
         condition,
         then_keyword,
+        do_keyword,
         body,
         fi_keyword,
+        done_keyword,
     };
 };
 
@@ -128,6 +132,8 @@ pub const Error = struct {
         expected_separator,
         expected_then_keyword,
         expected_fi_keyword,
+        expected_do_keyword,
+        expected_done_keyword,
         here_document_mismatch,
     };
 };
@@ -217,6 +223,12 @@ pub fn subshell(tree: *const Ast, index: Node.Index) Node.Subshell {
 pub fn ifClause(tree: *const Ast, index: Node.Index) Node.If {
     std.debug.assert(tree.nodeTag(index) == .if_clause);
     return tree.extraData(tree.nodeData(index).extra, Node.If);
+}
+
+pub fn loopClause(tree: *const Ast, index: Node.Index) Node.Loop {
+    const tag = tree.nodeTag(index);
+    std.debug.assert(tag == .while_clause or tag == .until_clause);
+    return tree.extraData(tree.nodeData(index).extra, Node.Loop);
 }
 
 pub fn redirect(tree: *const Ast, index: Node.Index) Node.Redirect {
@@ -347,6 +359,10 @@ pub const Node = struct {
         /// `data.extra`: encoded `If` data.
         if_clause,
 
+        /// `data.extra`: encoded `Loop` data.
+        while_clause,
+        until_clause,
+
         /// `main_token` identifies the word; `data.none`.
         word,
 
@@ -397,6 +413,15 @@ pub const Node = struct {
         condition: OptionalIndex,
         then_token: OptionalTokenIndex,
         body: OptionalIndex,
+    };
+
+    pub const Loop = struct {
+        condition: OptionalIndex,
+        do_token: OptionalTokenIndex,
+        body: OptionalIndex,
+        done_token: OptionalTokenIndex,
+        redirects_start: ExtraIndex,
+        redirects_end: ExtraIndex,
     };
 
     pub const Redirect = struct {

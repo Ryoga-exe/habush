@@ -39,6 +39,14 @@ const IfBuilder = struct {
     redirects: ?Node.SubRange = null,
 };
 
+const LoopBuilder = struct {
+    condition: Node.OptionalIndex = .none,
+    do_token: Node.OptionalTokenIndex = .none,
+    body: Node.OptionalIndex = .none,
+    done_token: Node.OptionalTokenIndex = .none,
+    redirects: ?Node.SubRange = null,
+};
+
 const HereDocumentBuilder = struct {
     index: Ast.HereDocumentIndex,
     delimiter_start: u32,
@@ -323,6 +331,8 @@ fn parsePipeline(parser: *Parse) Ast.ParseError!Node.Index {
 fn parseCommand(parser: *Parse) Ast.ParseError!Node.Index {
     return switch (parser.tokenTag(parser.tok_i)) {
         .keyword_if => parser.parseIfClause(),
+        .keyword_while => parser.parseLoopClause(.while_clause),
+        .keyword_until => parser.parseLoopClause(.until_clause),
         .l_paren => parser.parseSubshell(),
         else => parser.parseSimpleCommand(),
     };
@@ -540,6 +550,122 @@ fn finishIf(
     return parser.addNode(.{
         .tag = .if_clause,
         .main_token = if_token,
+        .data = .{ .extra = extra },
+    });
+}
+
+fn parseLoopClause(
+    parser: *Parse,
+    node_tag: Node.Tag,
+) Ast.ParseError!Node.Index {
+    const kind: Ast.CompoundContinuation.Kind = switch (node_tag) {
+        .while_clause => .while_clause,
+        .until_clause => .until_clause,
+        else => unreachable,
+    };
+    const open_token = parser.nextToken();
+    var builder: LoopBuilder = .{};
+
+    parser.skipNewlines();
+    if (parser.tokenTag(parser.tok_i) == .eof) {
+        parser.setCompoundIncomplete(kind, .condition, open_token);
+        return parser.finishLoop(node_tag, open_token, builder);
+    }
+
+    const condition_errors = parser.errors.items.len;
+    const condition = try parser.parseList(.{
+        .reserved_words = &.{.keyword_do},
+    });
+    if (condition) |node| {
+        builder.condition = node.toOptional();
+    } else {
+        try parser.warn(.{
+            .tag = .expected_command,
+            .token = parser.tok_i,
+        });
+        return parser.finishLoop(node_tag, open_token, builder);
+    }
+    if (parser.failedSince(condition_errors)) {
+        return parser.finishLoop(node_tag, open_token, builder);
+    }
+    if (parser.tokenTag(parser.tok_i) == .eof) {
+        parser.setCompoundIncomplete(kind, .do_keyword, open_token);
+        return parser.finishLoop(node_tag, open_token, builder);
+    }
+    if (parser.tokenTag(parser.tok_i) != .keyword_do) {
+        try parser.warn(.{
+            .tag = .expected_do_keyword,
+            .token = parser.tok_i,
+        });
+        return parser.finishLoop(node_tag, open_token, builder);
+    }
+
+    const do_token = parser.nextToken();
+    builder.do_token = Node.OptionalTokenIndex.fromOptional(do_token);
+    parser.skipNewlines();
+    if (parser.tokenTag(parser.tok_i) == .eof) {
+        parser.setCompoundIncomplete(kind, .body, do_token);
+        return parser.finishLoop(node_tag, open_token, builder);
+    }
+
+    const body_errors = parser.errors.items.len;
+    const body = try parser.parseList(.{
+        .reserved_words = &.{.keyword_done},
+    });
+    if (body) |node| {
+        builder.body = node.toOptional();
+    } else {
+        try parser.warn(.{
+            .tag = .expected_command,
+            .token = parser.tok_i,
+        });
+        return parser.finishLoop(node_tag, open_token, builder);
+    }
+    if (parser.failedSince(body_errors)) {
+        return parser.finishLoop(node_tag, open_token, builder);
+    }
+
+    if (parser.tokenTag(parser.tok_i) == .eof) {
+        parser.setCompoundIncomplete(kind, .done_keyword, open_token);
+        return parser.finishLoop(node_tag, open_token, builder);
+    }
+    if (parser.tokenTag(parser.tok_i) != .keyword_done) {
+        try parser.warn(.{
+            .tag = .expected_done_keyword,
+            .token = parser.tok_i,
+        });
+        return parser.finishLoop(node_tag, open_token, builder);
+    }
+    builder.done_token = Node.OptionalTokenIndex.fromOptional(parser.nextToken());
+
+    const redirect_start = parser.scratch.items.len;
+    defer parser.scratch.shrinkRetainingCapacity(redirect_start);
+    while (parser.startsRedirect()) {
+        try parser.scratch.append(parser.gpa, try parser.parseRedirect());
+    }
+    builder.redirects = try parser.listToSpan(parser.scratch.items[redirect_start..]);
+
+    return parser.finishLoop(node_tag, open_token, builder);
+}
+
+fn finishLoop(
+    parser: *Parse,
+    node_tag: Node.Tag,
+    open_token: Ast.TokenIndex,
+    builder: LoopBuilder,
+) Ast.ParseError!Node.Index {
+    const redirects = builder.redirects orelse try parser.emptySpan();
+    const extra = try parser.addExtra(Node.Loop{
+        .condition = builder.condition,
+        .do_token = builder.do_token,
+        .body = builder.body,
+        .done_token = builder.done_token,
+        .redirects_start = redirects.start,
+        .redirects_end = redirects.end,
+    });
+    return parser.addNode(.{
+        .tag = node_tag,
+        .main_token = open_token,
         .data = .{ .extra = extra },
     });
 }
@@ -837,7 +963,9 @@ fn nextToken(parser: *Parse) Ast.TokenIndex {
 
 fn canStartCommand(parser: *const Parse) bool {
     const tag = parser.tokenTag(parser.tok_i);
-    if (isReservedWord(tag)) return tag == .keyword_if;
+    if (isReservedWord(tag)) {
+        return tag == .keyword_if or tag == .keyword_while or tag == .keyword_until;
+    }
     return tag == .l_paren or isWord(tag) or parser.startsRedirect();
 }
 
@@ -906,6 +1034,10 @@ fn isReservedWord(tag: Token.Tag) bool {
         .keyword_elif,
         .keyword_else,
         .keyword_fi,
+        .keyword_while,
+        .keyword_until,
+        .keyword_do,
+        .keyword_done,
         => true,
         else => false,
     };
@@ -1354,12 +1486,15 @@ test "parses if elif else and trailing redirection" {
 }
 
 test "keyword candidates remain words in argument position" {
-    var tree = try Ast.parse(std.testing.allocator, "echo if then elif else fi");
+    var tree = try Ast.parse(
+        std.testing.allocator,
+        "echo if then elif else fi while until do done",
+    );
     defer tree.deinit(std.testing.allocator);
 
     const command = firstCommand(&tree);
     const parts = tree.simpleCommandParts(command);
-    try std.testing.expectEqual(@as(usize, 6), parts.len);
+    try std.testing.expectEqual(@as(usize, 10), parts.len);
     for (parts) |part| {
         try std.testing.expectEqual(Node.Tag.word, tree.nodeTag(part));
     }
@@ -1432,6 +1567,78 @@ test "rejects a reserved word at command start" {
     try std.testing.expectEqual(@as(usize, 1), tree.errors.len);
     try std.testing.expectEqual(Ast.Error.Tag.expected_command, tree.errors[0].tag);
     try std.testing.expectEqual(Token.Tag.keyword_then, tree.tokenTag(tree.errors[0].token));
+}
+
+test "parses while and until clauses" {
+    var while_tree = try Ast.parse(
+        std.testing.allocator,
+        "while check; do work; done >log",
+    );
+    defer while_tree.deinit(std.testing.allocator);
+
+    const while_node = firstCommand(&while_tree);
+    try std.testing.expectEqual(Node.Tag.while_clause, while_tree.nodeTag(while_node));
+    const while_clause = while_tree.loopClause(while_node);
+    try std.testing.expect(while_clause.condition.unwrap() != null);
+    try std.testing.expect(while_clause.do_token.unwrap() != null);
+    try std.testing.expect(while_clause.body.unwrap() != null);
+    try std.testing.expectEqualStrings("done", while_tree.tokenSlice(while_clause.done_token.unwrap().?));
+    const redirects = while_tree.extraDataSlice(.{
+        .start = while_clause.redirects_start,
+        .end = while_clause.redirects_end,
+    }, Node.Index);
+    try std.testing.expectEqual(@as(usize, 1), redirects.len);
+
+    var until_tree = try Ast.parse(
+        std.testing.allocator,
+        "until ready; do wait; done",
+    );
+    defer until_tree.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Node.Tag.until_clause, until_tree.nodeTag(firstCommand(&until_tree)));
+    try std.testing.expectEqual(@as(usize, 0), until_tree.errors.len);
+}
+
+test "parses a nested loop clause" {
+    const source =
+        \\while outer; do
+        \\  until inner; do
+        \\    step
+        \\  done
+        \\done
+        \\
+    ;
+    var tree = try Ast.parse(std.testing.allocator, source);
+    defer tree.deinit(std.testing.allocator);
+
+    const outer = tree.loopClause(firstCommand(&tree));
+    const inner = tree.listItem(outer.body.unwrap().?, 0).command;
+    try std.testing.expectEqual(Node.Tag.until_clause, tree.nodeTag(inner));
+    try std.testing.expect(tree.loopClause(inner).done_token.unwrap() != null);
+}
+
+test "reports each incomplete loop stage" {
+    try expectCompoundContinuation("while", .while_clause, .condition);
+    try expectCompoundContinuation("while check", .while_clause, .do_keyword);
+    try expectCompoundContinuation("while check; do", .while_clause, .body);
+    try expectCompoundContinuation("while check; do work", .while_clause, .done_keyword);
+
+    try expectCompoundContinuation("until", .until_clause, .condition);
+    try expectCompoundContinuation("until ready", .until_clause, .do_keyword);
+    try expectCompoundContinuation("until ready; do", .until_clause, .body);
+    try expectCompoundContinuation("until ready; do wait", .until_clause, .done_keyword);
+}
+
+test "makes a loop here-document ready before syntax continuation" {
+    var tree = try Ast.parse(std.testing.allocator, "while read <<EOF\n");
+    defer tree.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 1), tree.ready_here_document_count);
+    try std.testing.expect(tree.status == .incomplete);
+    try std.testing.expect(tree.status.incomplete == .compound);
+    try std.testing.expectEqual(
+        Ast.CompoundContinuation.Expected.do_keyword,
+        tree.status.incomplete.compound.expected,
+    );
 }
 
 fn expectCompoundContinuation(
