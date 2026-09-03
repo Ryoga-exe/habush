@@ -106,7 +106,7 @@ fn parseRoot(parser: *Parse) Ast.ParseError!void {
     }
 
     const errors_before_command = parser.errors.items.len;
-    const command = try parser.parsePipeline();
+    const command = try parser.parseAndOr();
 
     var separator: Node.OptionalTokenIndex = .none;
     if (parser.tokenTag(parser.tok_i) == .newline) {
@@ -142,6 +142,36 @@ fn parseRoot(parser: *Parse) Ast.ParseError!void {
         .main_token = parser.nodeMainToken(list),
         .data = .{ .opt_node = list.toOptional() },
     });
+}
+
+fn parseAndOr(parser: *Parse) Ast.ParseError!Node.Index {
+    var lhs = try parser.parsePipeline();
+
+    while (isAndOr(parser.tokenTag(parser.tok_i))) {
+        const operator = parser.nextToken();
+        parser.skipNewlines();
+
+        if (!parser.canStartSimpleCommand()) {
+            try parser.warn(.{
+                .tag = .expected_command,
+                .token = parser.tok_i,
+            });
+            return lhs;
+        }
+
+        const rhs = try parser.parsePipeline();
+        lhs = try parser.addNode(.{
+            .tag = switch (parser.tokenTag(operator)) {
+                .ampersand_ampersand => .and_if,
+                .pipe_pipe => .or_if,
+                else => unreachable,
+            },
+            .main_token = operator,
+            .data = .{ .node_and_node = .{ lhs, rhs } },
+        });
+    }
+
+    return lhs;
 }
 
 fn parsePipeline(parser: *Parse) Ast.ParseError!Node.Index {
@@ -320,6 +350,10 @@ fn isPipe(tag: Token.Tag) bool {
     return tag == .pipe or tag == .pipe_ampersand;
 }
 
+fn isAndOr(tag: Token.Tag) bool {
+    return tag == .ampersand_ampersand or tag == .pipe_pipe;
+}
+
 fn isRedirect(tag: Token.Tag) bool {
     return switch (tag) {
         .ampersand_gt,
@@ -492,4 +526,37 @@ test "records a repeated pipe once" {
     try std.testing.expectEqual(@as(usize, 1), tree.errors.len);
     try std.testing.expectEqual(Ast.Error.Tag.expected_command, tree.errors[0].tag);
     try std.testing.expectEqual(Token.Tag.pipe, tree.tokenTag(tree.errors[0].token));
+}
+
+test "parses and-or after pipelines with the correct precedence" {
+    var tree = try Ast.parse(std.testing.allocator, "a | b && c || d | e");
+    defer tree.deinit(std.testing.allocator);
+
+    const outer = firstCommand(&tree);
+    try std.testing.expectEqual(Node.Tag.or_if, tree.nodeTag(outer));
+
+    const outer_data = tree.nodeData(outer).node_and_node;
+    try std.testing.expectEqual(Node.Tag.and_if, tree.nodeTag(outer_data[0]));
+    try std.testing.expectEqual(Node.Tag.pipe, tree.nodeTag(outer_data[1]));
+
+    const and_data = tree.nodeData(outer_data[0]).node_and_node;
+    try std.testing.expectEqual(Node.Tag.pipe, tree.nodeTag(and_data[0]));
+    try std.testing.expectEqual(Node.Tag.simple_command, tree.nodeTag(and_data[1]));
+}
+
+test "allows newlines after an and-or operator" {
+    var tree = try Ast.parse(std.testing.allocator, "first &&\nsecond");
+    defer tree.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(Node.Tag.and_if, tree.nodeTag(firstCommand(&tree)));
+    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+}
+
+test "records a missing and-or command once" {
+    var tree = try Ast.parse(std.testing.allocator, "first ||");
+    defer tree.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), tree.errors.len);
+    try std.testing.expectEqual(Ast.Error.Tag.expected_command, tree.errors[0].tag);
+    try std.testing.expectEqual(Token.Tag.eof, tree.tokenTag(tree.errors[0].token));
 }
