@@ -17,6 +17,9 @@ source: [:0]const u8,
 tokens: TokenList.Slice,
 nodes: NodeList.Slice,
 extra_data: []u32,
+here_documents: HereDocumentList.Slice,
+here_document_data: []u8,
+ready_here_document_count: u32,
 errors: []const Error,
 status: Status,
 
@@ -27,9 +30,42 @@ pub const TokenList = std.MultiArrayList(struct {
     start: ByteOffset,
 });
 pub const NodeList = std.MultiArrayList(Node);
+pub const HereDocumentList = std.MultiArrayList(struct {
+    redirect: Node.Index,
+    delimiter_start: u32,
+    delimiter_end: u32,
+    strip_tabs: bool,
+    expand_body: bool,
+});
 
 pub const TokenIndex = u32;
 pub const ParseError = Allocator.Error || error{SourceTooLarge};
+
+pub const HereDocumentIndex = enum(u32) {
+    _,
+
+    pub fn toOptional(index: HereDocumentIndex) Optional {
+        const result: Optional = @enumFromInt(@intFromEnum(index));
+        std.debug.assert(result != .none);
+        return result;
+    }
+
+    pub const Optional = enum(u32) {
+        none = std.math.maxInt(u32),
+        _,
+
+        pub fn unwrap(index: Optional) ?HereDocumentIndex {
+            return if (index == .none) null else @enumFromInt(@intFromEnum(index));
+        }
+    };
+};
+
+pub const HereDocument = struct {
+    redirect: Node.Index,
+    delimiter: []const u8,
+    strip_tabs: bool,
+    expand_body: bool,
+};
 
 pub const Status = union(enum) {
     complete,
@@ -96,6 +132,8 @@ pub fn deinit(tree: *Ast, allocator: Allocator) void {
     tree.tokens.deinit(allocator);
     tree.nodes.deinit(allocator);
     allocator.free(tree.extra_data);
+    tree.here_documents.deinit(allocator);
+    allocator.free(tree.here_document_data);
     allocator.free(tree.errors);
     tree.* = undefined;
 }
@@ -165,6 +203,25 @@ pub fn ifClause(tree: *const Ast, index: Node.Index) Node.If {
     return tree.extraData(tree.nodeData(index).extra, Node.If);
 }
 
+pub fn redirect(tree: *const Ast, index: Node.Index) Node.Redirect {
+    std.debug.assert(tree.nodeTag(index) == .redirect);
+    return tree.extraData(tree.nodeData(index).extra, Node.Redirect);
+}
+
+pub fn hereDocument(tree: *const Ast, index: HereDocumentIndex) HereDocument {
+    const item_index = @intFromEnum(index);
+    std.debug.assert(item_index < tree.here_documents.len);
+
+    const starts = tree.here_documents.items(.delimiter_start);
+    const ends = tree.here_documents.items(.delimiter_end);
+    return .{
+        .redirect = tree.here_documents.items(.redirect)[item_index],
+        .delimiter = tree.here_document_data[starts[item_index]..ends[item_index]],
+        .strip_tabs = tree.here_documents.items(.strip_tabs)[item_index],
+        .expand_body = tree.here_documents.items(.expand_body)[item_index],
+    };
+}
+
 pub fn elifBranchCount(tree: *const Ast, node: Node.If) usize {
     _ = tree;
     const raw_len = @intFromEnum(node.elif_end) - @intFromEnum(node.elif_start);
@@ -197,6 +254,7 @@ pub fn extraData(tree: *const Ast, index: ExtraIndex, comptime T: type) T {
             Node.Index,
             Node.OptionalIndex,
             Node.OptionalTokenIndex,
+            HereDocumentIndex.Optional,
             ExtraIndex,
             => @enumFromInt(tree.extra_data[@intFromEnum(index) + offset]),
             TokenIndex => tree.extra_data[@intFromEnum(index) + offset],
@@ -275,8 +333,7 @@ pub const Node = struct {
         /// `main_token` identifies the word; `data.none`.
         word,
 
-        /// `main_token` identifies the operator;
-        /// `data.opt_token_and_token` stores the optional I/O number and target.
+        /// `main_token` identifies the operator; `data.extra` encodes `Redirect`.
         redirect,
     };
 
@@ -286,7 +343,6 @@ pub const Node = struct {
         node_and_node: struct { Index, Index },
         extra: ExtraIndex,
         extra_range: SubRange,
-        opt_token_and_token: struct { OptionalTokenIndex, TokenIndex },
     };
 
     pub const SubRange = struct {
@@ -325,6 +381,12 @@ pub const Node = struct {
         then_token: OptionalTokenIndex,
         body: OptionalIndex,
     };
+
+    pub const Redirect = struct {
+        io_number: OptionalTokenIndex,
+        target: TokenIndex,
+        here_document: HereDocumentIndex.Optional,
+    };
 };
 
 test "MultiArrayList stores node fields and index relationships" {
@@ -358,12 +420,19 @@ test "MultiArrayList stores node fields and index relationships" {
     errdefer allocator.free(extra_data);
     const errors = try allocator.alloc(Error, 0);
     errdefer allocator.free(errors);
+    var here_documents: HereDocumentList = .empty;
+    errdefer here_documents.deinit(allocator);
+    const here_document_data = try allocator.alloc(u8, 0);
+    errdefer allocator.free(here_document_data);
 
     var tree: Ast = .{
         .source = "echo",
         .tokens = tokens.toOwnedSlice(),
         .nodes = nodes.toOwnedSlice(),
         .extra_data = extra_data,
+        .here_documents = here_documents.toOwnedSlice(),
+        .here_document_data = here_document_data,
+        .ready_here_document_count = 0,
         .errors = errors,
         .status = .complete,
     };

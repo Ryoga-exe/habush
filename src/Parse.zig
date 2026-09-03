@@ -4,6 +4,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Ast = @import("Ast.zig");
 const Node = Ast.Node;
+const heredoc = @import("heredoc.zig");
 const Token = @import("tokenizer.zig").Token;
 const Tokenizer = @import("tokenizer.zig").Tokenizer;
 const Parse = @This();
@@ -38,6 +39,14 @@ const IfBuilder = struct {
     redirects: ?Node.SubRange = null,
 };
 
+const HereDocumentBuilder = struct {
+    index: Ast.HereDocumentIndex,
+    delimiter_start: u32,
+    delimiter_end: u32,
+    strip_tabs: bool,
+    expand_body: bool,
+};
+
 gpa: Allocator,
 source: [:0]const u8,
 tokens: Ast.TokenList.Slice,
@@ -46,6 +55,9 @@ errors: std.ArrayList(Ast.Error) = .empty,
 status: Ast.Status = .complete,
 nodes: Ast.NodeList = .empty,
 extra_data: std.ArrayList(u32) = .empty,
+here_documents: Ast.HereDocumentList = .empty,
+here_document_data: std.ArrayList(u8) = .empty,
+ready_here_document_count: u32 = 0,
 scratch: std.ArrayList(Node.Index) = .empty,
 list_scratch: std.ArrayList(Node.ListItem) = .empty,
 elif_scratch: std.ArrayList(Node.ElifBranch) = .empty,
@@ -100,6 +112,8 @@ pub fn parse(gpa: Allocator, source: [:0]const u8) Ast.ParseError!Ast {
     defer parser.errors.deinit(gpa);
     defer parser.nodes.deinit(gpa);
     defer parser.extra_data.deinit(gpa);
+    defer parser.here_documents.deinit(gpa);
+    defer parser.here_document_data.deinit(gpa);
     defer parser.scratch.deinit(gpa);
     defer parser.list_scratch.deinit(gpa);
     defer parser.elif_scratch.deinit(gpa);
@@ -108,6 +122,10 @@ pub fn parse(gpa: Allocator, source: [:0]const u8) Ast.ParseError!Ast {
 
     const extra_data = try parser.extra_data.toOwnedSlice(gpa);
     errdefer gpa.free(extra_data);
+    var here_documents = parser.here_documents.toOwnedSlice();
+    errdefer here_documents.deinit(gpa);
+    const here_document_data = try parser.here_document_data.toOwnedSlice(gpa);
+    errdefer gpa.free(here_document_data);
     const parse_errors = try parser.errors.toOwnedSlice(gpa);
     errdefer gpa.free(parse_errors);
 
@@ -116,6 +134,9 @@ pub fn parse(gpa: Allocator, source: [:0]const u8) Ast.ParseError!Ast {
         .tokens = token_slice,
         .nodes = parser.nodes.toOwnedSlice(),
         .extra_data = extra_data,
+        .here_documents = here_documents,
+        .here_document_data = here_document_data,
+        .ready_here_document_count = parser.ready_here_document_count,
         .errors = parse_errors,
         .status = parser.status,
     };
@@ -171,7 +192,7 @@ fn parseList(
                 parser.skipNewlines();
             },
             .newline => {
-                separator = Node.OptionalTokenIndex.fromOptional(parser.nextToken());
+                separator = Node.OptionalTokenIndex.fromOptional(parser.consumeNewline());
                 parser.skipNewlines();
             },
             else => {},
@@ -595,7 +616,8 @@ fn parseRedirect(parser: *Parse) Ast.ParseError!Node.Index {
 
     const operator = parser.nextToken();
     const target = parser.tok_i;
-    if (!isWord(parser.tokenTag(target))) {
+    const has_target = isWord(parser.tokenTag(target));
+    if (!has_target) {
         if (parser.tokenTag(target) == .eof) {
             parser.setIncomplete(.{ .redirect_target = operator });
         } else {
@@ -608,11 +630,55 @@ fn parseRedirect(parser: *Parse) Ast.ParseError!Node.Index {
         _ = parser.nextToken();
     }
 
-    return parser.addNode(.{
+    const document = if (has_target and isHereDocument(parser.tokenTag(operator)))
+        try parser.prepareHereDocument(operator, target)
+    else
+        null;
+    const redirect_extra = try parser.addExtra(Node.Redirect{
+        .io_number = io_number,
+        .target = target,
+        .here_document = if (document) |value| value.index.toOptional() else .none,
+    });
+    const redirect = try parser.addNode(.{
         .tag = .redirect,
         .main_token = operator,
-        .data = .{ .opt_token_and_token = .{ io_number, target } },
+        .data = .{ .extra = redirect_extra },
     });
+    if (document) |value| {
+        try parser.here_documents.append(parser.gpa, .{
+            .redirect = redirect,
+            .delimiter_start = value.delimiter_start,
+            .delimiter_end = value.delimiter_end,
+            .strip_tabs = value.strip_tabs,
+            .expand_body = value.expand_body,
+        });
+    }
+    return redirect;
+}
+
+fn prepareHereDocument(
+    parser: *Parse,
+    operator: Ast.TokenIndex,
+    target: Ast.TokenIndex,
+) Ast.ParseError!HereDocumentBuilder {
+    var delimiter = try heredoc.decodeDelimiter(parser.gpa, parser.rawTokenSlice(target));
+    defer delimiter.deinit(parser.gpa);
+
+    const document_index = std.math.cast(u32, parser.here_documents.len) orelse
+        return error.SourceTooLarge;
+    const delimiter_start = std.math.cast(u32, parser.here_document_data.items.len) orelse
+        return error.SourceTooLarge;
+    try parser.here_document_data.appendSlice(parser.gpa, delimiter.text);
+    const delimiter_end = std.math.cast(u32, parser.here_document_data.items.len) orelse
+        return error.SourceTooLarge;
+
+    return .{
+        .index = @enumFromInt(document_index),
+        .delimiter_start = delimiter_start,
+        .delimiter_end = delimiter_end,
+        .strip_tabs = parser.tokenTag(operator) == .lt_lt_minus,
+        .expand_body = !delimiter.quoted,
+    };
 }
 
 fn listToSpan(
@@ -683,6 +749,7 @@ fn addExtra(parser: *Parse, extra: anytype) Ast.ParseError!Ast.ExtraIndex {
             Node.Index,
             Node.OptionalIndex,
             Node.OptionalTokenIndex,
+            Ast.HereDocumentIndex.Optional,
             Ast.ExtraIndex,
             => @intFromEnum(value),
             Ast.TokenIndex => value,
@@ -714,7 +781,13 @@ fn warn(parser: *Parse, parse_error: Ast.Error) Allocator.Error!void {
 }
 
 fn skipNewlines(parser: *Parse) void {
-    while (parser.tokenTag(parser.tok_i) == .newline) _ = parser.nextToken();
+    while (parser.tokenTag(parser.tok_i) == .newline) _ = parser.consumeNewline();
+}
+
+fn consumeNewline(parser: *Parse) Ast.TokenIndex {
+    const newline = parser.nextToken();
+    parser.ready_here_document_count = @intCast(parser.here_documents.len);
+    return newline;
 }
 
 fn tokenTag(parser: *const Parse, token_index: Ast.TokenIndex) Token.Tag {
@@ -786,6 +859,11 @@ fn tokenEnd(parser: *const Parse, token_index: Ast.TokenIndex) usize {
     return scanner.next().loc.end;
 }
 
+fn rawTokenSlice(parser: *const Parse, token_index: Ast.TokenIndex) []const u8 {
+    const start = parser.tokens.items(.start)[token_index];
+    return parser.source[start..parser.tokenEnd(token_index)];
+}
+
 fn isWord(tag: Token.Tag) bool {
     return tag == .word or tag == .digits or isReservedWord(tag);
 }
@@ -827,6 +905,10 @@ fn isRedirect(tag: Token.Tag) bool {
         => true,
         else => false,
     };
+}
+
+fn isHereDocument(tag: Token.Tag) bool {
+    return tag == .lt_lt or tag == .lt_lt_minus;
 }
 
 fn supportsIoNumber(tag: Token.Tag) bool {
@@ -895,15 +977,15 @@ test "parses redirections in simple command source order" {
     try std.testing.expectEqual(@as(usize, 3), parts.len);
     try std.testing.expectEqual(Node.Tag.word, tree.nodeTag(parts[0]));
 
-    const output = tree.nodeData(parts[1]).opt_token_and_token;
-    try std.testing.expectEqualStrings("2", tree.tokenSlice(output[0].unwrap().?));
+    const output = tree.redirect(parts[1]);
+    try std.testing.expectEqualStrings("2", tree.tokenSlice(output.io_number.unwrap().?));
     try std.testing.expectEqualStrings(">>", tree.tokenSlice(tree.nodeMainToken(parts[1])));
-    try std.testing.expectEqualStrings("error.log", tree.tokenSlice(output[1]));
+    try std.testing.expectEqualStrings("error.log", tree.tokenSlice(output.target));
 
-    const input = tree.nodeData(parts[2]).opt_token_and_token;
-    try std.testing.expect(input[0].unwrap() == null);
+    const input = tree.redirect(parts[2]);
+    try std.testing.expect(input.io_number.unwrap() == null);
     try std.testing.expectEqualStrings("<", tree.tokenSlice(tree.nodeMainToken(parts[2])));
-    try std.testing.expectEqualStrings("input", tree.tokenSlice(input[1]));
+    try std.testing.expectEqualStrings("input", tree.tokenSlice(input.target));
 }
 
 test "digits separated from redirect remain a word" {
@@ -926,8 +1008,8 @@ test "digits before a both-stream redirect remain a word" {
     const parts = tree.extraDataSlice(tree.nodeData(command).extra_range, Node.Index);
     try std.testing.expectEqual(@as(usize, 3), parts.len);
     try std.testing.expectEqualStrings("2", tree.tokenSlice(tree.nodeMainToken(parts[1])));
-    const redirect = tree.nodeData(parts[2]).opt_token_and_token;
-    try std.testing.expect(redirect[0].unwrap() == null);
+    const redirect = tree.redirect(parts[2]);
+    try std.testing.expect(redirect.io_number.unwrap() == null);
 }
 
 test "requests continuation for a missing redirection target at EOF" {
@@ -950,6 +1032,51 @@ test "records a missing redirection target before a newline" {
     try std.testing.expectEqual(@as(usize, 1), tree.errors.len);
     try std.testing.expectEqual(Ast.Error.Tag.expected_redirect_target, tree.errors[0].tag);
     try std.testing.expectEqual(Token.Tag.newline, tree.tokenTag(tree.errors[0].token));
+}
+
+test "records a ready here-document after newline" {
+    var tree = try Ast.parse(std.testing.allocator, "cat <<EOF\n");
+    defer tree.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), tree.here_documents.len);
+    try std.testing.expectEqual(@as(u32, 1), tree.ready_here_document_count);
+
+    const command = firstCommand(&tree);
+    const parts = tree.simpleCommandParts(command);
+    const redirect = tree.redirect(parts[1]);
+    const document_index = redirect.here_document.unwrap().?;
+    const document = tree.hereDocument(document_index);
+    try std.testing.expectEqual(parts[1], document.redirect);
+    try std.testing.expectEqualStrings("EOF", document.delimiter);
+    try std.testing.expect(!document.strip_tabs);
+    try std.testing.expect(document.expand_body);
+}
+
+test "records multiple here-documents in lexical order" {
+    var tree = try Ast.parse(std.testing.allocator, "cat <<A <<-'B'\n");
+    defer tree.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), tree.here_documents.len);
+    try std.testing.expectEqual(@as(u32, 2), tree.ready_here_document_count);
+
+    const first = tree.hereDocument(@enumFromInt(0));
+    try std.testing.expectEqualStrings("A", first.delimiter);
+    try std.testing.expect(!first.strip_tabs);
+    try std.testing.expect(first.expand_body);
+
+    const second = tree.hereDocument(@enumFromInt(1));
+    try std.testing.expectEqualStrings("B", second.delimiter);
+    try std.testing.expect(second.strip_tabs);
+    try std.testing.expect(!second.expand_body);
+}
+
+test "makes here-document ready before pipeline continuation" {
+    var tree = try Ast.parse(std.testing.allocator, "cat <<EOF |\n");
+    defer tree.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 1), tree.ready_here_document_count);
+    try std.testing.expect(tree.status == .incomplete);
+    try std.testing.expect(tree.status.incomplete == .command_after);
 }
 
 fn firstCommand(tree: *const Ast) Node.Index {
