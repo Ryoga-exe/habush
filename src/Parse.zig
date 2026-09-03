@@ -105,7 +105,8 @@ fn parseRoot(parser: *Parse) Ast.ParseError!void {
         return;
     }
 
-    const command = try parser.parseSimpleCommand();
+    const errors_before_command = parser.errors.items.len;
+    const command = try parser.parsePipeline();
 
     var separator: Node.OptionalTokenIndex = .none;
     if (parser.tokenTag(parser.tok_i) == .newline) {
@@ -113,7 +114,7 @@ fn parseRoot(parser: *Parse) Ast.ParseError!void {
         parser.skipNewlines();
     }
 
-    if (parser.tokenTag(parser.tok_i) != .eof) {
+    if (parser.tokenTag(parser.tok_i) != .eof and parser.errors.items.len == errors_before_command) {
         try parser.warn(.{
             .tag = .unexpected_token,
             .token = parser.tok_i,
@@ -141,6 +142,36 @@ fn parseRoot(parser: *Parse) Ast.ParseError!void {
         .main_token = parser.nodeMainToken(list),
         .data = .{ .opt_node = list.toOptional() },
     });
+}
+
+fn parsePipeline(parser: *Parse) Ast.ParseError!Node.Index {
+    var lhs = try parser.parseSimpleCommand();
+
+    while (isPipe(parser.tokenTag(parser.tok_i))) {
+        const operator = parser.nextToken();
+        parser.skipNewlines();
+
+        if (!parser.canStartSimpleCommand()) {
+            try parser.warn(.{
+                .tag = .expected_command,
+                .token = parser.tok_i,
+            });
+            return lhs;
+        }
+
+        const rhs = try parser.parseSimpleCommand();
+        lhs = try parser.addNode(.{
+            .tag = switch (parser.tokenTag(operator)) {
+                .pipe => .pipe,
+                .pipe_ampersand => .pipe_and,
+                else => unreachable,
+            },
+            .main_token = operator,
+            .data = .{ .node_and_node = .{ lhs, rhs } },
+        });
+    }
+
+    return lhs;
 }
 
 fn parseSimpleCommand(parser: *Parse) Ast.ParseError!Node.Index {
@@ -285,6 +316,10 @@ fn isWord(tag: Token.Tag) bool {
     return tag == .word or tag == .digits;
 }
 
+fn isPipe(tag: Token.Tag) bool {
+    return tag == .pipe or tag == .pipe_ampersand;
+}
+
 fn isRedirect(tag: Token.Tag) bool {
     return switch (tag) {
         .ampersand_gt,
@@ -414,4 +449,47 @@ fn firstCommand(tree: *const Ast) Node.Index {
     const list = tree.nodeData(.root).opt_node.unwrap().?;
     const range = tree.nodeData(list).extra_range;
     return tree.extraData(range.start, Node.ListItem).command;
+}
+
+test "parses pipe and pipe-and left associatively" {
+    var tree = try Ast.parse(std.testing.allocator, "echo hi | grep h |& count");
+    defer tree.deinit(std.testing.allocator);
+
+    const outer = firstCommand(&tree);
+    try std.testing.expectEqual(Node.Tag.pipe_and, tree.nodeTag(outer));
+    try std.testing.expectEqualStrings("|&", tree.tokenSlice(tree.nodeMainToken(outer)));
+
+    const outer_data = tree.nodeData(outer).node_and_node;
+    try std.testing.expectEqual(Node.Tag.pipe, tree.nodeTag(outer_data[0]));
+    try std.testing.expectEqual(Node.Tag.simple_command, tree.nodeTag(outer_data[1]));
+
+    const inner_data = tree.nodeData(outer_data[0]).node_and_node;
+    try std.testing.expectEqual(Node.Tag.simple_command, tree.nodeTag(inner_data[0]));
+    try std.testing.expectEqual(Node.Tag.simple_command, tree.nodeTag(inner_data[1]));
+}
+
+test "allows newlines after a pipe operator" {
+    var tree = try Ast.parse(std.testing.allocator, "echo hi |\ngrep hi");
+    defer tree.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(Node.Tag.pipe, tree.nodeTag(firstCommand(&tree)));
+    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+}
+
+test "records a missing pipeline command once" {
+    var tree = try Ast.parse(std.testing.allocator, "echo hi |");
+    defer tree.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), tree.errors.len);
+    try std.testing.expectEqual(Ast.Error.Tag.expected_command, tree.errors[0].tag);
+    try std.testing.expectEqual(Token.Tag.eof, tree.tokenTag(tree.errors[0].token));
+}
+
+test "records a repeated pipe once" {
+    var tree = try Ast.parse(std.testing.allocator, "echo | | cat");
+    defer tree.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), tree.errors.len);
+    try std.testing.expectEqual(Ast.Error.Tag.expected_command, tree.errors[0].tag);
+    try std.testing.expectEqual(Token.Tag.pipe, tree.tokenTag(tree.errors[0].token));
 }
