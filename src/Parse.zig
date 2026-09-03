@@ -9,6 +9,7 @@ const Tokenizer = @import("tokenizer.zig").Tokenizer;
 const Parse = @This();
 
 gpa: Allocator,
+source: [:0]const u8,
 tokens: Ast.TokenList.Slice,
 tok_i: Ast.TokenIndex = 0,
 errors: std.ArrayList(Ast.Error) = .empty,
@@ -56,6 +57,7 @@ pub fn parse(gpa: Allocator, source: [:0]const u8) Ast.ParseError!Ast {
 
     var parser: Parse = .{
         .gpa = gpa,
+        .source = source,
         .tokens = token_slice,
         .errors = errors,
     };
@@ -95,7 +97,7 @@ fn parseRoot(parser: *Parse) Ast.ParseError!void {
     parser.skipNewlines();
     if (parser.tokenTag(parser.tok_i) == .eof) return;
 
-    if (!isWord(parser.tokenTag(parser.tok_i))) {
+    if (!parser.canStartSimpleCommand()) {
         try parser.warn(.{
             .tag = .expected_command,
             .token = parser.tok_i,
@@ -146,14 +148,14 @@ fn parseSimpleCommand(parser: *Parse) Ast.ParseError!Node.Index {
     defer parser.scratch.shrinkRetainingCapacity(scratch_start);
 
     const main_token = parser.tok_i;
-    while (isWord(parser.tokenTag(parser.tok_i))) {
-        const word_token = parser.nextToken();
-        const word = try parser.addNode(.{
-            .tag = .word,
-            .main_token = word_token,
-            .data = .{ .none = {} },
-        });
-        try parser.scratch.append(parser.gpa, word);
+    while (true) {
+        const part = if (parser.startsRedirect())
+            try parser.parseRedirect()
+        else if (isWord(parser.tokenTag(parser.tok_i)))
+            try parser.parseWord()
+        else
+            break;
+        try parser.scratch.append(parser.gpa, part);
     }
 
     const parts = try parser.listToSpan(parser.scratch.items[scratch_start..]);
@@ -161,6 +163,39 @@ fn parseSimpleCommand(parser: *Parse) Ast.ParseError!Node.Index {
         .tag = .simple_command,
         .main_token = main_token,
         .data = .{ .extra_range = parts },
+    });
+}
+
+fn parseWord(parser: *Parse) Ast.ParseError!Node.Index {
+    const word_token = parser.nextToken();
+    return parser.addNode(.{
+        .tag = .word,
+        .main_token = word_token,
+        .data = .{ .none = {} },
+    });
+}
+
+fn parseRedirect(parser: *Parse) Ast.ParseError!Node.Index {
+    var io_number: Node.OptionalTokenIndex = .none;
+    if (parser.hasIoNumber()) {
+        io_number = Node.OptionalTokenIndex.fromOptional(parser.nextToken());
+    }
+
+    const operator = parser.nextToken();
+    const target = parser.tok_i;
+    if (!isWord(parser.tokenTag(target))) {
+        try parser.warn(.{
+            .tag = .expected_redirect_target,
+            .token = target,
+        });
+    } else {
+        _ = parser.nextToken();
+    }
+
+    return parser.addNode(.{
+        .tag = .redirect,
+        .main_token = operator,
+        .data = .{ .opt_token_and_token = .{ io_number, target } },
     });
 }
 
@@ -221,8 +256,56 @@ fn nextToken(parser: *Parse) Ast.TokenIndex {
     return result;
 }
 
+fn canStartSimpleCommand(parser: *const Parse) bool {
+    return isWord(parser.tokenTag(parser.tok_i)) or parser.startsRedirect();
+}
+
+fn startsRedirect(parser: *const Parse) bool {
+    return isRedirect(parser.tokenTag(parser.tok_i)) or parser.hasIoNumber();
+}
+
+fn hasIoNumber(parser: *const Parse) bool {
+    if (parser.tokenTag(parser.tok_i) != .digits) return false;
+
+    const operator_index = parser.tok_i + 1;
+    if (!supportsIoNumber(parser.tokenTag(operator_index))) return false;
+
+    return parser.tokenEnd(parser.tok_i) == parser.tokens.items(.start)[operator_index];
+}
+
+fn tokenEnd(parser: *const Parse, token_index: Ast.TokenIndex) usize {
+    var scanner: Tokenizer = .{
+        .buffer = parser.source,
+        .index = parser.tokens.items(.start)[token_index],
+    };
+    return scanner.next().loc.end;
+}
+
 fn isWord(tag: Token.Tag) bool {
     return tag == .word or tag == .digits;
+}
+
+fn isRedirect(tag: Token.Tag) bool {
+    return switch (tag) {
+        .ampersand_gt,
+        .ampersand_gt_gt,
+        .lt,
+        .gt,
+        .lt_lt,
+        .lt_lt_minus,
+        .lt_lt_lt,
+        .gt_gt,
+        .lt_ampersand,
+        .gt_ampersand,
+        .lt_gt,
+        .gt_pipe,
+        => true,
+        else => false,
+    };
+}
+
+fn supportsIoNumber(tag: Token.Tag) bool {
+    return isRedirect(tag) and tag != .ampersand_gt and tag != .ampersand_gt_gt;
 }
 
 test "parses empty input" {
@@ -272,4 +355,63 @@ test "preserves a tokenizer issue as an AST error" {
     try std.testing.expectEqual(Ast.Error.Tag.invalid_token, tree.errors[0].tag);
     try std.testing.expectEqual(Token.Tag.unterminated_single_quote, tree.tokenTag(tree.errors[0].token));
     try std.testing.expect(tree.nodeData(.root).opt_node.unwrap() == null);
+}
+
+test "parses redirections in simple command source order" {
+    var tree = try Ast.parse(std.testing.allocator, "echo 2>>error.log <input");
+    defer tree.deinit(std.testing.allocator);
+
+    const command = firstCommand(&tree);
+    const parts = tree.extraDataSlice(tree.nodeData(command).extra_range, Node.Index);
+    try std.testing.expectEqual(@as(usize, 3), parts.len);
+    try std.testing.expectEqual(Node.Tag.word, tree.nodeTag(parts[0]));
+
+    const output = tree.nodeData(parts[1]).opt_token_and_token;
+    try std.testing.expectEqualStrings("2", tree.tokenSlice(output[0].unwrap().?));
+    try std.testing.expectEqualStrings(">>", tree.tokenSlice(tree.nodeMainToken(parts[1])));
+    try std.testing.expectEqualStrings("error.log", tree.tokenSlice(output[1]));
+
+    const input = tree.nodeData(parts[2]).opt_token_and_token;
+    try std.testing.expect(input[0].unwrap() == null);
+    try std.testing.expectEqualStrings("<", tree.tokenSlice(tree.nodeMainToken(parts[2])));
+    try std.testing.expectEqualStrings("input", tree.tokenSlice(input[1]));
+}
+
+test "digits separated from redirect remain a word" {
+    var tree = try Ast.parse(std.testing.allocator, "echo 2 >out");
+    defer tree.deinit(std.testing.allocator);
+
+    const command = firstCommand(&tree);
+    const parts = tree.extraDataSlice(tree.nodeData(command).extra_range, Node.Index);
+    try std.testing.expectEqual(@as(usize, 3), parts.len);
+    try std.testing.expectEqual(Node.Tag.word, tree.nodeTag(parts[1]));
+    try std.testing.expectEqualStrings("2", tree.tokenSlice(tree.nodeMainToken(parts[1])));
+    try std.testing.expectEqual(Node.Tag.redirect, tree.nodeTag(parts[2]));
+}
+
+test "digits before a both-stream redirect remain a word" {
+    var tree = try Ast.parse(std.testing.allocator, "echo 2&>out");
+    defer tree.deinit(std.testing.allocator);
+
+    const command = firstCommand(&tree);
+    const parts = tree.extraDataSlice(tree.nodeData(command).extra_range, Node.Index);
+    try std.testing.expectEqual(@as(usize, 3), parts.len);
+    try std.testing.expectEqualStrings("2", tree.tokenSlice(tree.nodeMainToken(parts[1])));
+    const redirect = tree.nodeData(parts[2]).opt_token_and_token;
+    try std.testing.expect(redirect[0].unwrap() == null);
+}
+
+test "records a missing redirection target" {
+    var tree = try Ast.parse(std.testing.allocator, "echo >");
+    defer tree.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), tree.errors.len);
+    try std.testing.expectEqual(Ast.Error.Tag.expected_redirect_target, tree.errors[0].tag);
+    try std.testing.expectEqual(Token.Tag.eof, tree.tokenTag(tree.errors[0].token));
+}
+
+fn firstCommand(tree: *const Ast) Node.Index {
+    const list = tree.nodeData(.root).opt_node.unwrap().?;
+    const range = tree.nodeData(list).extra_range;
+    return tree.extraData(range.start, Node.ListItem).command;
 }

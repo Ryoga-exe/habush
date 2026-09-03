@@ -48,6 +48,7 @@ pub const Error = struct {
         unexpected_token,
         expected_token,
         expected_command,
+        expected_redirect_target,
     };
 };
 
