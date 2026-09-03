@@ -141,6 +141,48 @@ pub const ExtraIndex = enum(u32) {
     _,
 };
 
+pub const ExtraData = struct {
+    pub fn width(comptime T: type) comptime_int {
+        inline for (std.meta.fields(T)) |field| {
+            if (comptime !supports(field.type)) {
+                @compileError("unsupported extra_data field: " ++
+                    @typeName(T) ++ "." ++ field.name ++ ": " ++
+                    @typeName(field.type));
+            }
+        }
+        return std.meta.fields(T).len;
+    }
+
+    pub fn encode(value: anytype) u32 {
+        const T = @TypeOf(value);
+        requireSupported(T);
+        if (comptime T == TokenIndex) return value;
+        return @intFromEnum(value);
+    }
+
+    pub fn decode(comptime T: type, raw: u32) T {
+        requireSupported(T);
+        if (comptime T == TokenIndex) return raw;
+        return @enumFromInt(raw);
+    }
+
+    fn requireSupported(comptime T: type) void {
+        if (comptime !supports(T)) {
+            @compileError("unsupported extra_data field type: " ++ @typeName(T));
+        }
+    }
+
+    fn supports(comptime T: type) bool {
+        return T == Node.Index or
+            T == Node.OptionalIndex or
+            T == Node.OptionalTokenIndex or
+            T == HereDocumentIndex.Optional or
+            T == WordPartIndex or
+            T == ExtraIndex or
+            T == TokenIndex;
+    }
+};
+
 pub const Error = struct {
     tag: Tag,
     token: TokenIndex,
@@ -345,7 +387,7 @@ pub fn listItemCount(tree: *const Ast, index: Node.Index) usize {
     std.debug.assert(tree.nodeTag(index) == .list);
     const range = tree.nodeData(index).extra_range;
     const raw_len = @intFromEnum(range.end) - @intFromEnum(range.start);
-    const width = std.meta.fields(Node.ListItem).len;
+    const width = ExtraData.width(Node.ListItem);
     std.debug.assert(raw_len % width == 0);
     return raw_len / width;
 }
@@ -353,7 +395,7 @@ pub fn listItemCount(tree: *const Ast, index: Node.Index) usize {
 pub fn listItem(tree: *const Ast, index: Node.Index, item_index: usize) Node.ListItem {
     std.debug.assert(item_index < tree.listItemCount(index));
     const range = tree.nodeData(index).extra_range;
-    const width = std.meta.fields(Node.ListItem).len;
+    const width = ExtraData.width(Node.ListItem);
     const offset = @intFromEnum(range.start) + item_index * width;
     return tree.extraData(@enumFromInt(offset), Node.ListItem);
 }
@@ -419,14 +461,14 @@ pub fn hereDocument(tree: *const Ast, index: HereDocumentIndex) HereDocument {
 pub fn elifBranchCount(tree: *const Ast, node: Node.If) usize {
     _ = tree;
     const raw_len = @intFromEnum(node.elif_end) - @intFromEnum(node.elif_start);
-    const width = std.meta.fields(Node.ElifBranch).len;
+    const width = ExtraData.width(Node.ElifBranch);
     std.debug.assert(raw_len % width == 0);
     return raw_len / width;
 }
 
 pub fn elifBranch(tree: *const Ast, node: Node.If, index: usize) Node.ElifBranch {
     std.debug.assert(index < tree.elifBranchCount(node));
-    const width = std.meta.fields(Node.ElifBranch).len;
+    const width = ExtraData.width(Node.ElifBranch);
     const offset = @intFromEnum(node.elif_start) + index * width;
     return tree.extraData(@enumFromInt(offset), Node.ElifBranch);
 }
@@ -444,17 +486,10 @@ pub fn extraData(tree: *const Ast, index: ExtraIndex, comptime T: type) T {
     const fields = std.meta.fields(T);
     var result: T = undefined;
     inline for (fields, 0..) |field, offset| {
-        @field(result, field.name) = switch (field.type) {
-            Node.Index,
-            Node.OptionalIndex,
-            Node.OptionalTokenIndex,
-            HereDocumentIndex.Optional,
-            WordPartIndex,
-            ExtraIndex,
-            => @enumFromInt(tree.extra_data[@intFromEnum(index) + offset]),
-            TokenIndex => tree.extra_data[@intFromEnum(index) + offset],
-            else => @compileError("unexpected extra_data field type: " ++ @typeName(field.type)),
-        };
+        @field(result, field.name) = ExtraData.decode(
+            field.type,
+            tree.extra_data[@intFromEnum(index) + offset],
+        );
     }
     return result;
 }

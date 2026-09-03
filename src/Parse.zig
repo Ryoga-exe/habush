@@ -1149,7 +1149,7 @@ fn listToSpan(
     const start = std.math.cast(u32, parser.extra_data.items.len) orelse
         return error.SourceTooLarge;
     for (items) |item| {
-        try parser.extra_data.append(parser.gpa, @intFromEnum(item));
+        try parser.extra_data.append(parser.gpa, Ast.ExtraData.encode(item));
     }
     const end = std.math.cast(u32, parser.extra_data.items.len) orelse
         return error.SourceTooLarge;
@@ -1166,8 +1166,7 @@ fn addListItems(
     const start = std.math.cast(u32, parser.extra_data.items.len) orelse
         return error.SourceTooLarge;
     for (items) |item| {
-        try parser.extra_data.append(parser.gpa, @intFromEnum(item.command));
-        try parser.extra_data.append(parser.gpa, @intFromEnum(item.separator));
+        _ = try parser.addExtra(item);
     }
     const end = std.math.cast(u32, parser.extra_data.items.len) orelse
         return error.SourceTooLarge;
@@ -1206,18 +1205,7 @@ fn addExtra(parser: *Parse, extra: anytype) Ast.ParseError!Ast.ExtraIndex {
         return error.SourceTooLarge;
     inline for (std.meta.fields(@TypeOf(extra))) |field| {
         const value = @field(extra, field.name);
-        const raw: u32 = switch (field.type) {
-            Node.Index,
-            Node.OptionalIndex,
-            Node.OptionalTokenIndex,
-            Ast.HereDocumentIndex.Optional,
-            Ast.WordPartIndex,
-            Ast.ExtraIndex,
-            => @intFromEnum(value),
-            Ast.TokenIndex => value,
-            else => @compileError("unexpected extra_data field type: " ++ @typeName(field.type)),
-        };
-        try parser.extra_data.append(parser.gpa, raw);
+        try parser.extra_data.append(parser.gpa, Ast.ExtraData.encode(value));
     }
     return @enumFromInt(start);
 }
