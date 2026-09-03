@@ -906,6 +906,72 @@ test "rejects an invalid for variable name" {
     try std.testing.expectEqual(Ast.Error.Tag.expected_name, tree.errors[0].tag);
 }
 
+test "parses a function definition with a compound body" {
+    var tree = try Ast.parse(std.testing.allocator, "build() { produce | consume; } >log");
+    defer tree.deinit(std.testing.allocator);
+
+    const definition_node = firstCommand(&tree);
+    try std.testing.expectEqual(Node.Tag.function_definition, tree.nodeTag(definition_node));
+    try std.testing.expectEqualStrings("build", tree.tokenSlice(tree.nodeMainToken(definition_node)));
+
+    const definition = tree.functionDefinition(definition_node);
+    try std.testing.expectEqualStrings("(", tree.tokenSlice(definition.l_paren));
+    try std.testing.expectEqualStrings(")", tree.tokenSlice(definition.r_paren));
+    const body = definition.body.unwrap().?;
+    try std.testing.expectEqual(Node.Tag.brace_group, tree.nodeTag(body));
+
+    const redirects = tree.extraDataSlice(.{
+        .start = tree.braceGroup(body).redirects_start,
+        .end = tree.braceGroup(body).redirects_end,
+    }, Node.Index);
+    try std.testing.expectEqual(@as(usize, 1), redirects.len);
+}
+
+test "allows a newline before a function body" {
+    var tree = try Ast.parse(std.testing.allocator, "build()\n(echo)");
+    defer tree.deinit(std.testing.allocator);
+
+    const definition = tree.functionDefinition(firstCommand(&tree));
+    try std.testing.expectEqual(Node.Tag.subshell, tree.nodeTag(definition.body.unwrap().?));
+}
+
+test "requests continuation for a missing function body" {
+    var tree = try Ast.parse(std.testing.allocator, "build()");
+    defer tree.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+    try std.testing.expect(tree.status == .incomplete);
+    try std.testing.expect(tree.status.incomplete == .compound);
+    try std.testing.expectEqual(
+        Ast.CompoundContinuation.Kind.function_definition,
+        tree.status.incomplete.compound.kind,
+    );
+    try std.testing.expectEqual(
+        Ast.CompoundContinuation.Expected.body,
+        tree.status.incomplete.compound.expected,
+    );
+    try std.testing.expect(tree.functionDefinition(firstCommand(&tree)).body.unwrap() == null);
+}
+
+test "rejects a simple command as a function body" {
+    var tree = try Ast.parse(std.testing.allocator, "build() echo");
+    defer tree.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), tree.errors.len);
+    try std.testing.expectEqual(Ast.Error.Tag.expected_compound_command, tree.errors[0].tag);
+    try std.testing.expectEqualStrings("echo", tree.tokenSlice(tree.errors[0].token));
+}
+
+test "does not parse an invalid name as a function definition" {
+    var tree = try Ast.parse(std.testing.allocator, "bad-name() { echo; }");
+    defer tree.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(Node.Tag.simple_command, tree.nodeTag(firstCommand(&tree)));
+    try std.testing.expectEqual(@as(usize, 1), tree.errors.len);
+    try std.testing.expectEqual(Ast.Error.Tag.unexpected_token, tree.errors[0].tag);
+    try std.testing.expectEqual(Token.Tag.l_paren, tree.tokenTag(tree.errors[0].token));
+}
+
 test "locates and renders parse errors" {
     var tree = try Ast.parse(std.testing.allocator, "echo ok\n(echo\nnext");
     defer tree.deinit(std.testing.allocator);

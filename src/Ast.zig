@@ -122,6 +122,7 @@ pub const CompoundContinuation = struct {
         while_clause,
         until_clause,
         for_clause,
+        function_definition,
     };
 
     pub const Expected = enum {
@@ -202,6 +203,7 @@ pub const Error = struct {
         expected_fi_keyword,
         expected_do_keyword,
         expected_done_keyword,
+        expected_compound_command,
         expected_name,
         here_document_mismatch,
     };
@@ -315,6 +317,7 @@ pub fn renderError(tree: *const Ast, parse_error: Error, writer: *Writer) Writer
         .expected_fi_keyword => writer.print("expected 'fi', found '{s}'", .{found}),
         .expected_do_keyword => writer.print("expected 'do', found '{s}'", .{found}),
         .expected_done_keyword => writer.print("expected 'done', found '{s}'", .{found}),
+        .expected_compound_command => writer.print("expected compound command, found '{s}'", .{found}),
         .expected_name => writer.print("expected a name, found '{s}'", .{found}),
         .here_document_mismatch => writer.writeAll(
             "collected here-document does not match its parsed delimiter",
@@ -429,6 +432,11 @@ pub fn loopClause(tree: *const Ast, index: Node.Index) Node.Loop {
 pub fn forClause(tree: *const Ast, index: Node.Index) Node.For {
     std.debug.assert(tree.nodeTag(index) == .for_clause);
     return tree.extraData(tree.nodeData(index).extra, Node.For);
+}
+
+pub fn functionDefinition(tree: *const Ast, index: Node.Index) Node.FunctionDefinition {
+    std.debug.assert(tree.nodeTag(index) == .function_definition);
+    return tree.extraData(tree.nodeData(index).extra, Node.FunctionDefinition);
 }
 
 pub fn forWords(tree: *const Ast, clause: Node.For) []const Node.Index {
@@ -573,6 +581,9 @@ pub const Node = struct {
         /// `data.extra`: encoded `For` data.
         for_clause,
 
+        /// `data.extra`: encoded `FunctionDefinition` data.
+        function_definition,
+
         /// `main_token` identifies the word; `data.word_parts` indexes its parts.
         word,
 
@@ -656,6 +667,12 @@ pub const Node = struct {
         done_token: OptionalTokenIndex,
         redirects_start: ExtraIndex,
         redirects_end: ExtraIndex,
+    };
+
+    pub const FunctionDefinition = struct {
+        l_paren: TokenIndex,
+        r_paren: TokenIndex,
+        body: OptionalIndex,
     };
 
     pub const Redirect = struct {

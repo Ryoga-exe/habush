@@ -372,6 +372,16 @@ fn parsePipeline(parser: *Parse) Ast.ParseError!Node.Index {
 }
 
 fn parseCommand(parser: *Parse) Ast.ParseError!Node.Index {
+    if (parser.isFunctionDefinitionStart()) {
+        return parser.parseFunctionDefinition();
+    }
+    if (parser.canStartCompoundCommand()) {
+        return parser.parseCompoundCommand();
+    }
+    return parser.parseSimpleCommand();
+}
+
+fn parseCompoundCommand(parser: *Parse) Ast.ParseError!Node.Index {
     return switch (parser.tokenTag(parser.tok_i)) {
         .keyword_if => parser.parseIfClause(),
         .keyword_while => parser.parseLoopClause(.while_clause),
@@ -379,8 +389,38 @@ fn parseCommand(parser: *Parse) Ast.ParseError!Node.Index {
         .keyword_for => parser.parseForClause(),
         .keyword_l_brace => parser.parseBraceGroup(),
         .l_paren => parser.parseSubshell(),
-        else => parser.parseSimpleCommand(),
+        else => unreachable,
     };
+}
+
+fn parseFunctionDefinition(parser: *Parse) Ast.ParseError!Node.Index {
+    const name = parser.nextToken();
+    const l_paren = parser.nextToken();
+    const r_paren = parser.nextToken();
+    parser.skipNewlines();
+
+    var body: Node.OptionalIndex = .none;
+    if (parser.tokenTag(parser.tok_i) == .eof) {
+        parser.setCompoundIncomplete(.function_definition, .body, name);
+    } else if (!parser.canStartCompoundCommand()) {
+        try parser.warn(.{
+            .tag = .expected_compound_command,
+            .token = parser.tok_i,
+        });
+    } else {
+        body = (try parser.parseCompoundCommand()).toOptional();
+    }
+
+    const extra = try parser.addExtra(Node.FunctionDefinition{
+        .l_paren = l_paren,
+        .r_paren = r_paren,
+        .body = body,
+    });
+    return parser.addNode(.{
+        .tag = .function_definition,
+        .main_token = name,
+        .data = .{ .extra = extra },
+    });
 }
 
 fn parseIfClause(parser: *Parse) Ast.ParseError!Node.Index {
@@ -1261,6 +1301,29 @@ fn canStartCommand(parser: *const Parse) bool {
             tag == .keyword_for or tag == .keyword_l_brace;
     }
     return tag == .l_paren or isWord(tag) or parser.startsRedirect();
+}
+
+fn canStartCompoundCommand(parser: *const Parse) bool {
+    return switch (parser.tokenTag(parser.tok_i)) {
+        .keyword_if,
+        .keyword_while,
+        .keyword_until,
+        .keyword_for,
+        .keyword_l_brace,
+        .l_paren,
+        => true,
+        else => false,
+    };
+}
+
+fn isFunctionDefinitionStart(parser: *const Parse) bool {
+    if (parser.tokenTag(parser.tok_i) != .word or
+        !isValidName(parser.rawTokenSlice(parser.tok_i)))
+    {
+        return false;
+    }
+    return parser.tokenTag(parser.tok_i + 1) == .l_paren and
+        parser.tokenTag(parser.tok_i + 2) == .r_paren;
 }
 
 fn canStartPipeline(parser: *const Parse) bool {

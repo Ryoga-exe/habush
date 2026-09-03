@@ -21,7 +21,7 @@ fn renderNode(
     try dump.indent(depth);
     try dump.writer.writeAll(@tagName(tag));
     switch (tag) {
-        .word, .assignment, .redirect, .negated_pipeline, .and_if, .or_if, .pipe, .pipe_and => {
+        .word, .assignment, .redirect, .negated_pipeline, .and_if, .or_if, .pipe, .pipe_and, .function_definition => {
             try dump.writer.print(" \"{f}\"", .{std.zig.fmtString(dump.tree.tokenSlice(dump.tree.nodeMainToken(node)))});
         },
         else => {},
@@ -116,6 +116,10 @@ fn renderNode(
                 clause.redirects_end,
                 depth + 1,
             );
+        },
+        .function_definition => {
+            const definition = dump.tree.functionDefinition(node);
+            try dump.renderOptionalChild("body", definition.body, depth + 1);
         },
         .word, .assignment => try dump.renderWordParts(node, depth + 1),
         .redirect => {
