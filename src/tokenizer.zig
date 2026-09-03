@@ -12,7 +12,13 @@ pub const Token = struct {
         end: usize,
     };
 
-    pub const keywords = std.StaticStringMap(Tag).initComptime(.{});
+    pub const keywords = std.StaticStringMap(Tag).initComptime(.{
+        .{ "if", .keyword_if },
+        .{ "then", .keyword_then },
+        .{ "elif", .keyword_elif },
+        .{ "else", .keyword_else },
+        .{ "fi", .keyword_fi },
+    });
 
     pub fn getKeyword(bytes: []const u8) ?Tag {
         return keywords.get(bytes);
@@ -23,6 +29,12 @@ pub const Token = struct {
         eof,
         word,
         digits,
+
+        keyword_if,
+        keyword_then,
+        keyword_elif,
+        keyword_else,
+        keyword_fi,
 
         unterminated_single_quote,
         unterminated_double_quote,
@@ -70,6 +82,12 @@ pub const Token = struct {
             .unterminated_escape,
             .newline,
             => null,
+
+            .keyword_if => "if",
+            .keyword_then => "then",
+            .keyword_elif => "elif",
+            .keyword_else => "else",
+            .keyword_fi => "fi",
 
             .semicolon => ";",
             .semicolon_semicolon => ";;",
@@ -510,10 +528,34 @@ pub const Tokenizer = struct {
                 self.index += 1;
             },
         }
+        if (result.tag == .word) {
+            const word = self.buffer[result.loc.start..self.index];
+            if (Token.getKeyword(word)) |keyword| {
+                result.tag = keyword;
+            }
+        }
         result.loc.end = self.index;
         return result;
     }
 };
+
+test "keywords" {
+    try testTokenize(
+        \\if then elif else fi 'if' "then" i\f
+    ,
+        &.{
+            .keyword_if,
+            .keyword_then,
+            .keyword_elif,
+            .keyword_else,
+            .keyword_fi,
+            .word,
+            .word,
+            .word,
+            .eof,
+        },
+    );
+}
 
 test "words" {
     try testTokenize("echo hello world", &.{

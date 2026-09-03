@@ -8,6 +8,36 @@ const Token = @import("tokenizer.zig").Token;
 const Tokenizer = @import("tokenizer.zig").Tokenizer;
 const Parse = @This();
 
+const StopSet = struct {
+    token_tag: ?Token.Tag = null,
+    reserved_words: []const Token.Tag = &.{},
+
+    fn matches(stop: StopSet, parser: *const Parse) bool {
+        if (stop.token_tag) |tag| {
+            if (parser.tokenTag(parser.tok_i) == tag) return true;
+        }
+        return stop.matchesReserved(parser);
+    }
+
+    fn matchesReserved(stop: StopSet, parser: *const Parse) bool {
+        const actual = parser.tokenTag(parser.tok_i);
+        for (stop.reserved_words) |expected| {
+            if (actual == expected) return true;
+        }
+        return false;
+    }
+};
+
+const IfBuilder = struct {
+    condition: Node.OptionalIndex = .none,
+    then_token: Node.OptionalTokenIndex = .none,
+    then_body: Node.OptionalIndex = .none,
+    else_token: Node.OptionalTokenIndex = .none,
+    else_body: Node.OptionalIndex = .none,
+    fi_token: Node.OptionalTokenIndex = .none,
+    redirects: ?Node.SubRange = null,
+};
+
 gpa: Allocator,
 source: [:0]const u8,
 tokens: Ast.TokenList.Slice,
@@ -18,6 +48,7 @@ nodes: Ast.NodeList = .empty,
 extra_data: std.ArrayList(u32) = .empty,
 scratch: std.ArrayList(Node.Index) = .empty,
 list_scratch: std.ArrayList(Node.ListItem) = .empty,
+elif_scratch: std.ArrayList(Node.ElifBranch) = .empty,
 
 pub fn parse(gpa: Allocator, source: [:0]const u8) Ast.ParseError!Ast {
     if (source.len > std.math.maxInt(Ast.ByteOffset)) return error.SourceTooLarge;
@@ -71,6 +102,7 @@ pub fn parse(gpa: Allocator, source: [:0]const u8) Ast.ParseError!Ast {
     defer parser.extra_data.deinit(gpa);
     defer parser.scratch.deinit(gpa);
     defer parser.list_scratch.deinit(gpa);
+    defer parser.elif_scratch.deinit(gpa);
 
     try parser.parseRoot();
 
@@ -100,7 +132,7 @@ fn parseRoot(parser: *Parse) Ast.ParseError!void {
     // source structure.
     if (parser.errors.items.len != 0 or parser.status == .incomplete) return;
 
-    const list = try parser.parseList(null) orelse return;
+    const list = try parser.parseList(.{}) orelse return;
 
     parser.nodes.set(@intFromEnum(Node.Index.root), .{
         .tag = .root,
@@ -111,13 +143,13 @@ fn parseRoot(parser: *Parse) Ast.ParseError!void {
 
 fn parseList(
     parser: *Parse,
-    stop_tag: ?Token.Tag,
+    stop: StopSet,
 ) Ast.ParseError!?Node.Index {
     const scratch_start = parser.list_scratch.items.len;
     defer parser.list_scratch.shrinkRetainingCapacity(scratch_start);
 
     parser.skipNewlines();
-    if (parser.atListEnd(stop_tag)) return null;
+    if (parser.atListEnd(stop)) return null;
 
     if (!parser.canStartCommand()) {
         try parser.warn(.{
@@ -150,7 +182,15 @@ fn parseList(
             .separator = separator,
         });
 
-        if (parser.atListEnd(stop_tag)) break;
+        if (parser.atListEnd(stop)) {
+            if (stop.matchesReserved(parser) and separator == .none) {
+                try parser.warn(.{
+                    .tag = .expected_separator,
+                    .token = parser.tok_i,
+                });
+            }
+            break;
+        }
         if (parser.errors.items.len != errors_before_command or
             parser.status == .incomplete)
         {
@@ -250,14 +290,231 @@ fn parsePipeline(parser: *Parse) Ast.ParseError!Node.Index {
 
 fn parseCommand(parser: *Parse) Ast.ParseError!Node.Index {
     return switch (parser.tokenTag(parser.tok_i)) {
+        .keyword_if => parser.parseIfClause(),
         .l_paren => parser.parseSubshell(),
         else => parser.parseSimpleCommand(),
     };
 }
 
+fn parseIfClause(parser: *Parse) Ast.ParseError!Node.Index {
+    const if_token = parser.nextToken();
+    var builder: IfBuilder = .{};
+    const elif_start = parser.elif_scratch.items.len;
+    defer parser.elif_scratch.shrinkRetainingCapacity(elif_start);
+
+    parser.skipNewlines();
+    if (parser.tokenTag(parser.tok_i) == .eof) {
+        parser.setCompoundIncomplete(.if_clause, .condition, if_token);
+        return parser.finishIf(if_token, builder, parser.elif_scratch.items[elif_start..]);
+    }
+
+    const condition_errors = parser.errors.items.len;
+    const condition = try parser.parseList(.{
+        .reserved_words = &.{.keyword_then},
+    });
+    if (condition) |node| {
+        builder.condition = node.toOptional();
+    } else {
+        try parser.warn(.{
+            .tag = .expected_command,
+            .token = parser.tok_i,
+        });
+        return parser.finishIf(if_token, builder, parser.elif_scratch.items[elif_start..]);
+    }
+    if (parser.failedSince(condition_errors)) {
+        return parser.finishIf(if_token, builder, parser.elif_scratch.items[elif_start..]);
+    }
+    if (parser.tokenTag(parser.tok_i) == .eof) {
+        parser.setCompoundIncomplete(.if_clause, .then_keyword, if_token);
+        return parser.finishIf(if_token, builder, parser.elif_scratch.items[elif_start..]);
+    }
+    if (parser.tokenTag(parser.tok_i) != .keyword_then) {
+        try parser.warn(.{
+            .tag = .expected_then_keyword,
+            .token = parser.tok_i,
+        });
+        return parser.finishIf(if_token, builder, parser.elif_scratch.items[elif_start..]);
+    }
+
+    const then_token = parser.nextToken();
+    builder.then_token = Node.OptionalTokenIndex.fromOptional(then_token);
+    parser.skipNewlines();
+    if (parser.tokenTag(parser.tok_i) == .eof) {
+        parser.setCompoundIncomplete(.if_clause, .body, then_token);
+        return parser.finishIf(if_token, builder, parser.elif_scratch.items[elif_start..]);
+    }
+
+    const body_errors = parser.errors.items.len;
+    const then_body = try parser.parseList(.{
+        .reserved_words = &.{ .keyword_elif, .keyword_else, .keyword_fi },
+    });
+    if (then_body) |node| {
+        builder.then_body = node.toOptional();
+    } else {
+        try parser.warn(.{
+            .tag = .expected_command,
+            .token = parser.tok_i,
+        });
+        return parser.finishIf(if_token, builder, parser.elif_scratch.items[elif_start..]);
+    }
+    if (parser.failedSince(body_errors)) {
+        return parser.finishIf(if_token, builder, parser.elif_scratch.items[elif_start..]);
+    }
+
+    while (parser.tokenTag(parser.tok_i) == .keyword_elif) {
+        var branch: Node.ElifBranch = .{
+            .elif_token = parser.nextToken(),
+            .condition = .none,
+            .then_token = .none,
+            .body = .none,
+        };
+        parser.skipNewlines();
+
+        if (parser.tokenTag(parser.tok_i) == .eof) {
+            parser.setCompoundIncomplete(.elif_clause, .condition, branch.elif_token);
+            try parser.elif_scratch.append(parser.gpa, branch);
+            return parser.finishIf(if_token, builder, parser.elif_scratch.items[elif_start..]);
+        }
+
+        const elif_condition_errors = parser.errors.items.len;
+        const elif_condition = try parser.parseList(.{
+            .reserved_words = &.{.keyword_then},
+        });
+        if (elif_condition) |node| {
+            branch.condition = node.toOptional();
+        } else {
+            try parser.warn(.{
+                .tag = .expected_command,
+                .token = parser.tok_i,
+            });
+            try parser.elif_scratch.append(parser.gpa, branch);
+            return parser.finishIf(if_token, builder, parser.elif_scratch.items[elif_start..]);
+        }
+        if (parser.failedSince(elif_condition_errors)) {
+            try parser.elif_scratch.append(parser.gpa, branch);
+            return parser.finishIf(if_token, builder, parser.elif_scratch.items[elif_start..]);
+        }
+        if (parser.tokenTag(parser.tok_i) == .eof) {
+            parser.setCompoundIncomplete(.elif_clause, .then_keyword, branch.elif_token);
+            try parser.elif_scratch.append(parser.gpa, branch);
+            return parser.finishIf(if_token, builder, parser.elif_scratch.items[elif_start..]);
+        }
+        if (parser.tokenTag(parser.tok_i) != .keyword_then) {
+            try parser.warn(.{
+                .tag = .expected_then_keyword,
+                .token = parser.tok_i,
+            });
+            try parser.elif_scratch.append(parser.gpa, branch);
+            return parser.finishIf(if_token, builder, parser.elif_scratch.items[elif_start..]);
+        }
+
+        const elif_then = parser.nextToken();
+        branch.then_token = Node.OptionalTokenIndex.fromOptional(elif_then);
+        parser.skipNewlines();
+        if (parser.tokenTag(parser.tok_i) == .eof) {
+            parser.setCompoundIncomplete(.elif_clause, .body, elif_then);
+            try parser.elif_scratch.append(parser.gpa, branch);
+            return parser.finishIf(if_token, builder, parser.elif_scratch.items[elif_start..]);
+        }
+
+        const elif_body_errors = parser.errors.items.len;
+        const elif_body = try parser.parseList(.{
+            .reserved_words = &.{ .keyword_elif, .keyword_else, .keyword_fi },
+        });
+        if (elif_body) |node| {
+            branch.body = node.toOptional();
+        } else {
+            try parser.warn(.{
+                .tag = .expected_command,
+                .token = parser.tok_i,
+            });
+        }
+        try parser.elif_scratch.append(parser.gpa, branch);
+        if (parser.failedSince(elif_body_errors) or elif_body == null) {
+            return parser.finishIf(if_token, builder, parser.elif_scratch.items[elif_start..]);
+        }
+    }
+
+    if (parser.tokenTag(parser.tok_i) == .keyword_else) {
+        const else_token = parser.nextToken();
+        builder.else_token = Node.OptionalTokenIndex.fromOptional(else_token);
+        parser.skipNewlines();
+        if (parser.tokenTag(parser.tok_i) == .eof) {
+            parser.setCompoundIncomplete(.else_clause, .body, else_token);
+            return parser.finishIf(if_token, builder, parser.elif_scratch.items[elif_start..]);
+        }
+
+        const else_errors = parser.errors.items.len;
+        const else_body = try parser.parseList(.{
+            .reserved_words = &.{.keyword_fi},
+        });
+        if (else_body) |node| {
+            builder.else_body = node.toOptional();
+        } else {
+            try parser.warn(.{
+                .tag = .expected_command,
+                .token = parser.tok_i,
+            });
+            return parser.finishIf(if_token, builder, parser.elif_scratch.items[elif_start..]);
+        }
+        if (parser.failedSince(else_errors)) {
+            return parser.finishIf(if_token, builder, parser.elif_scratch.items[elif_start..]);
+        }
+    }
+
+    if (parser.tokenTag(parser.tok_i) == .eof) {
+        parser.setCompoundIncomplete(.if_clause, .fi_keyword, if_token);
+        return parser.finishIf(if_token, builder, parser.elif_scratch.items[elif_start..]);
+    }
+    if (parser.tokenTag(parser.tok_i) != .keyword_fi) {
+        try parser.warn(.{
+            .tag = .expected_fi_keyword,
+            .token = parser.tok_i,
+        });
+        return parser.finishIf(if_token, builder, parser.elif_scratch.items[elif_start..]);
+    }
+    builder.fi_token = Node.OptionalTokenIndex.fromOptional(parser.nextToken());
+
+    const redirect_start = parser.scratch.items.len;
+    defer parser.scratch.shrinkRetainingCapacity(redirect_start);
+    while (parser.startsRedirect()) {
+        try parser.scratch.append(parser.gpa, try parser.parseRedirect());
+    }
+    builder.redirects = try parser.listToSpan(parser.scratch.items[redirect_start..]);
+
+    return parser.finishIf(if_token, builder, parser.elif_scratch.items[elif_start..]);
+}
+
+fn finishIf(
+    parser: *Parse,
+    if_token: Ast.TokenIndex,
+    builder: IfBuilder,
+    elif_branches: []const Node.ElifBranch,
+) Ast.ParseError!Node.Index {
+    const elif_range = try parser.addElifBranches(elif_branches);
+    const redirects = builder.redirects orelse try parser.emptySpan();
+    const extra = try parser.addExtra(Node.If{
+        .condition = builder.condition,
+        .then_token = builder.then_token,
+        .then_body = builder.then_body,
+        .elif_start = elif_range.start,
+        .elif_end = elif_range.end,
+        .else_token = builder.else_token,
+        .else_body = builder.else_body,
+        .fi_token = builder.fi_token,
+        .redirects_start = redirects.start,
+        .redirects_end = redirects.end,
+    });
+    return parser.addNode(.{
+        .tag = .if_clause,
+        .main_token = if_token,
+        .data = .{ .extra = extra },
+    });
+}
+
 fn parseSubshell(parser: *Parse) Ast.ParseError!Node.Index {
     const open = parser.nextToken();
-    const body = try parser.parseList(.r_paren);
+    const body = try parser.parseList(.{ .token_tag = .r_paren });
 
     var close_token = parser.tok_i;
     if (parser.tokenTag(parser.tok_i) == .r_paren) {
@@ -397,13 +654,52 @@ fn addSubshell(
     parser: *Parse,
     subshell: Node.Subshell,
 ) Ast.ParseError!Ast.ExtraIndex {
+    return parser.addExtra(subshell);
+}
+
+fn addElifBranches(
+    parser: *Parse,
+    branches: []const Node.ElifBranch,
+) Ast.ParseError!Node.SubRange {
     const start = std.math.cast(u32, parser.extra_data.items.len) orelse
         return error.SourceTooLarge;
-    try parser.extra_data.append(parser.gpa, @intFromEnum(subshell.body));
-    try parser.extra_data.append(parser.gpa, subshell.close_token);
-    try parser.extra_data.append(parser.gpa, @intFromEnum(subshell.redirects_start));
-    try parser.extra_data.append(parser.gpa, @intFromEnum(subshell.redirects_end));
+    for (branches) |branch| {
+        _ = try parser.addExtra(branch);
+    }
+    const end = std.math.cast(u32, parser.extra_data.items.len) orelse
+        return error.SourceTooLarge;
+    return .{
+        .start = @enumFromInt(start),
+        .end = @enumFromInt(end),
+    };
+}
+
+fn addExtra(parser: *Parse, extra: anytype) Ast.ParseError!Ast.ExtraIndex {
+    const start = std.math.cast(u32, parser.extra_data.items.len) orelse
+        return error.SourceTooLarge;
+    inline for (std.meta.fields(@TypeOf(extra))) |field| {
+        const value = @field(extra, field.name);
+        const raw: u32 = switch (field.type) {
+            Node.Index,
+            Node.OptionalIndex,
+            Node.OptionalTokenIndex,
+            Ast.ExtraIndex,
+            => @intFromEnum(value),
+            Ast.TokenIndex => value,
+            else => @compileError("unexpected extra_data field type: " ++ @typeName(field.type)),
+        };
+        try parser.extra_data.append(parser.gpa, raw);
+    }
     return @enumFromInt(start);
+}
+
+fn emptySpan(parser: *const Parse) Ast.ParseError!Node.SubRange {
+    const index = std.math.cast(u32, parser.extra_data.items.len) orelse
+        return error.SourceTooLarge;
+    return .{
+        .start = @enumFromInt(index),
+        .end = @enumFromInt(index),
+    };
 }
 
 fn addNode(parser: *Parse, node: Node) Ast.ParseError!Node.Index {
@@ -437,18 +733,36 @@ fn nextToken(parser: *Parse) Ast.TokenIndex {
 
 fn canStartCommand(parser: *const Parse) bool {
     const tag = parser.tokenTag(parser.tok_i);
+    if (isReservedWord(tag)) return tag == .keyword_if;
     return tag == .l_paren or isWord(tag) or parser.startsRedirect();
 }
 
-fn atListEnd(parser: *const Parse, stop_tag: ?Token.Tag) bool {
+fn atListEnd(parser: *const Parse, stop: StopSet) bool {
     const tag = parser.tokenTag(parser.tok_i);
-    return tag == .eof or (stop_tag != null and tag == stop_tag.?);
+    return tag == .eof or stop.matches(parser);
 }
 
 fn setIncomplete(parser: *Parse, continuation: Ast.Continuation) void {
     if (parser.status == .complete) {
         parser.status = .{ .incomplete = continuation };
     }
+}
+
+fn setCompoundIncomplete(
+    parser: *Parse,
+    kind: Ast.CompoundContinuation.Kind,
+    expected: Ast.CompoundContinuation.Expected,
+    opened_by: Ast.TokenIndex,
+) void {
+    parser.setIncomplete(.{ .compound = .{
+        .kind = kind,
+        .expected = expected,
+        .opened_by = opened_by,
+    } });
+}
+
+fn failedSince(parser: *const Parse, error_count: usize) bool {
+    return parser.errors.items.len != error_count or parser.status == .incomplete;
 }
 
 fn startsRedirect(parser: *const Parse) bool {
@@ -473,7 +787,19 @@ fn tokenEnd(parser: *const Parse, token_index: Ast.TokenIndex) usize {
 }
 
 fn isWord(tag: Token.Tag) bool {
-    return tag == .word or tag == .digits;
+    return tag == .word or tag == .digits or isReservedWord(tag);
+}
+
+fn isReservedWord(tag: Token.Tag) bool {
+    return switch (tag) {
+        .keyword_if,
+        .keyword_then,
+        .keyword_elif,
+        .keyword_else,
+        .keyword_fi,
+        => true,
+        else => false,
+    };
 }
 
 fn isPipe(tag: Token.Tag) bool {
@@ -780,4 +1106,136 @@ test "rejects an empty subshell" {
     try std.testing.expectEqual(@as(usize, 1), tree.errors.len);
     try std.testing.expectEqual(Ast.Error.Tag.expected_command, tree.errors[0].tag);
     try std.testing.expectEqual(Token.Tag.r_paren, tree.tokenTag(tree.errors[0].token));
+}
+
+test "parses if elif else and trailing redirection" {
+    const source =
+        \\if test -f file; then
+        \\  echo file
+        \\elif test -d file; then
+        \\  echo directory
+        \\else
+        \\  echo missing
+        \\fi >result
+        \\
+    ;
+    var tree = try Ast.parse(std.testing.allocator, source);
+    defer tree.deinit(std.testing.allocator);
+
+    const if_node = firstCommand(&tree);
+    try std.testing.expectEqual(Node.Tag.if_clause, tree.nodeTag(if_node));
+    const clause = tree.ifClause(if_node);
+    try std.testing.expect(clause.condition.unwrap() != null);
+    try std.testing.expect(clause.then_token.unwrap() != null);
+    try std.testing.expect(clause.then_body.unwrap() != null);
+    try std.testing.expectEqual(@as(usize, 1), tree.elifBranchCount(clause));
+    try std.testing.expect(tree.elifBranch(clause, 0).body.unwrap() != null);
+    try std.testing.expect(clause.else_token.unwrap() != null);
+    try std.testing.expect(clause.else_body.unwrap() != null);
+    try std.testing.expectEqualStrings("fi", tree.tokenSlice(clause.fi_token.unwrap().?));
+
+    const redirects = tree.extraDataSlice(.{
+        .start = clause.redirects_start,
+        .end = clause.redirects_end,
+    }, Node.Index);
+    try std.testing.expectEqual(@as(usize, 1), redirects.len);
+    try std.testing.expectEqual(Node.Tag.redirect, tree.nodeTag(redirects[0]));
+    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+    try std.testing.expect(tree.status == .complete);
+}
+
+test "keyword candidates remain words in argument position" {
+    var tree = try Ast.parse(std.testing.allocator, "echo if then elif else fi");
+    defer tree.deinit(std.testing.allocator);
+
+    const command = firstCommand(&tree);
+    const parts = tree.simpleCommandParts(command);
+    try std.testing.expectEqual(@as(usize, 6), parts.len);
+    for (parts) |part| {
+        try std.testing.expectEqual(Node.Tag.word, tree.nodeTag(part));
+    }
+}
+
+test "quoted if remains a simple command word" {
+    var tree = try Ast.parse(std.testing.allocator, "'if' true");
+    defer tree.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(Node.Tag.simple_command, tree.nodeTag(firstCommand(&tree)));
+    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+}
+
+test "parses nested if clauses" {
+    const source =
+        \\if outer; then
+        \\  if inner; then
+        \\    echo nested
+        \\  fi
+        \\fi
+        \\
+    ;
+    var tree = try Ast.parse(std.testing.allocator, source);
+    defer tree.deinit(std.testing.allocator);
+
+    const outer = tree.ifClause(firstCommand(&tree));
+    const outer_body = outer.then_body.unwrap().?;
+    const inner = tree.listItem(outer_body, 0).command;
+    try std.testing.expectEqual(Node.Tag.if_clause, tree.nodeTag(inner));
+    try std.testing.expect(tree.ifClause(inner).fi_token.unwrap() != null);
+}
+
+test "reports each incomplete if stage" {
+    try expectCompoundContinuation(
+        "if",
+        .if_clause,
+        .condition,
+    );
+    try expectCompoundContinuation(
+        "if true",
+        .if_clause,
+        .then_keyword,
+    );
+    try expectCompoundContinuation(
+        "if true; then",
+        .if_clause,
+        .body,
+    );
+    try expectCompoundContinuation(
+        "if true; then echo yes",
+        .if_clause,
+        .fi_keyword,
+    );
+    try expectCompoundContinuation(
+        "if true; then echo yes; elif",
+        .elif_clause,
+        .condition,
+    );
+    try expectCompoundContinuation(
+        "if true; then echo yes; else",
+        .else_clause,
+        .body,
+    );
+}
+
+test "rejects a reserved word at command start" {
+    var tree = try Ast.parse(std.testing.allocator, "then");
+    defer tree.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), tree.errors.len);
+    try std.testing.expectEqual(Ast.Error.Tag.expected_command, tree.errors[0].tag);
+    try std.testing.expectEqual(Token.Tag.keyword_then, tree.tokenTag(tree.errors[0].token));
+}
+
+fn expectCompoundContinuation(
+    source: [:0]const u8,
+    kind: Ast.CompoundContinuation.Kind,
+    expected: Ast.CompoundContinuation.Expected,
+) !void {
+    var tree = try Ast.parse(std.testing.allocator, source);
+    defer tree.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+    try std.testing.expect(tree.status == .incomplete);
+    try std.testing.expect(tree.status.incomplete == .compound);
+    try std.testing.expectEqual(kind, tree.status.incomplete.compound.kind);
+    try std.testing.expectEqual(expected, tree.status.incomplete.compound.expected);
 }

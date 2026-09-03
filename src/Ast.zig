@@ -41,6 +41,26 @@ pub const Continuation = union(enum) {
     command_after: TokenIndex,
     redirect_target: TokenIndex,
     closing_paren: TokenIndex,
+    compound: CompoundContinuation,
+};
+
+pub const CompoundContinuation = struct {
+    kind: Kind,
+    expected: Expected,
+    opened_by: TokenIndex,
+
+    pub const Kind = enum {
+        if_clause,
+        elif_clause,
+        else_clause,
+    };
+
+    pub const Expected = enum {
+        condition,
+        then_keyword,
+        body,
+        fi_keyword,
+    };
 };
 
 /// Index into `extra_data`.
@@ -62,6 +82,9 @@ pub const Error = struct {
         expected_token,
         expected_command,
         expected_redirect_target,
+        expected_separator,
+        expected_then_keyword,
+        expected_fi_keyword,
     };
 };
 
@@ -135,6 +158,26 @@ pub fn listItem(tree: *const Ast, index: Node.Index, item_index: usize) Node.Lis
 pub fn subshell(tree: *const Ast, index: Node.Index) Node.Subshell {
     std.debug.assert(tree.nodeTag(index) == .subshell);
     return tree.extraData(tree.nodeData(index).extra, Node.Subshell);
+}
+
+pub fn ifClause(tree: *const Ast, index: Node.Index) Node.If {
+    std.debug.assert(tree.nodeTag(index) == .if_clause);
+    return tree.extraData(tree.nodeData(index).extra, Node.If);
+}
+
+pub fn elifBranchCount(tree: *const Ast, node: Node.If) usize {
+    _ = tree;
+    const raw_len = @intFromEnum(node.elif_end) - @intFromEnum(node.elif_start);
+    const width = std.meta.fields(Node.ElifBranch).len;
+    std.debug.assert(raw_len % width == 0);
+    return raw_len / width;
+}
+
+pub fn elifBranch(tree: *const Ast, node: Node.If, index: usize) Node.ElifBranch {
+    std.debug.assert(index < tree.elifBranchCount(node));
+    const width = std.meta.fields(Node.ElifBranch).len;
+    const offset = @intFromEnum(node.elif_start) + index * width;
+    return tree.extraData(@enumFromInt(offset), Node.ElifBranch);
 }
 
 pub fn extraDataSlice(
@@ -226,6 +269,9 @@ pub const Node = struct {
         /// `data.extra`: encoded `Subshell` data.
         subshell,
 
+        /// `data.extra`: encoded `If` data.
+        if_clause,
+
         /// `main_token` identifies the word; `data.none`.
         word,
 
@@ -258,6 +304,26 @@ pub const Node = struct {
         close_token: TokenIndex,
         redirects_start: ExtraIndex,
         redirects_end: ExtraIndex,
+    };
+
+    pub const If = struct {
+        condition: OptionalIndex,
+        then_token: OptionalTokenIndex,
+        then_body: OptionalIndex,
+        elif_start: ExtraIndex,
+        elif_end: ExtraIndex,
+        else_token: OptionalTokenIndex,
+        else_body: OptionalIndex,
+        fi_token: OptionalTokenIndex,
+        redirects_start: ExtraIndex,
+        redirects_end: ExtraIndex,
+    };
+
+    pub const ElifBranch = struct {
+        elif_token: TokenIndex,
+        condition: OptionalIndex,
+        then_token: OptionalTokenIndex,
+        body: OptionalIndex,
     };
 };
 
