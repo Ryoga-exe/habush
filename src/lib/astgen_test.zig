@@ -217,6 +217,38 @@ test "generates if branches and lowers elif to nested if" {
     try std.testing.expectEqual(Hir.Inst.Tag.list, hir.instructionTag(else_body));
 }
 
+test "generates while and until clauses" {
+    const source =
+        \\while outer; do
+        \\  until inner; do
+        \\    step
+        \\  done
+        \\done 2>log
+        \\
+    ;
+    var tree = try Ast.parse(std.testing.allocator, source);
+    defer tree.deinit(std.testing.allocator);
+
+    var hir = try AstGen.generate(std.testing.allocator, tree);
+    defer hir.deinit(std.testing.allocator);
+
+    const outer_index = firstCommand(hir);
+    try std.testing.expectEqual(Hir.Inst.Tag.while_clause, hir.instructionTag(outer_index));
+    const outer = hir.loopClause(outer_index);
+    try std.testing.expectEqual(Hir.Inst.Tag.list, hir.instructionTag(outer.condition));
+    try std.testing.expectEqual(@as(usize, 1), outer.redirects.len);
+    const redirect = hir.redirect(outer.redirects[0]);
+    try std.testing.expectEqualStrings("2", redirect.io_number.?);
+    try std.testing.expectEqualStrings("log", firstWordPart(hir, redirect.target));
+
+    const inner_index = firstListCommand(hir, outer.body);
+    try std.testing.expectEqual(Hir.Inst.Tag.until_clause, hir.instructionTag(inner_index));
+    const inner = hir.loopClause(inner_index);
+    try std.testing.expectEqual(Hir.Inst.Tag.list, hir.instructionTag(inner.condition));
+    try std.testing.expectEqual(Hir.Inst.Tag.list, hir.instructionTag(inner.body));
+    try std.testing.expectEqual(@as(usize, 0), inner.redirects.len);
+}
+
 test "rejects invalid and unsupported ASTs" {
     var invalid = try Ast.parse(std.testing.allocator, "echo |");
     defer invalid.deinit(std.testing.allocator);
@@ -225,7 +257,10 @@ test "rejects invalid and unsupported ASTs" {
         AstGen.generate(std.testing.allocator, invalid),
     );
 
-    var unsupported = try Ast.parse(std.testing.allocator, "while condition; do result; done");
+    var unsupported = try Ast.parse(
+        std.testing.allocator,
+        "for item in first second; do use $item; done",
+    );
     defer unsupported.deinit(std.testing.allocator);
     try std.testing.expectError(
         error.UnsupportedSyntax,
@@ -237,7 +272,7 @@ test "AST generation handles every allocation failure" {
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         generateWithAllocator,
-        .{"if check; then (run; notify); elif retry; then again; else { fallback; }; fi >log &"},
+        .{"while check; do if ready; then run; else wait; fi; done >log &"},
     );
 }
 
@@ -270,6 +305,10 @@ fn generateWithAllocator(gpa: std.mem.Allocator, source: [:0]const u8) !void {
 
 fn firstCommand(hir: Hir) Hir.Inst.Index {
     const list = hir.root().?;
+    return firstListCommand(hir, list);
+}
+
+fn firstListCommand(hir: Hir, list: Hir.Inst.Index) Hir.Inst.Index {
     return hir.listItem(list, 0).command;
 }
 

@@ -127,6 +127,17 @@ pub fn ifClause(hir: Hir, index: Inst.Index) If.Value {
     };
 }
 
+pub fn loopClause(hir: Hir, index: Inst.Index) Loop.Value {
+    const tag = hir.instructionTag(index);
+    std.debug.assert(tag == .while_clause or tag == .until_clause);
+    const payload = hir.extraData(Loop, hir.instructionData(index).pl.payload_index);
+    return .{
+        .condition = payload.data.condition,
+        .body = payload.data.body,
+        .redirects = hir.instructionSlice(payload.end, payload.data.redirects_len),
+    };
+}
+
 pub fn extraData(hir: Hir, comptime T: type, index: ExtraIndex) ExtraData(T) {
     const fields = std.meta.fields(T);
     var result: T = undefined;
@@ -265,6 +276,10 @@ pub const Inst = struct {
         /// An `elif` branch is another `if_clause` in `If.else_body`.
         if_clause,
 
+        /// `data.pl`: `Loop`, followed by redirect `Inst.Index` values.
+        while_clause,
+        until_clause,
+
         /// `data.str`: the bytes represented by this word part.
         literal,
         escaped,
@@ -350,6 +365,18 @@ pub const If = struct {
         condition: Inst.Index,
         then_body: Inst.Index,
         else_body: Inst.OptionalIndex,
+        redirects: []const Inst.Index,
+    };
+};
+
+pub const Loop = struct {
+    condition: Inst.Index,
+    body: Inst.Index,
+    redirects_len: u32,
+
+    pub const Value = struct {
+        condition: Inst.Index,
+        body: Inst.Index,
         redirects: []const Inst.Index,
     };
 };

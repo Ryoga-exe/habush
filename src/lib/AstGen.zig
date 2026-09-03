@@ -112,8 +112,43 @@ fn command(astgen: *AstGen, node: Ast.Node.Index) Error!Hir.Inst.Index {
         .negated_pipeline => astgen.negatedPipeline(node),
         .subshell, .brace_group => astgen.groupedCommand(node),
         .if_clause => astgen.ifClause(node),
+        .while_clause, .until_clause => astgen.loopClause(node),
         else => error.UnsupportedSyntax,
     };
+}
+
+fn loopClause(astgen: *AstGen, node: Ast.Node.Index) Error!Hir.Inst.Index {
+    const tag = astgen.tree.nodeTag(node);
+    const clause = astgen.tree.loopClause(node);
+    const condition_node = clause.condition.unwrap() orelse return error.InvalidAst;
+    const body_node = clause.body.unwrap() orelse return error.InvalidAst;
+    const condition = try astgen.list(condition_node);
+    const body = try astgen.list(body_node);
+
+    const scratch_top = astgen.scratch.items.len;
+    defer astgen.scratch.items.len = scratch_top;
+    const redirects_len = try astgen.appendRedirects(
+        clause.redirects_start,
+        clause.redirects_end,
+    );
+    const payload_index = try astgen.addExtra(Hir.Loop{
+        .condition = condition,
+        .body = body,
+        .redirects_len = redirects_len,
+    });
+    try astgen.extra.appendSlice(astgen.gpa, astgen.scratch.items[scratch_top..]);
+
+    return astgen.addInstruction(.{
+        .tag = switch (tag) {
+            .while_clause => .while_clause,
+            .until_clause => .until_clause,
+            else => unreachable,
+        },
+        .data = .{ .pl = .{
+            .src_start = astgen.sourceStart(node),
+            .payload_index = payload_index,
+        } },
+    });
 }
 
 fn ifClause(astgen: *AstGen, node: Ast.Node.Index) Error!Hir.Inst.Index {
