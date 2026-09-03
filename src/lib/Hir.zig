@@ -76,6 +76,17 @@ pub fn root(hir: Hir) ?Inst.Index {
     return hir.instructionData(.root).un.operand.unwrap();
 }
 
+pub fn pipeline(hir: Hir, index: Inst.Index) Inst.Bin {
+    const tag = hir.instructionTag(index);
+    std.debug.assert(tag == .pipe or tag == .pipe_and);
+    return hir.instructionData(index).bin;
+}
+
+pub fn negatedPipeline(hir: Hir, index: Inst.Index) Inst.Index {
+    std.debug.assert(hir.instructionTag(index) == .negated_pipeline);
+    return hir.instructionData(index).un.operand.unwrap().?;
+}
+
 pub fn extraData(hir: Hir, comptime T: type, index: ExtraIndex) ExtraData(T) {
     const fields = std.meta.fields(T);
     var result: T = undefined;
@@ -194,6 +205,12 @@ pub const Inst = struct {
         /// `data.pl`: `HereDocument`.
         here_document,
 
+        /// `data.bin`: the commands connected by `|` or `|&`.
+        pipe,
+        pipe_and,
+        /// `data.un`: the pipeline following `!`.
+        negated_pipeline,
+
         /// `data.str`: the bytes represented by this word part.
         literal,
         escaped,
@@ -228,13 +245,19 @@ pub const Inst = struct {
         none: void,
         un: struct {
             operand: OptionalIndex,
-            unused: u32 = 0,
+            src_start: ByteOffset = 0,
         },
+        bin: Bin,
         pl: struct {
             src_start: ByteOffset,
             payload_index: ExtraIndex,
         },
         str: String,
+    };
+
+    pub const Bin = struct {
+        lhs: Index,
+        rhs: Index,
     };
 };
 

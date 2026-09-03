@@ -81,8 +81,37 @@ fn finish(astgen: *AstGen) Error!Hir {
 fn command(astgen: *AstGen, node: Ast.Node.Index) Error!Hir.Inst.Index {
     return switch (astgen.tree.nodeTag(node)) {
         .simple_command => astgen.simpleCommand(node),
+        .pipe, .pipe_and => astgen.pipeline(node),
+        .negated_pipeline => astgen.negatedPipeline(node),
         else => error.UnsupportedSyntax,
     };
+}
+
+fn pipeline(astgen: *AstGen, node: Ast.Node.Index) Error!Hir.Inst.Index {
+    const tag = astgen.tree.nodeTag(node);
+    const operands = astgen.tree.nodeData(node).node_and_node;
+    return astgen.addInstruction(.{
+        .tag = switch (tag) {
+            .pipe => .pipe,
+            .pipe_and => .pipe_and,
+            else => unreachable,
+        },
+        .data = .{ .bin = .{
+            .lhs = try astgen.command(operands[0]),
+            .rhs = try astgen.command(operands[1]),
+        } },
+    });
+}
+
+fn negatedPipeline(astgen: *AstGen, node: Ast.Node.Index) Error!Hir.Inst.Index {
+    const child = astgen.tree.negatedPipeline(node) orelse return error.InvalidAst;
+    return astgen.addInstruction(.{
+        .tag = .negated_pipeline,
+        .data = .{ .un = .{
+            .operand = (try astgen.command(child)).toOptional(),
+            .src_start = astgen.sourceStart(node),
+        } },
+    });
 }
 
 fn simpleCommand(astgen: *AstGen, node: Ast.Node.Index) Error!Hir.Inst.Index {

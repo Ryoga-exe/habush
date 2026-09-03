@@ -61,6 +61,36 @@ test "HIR owns source-derived and here-document strings" {
     try std.testing.expectEqualStrings("cat", hir.wordPart(hir.wordParts(command_parts[0])[0]));
 }
 
+test "generates pipelines and pipeline negation" {
+    var tree = try Ast.parse(std.testing.allocator, "! echo hi | grep h |& count");
+    defer tree.deinit(std.testing.allocator);
+
+    var hir = try AstGen.generate(std.testing.allocator, tree);
+    defer hir.deinit(std.testing.allocator);
+
+    const negation = hir.root().?;
+    try std.testing.expectEqual(Hir.Inst.Tag.negated_pipeline, hir.instructionTag(negation));
+
+    const outer = hir.negatedPipeline(negation);
+    try std.testing.expectEqual(Hir.Inst.Tag.pipe_and, hir.instructionTag(outer));
+    const outer_operands = hir.pipeline(outer);
+    try std.testing.expectEqual(Hir.Inst.Tag.pipe, hir.instructionTag(outer_operands.lhs));
+    try std.testing.expectEqual(
+        Hir.Inst.Tag.simple_command,
+        hir.instructionTag(outer_operands.rhs),
+    );
+
+    const inner_operands = hir.pipeline(outer_operands.lhs);
+    try std.testing.expectEqual(
+        Hir.Inst.Tag.simple_command,
+        hir.instructionTag(inner_operands.lhs),
+    );
+    try std.testing.expectEqual(
+        Hir.Inst.Tag.simple_command,
+        hir.instructionTag(inner_operands.rhs),
+    );
+}
+
 test "rejects invalid and unsupported ASTs" {
     var invalid = try Ast.parse(std.testing.allocator, "echo |");
     defer invalid.deinit(std.testing.allocator);
@@ -69,7 +99,7 @@ test "rejects invalid and unsupported ASTs" {
         AstGen.generate(std.testing.allocator, invalid),
     );
 
-    var unsupported = try Ast.parse(std.testing.allocator, "producer | consumer");
+    var unsupported = try Ast.parse(std.testing.allocator, "first && second");
     defer unsupported.deinit(std.testing.allocator);
     try std.testing.expectError(
         error.UnsupportedSyntax,
@@ -81,7 +111,7 @@ test "AST generation handles every allocation failure" {
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         generateWithAllocator,
-        .{"A=value command 2>>log"},
+        .{"! A=value command 2>>log | consume"},
     );
 }
 
