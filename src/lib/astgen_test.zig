@@ -21,9 +21,13 @@ test "generates a simple command while preserving part order" {
     var hir = try AstGen.generate(std.testing.allocator, tree);
     defer hir.deinit(std.testing.allocator);
 
-    const root = hir.root().?;
-    try std.testing.expectEqual(Hir.Inst.Tag.simple_command, hir.instructionTag(root));
-    const parts = hir.simpleCommandParts(root);
+    const root_list = hir.root().?;
+    try std.testing.expectEqual(Hir.Inst.Tag.list, hir.instructionTag(root_list));
+    try std.testing.expectEqual(@as(usize, 1), hir.listItemCount(root_list));
+    const root_item = hir.listItem(root_list, 0);
+    try std.testing.expectEqual(Hir.List.Item.Separator.none, root_item.separator);
+
+    const parts = hir.simpleCommandParts(root_item.command);
     try std.testing.expectEqual(@as(usize, 5), parts.len);
 
     try std.testing.expectEqual(Hir.Inst.Tag.assignment, hir.instructionTag(parts[0]));
@@ -52,7 +56,7 @@ test "HIR owns source-derived and here-document strings" {
     var hir = try generateOwnedHereDocument(std.testing.allocator);
     defer hir.deinit(std.testing.allocator);
 
-    const command_parts = hir.simpleCommandParts(hir.root().?);
+    const command_parts = hir.simpleCommandParts(firstCommand(hir));
     const redirect = hir.redirect(command_parts[1]);
     const document = hir.hereDocument(redirect.here_document.unwrap().?);
     try std.testing.expectEqualStrings("EOF", document.delimiter);
@@ -68,7 +72,7 @@ test "generates pipelines and pipeline negation" {
     var hir = try AstGen.generate(std.testing.allocator, tree);
     defer hir.deinit(std.testing.allocator);
 
-    const negation = hir.root().?;
+    const negation = firstCommand(hir);
     try std.testing.expectEqual(Hir.Inst.Tag.negated_pipeline, hir.instructionTag(negation));
 
     const outer = hir.negatedPipeline(negation);
@@ -98,7 +102,7 @@ test "generates and-or commands with pipeline precedence" {
     var hir = try AstGen.generate(std.testing.allocator, tree);
     defer hir.deinit(std.testing.allocator);
 
-    const outer = hir.root().?;
+    const outer = firstCommand(hir);
     try std.testing.expectEqual(Hir.Inst.Tag.or_if, hir.instructionTag(outer));
     const outer_operands = hir.andOr(outer);
     try std.testing.expectEqual(Hir.Inst.Tag.and_if, hir.instructionTag(outer_operands.lhs));
@@ -112,6 +116,34 @@ test "generates and-or commands with pipeline precedence" {
     );
 }
 
+test "normalizes list separators" {
+    var tree = try Ast.parse(std.testing.allocator, "first; second\nthird & fourth");
+    defer tree.deinit(std.testing.allocator);
+
+    var hir = try AstGen.generate(std.testing.allocator, tree);
+    defer hir.deinit(std.testing.allocator);
+
+    const list = hir.root().?;
+    try std.testing.expectEqual(Hir.Inst.Tag.list, hir.instructionTag(list));
+    try std.testing.expectEqual(@as(usize, 4), hir.listItemCount(list));
+    try std.testing.expectEqual(
+        Hir.List.Item.Separator.sequential,
+        hir.listItem(list, 0).separator,
+    );
+    try std.testing.expectEqual(
+        Hir.List.Item.Separator.sequential,
+        hir.listItem(list, 1).separator,
+    );
+    try std.testing.expectEqual(
+        Hir.List.Item.Separator.background,
+        hir.listItem(list, 2).separator,
+    );
+    try std.testing.expectEqual(
+        Hir.List.Item.Separator.none,
+        hir.listItem(list, 3).separator,
+    );
+}
+
 test "rejects invalid and unsupported ASTs" {
     var invalid = try Ast.parse(std.testing.allocator, "echo |");
     defer invalid.deinit(std.testing.allocator);
@@ -120,7 +152,7 @@ test "rejects invalid and unsupported ASTs" {
         AstGen.generate(std.testing.allocator, invalid),
     );
 
-    var unsupported = try Ast.parse(std.testing.allocator, "first; second");
+    var unsupported = try Ast.parse(std.testing.allocator, "(echo)");
     defer unsupported.deinit(std.testing.allocator);
     try std.testing.expectError(
         error.UnsupportedSyntax,
@@ -132,7 +164,7 @@ test "AST generation handles every allocation failure" {
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         generateWithAllocator,
-        .{"! A=value command 2>>log | consume && fallback"},
+        .{"! A=value command 2>>log | consume && fallback; notify &"},
     );
 }
 
@@ -161,4 +193,9 @@ fn generateWithAllocator(gpa: std.mem.Allocator, source: [:0]const u8) !void {
     defer tree.deinit(gpa);
     var hir = try AstGen.generate(gpa, tree);
     defer hir.deinit(gpa);
+}
+
+fn firstCommand(hir: Hir) Hir.Inst.Index {
+    const list = hir.root().?;
+    return hir.listItem(list, 0).command;
 }

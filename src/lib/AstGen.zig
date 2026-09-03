@@ -34,22 +34,11 @@ pub fn generate(gpa: Allocator, tree: Ast) Error!Hir {
         .data = .{ .un = .{ .operand = .none } },
     });
 
-    if (tree.nodeData(.root).opt_node.unwrap()) |list| {
-        if (tree.nodeTag(list) != .list or tree.listItemCount(list) != 1) {
-            return error.UnsupportedSyntax;
-        }
-        const item = tree.listItem(list, 0);
-        if (item.separator.unwrap()) |separator| {
-            switch (tree.tokenTag(separator)) {
-                .semicolon, .newline => {},
-                else => return error.UnsupportedSyntax,
-            }
-        }
-
-        const root_command = try astgen.command(item.command);
+    if (tree.nodeData(.root).opt_node.unwrap()) |list_node| {
+        const root_list = try astgen.list(list_node);
         astgen.instructions.set(@intFromEnum(Hir.Inst.Index.root), .{
             .tag = .root,
-            .data = .{ .un = .{ .operand = root_command.toOptional() } },
+            .data = .{ .un = .{ .operand = root_list.toOptional() } },
         });
     }
 
@@ -76,6 +65,44 @@ fn finish(astgen: *AstGen) Error!Hir {
         .string_bytes = string_bytes,
         .extra = extra,
     };
+}
+
+fn list(astgen: *AstGen, node: Ast.Node.Index) Error!Hir.Inst.Index {
+    if (astgen.tree.nodeTag(node) != .list) return error.InvalidAst;
+
+    const scratch_top = astgen.scratch.items.len;
+    defer astgen.scratch.items.len = scratch_top;
+
+    const items_len = astgen.tree.listItemCount(node);
+    for (0..items_len) |item_index| {
+        const item = astgen.tree.listItem(node, item_index);
+        const command_index = try astgen.command(item.command);
+        const separator: Hir.List.Item.Separator = if (item.separator.unwrap()) |token|
+            switch (astgen.tree.tokenTag(token)) {
+                .semicolon, .newline => .sequential,
+                .ampersand => .background,
+                else => return error.InvalidAst,
+            }
+        else
+            .none;
+
+        try astgen.scratch.append(astgen.gpa, @intFromEnum(command_index));
+        try astgen.scratch.append(astgen.gpa, @intFromEnum(separator));
+    }
+
+    const items = astgen.scratch.items[scratch_top..];
+    const payload_index = try astgen.addExtra(Hir.List{
+        .items_len = try index(u32, items_len),
+    });
+    try astgen.extra.appendSlice(astgen.gpa, items);
+
+    return astgen.addInstruction(.{
+        .tag = .list,
+        .data = .{ .pl = .{
+            .src_start = astgen.sourceStart(node),
+            .payload_index = payload_index,
+        } },
+    });
 }
 
 fn command(astgen: *AstGen, node: Ast.Node.Index) Error!Hir.Inst.Index {

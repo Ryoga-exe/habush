@@ -76,6 +76,19 @@ pub fn root(hir: Hir) ?Inst.Index {
     return hir.instructionData(.root).un.operand.unwrap();
 }
 
+pub fn listItemCount(hir: Hir, index: Inst.Index) usize {
+    std.debug.assert(hir.instructionTag(index) == .list);
+    const payload = hir.extraData(List, hir.instructionData(index).pl.payload_index);
+    return payload.data.items_len;
+}
+
+pub fn listItem(hir: Hir, index: Inst.Index, item_index: usize) List.Item {
+    std.debug.assert(item_index < hir.listItemCount(index));
+    const payload = hir.extraData(List, hir.instructionData(index).pl.payload_index);
+    const item_offset = payload.end + item_index * std.meta.fields(List.Item).len;
+    return hir.extraData(List.Item, @enumFromInt(item_offset)).data;
+}
+
 pub fn pipeline(hir: Hir, index: Inst.Index) Inst.Bin {
     const tag = hir.instructionTag(index);
     std.debug.assert(tag == .pipe or tag == .pipe_and);
@@ -198,8 +211,10 @@ pub const Inst = struct {
     };
 
     pub const Tag = enum(u8) {
-        /// `data.un`: the top-level command, if any.
+        /// `data.un`: the top-level list, if any.
         root,
+        /// `data.pl`: `List`, followed by encoded `List.Item` values.
+        list,
         /// `data.pl`: `SimpleCommand`, followed by `Inst.Index` values.
         simple_command,
         /// `data.pl`: `Assignment`.
@@ -268,6 +283,21 @@ pub const Inst = struct {
     pub const Bin = struct {
         lhs: Index,
         rhs: Index,
+    };
+};
+
+pub const List = struct {
+    items_len: u32,
+
+    pub const Item = struct {
+        command: Inst.Index,
+        separator: Separator,
+
+        pub const Separator = enum(u32) {
+            none,
+            sequential,
+            background,
+        };
     };
 };
 
