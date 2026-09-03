@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Writer = std.Io.Writer;
 const Ast = @This();
 const Parse = @import("Parse.zig");
 const heredoc = @import("heredoc.zig");
@@ -27,6 +28,13 @@ errors: []const Error,
 status: Status,
 
 pub const ByteOffset = u32;
+
+pub const Location = struct {
+    line: usize,
+    column: usize,
+    line_start: usize,
+    line_end: usize,
+};
 
 pub const TokenList = std.MultiArrayList(struct {
     tag: Token.Tag,
@@ -187,6 +195,48 @@ pub fn tokenStart(tree: *const Ast, index: TokenIndex) ByteOffset {
     return tree.tokens.items(.start)[index];
 }
 
+pub fn tokenLocation(
+    tree: *const Ast,
+    start_offset: ByteOffset,
+    token_index: TokenIndex,
+) Location {
+    var location: Location = .{
+        .line = 0,
+        .column = 0,
+        .line_start = start_offset,
+        .line_end = tree.source.len,
+    };
+    const token_start = tree.tokenStart(token_index);
+
+    while (std.mem.findScalarPos(u8, tree.source, location.line_start, '\n')) |newline| {
+        if (newline >= token_start) break;
+        location.line += 1;
+        location.line_start = newline + 1;
+    }
+
+    const line_start = location.line_start;
+    for (tree.source[line_start..], 0..) |byte, offset| {
+        const source_index = line_start + offset;
+        if (source_index == token_start) {
+            location.line_end = source_index;
+            while (location.line_end < tree.source.len and
+                tree.source[location.line_end] != '\n')
+            {
+                location.line_end += 1;
+            }
+            return location;
+        }
+        if (byte == '\n') {
+            location.line += 1;
+            location.column = 0;
+            location.line_start = source_index + 1;
+        } else {
+            location.column += 1;
+        }
+    }
+    return location;
+}
+
 pub fn tokenSlice(tree: *const Ast, index: TokenIndex) []const u8 {
     const tag = tree.tokenTag(index);
     if (Token.lexeme(tag)) |lexeme| return lexeme;
@@ -198,6 +248,35 @@ pub fn tokenSlice(tree: *const Ast, index: TokenIndex) []const u8 {
     const token = scanner.next();
     std.debug.assert(token.tag == tag);
     return tree.source[token.loc.start..token.loc.end];
+}
+
+pub fn renderError(tree: *const Ast, parse_error: Error, writer: *Writer) Writer.Error!void {
+    const found = Token.symbol(tree.tokenTag(parse_error.token));
+    switch (parse_error.tag) {
+        .invalid_token => try writer.print("invalid token '{s}'", .{tree.tokenSlice(parse_error.token)}),
+        .unexpected_token => try writer.print("unexpected token '{s}'", .{found}),
+        .expected_token => try writer.print("expected '{s}', found '{s}'", .{
+            Token.symbol(parse_error.extra.expected_tag),
+            found,
+        }),
+        .expected_command => try writer.print("expected command, found '{s}'", .{found}),
+        .expected_redirect_target => try writer.print(
+            "expected redirection target, found '{s}'",
+            .{found},
+        ),
+        .expected_separator => try writer.print(
+            "expected ';' or newline before '{s}'",
+            .{found},
+        ),
+        .expected_then_keyword => try writer.print("expected 'then', found '{s}'", .{found}),
+        .expected_fi_keyword => try writer.print("expected 'fi', found '{s}'", .{found}),
+        .expected_do_keyword => try writer.print("expected 'do', found '{s}'", .{found}),
+        .expected_done_keyword => try writer.print("expected 'done', found '{s}'", .{found}),
+        .expected_name => try writer.print("expected a name, found '{s}'", .{found}),
+        .here_document_mismatch => try writer.writeAll(
+            "collected here-document does not match its parsed delimiter",
+        ),
+    }
 }
 
 pub fn nodeTag(tree: *const Ast, index: Node.Index) Node.Tag {

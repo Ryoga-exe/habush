@@ -906,6 +906,28 @@ test "rejects an invalid for variable name" {
     try std.testing.expectEqual(Ast.Error.Tag.expected_name, tree.errors[0].tag);
 }
 
+test "locates and renders parse errors" {
+    var tree = try Ast.parse(std.testing.allocator, "echo ok\n(echo\nnext");
+    defer tree.deinit(std.testing.allocator);
+
+    const location = tree.tokenLocation(0, 6);
+    try std.testing.expectEqual(@as(usize, 2), location.line);
+    try std.testing.expectEqual(@as(usize, 0), location.column);
+    try std.testing.expectEqualStrings("next", tree.source[location.line_start..location.line_end]);
+
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try tree.renderError(.{
+        .tag = .expected_token,
+        .token = 6,
+        .extra = .{ .expected_tag = .r_paren },
+    }, &output.writer);
+    try std.testing.expectEqualStrings(
+        "expected ')', found 'a word'",
+        output.written(),
+    );
+}
+
 fn expectCompoundContinuation(
     source: [:0]const u8,
     kind: Ast.CompoundContinuation.Kind,
