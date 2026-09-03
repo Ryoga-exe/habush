@@ -176,6 +176,47 @@ test "generates subshell and brace group bodies with redirects" {
     try std.testing.expectEqualStrings("out", firstWordPart(hir, brace_redirect.target));
 }
 
+test "generates if branches and lowers elif to nested if" {
+    const source =
+        \\if check primary; then
+        \\  use primary
+        \\elif check secondary; then
+        \\  use secondary
+        \\elif check tertiary; then
+        \\  use tertiary
+        \\else
+        \\  use fallback
+        \\fi >result
+        \\
+    ;
+    var tree = try Ast.parse(std.testing.allocator, source);
+    defer tree.deinit(std.testing.allocator);
+
+    var hir = try AstGen.generate(std.testing.allocator, tree);
+    defer hir.deinit(std.testing.allocator);
+
+    const outer_index = firstCommand(hir);
+    try std.testing.expectEqual(Hir.Inst.Tag.if_clause, hir.instructionTag(outer_index));
+    const outer = hir.ifClause(outer_index);
+    try std.testing.expectEqual(Hir.Inst.Tag.list, hir.instructionTag(outer.condition));
+    try std.testing.expectEqual(Hir.Inst.Tag.list, hir.instructionTag(outer.then_body));
+    try std.testing.expectEqual(@as(usize, 1), outer.redirects.len);
+    try std.testing.expectEqualStrings(
+        "result",
+        firstWordPart(hir, hir.redirect(outer.redirects[0]).target),
+    );
+
+    const elif_index = outer.else_body.unwrap().?;
+    try std.testing.expectEqual(Hir.Inst.Tag.if_clause, hir.instructionTag(elif_index));
+    const elif_clause = hir.ifClause(elif_index);
+    try std.testing.expectEqual(@as(usize, 0), elif_clause.redirects.len);
+    const second_elif_index = elif_clause.else_body.unwrap().?;
+    try std.testing.expectEqual(Hir.Inst.Tag.if_clause, hir.instructionTag(second_elif_index));
+    const second_elif = hir.ifClause(second_elif_index);
+    const else_body = second_elif.else_body.unwrap().?;
+    try std.testing.expectEqual(Hir.Inst.Tag.list, hir.instructionTag(else_body));
+}
+
 test "rejects invalid and unsupported ASTs" {
     var invalid = try Ast.parse(std.testing.allocator, "echo |");
     defer invalid.deinit(std.testing.allocator);
@@ -184,7 +225,7 @@ test "rejects invalid and unsupported ASTs" {
         AstGen.generate(std.testing.allocator, invalid),
     );
 
-    var unsupported = try Ast.parse(std.testing.allocator, "if condition; then result; fi");
+    var unsupported = try Ast.parse(std.testing.allocator, "while condition; do result; done");
     defer unsupported.deinit(std.testing.allocator);
     try std.testing.expectError(
         error.UnsupportedSyntax,
@@ -196,7 +237,7 @@ test "AST generation handles every allocation failure" {
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         generateWithAllocator,
-        .{"! (A=value command 2>>log; notify) | { consume && fallback; } &"},
+        .{"if check; then (run; notify); elif retry; then again; else { fallback; }; fi >log &"},
     );
 }
 

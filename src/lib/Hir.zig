@@ -116,6 +116,17 @@ pub fn groupedCommand(hir: Hir, index: Inst.Index) Group.Value {
     };
 }
 
+pub fn ifClause(hir: Hir, index: Inst.Index) If.Value {
+    std.debug.assert(hir.instructionTag(index) == .if_clause);
+    const payload = hir.extraData(If, hir.instructionData(index).pl.payload_index);
+    return .{
+        .condition = payload.data.condition,
+        .then_body = payload.data.then_body,
+        .else_body = payload.data.else_body,
+        .redirects = hir.instructionSlice(payload.end, payload.data.redirects_len),
+    };
+}
+
 pub fn extraData(hir: Hir, comptime T: type, index: ExtraIndex) ExtraData(T) {
     const fields = std.meta.fields(T);
     var result: T = undefined;
@@ -250,6 +261,10 @@ pub const Inst = struct {
         subshell,
         brace_group,
 
+        /// `data.pl`: `If`, followed by redirect `Inst.Index` values.
+        /// An `elif` branch is another `if_clause` in `If.else_body`.
+        if_clause,
+
         /// `data.str`: the bytes represented by this word part.
         literal,
         escaped,
@@ -321,6 +336,20 @@ pub const Group = struct {
 
     pub const Value = struct {
         body: Inst.Index,
+        redirects: []const Inst.Index,
+    };
+};
+
+pub const If = struct {
+    condition: Inst.Index,
+    then_body: Inst.Index,
+    else_body: Inst.OptionalIndex,
+    redirects_len: u32,
+
+    pub const Value = struct {
+        condition: Inst.Index,
+        then_body: Inst.Index,
+        else_body: Inst.OptionalIndex,
         redirects: []const Inst.Index,
     };
 };

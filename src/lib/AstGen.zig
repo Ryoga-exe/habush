@@ -111,8 +111,72 @@ fn command(astgen: *AstGen, node: Ast.Node.Index) Error!Hir.Inst.Index {
         .pipe, .pipe_and, .and_if, .or_if => astgen.binaryCommand(node),
         .negated_pipeline => astgen.negatedPipeline(node),
         .subshell, .brace_group => astgen.groupedCommand(node),
+        .if_clause => astgen.ifClause(node),
         else => error.UnsupportedSyntax,
     };
+}
+
+fn ifClause(astgen: *AstGen, node: Ast.Node.Index) Error!Hir.Inst.Index {
+    const clause = astgen.tree.ifClause(node);
+    const condition_node = clause.condition.unwrap() orelse return error.InvalidAst;
+    const then_node = clause.then_body.unwrap() orelse return error.InvalidAst;
+    const condition = try astgen.list(condition_node);
+    const then_body = try astgen.list(then_node);
+    const else_body = try astgen.ifElseChain(clause);
+
+    const scratch_top = astgen.scratch.items.len;
+    defer astgen.scratch.items.len = scratch_top;
+    const redirects_len = try astgen.appendRedirects(
+        clause.redirects_start,
+        clause.redirects_end,
+    );
+
+    const payload_index = try astgen.addExtra(Hir.If{
+        .condition = condition,
+        .then_body = then_body,
+        .else_body = else_body,
+        .redirects_len = redirects_len,
+    });
+    try astgen.extra.appendSlice(astgen.gpa, astgen.scratch.items[scratch_top..]);
+
+    return astgen.addInstruction(.{
+        .tag = .if_clause,
+        .data = .{ .pl = .{
+            .src_start = astgen.sourceStart(node),
+            .payload_index = payload_index,
+        } },
+    });
+}
+
+fn ifElseChain(astgen: *AstGen, clause: Ast.Node.If) Error!Hir.Inst.OptionalIndex {
+    var next: Hir.Inst.OptionalIndex = if (clause.else_body.unwrap()) |else_node|
+        (try astgen.list(else_node)).toOptional()
+    else
+        .none;
+
+    var branch_index = astgen.tree.elifBranchCount(clause);
+    while (branch_index > 0) {
+        branch_index -= 1;
+        const branch = astgen.tree.elifBranch(clause, branch_index);
+        const condition_node = branch.condition.unwrap() orelse return error.InvalidAst;
+        const body_node = branch.body.unwrap() orelse return error.InvalidAst;
+        const condition = try astgen.list(condition_node);
+        const body = try astgen.list(body_node);
+        const payload_index = try astgen.addExtra(Hir.If{
+            .condition = condition,
+            .then_body = body,
+            .else_body = next,
+            .redirects_len = 0,
+        });
+        next = (try astgen.addInstruction(.{
+            .tag = .if_clause,
+            .data = .{ .pl = .{
+                .src_start = astgen.tree.tokenStart(branch.elif_token),
+                .payload_index = payload_index,
+            } },
+        })).toOptional();
+    }
+    return next;
 }
 
 fn groupedCommand(astgen: *AstGen, node: Ast.Node.Index) Error!Hir.Inst.Index {
@@ -123,8 +187,8 @@ fn groupedCommand(astgen: *AstGen, node: Ast.Node.Index) Error!Hir.Inst.Index {
     };
 
     const tag = astgen.tree.nodeTag(node);
-    const group: AstGroup = switch (tag) {
-        .subshell => blk: {
+    const group: AstGroup = blk: switch (tag) {
+        .subshell => {
             const subshell = astgen.tree.subshell(node);
             break :blk .{
                 .body = subshell.body,
@@ -132,7 +196,7 @@ fn groupedCommand(astgen: *AstGen, node: Ast.Node.Index) Error!Hir.Inst.Index {
                 .redirects_end = subshell.redirects_end,
             };
         },
-        .brace_group => blk: {
+        .brace_group => {
             const brace_group = astgen.tree.braceGroup(node);
             break :blk .{
                 .body = brace_group.body,
@@ -147,20 +211,15 @@ fn groupedCommand(astgen: *AstGen, node: Ast.Node.Index) Error!Hir.Inst.Index {
 
     const scratch_top = astgen.scratch.items.len;
     defer astgen.scratch.items.len = scratch_top;
-    const redirects = astgen.tree.extraDataSlice(.{
-        .start = group.redirects_start,
-        .end = group.redirects_end,
-    }, Ast.Node.Index);
-    for (redirects) |redirect_node| {
-        try astgen.scratch.append(astgen.gpa, @intFromEnum(try astgen.redirect(redirect_node)));
-    }
-
-    const redirect_instructions = astgen.scratch.items[scratch_top..];
+    const redirects_len = try astgen.appendRedirects(
+        group.redirects_start,
+        group.redirects_end,
+    );
     const payload_index = try astgen.addExtra(Hir.Group{
         .body = body,
-        .redirects_len = try index(u32, redirect_instructions.len),
+        .redirects_len = redirects_len,
     });
-    try astgen.extra.appendSlice(astgen.gpa, redirect_instructions);
+    try astgen.extra.appendSlice(astgen.gpa, astgen.scratch.items[scratch_top..]);
 
     return astgen.addInstruction(.{
         .tag = switch (tag) {
@@ -173,6 +232,19 @@ fn groupedCommand(astgen: *AstGen, node: Ast.Node.Index) Error!Hir.Inst.Index {
             .payload_index = payload_index,
         } },
     });
+}
+
+fn appendRedirects(
+    astgen: *AstGen,
+    start: Ast.ExtraIndex,
+    end: Ast.ExtraIndex,
+) Error!u32 {
+    const redirects = astgen.tree.extraDataSlice(.{ .start = start, .end = end }, Ast.Node.Index);
+    for (redirects) |redirect_node| {
+        if (astgen.tree.nodeTag(redirect_node) != .redirect) return error.InvalidAst;
+        try astgen.scratch.append(astgen.gpa, @intFromEnum(try astgen.redirect(redirect_node)));
+    }
+    return index(u32, redirects.len);
 }
 
 fn binaryCommand(astgen: *AstGen, node: Ast.Node.Index) Error!Hir.Inst.Index {
