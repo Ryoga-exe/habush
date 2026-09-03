@@ -73,7 +73,14 @@ const Shell = struct {
     }
 
     fn handleInput(self: *Shell, input: []const u8) !LoopAction {
-        _ = self;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+
+        const allocator = arena.allocator();
+        _ = allocator; // autofix
+
+        // tokenizer
+        // parser
 
         if (std.mem.eql(u8, input, "exit")) {
             return .exit;
@@ -83,6 +90,12 @@ const Shell = struct {
         return .@"continue";
     }
 };
+
+test {
+    _ = @import("tokenizer.zig");
+    _ = @import("Ast.zig");
+    _ = @import("Parse.zig");
+}
 
 fn ignoreSigint() void {
     const sigint_ignore: posix.Sigaction = .{

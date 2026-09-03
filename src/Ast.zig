@@ -7,6 +7,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Ast = @This();
+const Parse = @import("Parse.zig");
 const tokenizer = @import("tokenizer.zig");
 const Token = tokenizer.Token;
 
@@ -27,6 +28,7 @@ pub const TokenList = std.MultiArrayList(struct {
 pub const NodeList = std.MultiArrayList(Node);
 
 pub const TokenIndex = u32;
+pub const ParseError = Allocator.Error || error{SourceTooLarge};
 
 /// Index into `extra_data`.
 pub const ExtraIndex = enum(u32) {
@@ -48,6 +50,10 @@ pub const Error = struct {
         expected_command,
     };
 };
+
+pub fn parse(allocator: Allocator, source_bytes: [:0]const u8) ParseError!Ast {
+    return Parse.parse(allocator, source_bytes);
+}
 
 pub fn deinit(tree: *Ast, allocator: Allocator) void {
     tree.tokens.deinit(allocator);
@@ -97,6 +103,23 @@ pub fn extraDataSlice(
 ) []const T {
     comptime std.debug.assert(@sizeOf(T) == @sizeOf(u32));
     return @ptrCast(tree.extra_data[@intFromEnum(range.start)..@intFromEnum(range.end)]);
+}
+
+pub fn extraData(tree: *const Ast, index: ExtraIndex, comptime T: type) T {
+    const fields = std.meta.fields(T);
+    var result: T = undefined;
+    inline for (fields, 0..) |field, offset| {
+        @field(result, field.name) = switch (field.type) {
+            Node.Index,
+            Node.OptionalIndex,
+            Node.OptionalTokenIndex,
+            ExtraIndex,
+            => @enumFromInt(tree.extra_data[@intFromEnum(index) + offset]),
+            TokenIndex => tree.extra_data[@intFromEnum(index) + offset],
+            else => @compileError("unexpected extra_data field type: " ++ @typeName(field.type)),
+        };
+    }
+    return result;
 }
 
 pub const Node = struct {
