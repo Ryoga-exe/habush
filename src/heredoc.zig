@@ -16,6 +16,14 @@ pub const DecodedDelimiter = struct {
     }
 };
 
+/// A body owned by the input layer. The AST borrows both slices.
+pub const Collected = struct {
+    delimiter: []const u8,
+    strip_tabs: bool,
+    expand_body: bool,
+    body: []const u8,
+};
+
 pub fn decodeDelimiter(
     allocator: Allocator,
     raw: []const u8,

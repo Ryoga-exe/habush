@@ -45,6 +45,7 @@ const HereDocumentBuilder = struct {
     delimiter_end: u32,
     strip_tabs: bool,
     expand_body: bool,
+    body: ?[]const u8,
 };
 
 gpa: Allocator,
@@ -58,11 +59,20 @@ extra_data: std.ArrayList(u32) = .empty,
 here_documents: Ast.HereDocumentList = .empty,
 here_document_data: std.ArrayList(u8) = .empty,
 ready_here_document_count: u32 = 0,
+collected_here_documents: []const heredoc.Collected,
 scratch: std.ArrayList(Node.Index) = .empty,
 list_scratch: std.ArrayList(Node.ListItem) = .empty,
 elif_scratch: std.ArrayList(Node.ElifBranch) = .empty,
 
 pub fn parse(gpa: Allocator, source: [:0]const u8) Ast.ParseError!Ast {
+    return parseWithOptions(gpa, source, .{});
+}
+
+pub fn parseWithOptions(
+    gpa: Allocator,
+    source: [:0]const u8,
+    options: Ast.ParseOptions,
+) Ast.ParseError!Ast {
     if (source.len > std.math.maxInt(Ast.ByteOffset)) return error.SourceTooLarge;
 
     var tokens: Ast.TokenList = .empty;
@@ -107,6 +117,7 @@ pub fn parse(gpa: Allocator, source: [:0]const u8) Ast.ParseError!Ast {
         .tokens = token_slice,
         .errors = errors,
         .status = status,
+        .collected_here_documents = options.collected_here_documents,
     };
     errors = .empty;
     defer parser.errors.deinit(gpa);
@@ -651,6 +662,7 @@ fn parseRedirect(parser: *Parse) Ast.ParseError!Node.Index {
             .delimiter_end = value.delimiter_end,
             .strip_tabs = value.strip_tabs,
             .expand_body = value.expand_body,
+            .body = value.body,
         });
     }
     return redirect;
@@ -672,12 +684,31 @@ fn prepareHereDocument(
     const delimiter_end = std.math.cast(u32, parser.here_document_data.items.len) orelse
         return error.SourceTooLarge;
 
+    const strip_tabs = parser.tokenTag(operator) == .lt_lt_minus;
+    const expand_body = !delimiter.quoted;
+    var body: ?[]const u8 = null;
+    if (document_index < parser.collected_here_documents.len) {
+        const collected = parser.collected_here_documents[document_index];
+        if (!std.mem.eql(u8, delimiter.text, collected.delimiter) or
+            strip_tabs != collected.strip_tabs or
+            expand_body != collected.expand_body)
+        {
+            try parser.warn(.{
+                .tag = .here_document_mismatch,
+                .token = target,
+            });
+        } else {
+            body = collected.body;
+        }
+    }
+
     return .{
         .index = @enumFromInt(document_index),
         .delimiter_start = delimiter_start,
         .delimiter_end = delimiter_end,
-        .strip_tabs = parser.tokenTag(operator) == .lt_lt_minus,
-        .expand_body = !delimiter.quoted,
+        .strip_tabs = strip_tabs,
+        .expand_body = expand_body,
+        .body = body,
     };
 }
 
@@ -1068,6 +1099,57 @@ test "records multiple here-documents in lexical order" {
     try std.testing.expectEqualStrings("B", second.delimiter);
     try std.testing.expect(second.strip_tabs);
     try std.testing.expect(!second.expand_body);
+}
+
+test "attaches a collected here-document body" {
+    const collected = [_]heredoc.Collected{.{
+        .delimiter = "EOF",
+        .strip_tabs = false,
+        .expand_body = true,
+        .body = "hello\nworld\n",
+    }};
+    var tree = try Ast.parseWithOptions(std.testing.allocator, "cat <<EOF\n", .{
+        .collected_here_documents = &collected,
+    });
+    defer tree.deinit(std.testing.allocator);
+
+    const document = tree.hereDocument(@enumFromInt(0));
+    try std.testing.expectEqualStrings("hello\nworld\n", document.body.?);
+    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+}
+
+test "keeps uncollected here-documents pending after collected ones" {
+    const collected = [_]heredoc.Collected{.{
+        .delimiter = "A",
+        .strip_tabs = false,
+        .expand_body = true,
+        .body = "first\n",
+    }};
+    var tree = try Ast.parseWithOptions(std.testing.allocator, "cat <<A <<B\n", .{
+        .collected_here_documents = &collected,
+    });
+    defer tree.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 2), tree.ready_here_document_count);
+    try std.testing.expectEqualStrings("first\n", tree.hereDocument(@enumFromInt(0)).body.?);
+    try std.testing.expect(tree.hereDocument(@enumFromInt(1)).body == null);
+}
+
+test "reports a collected here-document mismatch" {
+    const collected = [_]heredoc.Collected{.{
+        .delimiter = "OTHER",
+        .strip_tabs = false,
+        .expand_body = true,
+        .body = "body\n",
+    }};
+    var tree = try Ast.parseWithOptions(std.testing.allocator, "cat <<EOF\n", .{
+        .collected_here_documents = &collected,
+    });
+    defer tree.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), tree.errors.len);
+    try std.testing.expectEqual(Ast.Error.Tag.here_document_mismatch, tree.errors[0].tag);
+    try std.testing.expect(tree.hereDocument(@enumFromInt(0)).body == null);
 }
 
 test "makes here-document ready before pipeline continuation" {

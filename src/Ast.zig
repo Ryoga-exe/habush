@@ -8,6 +8,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Ast = @This();
 const Parse = @import("Parse.zig");
+const heredoc = @import("heredoc.zig");
 const tokenizer = @import("tokenizer.zig");
 const Token = tokenizer.Token;
 
@@ -36,10 +37,15 @@ pub const HereDocumentList = std.MultiArrayList(struct {
     delimiter_end: u32,
     strip_tabs: bool,
     expand_body: bool,
+    body: ?[]const u8,
 });
 
 pub const TokenIndex = u32;
 pub const ParseError = Allocator.Error || error{SourceTooLarge};
+pub const ParseOptions = struct {
+    /// The AST borrows the bodies for its lifetime.
+    collected_here_documents: []const heredoc.Collected = &.{},
+};
 
 pub const HereDocumentIndex = enum(u32) {
     _,
@@ -65,6 +71,7 @@ pub const HereDocument = struct {
     delimiter: []const u8,
     strip_tabs: bool,
     expand_body: bool,
+    body: ?[]const u8,
 };
 
 pub const Status = union(enum) {
@@ -121,11 +128,20 @@ pub const Error = struct {
         expected_separator,
         expected_then_keyword,
         expected_fi_keyword,
+        here_document_mismatch,
     };
 };
 
 pub fn parse(allocator: Allocator, source_bytes: [:0]const u8) ParseError!Ast {
     return Parse.parse(allocator, source_bytes);
+}
+
+pub fn parseWithOptions(
+    allocator: Allocator,
+    source_bytes: [:0]const u8,
+    options: ParseOptions,
+) ParseError!Ast {
+    return Parse.parseWithOptions(allocator, source_bytes, options);
 }
 
 pub fn deinit(tree: *Ast, allocator: Allocator) void {
@@ -219,6 +235,7 @@ pub fn hereDocument(tree: *const Ast, index: HereDocumentIndex) HereDocument {
         .delimiter = tree.here_document_data[starts[item_index]..ends[item_index]],
         .strip_tabs = tree.here_documents.items(.strip_tabs)[item_index],
         .expand_body = tree.here_documents.items(.expand_body)[item_index],
+        .body = tree.here_documents.items(.body)[item_index],
     };
 }
 
