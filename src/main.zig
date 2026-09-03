@@ -1,69 +1,135 @@
 const std = @import("std");
 const Io = std.Io;
-const buffer_initial_size = 1024;
-
-const Ast = @import("ast.zig");
-const Evaluator = @import("evaluator.zig");
+const posix = std.posix;
 
 pub fn main(init: std.process.Init) !void {
-    const io = init.io;
+    const arena = init.arena.allocator();
     const gpa = init.gpa;
+    const io = init.io;
 
-    var stdin_buffer: [1024]u8 = undefined;
-    var stdin_file_reader: Io.File.Reader = .init(.stdin(), io, &stdin_buffer);
-    const stdin_reader = &stdin_file_reader.interface;
+    const args = try init.minimal.args.toSlice(arena);
+    for (args) |arg| {
+        std.log.info("arg: {s}", .{arg});
+    }
 
-    var stdout_buffer: [1024]u8 = undefined;
-    var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
-    const stdout_writer = &stdout_file_writer.interface;
+    const interactive = try Io.File.stdin().isTty(io) and try Io.File.stderr().isTty(io);
 
-    var buffer = try Io.Writer.Allocating.initCapacity(gpa, buffer_initial_size);
-    defer buffer.deinit();
-    const buffer_writer = &buffer.writer;
+    if (interactive) {
+        ignoreSigint();
+    }
 
-    var evaluator = Evaluator.init(gpa);
+    var stdin_buffer: [4096]u8 = undefined;
+    var stdin_file_reader: Io.File.Reader = .initStreaming(.stdin(), io, &stdin_buffer);
 
-    while (true) {
-        // print prompt
-        try stdout_writer.print("habush> ", .{});
-        try stdout_writer.flush();
+    var shell: Shell = .{
+        .io = io,
+        .allocator = gpa,
+        .stdin = &stdin_file_reader.interface,
+        .interactive = interactive,
+    };
 
-        // buffer.clearRetainingCapacity();
-        // if (buffer.items.len > buffer_initial_size) {
-        //     buffer.shrinkAndFree(gpa, buffer_initial_size);
-        // }
+    try shell.run();
+}
 
-        const input = input: {
-            _ = stdin_reader.streamDelimiter(buffer_writer, '\n') catch |err| switch (err) {
-                error.EndOfStream => if (buffer.written().len == 0) {
-                    // EOF
-                    try stdout_writer.print("\n", .{});
-                    try stdout_writer.flush();
-                    return;
-                },
-                else => |e| {
-                    return e;
-                },
+const Shell = struct {
+    io: Io,
+    allocator: std.mem.Allocator,
+    stdin: *Io.Reader,
+    interactive: bool,
+
+    const LoopAction = enum {
+        @"continue",
+        exit,
+    };
+
+    fn run(self: *Shell) !void {
+        while (true) {
+            if (self.interactive) {
+                try self.printPrompt();
+            }
+
+            const line = try readLineAlloc(self.stdin, self.allocator) orelse {
+                if (self.interactive) {
+                    try Io.File.stderr().writeStreamingAll(self.io, "\n");
+                }
+                break;
             };
-            break :input buffer.written();
-        };
+            defer self.allocator.free(line);
 
-        if (input.len == 0) {
-            continue;
-        }
+            const input = std.mem.trim(u8, line, &std.ascii.whitespace);
+            if (input.len == 0) {
+                continue;
+            }
 
-        var ast = try Ast.parse(gpa, input);
-        defer ast.deinit(gpa);
-
-        const status = evaluator.eval(&ast) catch |err| {
-            try stdout_writer.print("ERROR: {}\n", .{err});
-            try stdout_writer.flush();
-            return;
-        };
-
-        if (status != 0) {
-            try stdout_writer.print("Command returned {}.\n", .{status});
-            try stdout_writer.flush();
+            switch (try self.handleInput(input)) {
+                .@"continue" => continue,
+                .exit => break,
+            }
         }
     }
+
+    fn printPrompt(self: *Shell) !void {
+        try Io.File.stderr().writeStreamingAll(self.io, "habush> ");
+    }
+
+    fn handleInput(self: *Shell, input: []const u8) !LoopAction {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+
+        const allocator = arena.allocator();
+        _ = allocator; // autofix
+
+        // tokenizer
+        // parser
+
+        if (std.mem.eql(u8, input, "exit")) {
+            return .exit;
+        }
+
+        std.log.info("input: {s}", .{input});
+        return .@"continue";
+    }
+};
+
+test {
+    _ = @import("tokenizer.zig");
+    _ = @import("word.zig");
+    _ = @import("heredoc.zig");
+    _ = @import("Ast.zig");
+    _ = @import("Parse.zig");
+}
+
+fn ignoreSigint() void {
+    const sigint_ignore: posix.Sigaction = .{
+        .handler = .{ .handler = posix.SIG.IGN },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    posix.sigaction(posix.SIG.INT, &sigint_ignore, null);
+}
+
+fn readLineAlloc(reader: *Io.Reader, allocator: std.mem.Allocator) !?[]u8 {
+    var out: Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+
+    const n = try reader.streamDelimiterEnding(&out.writer, '\n');
+
+    const found_newline = reader.bufferedLen() > 0;
+    if (found_newline) {
+        // consume new line
+        reader.toss(1);
+    } else if (n == 0) {
+        // EOF
+        out.deinit();
+        return null;
+    }
+
+    const line = out.written();
+
+    // CRLF
+    if (line.len > 0 and line[line.len - 1] == '\r') {
+        out.shrinkRetainingCapacity(line.len - 1);
+    }
+
+    return try out.toOwnedSlice();
 }
