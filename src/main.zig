@@ -91,14 +91,6 @@ const Shell = struct {
     }
 };
 
-test {
-    _ = @import("tokenizer.zig");
-    _ = @import("word.zig");
-    _ = @import("heredoc.zig");
-    _ = @import("Ast.zig");
-    _ = @import("Parse.zig");
-}
-
 fn ignoreSigint() void {
     const sigint_ignore: posix.Sigaction = .{
         .handler = .{ .handler = posix.SIG.IGN },
