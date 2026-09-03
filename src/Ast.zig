@@ -9,7 +9,7 @@ const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
 const Ast = @This();
 const Parse = @import("Parse.zig");
-const debug = @import("Ast/debug.zig");
+const Dump = @import("Ast/Dump.zig");
 const heredoc = @import("heredoc.zig");
 const tokenizer = @import("tokenizer.zig");
 const word = @import("word.zig");
@@ -281,7 +281,7 @@ pub fn renderError(tree: *const Ast, parse_error: Error, writer: *Writer) Writer
 }
 
 pub fn dump(tree: *const Ast, writer: *Writer) Writer.Error!void {
-    return debug.render(tree, writer);
+    return Dump.render(tree, writer);
 }
 
 pub fn nodeTag(tree: *const Ast, index: Node.Index) Node.Tag {
