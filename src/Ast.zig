@@ -253,31 +253,31 @@ pub fn tokenSlice(tree: *const Ast, index: TokenIndex) []const u8 {
 
 pub fn renderError(tree: *const Ast, parse_error: Error, writer: *Writer) Writer.Error!void {
     const found = Token.symbol(tree.tokenTag(parse_error.token));
-    switch (parse_error.tag) {
-        .invalid_token => try writer.print("invalid token '{s}'", .{tree.tokenSlice(parse_error.token)}),
-        .unexpected_token => try writer.print("unexpected token '{s}'", .{found}),
-        .expected_token => try writer.print("expected '{s}', found '{s}'", .{
+    return switch (parse_error.tag) {
+        .invalid_token => writer.print("invalid token '{s}'", .{tree.tokenSlice(parse_error.token)}),
+        .unexpected_token => writer.print("unexpected token '{s}'", .{found}),
+        .expected_token => writer.print("expected '{s}', found '{s}'", .{
             Token.symbol(parse_error.extra.expected_tag),
             found,
         }),
-        .expected_command => try writer.print("expected command, found '{s}'", .{found}),
-        .expected_redirect_target => try writer.print(
+        .expected_command => writer.print("expected command, found '{s}'", .{found}),
+        .expected_redirect_target => writer.print(
             "expected redirection target, found '{s}'",
             .{found},
         ),
-        .expected_separator => try writer.print(
+        .expected_separator => writer.print(
             "expected ';' or newline before '{s}'",
             .{found},
         ),
-        .expected_then_keyword => try writer.print("expected 'then', found '{s}'", .{found}),
-        .expected_fi_keyword => try writer.print("expected 'fi', found '{s}'", .{found}),
-        .expected_do_keyword => try writer.print("expected 'do', found '{s}'", .{found}),
-        .expected_done_keyword => try writer.print("expected 'done', found '{s}'", .{found}),
-        .expected_name => try writer.print("expected a name, found '{s}'", .{found}),
-        .here_document_mismatch => try writer.writeAll(
+        .expected_then_keyword => writer.print("expected 'then', found '{s}'", .{found}),
+        .expected_fi_keyword => writer.print("expected 'fi', found '{s}'", .{found}),
+        .expected_do_keyword => writer.print("expected 'do', found '{s}'", .{found}),
+        .expected_done_keyword => writer.print("expected 'done', found '{s}'", .{found}),
+        .expected_name => writer.print("expected a name, found '{s}'", .{found}),
+        .here_document_mismatch => writer.writeAll(
             "collected here-document does not match its parsed delimiter",
         ),
-    }
+    };
 }
 
 pub fn dump(tree: *const Ast, writer: *Writer) Writer.Error!void {
