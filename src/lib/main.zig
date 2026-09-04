@@ -12,6 +12,7 @@ pub const Host = @import("Host.zig");
 pub const Hir = @import("Hir.zig");
 pub const SandboxPolicy = @import("SandboxPolicy.zig");
 pub const Session = @import("Session.zig");
+pub const VariableStore = @import("VariableStore.zig");
 
 test {
     std.testing.refAllDecls(@This());

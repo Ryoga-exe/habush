@@ -3,23 +3,35 @@
 const std = @import("std");
 const Expander = @This();
 const Hir = @import("Hir.zig");
+const VariableStore = @import("VariableStore.zig");
 
 allocator: std.mem.Allocator,
+context: Context,
+
+pub const Context = struct {
+    variables: ?*const VariableStore = null,
+};
 
 pub const Error = std.mem.Allocator.Error || error{
+    FieldSplittingUnsupported,
     ParameterExpansionUnsupported,
     PathnameExpansionUnsupported,
     TildeExpansionUnsupported,
 };
 
 pub fn init(allocator: std.mem.Allocator) Expander {
-    return .{ .allocator = allocator };
+    return initWithContext(allocator, .{});
+}
+
+pub fn initWithContext(allocator: std.mem.Allocator, context: Context) Expander {
+    return .{ .allocator = allocator, .context = context };
 }
 
 /// Expands one argument word to zero or more fields.
 ///
-/// Returned slices are owned by `allocator`. The initial implementation only
-/// performs quote removal for static words and always returns one field.
+/// Returned slices are owned by `allocator`. The initial implementation
+/// performs quote removal and named parameter expansion inside double quotes.
+/// Field splitting remains a separate, unsupported stage.
 pub fn expandArgument(
     expander: Expander,
     hir: Hir,
@@ -43,11 +55,17 @@ pub fn expandArgument(
             .double_quoted,
             .double_quoted_escaped,
             => try bytes.appendSlice(expander.allocator, value),
-            .parameter,
-            .braced_parameter,
+            .parameter, .braced_parameter => return error.FieldSplittingUnsupported,
             .double_quoted_parameter,
             .double_quoted_braced_parameter,
-            => return error.ParameterExpansionUnsupported,
+            => {
+                if (!VariableStore.isValidName(value))
+                    return error.ParameterExpansionUnsupported;
+                if (expander.context.variables) |variables| {
+                    if (variables.get(value)) |parameter_value|
+                        try bytes.appendSlice(expander.allocator, parameter_value);
+                }
+            },
             else => unreachable,
         }
     }

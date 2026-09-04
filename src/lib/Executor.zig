@@ -8,6 +8,7 @@ const Expander = @import("Expander.zig");
 const Hir = @import("Hir.zig");
 const Host = @import("Host.zig");
 const SandboxPolicy = @import("SandboxPolicy.zig");
+const VariableStore = @import("VariableStore.zig");
 
 gpa: std.mem.Allocator,
 host: Host,
@@ -15,6 +16,7 @@ sandbox: CommandPlan.Sandbox,
 resolver: ?CommandResolver,
 search_path: []const []const u8,
 cwd: ?[]const u8,
+variables: ?*const VariableStore,
 
 pub const Error = Host.Error || Expander.Error || CommandResolver.Error || error{
     UnsupportedInstruction,
@@ -27,6 +29,7 @@ pub const Options = struct {
     resolver: ?CommandResolver = null,
     search_path: []const []const u8 = &.{},
     cwd: ?[]const u8 = null,
+    variables: ?*const VariableStore = null,
 };
 
 pub const Result = struct {
@@ -46,6 +49,7 @@ pub fn initWithOptions(gpa: std.mem.Allocator, host: Host, options: Options) Exe
         .resolver = options.resolver,
         .search_path = options.search_path,
         .cwd = options.cwd,
+        .variables = options.variables,
     };
 }
 
@@ -85,7 +89,9 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
     var arena = std.heap.ArenaAllocator.init(executor.gpa);
     defer arena.deinit();
     const allocator = arena.allocator();
-    const expander = Expander.init(allocator);
+    const expander = Expander.initWithContext(allocator, .{
+        .variables = executor.variables,
+    });
 
     var argv: std.ArrayList([]const u8) = .empty;
     for (hir.simpleCommandParts(index)) |part| {
