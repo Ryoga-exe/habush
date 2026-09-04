@@ -3,6 +3,7 @@
 const std = @import("std");
 const CommandPlan = @import("CommandPlan.zig");
 const Executor = @This();
+const Expander = @import("Expander.zig");
 const Hir = @import("Hir.zig");
 const Host = @import("Host.zig");
 const SandboxPolicy = @import("SandboxPolicy.zig");
@@ -11,7 +12,7 @@ gpa: std.mem.Allocator,
 host: Host,
 sandbox: CommandPlan.Sandbox,
 
-pub const Error = Host.Error || error{
+pub const Error = Host.Error || Expander.Error || error{
     UnsupportedInstruction,
     CommandResolutionUnavailable,
     UnexpectedTermination,
@@ -74,11 +75,12 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
     var arena = std.heap.ArenaAllocator.init(executor.gpa);
     defer arena.deinit();
     const allocator = arena.allocator();
+    const expander = Expander.init(allocator);
 
     var argv: std.ArrayList([]const u8) = .empty;
     for (hir.simpleCommandParts(index)) |part| {
         if (hir.instructionTag(part) != .word) return error.UnsupportedInstruction;
-        try argv.append(allocator, try expandStaticWord(allocator, hir, part));
+        try argv.appendSlice(allocator, try expander.expandArgument(hir, part));
     }
     if (argv.items.len == 0) return error.UnsupportedInstruction;
     if (!CommandPlan.isExplicitPath(argv.items[0]))
@@ -102,36 +104,6 @@ fn combineSandboxCoverage(
     if (lhs == .partial or rhs == .partial) return .partial;
     if (lhs == .complete or rhs == .complete) return .complete;
     return .not_requested;
-}
-
-fn expandStaticWord(
-    allocator: std.mem.Allocator,
-    hir: Hir,
-    index: Hir.Inst.Index,
-) Error![]const u8 {
-    var bytes: std.ArrayList(u8) = .empty;
-    for (hir.wordParts(index), 0..) |part, part_index| {
-        const tag = hir.instructionTag(part);
-        const value = hir.wordPart(part);
-        switch (tag) {
-            .literal => {
-                // These require expansion rather than simple quote removal.
-                if (std.mem.indexOfAny(u8, value, "*?[") != null or
-                    (part_index == 0 and std.mem.startsWith(u8, value, "~")))
-                {
-                    return error.UnsupportedInstruction;
-                }
-                try bytes.appendSlice(allocator, value);
-            },
-            .escaped,
-            .single_quoted,
-            .double_quoted,
-            .double_quoted_escaped,
-            => try bytes.appendSlice(allocator, value),
-            else => return error.UnsupportedInstruction,
-        }
-    }
-    return bytes.toOwnedSlice(allocator);
 }
 
 fn terminationStatus(termination: Host.Termination) Error!u8 {

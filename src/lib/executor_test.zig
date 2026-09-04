@@ -65,7 +65,7 @@ test "unsupported expansion has no host side effects" {
     defer fake.deinit();
 
     try std.testing.expectError(
-        error.UnsupportedInstruction,
+        error.ParameterExpansionUnsupported,
         Executor.init(std.testing.allocator, fake.host()).execute(hir),
     );
     try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
@@ -79,7 +79,7 @@ test "pathname expansion is not executed as a literal argument" {
     defer fake.deinit();
 
     try std.testing.expectError(
-        error.UnsupportedInstruction,
+        error.PathnameExpansionUnsupported,
         Executor.init(std.testing.allocator, fake.host()).execute(hir),
     );
     try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
