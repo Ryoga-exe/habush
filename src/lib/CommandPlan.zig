@@ -1,18 +1,18 @@
 //! Fully expanded, ephemeral plan for one external command.
 
 const CommandPlan = @This();
-const Policy = @import("Security/Policy.zig");
+const SandboxPolicy = @import("SandboxPolicy.zig");
 
 /// Resolved executable path. `Host` does not perform `PATH` lookup.
 executable: []const u8,
 argv: []const []const u8,
 environment: Environment = .inherit,
 cwd: WorkingDirectory = .inherit,
-/// Path-opening actions must observe the security policy. All actions retain
+/// Path-opening actions must observe the sandbox policy. All actions retain
 /// source order because shell redirections are order-dependent.
 file_actions: []const FileAction = &.{},
 process_group: ProcessGroupAction = .inherit,
-security: Security = .inherit,
+sandbox: Sandbox = .inherit,
 
 pub const EnvironmentVariable = struct {
     name: []const u8,
@@ -90,16 +90,16 @@ pub const ProcessGroupAction = union(enum) {
     join: ProcessGroup,
 };
 
-pub const Security = union(enum) {
+pub const Sandbox = union(enum) {
     inherit,
-    restrict: Policy,
+    restrict: SandboxPolicy,
 };
 
 pub fn validate(plan: CommandPlan) error{InvalidArguments}!void {
     if (plan.executable.len == 0 or plan.argv.len == 0 or plan.argv[0].len == 0)
         return error.InvalidArguments;
     if (!isExplicitPath(plan.executable)) return error.InvalidArguments;
-    switch (plan.security) {
+    switch (plan.sandbox) {
         .inherit => {},
         .restrict => |policy| policy.validate() catch return error.InvalidArguments,
     }

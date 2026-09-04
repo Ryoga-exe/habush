@@ -2,12 +2,12 @@
 //!
 //! This is a shell-domain boundary rather than a replacement for `std.Io`.
 //! A system implementation may use `std.Io` internally, while tests and
-//! policy-enforcing hosts can provide another implementation.
+//! sandbox-enforcing hosts can provide another implementation.
 
 const std = @import("std");
 const Host = @This();
 const CommandPlan = @import("CommandPlan.zig");
-const Policy = @import("Security/Policy.zig");
+const SandboxPolicy = @import("SandboxPolicy.zig");
 
 userdata: ?*anyopaque,
 vtable: *const VTable,
@@ -24,7 +24,7 @@ pub const Error = error{
     AccessDenied,
     InvalidExecutable,
     ResourceUnavailable,
-    SecurityUnavailable,
+    SandboxUnavailable,
     Unsupported,
     Unexpected,
 };
@@ -38,7 +38,7 @@ pub const SpawnResult = struct {
     process: Process,
     /// Populated when this spawn created or joined a process group.
     process_group: ?CommandPlan.ProcessGroup = null,
-    security: Policy.Coverage,
+    sandbox_coverage: SandboxPolicy.Coverage,
 };
 
 pub const Termination = union(enum) {

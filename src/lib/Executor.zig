@@ -5,11 +5,11 @@ const CommandPlan = @import("CommandPlan.zig");
 const Executor = @This();
 const Hir = @import("Hir.zig");
 const Host = @import("Host.zig");
-const Policy = @import("Security/Policy.zig");
+const SandboxPolicy = @import("SandboxPolicy.zig");
 
 gpa: std.mem.Allocator,
 host: Host,
-security: CommandPlan.Security,
+sandbox: CommandPlan.Sandbox,
 
 pub const Error = Host.Error || error{
     UnsupportedInstruction,
@@ -18,12 +18,12 @@ pub const Error = Host.Error || error{
 };
 
 pub const Options = struct {
-    security: CommandPlan.Security = .inherit,
+    sandbox: CommandPlan.Sandbox = .inherit,
 };
 
 pub const Result = struct {
     status: u8,
-    security: Policy.Coverage,
+    sandbox_coverage: SandboxPolicy.Coverage,
 };
 
 pub fn init(gpa: std.mem.Allocator, host: Host) Executor {
@@ -34,7 +34,7 @@ pub fn initWithOptions(gpa: std.mem.Allocator, host: Host, options: Options) Exe
     return .{
         .gpa = gpa,
         .host = host,
-        .security = options.security,
+        .sandbox = options.sandbox,
     };
 }
 
@@ -42,7 +42,7 @@ pub fn initWithOptions(gpa: std.mem.Allocator, host: Host, options: Options) Exe
 pub fn execute(executor: Executor, hir: Hir) Error!Result {
     const root = hir.root() orelse return .{
         .status = 0,
-        .security = .not_requested,
+        .sandbox_coverage = .not_requested,
     };
     return executor.executeInstruction(hir, root);
 }
@@ -56,13 +56,16 @@ fn executeInstruction(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error
 }
 
 fn executeList(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
-    var result: Result = .{ .status = 0, .security = .not_requested };
+    var result: Result = .{ .status = 0, .sandbox_coverage = .not_requested };
     for (0..hir.listItemCount(index)) |item_index| {
         const item = hir.listItem(index, item_index);
         if (item.separator == .background) return error.UnsupportedInstruction;
         const command_result = try executor.executeInstruction(hir, item.command);
         result.status = command_result.status;
-        result.security = combineSecurityStatus(result.security, command_result.security);
+        result.sandbox_coverage = combineSandboxCoverage(
+            result.sandbox_coverage,
+            command_result.sandbox_coverage,
+        );
     }
     return result;
 }
@@ -84,15 +87,18 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
     const spawned = try executor.host.spawn(.{
         .executable = argv.items[0],
         .argv = argv.items,
-        .security = executor.security,
+        .sandbox = executor.sandbox,
     });
     return .{
         .status = try terminationStatus(try executor.host.wait(spawned.process)),
-        .security = spawned.security,
+        .sandbox_coverage = spawned.sandbox_coverage,
     };
 }
 
-fn combineSecurityStatus(lhs: Policy.Coverage, rhs: Policy.Coverage) Policy.Coverage {
+fn combineSandboxCoverage(
+    lhs: SandboxPolicy.Coverage,
+    rhs: SandboxPolicy.Coverage,
+) SandboxPolicy.Coverage {
     if (lhs == .partial or rhs == .partial) return .partial;
     if (lhs == .complete or rhs == .complete) return .complete;
     return .not_requested;

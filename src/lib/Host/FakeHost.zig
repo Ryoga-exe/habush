@@ -1,7 +1,7 @@
 const std = @import("std");
 const CommandPlan = @import("../CommandPlan.zig");
 const Host = @import("../Host.zig");
-const Policy = @import("../Security/Policy.zig");
+const SandboxPolicy = @import("../SandboxPolicy.zig");
 const FakeHost = @This();
 
 arena: std.heap.ArenaAllocator,
@@ -12,7 +12,7 @@ next_process_group: u32 = 1,
 termination: Host.Termination = .{ .exited = 0 },
 spawn_error: ?Host.Error = null,
 wait_error: ?Host.Error = null,
-security_coverage: ?Policy.Coverage = null,
+sandbox_coverage: ?SandboxPolicy.Coverage = null,
 
 pub fn init(gpa: std.mem.Allocator) FakeHost {
     return .{ .arena = std.heap.ArenaAllocator.init(gpa) };
@@ -53,14 +53,14 @@ fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.Error!Host.SpawnResult {
         },
         .join => |group| group,
     };
-    const security_coverage: Policy.Coverage = fake.security_coverage orelse switch (plan.security) {
+    const sandbox_coverage: SandboxPolicy.Coverage = fake.sandbox_coverage orelse switch (plan.sandbox) {
         .inherit => .not_requested,
         .restrict => .complete,
     };
     return .{
         .process = process,
         .process_group = process_group,
-        .security = security_coverage,
+        .sandbox_coverage = sandbox_coverage,
     };
 }
 
@@ -94,7 +94,7 @@ fn clonePlan(allocator: std.mem.Allocator, plan: CommandPlan) !CommandPlan {
         },
         .file_actions = actions,
         .process_group = plan.process_group,
-        .security = try cloneSecurity(allocator, plan.security),
+        .sandbox = try cloneSandbox(allocator, plan.sandbox),
     };
 }
 
@@ -117,18 +117,18 @@ fn cloneEnvironment(
     };
 }
 
-fn cloneSecurity(
+fn cloneSandbox(
     allocator: std.mem.Allocator,
-    security: CommandPlan.Security,
-) !CommandPlan.Security {
-    return switch (security) {
+    sandbox: CommandPlan.Sandbox,
+) !CommandPlan.Sandbox {
+    return switch (sandbox) {
         .inherit => .inherit,
         .restrict => |policy| .{ .restrict = .{
             .enforcement = policy.enforcement,
             .file_system = switch (policy.file_system) {
                 .unrestricted => .unrestricted,
                 .allow => |rules| allow: {
-                    const copy = try allocator.alloc(Policy.PathRule, rules.len);
+                    const copy = try allocator.alloc(SandboxPolicy.PathRule, rules.len);
                     for (rules, copy) |rule, *destination| {
                         destination.* = .{
                             .path = try allocator.dupe(u8, rule.path),
@@ -141,7 +141,7 @@ fn cloneSecurity(
             },
             .network = switch (policy.network) {
                 .unrestricted => .unrestricted,
-                .allow => |rules| .{ .allow = try allocator.dupe(Policy.NetworkRule, rules) },
+                .allow => |rules| .{ .allow = try allocator.dupe(SandboxPolicy.NetworkRule, rules) },
             },
         } },
     };

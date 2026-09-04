@@ -2,7 +2,7 @@ const std = @import("std");
 const CommandPlan = @import("CommandPlan.zig");
 const Host = @import("Host.zig");
 const FakeHost = @import("Host/FakeHost.zig");
-const Policy = @import("Security/Policy.zig");
+const SandboxPolicy = @import("SandboxPolicy.zig");
 
 test "fake host records owned spawn options and wait calls" {
     var fake = FakeHost.init(std.testing.allocator);
@@ -25,7 +25,7 @@ test "fake host records owned spawn options and wait calls" {
             .disposition = .create_or_truncate,
         } },
     };
-    const rules = [_]Policy.PathRule{
+    const rules = [_]SandboxPolicy.PathRule{
         .{ .path = &allowed_path, .access = .{ .read = true } },
     };
 
@@ -37,7 +37,7 @@ test "fake host records owned spawn options and wait calls" {
         .cwd = .{ .path = "/tmp/example" },
         .file_actions = &actions,
         .process_group = .create,
-        .security = .{ .restrict = .{
+        .sandbox = .{ .restrict = .{
             .file_system = .{ .allow = &rules },
         } },
     });
@@ -59,10 +59,13 @@ test "fake host records owned spawn options and wait calls" {
     try std.testing.expectEqualStrings("out", call.file_actions[1].open.path);
     try std.testing.expectEqualStrings(
         "/usr",
-        call.security.restrict.file_system.allow[0].path,
+        call.sandbox.restrict.file_system.allow[0].path,
     );
     try std.testing.expect(spawned.process_group != null);
-    try std.testing.expectEqual(Policy.Coverage.complete, spawned.security);
+    try std.testing.expectEqual(
+        SandboxPolicy.Coverage.complete,
+        spawned.sandbox_coverage,
+    );
 
     fake.termination = .{ .exited = 23 };
     try std.testing.expectEqualDeep(
@@ -91,10 +94,10 @@ test "host rejects an empty command before dispatch" {
     try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
 }
 
-test "host rejects an invalid portable security policy before dispatch" {
+test "host rejects an invalid portable sandbox policy before dispatch" {
     var fake = FakeHost.init(std.testing.allocator);
     defer fake.deinit();
-    const rules = [_]Policy.NetworkRule{.{
+    const rules = [_]SandboxPolicy.NetworkRule{.{
         .protocol = .tcp,
         .operation = .connect,
         .ports = .{ .first = 9000, .last = 8000 },
@@ -105,7 +108,7 @@ test "host rejects an invalid portable security policy before dispatch" {
         fake.host().spawn(.{
             .executable = "/bin/client",
             .argv = &.{"client"},
-            .security = .{ .restrict = .{
+            .sandbox = .{ .restrict = .{
                 .network = .{ .allow = &rules },
             } },
         }),
@@ -144,7 +147,7 @@ fn recordPlanWithAllocator(gpa: std.mem.Allocator) !void {
         .access = .write,
         .disposition = .create_or_truncate,
     } }};
-    const rules = [_]Policy.PathRule{
+    const rules = [_]SandboxPolicy.PathRule{
         .{ .path = "/workspace", .access = .{ .read = true, .write = true } },
     };
 
@@ -154,7 +157,7 @@ fn recordPlanWithAllocator(gpa: std.mem.Allocator) !void {
         .environment = .{ .replace = &environment },
         .cwd = .{ .path = "/workspace" },
         .file_actions = &actions,
-        .security = .{ .restrict = .{
+        .sandbox = .{ .restrict = .{
             .file_system = .{ .allow = &rules },
         } },
     });

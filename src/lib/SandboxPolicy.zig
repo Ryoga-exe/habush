@@ -1,10 +1,10 @@
-//! Platform- and mechanism-independent restrictions for an execution domain.
+//! Platform- and mechanism-independent restrictions for a sandboxed process.
 //!
 //! A policy can only reduce the authority inherited from its parent domain.
 //! A host may use one backend, combine multiple mechanisms, or reject a
 //! policy it cannot enforce. Backend-specific concepts do not belong here.
 
-const Policy = @This();
+const SandboxPolicy = @This();
 
 enforcement: Enforcement = .required,
 file_system: FileSystem = .unrestricted,
@@ -79,7 +79,7 @@ pub const NetworkOperation = enum {
     connect,
 };
 
-pub fn validate(policy: Policy) error{InvalidPolicy}!void {
+pub fn validate(policy: SandboxPolicy) error{InvalidPolicy}!void {
     switch (policy.file_system) {
         .unrestricted => {},
         .allow => |rules| for (rules) |rule| {

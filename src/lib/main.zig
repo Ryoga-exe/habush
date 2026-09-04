@@ -8,7 +8,7 @@ pub const CommandPlan = @import("CommandPlan.zig");
 pub const Executor = @import("Executor.zig");
 pub const Host = @import("Host.zig");
 pub const Hir = @import("Hir.zig");
-pub const SecurityPolicy = @import("Security/Policy.zig");
+pub const SandboxPolicy = @import("SandboxPolicy.zig");
 
 test {
     std.testing.refAllDecls(@This());

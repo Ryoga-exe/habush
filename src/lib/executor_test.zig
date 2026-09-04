@@ -3,7 +3,7 @@ const Ast = @import("Ast.zig");
 const AstGen = @import("AstGen.zig");
 const Executor = @import("Executor.zig");
 const FakeHost = @import("Host/FakeHost.zig");
-const Policy = @import("Security/Policy.zig");
+const SandboxPolicy = @import("SandboxPolicy.zig");
 
 test "executes static simple commands through the host" {
     var hir = try generate("/bin/echo 'hello world' x\\ y \"\"");
@@ -53,7 +53,7 @@ test "empty HIR succeeds without host calls" {
     const result = try Executor.init(std.testing.allocator, fake.host()).execute(hir);
 
     try std.testing.expectEqual(@as(u8, 0), result.status);
-    try std.testing.expectEqual(.not_requested, result.security);
+    try std.testing.expectEqual(.not_requested, result.sandbox_coverage);
     try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
 }
 
@@ -113,17 +113,17 @@ test "command names are not resolved by the host" {
     try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
 }
 
-test "forwards the active security policy to the host" {
+test "forwards the active sandbox policy to the host" {
     var hir = try generate("/bin/echo hello");
     defer hir.deinit(std.testing.allocator);
 
     var fake = FakeHost.init(std.testing.allocator);
     defer fake.deinit();
-    const rules = [_]Policy.PathRule{
+    const rules = [_]SandboxPolicy.PathRule{
         .{ .path = "/usr", .access = .{ .read = true } },
     };
     const executor = Executor.initWithOptions(std.testing.allocator, fake.host(), .{
-        .security = .{ .restrict = .{
+        .sandbox = .{ .restrict = .{
             .enforcement = .required,
             .file_system = .{ .allow = &rules },
         } },
@@ -131,22 +131,22 @@ test "forwards the active security policy to the host" {
 
     _ = try executor.execute(hir);
 
-    const policy = fake.spawn_calls.items[0].security.restrict;
-    try std.testing.expectEqual(Policy.Enforcement.required, policy.enforcement);
+    const policy = fake.spawn_calls.items[0].sandbox.restrict;
+    try std.testing.expectEqual(SandboxPolicy.Enforcement.required, policy.enforcement);
     try std.testing.expectEqualStrings("/usr", policy.file_system.allow[0].path);
 }
 
-test "reports partial best-effort security coverage" {
+test "reports partial best-effort sandbox coverage" {
     var hir = try generate("/bin/echo hello");
     defer hir.deinit(std.testing.allocator);
 
     var fake = FakeHost.init(std.testing.allocator);
     defer fake.deinit();
-    fake.security_coverage = .partial;
+    fake.sandbox_coverage = .partial;
 
     const result = try Executor.init(std.testing.allocator, fake.host()).execute(hir);
 
-    try std.testing.expectEqual(.partial, result.security);
+    try std.testing.expectEqual(.partial, result.sandbox_coverage);
 }
 
 fn generate(source: [:0]const u8) !@import("Hir.zig") {
