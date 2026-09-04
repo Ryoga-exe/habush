@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const CommandPlan = @import("CommandPlan.zig");
+const CommandResolver = @import("CommandResolver.zig");
 const Executor = @This();
 const Expander = @import("Expander.zig");
 const Hir = @import("Hir.zig");
@@ -11,8 +12,11 @@ const SandboxPolicy = @import("SandboxPolicy.zig");
 gpa: std.mem.Allocator,
 host: Host,
 sandbox: CommandPlan.Sandbox,
+resolver: ?CommandResolver,
+search_path: []const []const u8,
+cwd: ?[]const u8,
 
-pub const Error = Host.Error || Expander.Error || error{
+pub const Error = Host.Error || Expander.Error || CommandResolver.Error || error{
     UnsupportedInstruction,
     CommandResolutionUnavailable,
     UnexpectedTermination,
@@ -20,6 +24,9 @@ pub const Error = Host.Error || Expander.Error || error{
 
 pub const Options = struct {
     sandbox: CommandPlan.Sandbox = .inherit,
+    resolver: ?CommandResolver = null,
+    search_path: []const []const u8 = &.{},
+    cwd: ?[]const u8 = null,
 };
 
 pub const Result = struct {
@@ -36,6 +43,9 @@ pub fn initWithOptions(gpa: std.mem.Allocator, host: Host, options: Options) Exe
         .gpa = gpa,
         .host = host,
         .sandbox = options.sandbox,
+        .resolver = options.resolver,
+        .search_path = options.search_path,
+        .cwd = options.cwd,
     };
 }
 
@@ -83,12 +93,21 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
         try argv.appendSlice(allocator, try expander.expandArgument(hir, part));
     }
     if (argv.items.len == 0) return error.UnsupportedInstruction;
-    if (!CommandPlan.isExplicitPath(argv.items[0]))
+    const executable = if (CommandPlan.isExplicitPath(argv.items[0]))
+        argv.items[0]
+    else if (executor.resolver) |resolver|
+        (try resolver.resolve(allocator, .{
+            .name = argv.items[0],
+            .search_path = executor.search_path,
+            .cwd = executor.cwd,
+        })) orelse return error.CommandNotFound
+    else
         return error.CommandResolutionUnavailable;
 
     const spawned = try executor.host.spawn(.{
-        .executable = argv.items[0],
+        .executable = executable,
         .argv = argv.items,
+        .cwd = if (executor.cwd) |cwd| .{ .path = cwd } else .inherit,
         .sandbox = executor.sandbox,
     });
     return .{

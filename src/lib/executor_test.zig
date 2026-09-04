@@ -1,6 +1,7 @@
 const std = @import("std");
 const Ast = @import("Ast.zig");
 const AstGen = @import("AstGen.zig");
+const FakeResolver = @import("CommandResolver/FakeResolver.zig");
 const Executor = @import("Executor.zig");
 const FakeHost = @import("Host/FakeHost.zig");
 const SandboxPolicy = @import("SandboxPolicy.zig");
@@ -111,6 +112,53 @@ test "command names are not resolved by the host" {
         Executor.init(std.testing.allocator, fake.host()).execute(hir),
     );
     try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+}
+
+test "resolves command names from explicit session state" {
+    var hir = try generate("echo hello");
+    defer hir.deinit(std.testing.allocator);
+
+    var fake_host = FakeHost.init(std.testing.allocator);
+    defer fake_host.deinit();
+    var fake_resolver = FakeResolver.init(std.testing.allocator);
+    defer fake_resolver.deinit();
+    fake_resolver.result = "/usr/bin/echo";
+    const search_path = [_][]const u8{ "/bin", "/usr/bin" };
+    const executor = Executor.initWithOptions(std.testing.allocator, fake_host.host(), .{
+        .resolver = fake_resolver.resolver(),
+        .search_path = &search_path,
+        .cwd = "/workspace",
+    });
+
+    _ = try executor.execute(hir);
+
+    try std.testing.expectEqual(@as(usize, 1), fake_resolver.calls.items.len);
+    const request = fake_resolver.calls.items[0];
+    try std.testing.expectEqualStrings("echo", request.name);
+    try std.testing.expectEqualStrings("/bin", request.search_path[0]);
+    try std.testing.expectEqualStrings("/workspace", request.cwd.?);
+    const plan = fake_host.spawn_calls.items[0];
+    try std.testing.expectEqualStrings("/usr/bin/echo", plan.executable);
+    try std.testing.expectEqualStrings("echo", plan.argv[0]);
+    try std.testing.expectEqualStrings("/workspace", plan.cwd.path);
+}
+
+test "does not spawn when command resolution finds no executable" {
+    var hir = try generate("missing");
+    defer hir.deinit(std.testing.allocator);
+
+    var fake_host = FakeHost.init(std.testing.allocator);
+    defer fake_host.deinit();
+    var fake_resolver = FakeResolver.init(std.testing.allocator);
+    defer fake_resolver.deinit();
+
+    try std.testing.expectError(
+        error.CommandNotFound,
+        Executor.initWithOptions(std.testing.allocator, fake_host.host(), .{
+            .resolver = fake_resolver.resolver(),
+        }).execute(hir),
+    );
+    try std.testing.expectEqual(@as(usize, 0), fake_host.spawn_calls.items.len);
 }
 
 test "forwards the active sandbox policy to the host" {
