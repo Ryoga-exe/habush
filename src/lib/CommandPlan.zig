@@ -1,5 +1,6 @@
 //! Fully expanded, ephemeral plan for one external command.
 
+const std = @import("std");
 const CommandPlan = @This();
 const SandboxPolicy = @import("SandboxPolicy.zig");
 
@@ -93,6 +94,21 @@ pub const ProcessGroupAction = union(enum) {
 pub const Sandbox = union(enum) {
     inherit,
     restrict: SandboxPolicy,
+
+    pub fn clone(sandbox: Sandbox, allocator: std.mem.Allocator) !Sandbox {
+        return switch (sandbox) {
+            .inherit => .inherit,
+            .restrict => |policy| .{ .restrict = try policy.clone(allocator) },
+        };
+    }
+
+    pub fn deinit(sandbox: *Sandbox, allocator: std.mem.Allocator) void {
+        switch (sandbox.*) {
+            .inherit => {},
+            .restrict => |*policy| policy.deinit(allocator),
+        }
+        sandbox.* = undefined;
+    }
 };
 
 pub fn validate(plan: CommandPlan) error{InvalidArguments}!void {

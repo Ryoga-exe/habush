@@ -94,7 +94,7 @@ fn clonePlan(allocator: std.mem.Allocator, plan: CommandPlan) !CommandPlan {
         },
         .file_actions = actions,
         .process_group = plan.process_group,
-        .sandbox = try cloneSandbox(allocator, plan.sandbox),
+        .sandbox = try plan.sandbox.clone(allocator),
     };
 }
 
@@ -114,36 +114,6 @@ fn cloneEnvironment(
             }
             break :replace .{ .replace = copy };
         },
-    };
-}
-
-fn cloneSandbox(
-    allocator: std.mem.Allocator,
-    sandbox: CommandPlan.Sandbox,
-) !CommandPlan.Sandbox {
-    return switch (sandbox) {
-        .inherit => .inherit,
-        .restrict => |policy| .{ .restrict = .{
-            .enforcement = policy.enforcement,
-            .file_system = switch (policy.file_system) {
-                .unrestricted => .unrestricted,
-                .allow => |rules| allow: {
-                    const copy = try allocator.alloc(SandboxPolicy.PathRule, rules.len);
-                    for (rules, copy) |rule, *destination| {
-                        destination.* = .{
-                            .path = try allocator.dupe(u8, rule.path),
-                            .scope = rule.scope,
-                            .access = rule.access,
-                        };
-                    }
-                    break :allow .{ .allow = copy };
-                },
-            },
-            .network = switch (policy.network) {
-                .unrestricted => .unrestricted,
-                .allow => |rules| .{ .allow = try allocator.dupe(SandboxPolicy.NetworkRule, rules) },
-            },
-        } },
     };
 }
 

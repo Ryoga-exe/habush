@@ -1,0 +1,118 @@
+const std = @import("std");
+const Ast = @import("Ast.zig");
+const AstGen = @import("AstGen.zig");
+const CommandPlan = @import("CommandPlan.zig");
+const FakeResolver = @import("CommandResolver/FakeResolver.zig");
+const FakeHost = @import("Host/FakeHost.zig");
+const Hir = @import("Hir.zig");
+const SandboxPolicy = @import("SandboxPolicy.zig");
+const Session = @import("Session.zig");
+
+test "session owns runtime configuration and executes with it" {
+    var fake_host = FakeHost.init(std.testing.allocator);
+    defer fake_host.deinit();
+    fake_host.termination = .{ .exited = 4 };
+    var fake_resolver = FakeResolver.init(std.testing.allocator);
+    defer fake_resolver.deinit();
+    fake_resolver.result = "/usr/bin/echo";
+
+    var cwd = [_]u8{ '/', 'w', 'o', 'r', 'k' };
+    var bin = [_]u8{ '/', 'b', 'i', 'n' };
+    var allowed = [_]u8{ '/', 'w', 'o', 'r', 'k' };
+    const search_path = [_][]const u8{ &bin, "/usr/bin" };
+    const rules = [_]SandboxPolicy.PathRule{
+        .{ .path = &allowed, .access = .{ .read = true } },
+    };
+    var session = try Session.init(std.testing.allocator, fake_host.host(), .{
+        .resolver = fake_resolver.resolver(),
+        .cwd = &cwd,
+        .search_path = &search_path,
+        .sandbox = .{ .restrict = .{
+            .file_system = .{ .allow = &rules },
+        } },
+    });
+    defer session.deinit();
+
+    cwd[1] = 'x';
+    bin[1] = 'x';
+    allowed[1] = 'x';
+
+    try std.testing.expectEqualStrings("/work", session.workingDirectory().?);
+    try std.testing.expectEqualStrings("/bin", session.commandSearchPath()[0]);
+    try std.testing.expectEqualStrings(
+        "/work",
+        session.activeSandbox().restrict.file_system.allow[0].path,
+    );
+
+    var hir = try generate("echo hello");
+    defer hir.deinit(std.testing.allocator);
+    const result = try session.execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 4), result.status);
+    try std.testing.expectEqualDeep(result, session.lastResult());
+    try std.testing.expectEqualStrings("/work", fake_resolver.calls.items[0].cwd.?);
+    try std.testing.expectEqualStrings("/usr/bin/echo", fake_host.spawn_calls.items[0].executable);
+    try std.testing.expectEqualStrings("/work", fake_host.spawn_calls.items[0].cwd.path);
+}
+
+test "session replaces owned runtime configuration" {
+    var fake_host = FakeHost.init(std.testing.allocator);
+    defer fake_host.deinit();
+    var session = try Session.init(std.testing.allocator, fake_host.host(), .{});
+    defer session.deinit();
+
+    try session.setWorkingDirectory("/new");
+    try session.setCommandSearchPath(&.{ "/one", "/two" });
+    const rules = [_]SandboxPolicy.PathRule{
+        .{ .path = "/new", .access = .{ .write = true } },
+    };
+    try session.setSandbox(.{ .restrict = .{
+        .file_system = .{ .allow = &rules },
+    } });
+
+    try std.testing.expectEqualStrings("/new", session.workingDirectory().?);
+    try std.testing.expectEqual(@as(usize, 2), session.commandSearchPath().len);
+    try std.testing.expectEqualStrings(
+        "/new",
+        session.activeSandbox().restrict.file_system.allow[0].path,
+    );
+}
+
+test "session initialization handles every allocation failure" {
+    var fake_host = FakeHost.init(std.testing.allocator);
+    defer fake_host.deinit();
+    var fake_resolver = FakeResolver.init(std.testing.allocator);
+    defer fake_resolver.deinit();
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        initWithAllocator,
+        .{ fake_host.host(), fake_resolver.resolver() },
+    );
+}
+
+fn initWithAllocator(
+    gpa: std.mem.Allocator,
+    host: @import("Host.zig"),
+    resolver: @import("CommandResolver.zig"),
+) !void {
+    const path = [_][]const u8{ "/bin", "/usr/bin" };
+    const rules = [_]SandboxPolicy.PathRule{
+        .{ .path = "/workspace", .access = .{ .read = true, .write = true } },
+    };
+    var session = try Session.init(gpa, host, .{
+        .resolver = resolver,
+        .cwd = "/workspace",
+        .search_path = &path,
+        .sandbox = CommandPlan.Sandbox{ .restrict = .{
+            .file_system = .{ .allow = &rules },
+        } },
+    });
+    defer session.deinit();
+}
+
+fn generate(source: [:0]const u8) !Hir {
+    var tree = try Ast.parse(std.testing.allocator, source);
+    defer tree.deinit(std.testing.allocator);
+    return AstGen.generate(std.testing.allocator, tree);
+}

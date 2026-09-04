@@ -4,6 +4,7 @@
 //! A host may use one backend, combine multiple mechanisms, or reject a
 //! policy it cannot enforce. Backend-specific concepts do not belong here.
 
+const std = @import("std");
 const SandboxPolicy = @This();
 
 enforcement: Enforcement = .required,
@@ -92,4 +93,54 @@ pub fn validate(policy: SandboxPolicy) error{InvalidPolicy}!void {
             if (rule.ports.first > rule.ports.last) return error.InvalidPolicy;
         },
     }
+}
+
+pub fn clone(policy: SandboxPolicy, allocator: std.mem.Allocator) !SandboxPolicy {
+    var copy: SandboxPolicy = .{
+        .enforcement = policy.enforcement,
+    };
+    errdefer copy.deinit(allocator);
+
+    copy.file_system = switch (policy.file_system) {
+        .unrestricted => .unrestricted,
+        .allow => |rules| .{ .allow = try clonePathRules(allocator, rules) },
+    };
+    copy.network = switch (policy.network) {
+        .unrestricted => .unrestricted,
+        .allow => |rules| .{ .allow = try allocator.dupe(NetworkRule, rules) },
+    };
+    return copy;
+}
+
+pub fn deinit(policy: *SandboxPolicy, allocator: std.mem.Allocator) void {
+    switch (policy.file_system) {
+        .unrestricted => {},
+        .allow => |rules| {
+            for (rules) |rule| allocator.free(rule.path);
+            allocator.free(rules);
+        },
+    }
+    switch (policy.network) {
+        .unrestricted => {},
+        .allow => |rules| allocator.free(rules),
+    }
+    policy.* = undefined;
+}
+
+fn clonePathRules(
+    allocator: std.mem.Allocator,
+    rules: []const PathRule,
+) std.mem.Allocator.Error![]const PathRule {
+    const copy = try allocator.alloc(PathRule, rules.len);
+    var copied: usize = 0;
+    errdefer {
+        for (copy[0..copied]) |rule| allocator.free(rule.path);
+        allocator.free(copy);
+    }
+    for (rules, copy) |rule, *destination| {
+        destination.* = rule;
+        destination.path = try allocator.dupe(u8, rule.path);
+        copied += 1;
+    }
+    return copy;
 }
