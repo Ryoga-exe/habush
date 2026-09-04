@@ -3,22 +3,23 @@ const Ast = @import("Ast.zig");
 const AstGen = @import("AstGen.zig");
 const Executor = @import("Executor.zig");
 const FakeHost = @import("Host/FakeHost.zig");
+const Policy = @import("Security/Policy.zig");
 
 test "executes static simple commands through the host" {
-    var hir = try generate("echo 'hello world' x\\ y \"\"");
+    var hir = try generate("/bin/echo 'hello world' x\\ y \"\"");
     defer hir.deinit(std.testing.allocator);
 
     var fake = FakeHost.init(std.testing.allocator);
     defer fake.deinit();
     fake.termination = .{ .exited = 7 };
 
-    const status = try Executor.init(std.testing.allocator, fake.host()).execute(hir);
+    const result = try Executor.init(std.testing.allocator, fake.host()).execute(hir);
 
-    try std.testing.expectEqual(@as(u8, 7), status);
+    try std.testing.expectEqual(@as(u8, 7), result.status);
     try std.testing.expectEqual(@as(usize, 1), fake.spawn_calls.items.len);
     const argv = fake.spawn_calls.items[0].argv;
     try std.testing.expectEqual(@as(usize, 4), argv.len);
-    try std.testing.expectEqualStrings("echo", argv[0]);
+    try std.testing.expectEqualStrings("/bin/echo", argv[0]);
     try std.testing.expectEqualStrings("hello world", argv[1]);
     try std.testing.expectEqualStrings("x y", argv[2]);
     try std.testing.expectEqualStrings("", argv[3]);
@@ -26,20 +27,20 @@ test "executes static simple commands through the host" {
 }
 
 test "executes sequential lists and returns the last status" {
-    var hir = try generate("first; second\nthird");
+    var hir = try generate("/bin/first; /bin/second\n/bin/third");
     defer hir.deinit(std.testing.allocator);
 
     var fake = FakeHost.init(std.testing.allocator);
     defer fake.deinit();
     fake.termination = .{ .signal = 9 };
 
-    const status = try Executor.init(std.testing.allocator, fake.host()).execute(hir);
+    const result = try Executor.init(std.testing.allocator, fake.host()).execute(hir);
 
-    try std.testing.expectEqual(@as(u8, 137), status);
+    try std.testing.expectEqual(@as(u8, 137), result.status);
     try std.testing.expectEqual(@as(usize, 3), fake.spawn_calls.items.len);
-    try std.testing.expectEqualStrings("first", fake.spawn_calls.items[0].argv[0]);
-    try std.testing.expectEqualStrings("second", fake.spawn_calls.items[1].argv[0]);
-    try std.testing.expectEqualStrings("third", fake.spawn_calls.items[2].argv[0]);
+    try std.testing.expectEqualStrings("/bin/first", fake.spawn_calls.items[0].argv[0]);
+    try std.testing.expectEqualStrings("/bin/second", fake.spawn_calls.items[1].argv[0]);
+    try std.testing.expectEqualStrings("/bin/third", fake.spawn_calls.items[2].argv[0]);
 }
 
 test "empty HIR succeeds without host calls" {
@@ -49,14 +50,15 @@ test "empty HIR succeeds without host calls" {
     var fake = FakeHost.init(std.testing.allocator);
     defer fake.deinit();
 
-    const status = try Executor.init(std.testing.allocator, fake.host()).execute(hir);
+    const result = try Executor.init(std.testing.allocator, fake.host()).execute(hir);
 
-    try std.testing.expectEqual(@as(u8, 0), status);
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqual(.not_requested, result.security);
     try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
 }
 
 test "unsupported expansion has no host side effects" {
-    var hir = try generate("echo $name");
+    var hir = try generate("/bin/echo $name");
     defer hir.deinit(std.testing.allocator);
 
     var fake = FakeHost.init(std.testing.allocator);
@@ -70,7 +72,7 @@ test "unsupported expansion has no host side effects" {
 }
 
 test "pathname expansion is not executed as a literal argument" {
-    var hir = try generate("echo *.zig");
+    var hir = try generate("/bin/echo *.zig");
     defer hir.deinit(std.testing.allocator);
 
     var fake = FakeHost.init(std.testing.allocator);
@@ -84,7 +86,7 @@ test "pathname expansion is not executed as a literal argument" {
 }
 
 test "background execution has no host side effects" {
-    var hir = try generate("sleep &");
+    var hir = try generate("/bin/sleep &");
     defer hir.deinit(std.testing.allocator);
 
     var fake = FakeHost.init(std.testing.allocator);
@@ -95,6 +97,56 @@ test "background execution has no host side effects" {
         Executor.init(std.testing.allocator, fake.host()).execute(hir),
     );
     try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+}
+
+test "command names are not resolved by the host" {
+    var hir = try generate("echo hello");
+    defer hir.deinit(std.testing.allocator);
+
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+
+    try std.testing.expectError(
+        error.CommandResolutionUnavailable,
+        Executor.init(std.testing.allocator, fake.host()).execute(hir),
+    );
+    try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+}
+
+test "forwards the active security policy to the host" {
+    var hir = try generate("/bin/echo hello");
+    defer hir.deinit(std.testing.allocator);
+
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    const rules = [_]Policy.PathRule{
+        .{ .path = "/usr", .access = .{ .read = true } },
+    };
+    const executor = Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .security = .{ .restrict = .{
+            .enforcement = .required,
+            .file_system = .{ .allow = &rules },
+        } },
+    });
+
+    _ = try executor.execute(hir);
+
+    const policy = fake.spawn_calls.items[0].security.restrict;
+    try std.testing.expectEqual(Policy.Enforcement.required, policy.enforcement);
+    try std.testing.expectEqualStrings("/usr", policy.file_system.allow[0].path);
+}
+
+test "reports partial best-effort security coverage" {
+    var hir = try generate("/bin/echo hello");
+    defer hir.deinit(std.testing.allocator);
+
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    fake.security_coverage = .partial;
+
+    const result = try Executor.init(std.testing.allocator, fake.host()).execute(hir);
+
+    try std.testing.expectEqual(.partial, result.security);
 }
 
 fn generate(source: [:0]const u8) !@import("Hir.zig") {

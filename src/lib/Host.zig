@@ -6,12 +6,14 @@
 
 const std = @import("std");
 const Host = @This();
+const CommandPlan = @import("CommandPlan.zig");
+const Policy = @import("Security/Policy.zig");
 
 userdata: ?*anyopaque,
 vtable: *const VTable,
 
 pub const VTable = struct {
-    spawn: *const fn (?*anyopaque, SpawnOptions) Error!Process,
+    spawn: *const fn (?*anyopaque, CommandPlan) Error!SpawnResult,
     wait: *const fn (?*anyopaque, Process) Error!Termination,
 };
 
@@ -22,6 +24,7 @@ pub const Error = error{
     AccessDenied,
     InvalidExecutable,
     ResourceUnavailable,
+    SecurityUnavailable,
     Unsupported,
     Unexpected,
 };
@@ -31,17 +34,11 @@ pub const Process = enum(u32) {
     _,
 };
 
-pub const EnvironmentVariable = struct {
-    name: []const u8,
-    value: []const u8,
-};
-
-pub const SpawnOptions = struct {
-    argv: []const []const u8,
-    /// `null` inherits the host environment. A non-null slice replaces it.
-    environment: ?[]const EnvironmentVariable = null,
-    /// `null` inherits the host working directory.
-    cwd: ?[]const u8 = null,
+pub const SpawnResult = struct {
+    process: Process,
+    /// Populated when this spawn created or joined a process group.
+    process_group: ?CommandPlan.ProcessGroup = null,
+    security: Policy.Coverage,
 };
 
 pub const Termination = union(enum) {
@@ -51,10 +48,9 @@ pub const Termination = union(enum) {
     unknown: u32,
 };
 
-pub fn spawn(host: Host, options: SpawnOptions) Error!Process {
-    if (options.argv.len == 0 or options.argv[0].len == 0)
-        return error.InvalidArguments;
-    return host.vtable.spawn(host.userdata, options);
+pub fn spawn(host: Host, plan: CommandPlan) Error!SpawnResult {
+    plan.validate() catch return error.InvalidArguments;
+    return host.vtable.spawn(host.userdata, plan);
 }
 
 pub fn wait(host: Host, process: Process) Error!Termination {

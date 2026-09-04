@@ -98,8 +98,16 @@ pub const Security = union(enum) {
 pub fn validate(plan: CommandPlan) error{InvalidArguments}!void {
     if (plan.executable.len == 0 or plan.argv.len == 0 or plan.argv[0].len == 0)
         return error.InvalidArguments;
+    if (!isExplicitPath(plan.executable)) return error.InvalidArguments;
     switch (plan.security) {
         .inherit => {},
         .restrict => |policy| policy.validate() catch return error.InvalidArguments,
     }
+}
+
+pub fn isExplicitPath(path: []const u8) bool {
+    for (path) |byte| {
+        if (byte == '/' or byte == '\\') return true;
+    }
+    return false;
 }
