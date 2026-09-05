@@ -104,17 +104,23 @@ fn cloneEnvironment(
 ) !CommandPlan.Environment {
     return switch (environment) {
         .inherit => .inherit,
-        .replace => |variables| replace: {
-            const copy = try allocator.alloc(CommandPlan.EnvironmentVariable, variables.len);
-            for (variables, copy) |variable, *destination| {
-                destination.* = .{
-                    .name = try allocator.dupe(u8, variable.name),
-                    .value = try allocator.dupe(u8, variable.value),
-                };
-            }
-            break :replace .{ .replace = copy };
-        },
+        .overlay => |variables| .{ .overlay = try cloneEnvironmentVariables(allocator, variables) },
+        .replace => |variables| .{ .replace = try cloneEnvironmentVariables(allocator, variables) },
     };
+}
+
+fn cloneEnvironmentVariables(
+    allocator: std.mem.Allocator,
+    variables: []const CommandPlan.EnvironmentVariable,
+) ![]const CommandPlan.EnvironmentVariable {
+    const copy = try allocator.alloc(CommandPlan.EnvironmentVariable, variables.len);
+    for (variables, copy) |variable, *destination| {
+        destination.* = .{
+            .name = try allocator.dupe(u8, variable.name),
+            .value = try allocator.dupe(u8, variable.value),
+        };
+    }
+    return copy;
 }
 
 fn wait(userdata: ?*anyopaque, process: Host.Process) Host.Error!Host.Termination {

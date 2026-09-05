@@ -10,6 +10,15 @@ context: Context,
 
 pub const Context = struct {
     variables: ?*const VariableStore = null,
+    overrides: ?*const VariableStore = null,
+
+    fn variable(context: Context, name: []const u8) ?[]const u8 {
+        if (context.overrides) |overrides| {
+            if (overrides.get(name)) |value| return value;
+        }
+        if (context.variables) |variables| return variables.get(name);
+        return null;
+    }
 };
 
 pub const Error = std.mem.Allocator.Error || error{
@@ -111,10 +120,8 @@ fn appendNamedParameter(
     name: []const u8,
 ) Error!void {
     if (!VariableStore.isValidName(name)) return error.ParameterExpansionUnsupported;
-    if (expander.context.variables) |variables| {
-        if (variables.get(name)) |value|
-            try bytes.appendSlice(expander.allocator, value);
-    }
+    if (expander.context.variable(name)) |parameter_value|
+        try bytes.appendSlice(expander.allocator, parameter_value);
 }
 
 test {

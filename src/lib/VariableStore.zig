@@ -13,6 +13,20 @@ pub const Binding = struct {
 
 pub const Error = std.mem.Allocator.Error || error{InvalidName};
 
+pub const Iterator = struct {
+    variables: *const VariableStore,
+    index: usize = 0,
+
+    pub fn next(self: *Iterator) ?Binding {
+        if (self.index == self.variables.map.count()) return null;
+        defer self.index += 1;
+        return .{
+            .name = self.variables.map.keys()[self.index],
+            .value = self.variables.map.values()[self.index],
+        };
+    }
+};
+
 pub fn init(gpa: std.mem.Allocator) VariableStore {
     return .{ .gpa = gpa };
 }
@@ -28,6 +42,14 @@ pub fn deinit(variables: *VariableStore) void {
 
 pub fn get(variables: VariableStore, name: []const u8) ?[]const u8 {
     return variables.map.get(name);
+}
+
+pub fn count(variables: VariableStore) usize {
+    return variables.map.count();
+}
+
+pub fn iterator(variables: *const VariableStore) Iterator {
+    return .{ .variables = variables };
 }
 
 /// Sets a named shell variable while preserving the previous value if
@@ -99,6 +121,22 @@ test "variable store replaces and removes values" {
     try std.testing.expect(variables.unset("name"));
     try std.testing.expect(!variables.unset("name"));
     try std.testing.expect(variables.get("name") == null);
+}
+
+test "variable store iterates in insertion order" {
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+    try variables.set("first", "one");
+    try variables.set("second", "two");
+
+    var iterator_value = variables.iterator();
+    const first = iterator_value.next().?;
+    const second = iterator_value.next().?;
+    try std.testing.expectEqualStrings("first", first.name);
+    try std.testing.expectEqualStrings("one", first.value);
+    try std.testing.expectEqualStrings("second", second.name);
+    try std.testing.expectEqualStrings("two", second.value);
+    try std.testing.expect(iterator_value.next() == null);
 }
 
 test "failed replacement preserves the previous value" {

@@ -92,8 +92,10 @@ test "standalone assignment execution handles every allocation failure" {
     );
 }
 
-test "command-local assignments do not mutate session variables" {
-    var hir = try generate("name=temporary /bin/env");
+test "command-local assignments overlay the inherited environment" {
+    var hir = try generate(
+        "name=temporary next=\"$name value\" name=final /bin/echo \"$name\"",
+    );
     defer hir.deinit(std.testing.allocator);
 
     var fake = FakeHost.init(std.testing.allocator);
@@ -102,14 +104,31 @@ test "command-local assignments do not mutate session variables" {
     defer variables.deinit();
     try variables.set("name", "persistent");
 
-    try std.testing.expectError(
-        error.CommandLocalAssignmentUnsupported,
-        Executor.initWithOptions(std.testing.allocator, fake.host(), .{
-            .variables = &variables,
-        }).execute(hir),
-    );
+    _ = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .variables = &variables,
+    }).execute(hir);
+
     try std.testing.expectEqualStrings("persistent", variables.get("name").?);
-    try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+    try std.testing.expect(variables.get("next") == null);
+    try std.testing.expectEqual(@as(usize, 1), fake.spawn_calls.items.len);
+    const plan = fake.spawn_calls.items[0];
+    try std.testing.expectEqualStrings("persistent", plan.argv[1]);
+    try std.testing.expectEqual(@as(usize, 2), plan.environment.overlay.len);
+    try std.testing.expectEqualStrings("name", plan.environment.overlay[0].name);
+    try std.testing.expectEqualStrings("final", plan.environment.overlay[0].value);
+    try std.testing.expectEqualStrings("next", plan.environment.overlay[1].name);
+    try std.testing.expectEqualStrings("temporary value", plan.environment.overlay[1].value);
+}
+
+test "command-local assignment execution handles every allocation failure" {
+    var hir = try generate("first=one second=\"$first two\" /bin/true");
+    defer hir.deinit(std.testing.allocator);
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        executeCommandAssignmentsWithAllocator,
+        .{hir},
+    );
 }
 
 test "standalone assignments require mutable variable state" {
@@ -278,6 +297,19 @@ fn executeAssignmentsWithAllocator(
     var variables = VariableStore.init(gpa);
     defer variables.deinit();
     _ = try Executor.initWithOptions(gpa, host, .{
+        .variables = &variables,
+    }).execute(hir);
+}
+
+fn executeCommandAssignmentsWithAllocator(
+    gpa: std.mem.Allocator,
+    hir: @import("Hir.zig"),
+) !void {
+    var fake = FakeHost.init(gpa);
+    defer fake.deinit();
+    var variables = VariableStore.init(gpa);
+    defer variables.deinit();
+    _ = try Executor.initWithOptions(gpa, fake.host(), .{
         .variables = &variables,
     }).execute(hir);
 }

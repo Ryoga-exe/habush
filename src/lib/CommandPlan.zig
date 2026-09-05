@@ -22,6 +22,9 @@ pub const EnvironmentVariable = struct {
 
 pub const Environment = union(enum) {
     inherit,
+    /// Inherit the parent environment, replacing variables with matching names.
+    overlay: []const EnvironmentVariable,
+    /// Use exactly the listed variables without inheriting the parent environment.
     replace: []const EnvironmentVariable,
 };
 
@@ -115,6 +118,18 @@ pub fn validate(plan: CommandPlan) error{InvalidArguments}!void {
     if (plan.executable.len == 0 or plan.argv.len == 0 or plan.argv[0].len == 0)
         return error.InvalidArguments;
     if (!isExplicitPath(plan.executable)) return error.InvalidArguments;
+    switch (plan.environment) {
+        .inherit => {},
+        .overlay, .replace => |variables| for (variables) |variable| {
+            if (variable.name.len == 0 or
+                std.mem.indexOfScalar(u8, variable.name, '=') != null or
+                std.mem.indexOfScalar(u8, variable.name, 0) != null or
+                std.mem.indexOfScalar(u8, variable.value, 0) != null)
+            {
+                return error.InvalidArguments;
+            }
+        },
+    }
     switch (plan.sandbox) {
         .inherit => {},
         .restrict => |policy| policy.validate() catch return error.InvalidArguments,

@@ -19,7 +19,6 @@ cwd: ?[]const u8,
 variables: ?*VariableStore,
 
 pub const Error = Host.Error || Expander.Error || CommandResolver.Error || VariableStore.Error || error{
-    CommandLocalAssignmentUnsupported,
     UnsupportedInstruction,
     CommandResolutionUnavailable,
     UnexpectedTermination,
@@ -115,7 +114,26 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
         }
         return .{ .status = 0, .sandbox_coverage = .not_requested };
     }
-    if (has_assignments) return error.CommandLocalAssignmentUnsupported;
+
+    var command_variables = VariableStore.init(allocator);
+    defer command_variables.deinit();
+    if (has_assignments) {
+        for (parts) |part| {
+            if (hir.instructionTag(part) != .assignment) continue;
+            const assignment = hir.assignment(part);
+            const assignment_expander = Expander.initWithContext(allocator, .{
+                .variables = executor.variables,
+                .overrides = &command_variables,
+            });
+            const value = try assignment_expander.expandAssignment(hir, assignment.value);
+            try command_variables.set(assignment.name, value);
+        }
+    }
+    const environment: CommandPlan.Environment = if (has_assignments)
+        .{ .overlay = try environmentVariables(allocator, &command_variables) }
+    else
+        .inherit;
+
     const executable = if (CommandPlan.isExplicitPath(argv.items[0]))
         argv.items[0]
     else if (executor.resolver) |resolver|
@@ -130,6 +148,7 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
     const spawned = try executor.host.spawn(.{
         .executable = executable,
         .argv = argv.items,
+        .environment = environment,
         .cwd = if (executor.cwd) |cwd| .{ .path = cwd } else .inherit,
         .sandbox = executor.sandbox,
     });
@@ -137,6 +156,19 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
         .status = try terminationStatus(try executor.host.wait(spawned.process)),
         .sandbox_coverage = spawned.sandbox_coverage,
     };
+}
+
+fn environmentVariables(
+    allocator: std.mem.Allocator,
+    variables: *const VariableStore,
+) std.mem.Allocator.Error![]const CommandPlan.EnvironmentVariable {
+    const result = try allocator.alloc(CommandPlan.EnvironmentVariable, variables.count());
+    var iterator = variables.iterator();
+    var index: usize = 0;
+    while (iterator.next()) |binding| : (index += 1) {
+        result[index] = .{ .name = binding.name, .value = binding.value };
+    }
+    return result;
 }
 
 fn combineSandboxCoverage(

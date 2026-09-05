@@ -33,7 +33,7 @@ test "fake host records owned spawn options and wait calls" {
     const spawned = try host.spawn(.{
         .executable = "/bin/echo",
         .argv = &argv,
-        .environment = .{ .replace = &environment },
+        .environment = .{ .overlay = &environment },
         .cwd = .{ .path = "/tmp/example" },
         .file_actions = &actions,
         .process_group = .create,
@@ -52,8 +52,8 @@ test "fake host records owned spawn options and wait calls" {
     try std.testing.expectEqualStrings("/bin/echo", call.executable);
     try std.testing.expectEqualStrings("echo", call.argv[0]);
     try std.testing.expectEqualStrings("hello", call.argv[1]);
-    try std.testing.expectEqualStrings("FOO", call.environment.replace[0].name);
-    try std.testing.expectEqualStrings("bar", call.environment.replace[0].value);
+    try std.testing.expectEqualStrings("FOO", call.environment.overlay[0].name);
+    try std.testing.expectEqualStrings("bar", call.environment.overlay[0].value);
     try std.testing.expectEqualStrings("/tmp/example", call.cwd.path);
     try std.testing.expectEqual(CommandPlan.ProcessGroupAction.create, call.process_group);
     try std.testing.expectEqualStrings("out", call.file_actions[1].open.path);
@@ -111,6 +111,24 @@ test "host rejects an invalid portable sandbox policy before dispatch" {
             .sandbox = .{ .restrict = .{
                 .network = .{ .allow = &rules },
             } },
+        }),
+    );
+    try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+}
+
+test "host rejects invalid environment variables before dispatch" {
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    const environment = [_]CommandPlan.EnvironmentVariable{
+        .{ .name = "INVALID=NAME", .value = "value" },
+    };
+
+    try std.testing.expectError(
+        error.InvalidArguments,
+        fake.host().spawn(.{
+            .executable = "/bin/command",
+            .argv = &.{"command"},
+            .environment = .{ .overlay = &environment },
         }),
     );
     try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
