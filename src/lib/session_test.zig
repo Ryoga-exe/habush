@@ -33,7 +33,7 @@ test "session owns runtime configuration and executes with it" {
             .file_system = .{ .allow = &rules },
         } },
         .variables = &.{
-            .{ .name = &variable_name, .value = &variable_value },
+            .{ .name = &variable_name, .value = &variable_value, .exported = true },
         },
     });
     defer session.deinit();
@@ -51,6 +51,7 @@ test "session owns runtime configuration and executes with it" {
         session.activeSandbox().restrict.file_system.allow[0].path,
     );
     try std.testing.expectEqualStrings("from session", session.variable("greeting").?);
+    try std.testing.expect(session.isVariableExported("greeting"));
 
     var hir = try generate("echo \"$greeting\"");
     defer hir.deinit(std.testing.allocator);
@@ -61,6 +62,14 @@ test "session owns runtime configuration and executes with it" {
     try std.testing.expectEqualStrings("/work", fake_resolver.calls.items[0].cwd.?);
     try std.testing.expectEqualStrings("/usr/bin/echo", fake_host.spawn_calls.items[0].executable);
     try std.testing.expectEqualStrings("from session", fake_host.spawn_calls.items[0].argv[1]);
+    try std.testing.expectEqualStrings(
+        "greeting",
+        fake_host.spawn_calls.items[0].environment.replace[0].name,
+    );
+    try std.testing.expectEqualStrings(
+        "from session",
+        fake_host.spawn_calls.items[0].environment.replace[0].value,
+    );
     try std.testing.expectEqualStrings("/work", fake_host.spawn_calls.items[0].cwd.path);
 }
 
@@ -79,6 +88,7 @@ test "session replaces owned runtime configuration" {
         .file_system = .{ .allow = &rules },
     } });
     try session.setVariable("name", "value");
+    try session.setVariableExported("name", true);
 
     try std.testing.expectEqualStrings("/new", session.workingDirectory().?);
     try std.testing.expectEqual(@as(usize, 2), session.commandSearchPath().len);
@@ -87,6 +97,9 @@ test "session replaces owned runtime configuration" {
         session.activeSandbox().restrict.file_system.allow[0].path,
     );
     try std.testing.expectEqualStrings("value", session.variable("name").?);
+    try std.testing.expect(session.isVariableExported("name"));
+    try session.setVariableExported("name", false);
+    try std.testing.expect(!session.isVariableExported("name"));
     try std.testing.expect(session.unsetVariable("name"));
     try std.testing.expect(session.variable("name") == null);
 }
@@ -150,7 +163,7 @@ fn initWithAllocator(
             .file_system = .{ .allow = &rules },
         } },
         .variables = &.{
-            .{ .name = "first", .value = "one" },
+            .{ .name = "first", .value = "one", .exported = true },
             .{ .name = "second", .value = "two" },
         },
     });

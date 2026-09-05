@@ -30,6 +30,8 @@ pub const Options = struct {
     resolver: ?CommandResolver = null,
     search_path: []const []const u8 = &.{},
     cwd: ?[]const u8 = null,
+    /// Complete shell variable state. When present, exported bindings become
+    /// an exact replacement environment; `null` preserves host inheritance.
     variables: ?*VariableStore = null,
 };
 
@@ -129,10 +131,14 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
             try command_variables.set(assignment.name, value);
         }
     }
-    const environment: CommandPlan.Environment = if (has_assignments)
-        .{ .overlay = try environmentVariables(allocator, &command_variables) }
-    else
-        .inherit;
+    var process_environment = VariableStore.init(allocator);
+    defer process_environment.deinit();
+    const environment = try prepareEnvironment(
+        allocator,
+        executor.variables,
+        &command_variables,
+        &process_environment,
+    );
 
     const executable = if (CommandPlan.isExplicitPath(argv.items[0]))
         argv.items[0]
@@ -169,6 +175,31 @@ fn environmentVariables(
         result[index] = .{ .name = binding.name, .value = binding.value };
     }
     return result;
+}
+
+fn prepareEnvironment(
+    allocator: std.mem.Allocator,
+    session_variables: ?*const VariableStore,
+    command_variables: *const VariableStore,
+    process_environment: *VariableStore,
+) VariableStore.Error!CommandPlan.Environment {
+    if (session_variables == null and command_variables.count() == 0) return .inherit;
+    if (session_variables) |variables| {
+        var iterator = variables.iterator();
+        while (iterator.next()) |binding| {
+            if (binding.exported)
+                try process_environment.set(binding.name, binding.value);
+        }
+    }
+    var command_iterator = command_variables.iterator();
+    while (command_iterator.next()) |binding|
+        try process_environment.set(binding.name, binding.value);
+
+    const variables = try environmentVariables(allocator, process_environment);
+    return if (session_variables != null)
+        .{ .replace = variables }
+    else
+        .{ .overlay = variables };
 }
 
 fn combineSandboxCoverage(

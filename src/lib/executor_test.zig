@@ -103,21 +103,58 @@ test "command-local assignments overlay the inherited environment" {
     var variables = VariableStore.init(std.testing.allocator);
     defer variables.deinit();
     try variables.set("name", "persistent");
+    try variables.setExported("name", true);
 
     _ = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
         .variables = &variables,
     }).execute(hir);
 
     try std.testing.expectEqualStrings("persistent", variables.get("name").?);
+    try std.testing.expect(variables.isExported("name"));
     try std.testing.expect(variables.get("next") == null);
     try std.testing.expectEqual(@as(usize, 1), fake.spawn_calls.items.len);
     const plan = fake.spawn_calls.items[0];
     try std.testing.expectEqualStrings("persistent", plan.argv[1]);
-    try std.testing.expectEqual(@as(usize, 2), plan.environment.overlay.len);
-    try std.testing.expectEqualStrings("name", plan.environment.overlay[0].name);
-    try std.testing.expectEqualStrings("final", plan.environment.overlay[0].value);
-    try std.testing.expectEqualStrings("next", plan.environment.overlay[1].name);
-    try std.testing.expectEqualStrings("temporary value", plan.environment.overlay[1].value);
+    try std.testing.expectEqual(@as(usize, 2), plan.environment.replace.len);
+    try std.testing.expectEqualStrings("name", plan.environment.replace[0].name);
+    try std.testing.expectEqualStrings("final", plan.environment.replace[0].value);
+    try std.testing.expectEqualStrings("next", plan.environment.replace[1].name);
+    try std.testing.expectEqualStrings("temporary value", plan.environment.replace[1].value);
+}
+
+test "exports session variables through an exact environment snapshot" {
+    var hir = try generate("/bin/env");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+    try variables.set("visible", "yes");
+    try variables.setExported("visible", true);
+    try variables.set("hidden", "no");
+
+    _ = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .variables = &variables,
+    }).execute(hir);
+
+    const environment = fake.spawn_calls.items[0].environment.replace;
+    try std.testing.expectEqual(@as(usize, 1), environment.len);
+    try std.testing.expectEqualStrings("visible", environment[0].name);
+    try std.testing.expectEqualStrings("yes", environment[0].value);
+}
+
+test "command-local assignments overlay the host environment without session state" {
+    var hir = try generate("local=value /bin/true");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+
+    _ = try Executor.init(std.testing.allocator, fake.host()).execute(hir);
+
+    const environment = fake.spawn_calls.items[0].environment.overlay;
+    try std.testing.expectEqual(@as(usize, 1), environment.len);
+    try std.testing.expectEqualStrings("local", environment[0].name);
+    try std.testing.expectEqualStrings("value", environment[0].value);
 }
 
 test "command-local assignment execution handles every allocation failure" {
@@ -309,6 +346,8 @@ fn executeCommandAssignmentsWithAllocator(
     defer fake.deinit();
     var variables = VariableStore.init(gpa);
     defer variables.deinit();
+    try variables.set("inherited", "value");
+    try variables.setExported("inherited", true);
     _ = try Executor.initWithOptions(gpa, fake.host(), .{
         .variables = &variables,
     }).execute(hir);

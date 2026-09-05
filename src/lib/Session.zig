@@ -26,6 +26,8 @@ pub const Options = struct {
     cwd: ?[]const u8 = null,
     search_path: []const []const u8 = &.{},
     sandbox: CommandPlan.Sandbox = .inherit,
+    /// Complete initial shell variable state. The caller should import the
+    /// host environment here and mark those bindings exported when desired.
     variables: []const VariableStore.Binding = &.{},
 };
 
@@ -42,7 +44,10 @@ pub fn init(
 
     var variables = VariableStore.init(gpa);
     errdefer variables.deinit();
-    for (options.variables) |binding| try variables.set(binding.name, binding.value);
+    for (options.variables) |binding| {
+        try variables.set(binding.name, binding.value);
+        if (binding.exported) try variables.setExported(binding.name, true);
+    }
 
     const sandbox = try options.sandbox.clone(gpa);
 
@@ -103,6 +108,18 @@ pub fn setVariable(session: *Session, name: []const u8, value: []const u8) Varia
 
 pub fn unsetVariable(session: *Session, name: []const u8) bool {
     return session.variables.unset(name);
+}
+
+pub fn isVariableExported(session: Session, name: []const u8) bool {
+    return session.variables.isExported(name);
+}
+
+pub fn setVariableExported(
+    session: *Session,
+    name: []const u8,
+    exported: bool,
+) VariableStore.Error!void {
+    return session.variables.setExported(name, exported);
 }
 
 pub fn setWorkingDirectory(session: *Session, cwd: ?[]const u8) !void {

@@ -4,11 +4,17 @@ const std = @import("std");
 const VariableStore = @This();
 
 gpa: std.mem.Allocator,
-map: std.StringArrayHashMapUnmanaged([]u8) = .empty,
+map: std.StringArrayHashMapUnmanaged(Value) = .empty,
 
 pub const Binding = struct {
     name: []const u8,
     value: []const u8,
+    exported: bool = false,
+};
+
+const Value = struct {
+    bytes: []u8,
+    exported: bool = false,
 };
 
 pub const Error = std.mem.Allocator.Error || error{InvalidName};
@@ -22,7 +28,8 @@ pub const Iterator = struct {
         defer self.index += 1;
         return .{
             .name = self.variables.map.keys()[self.index],
-            .value = self.variables.map.values()[self.index],
+            .value = self.variables.map.values()[self.index].bytes,
+            .exported = self.variables.map.values()[self.index].exported,
         };
     }
 };
@@ -34,14 +41,20 @@ pub fn init(gpa: std.mem.Allocator) VariableStore {
 pub fn deinit(variables: *VariableStore) void {
     for (variables.map.keys(), variables.map.values()) |name, value| {
         variables.gpa.free(name);
-        variables.gpa.free(value);
+        variables.gpa.free(value.bytes);
     }
     variables.map.deinit(variables.gpa);
     variables.* = undefined;
 }
 
 pub fn get(variables: VariableStore, name: []const u8) ?[]const u8 {
-    return variables.map.get(name);
+    const value = variables.map.get(name) orelse return null;
+    return value.bytes;
+}
+
+pub fn isExported(variables: VariableStore, name: []const u8) bool {
+    const value = variables.map.get(name) orelse return false;
+    return value.exported;
 }
 
 pub fn count(variables: VariableStore) usize {
@@ -61,20 +74,34 @@ pub fn set(variables: *VariableStore, name: []const u8, value: []const u8) Error
     errdefer variables.gpa.free(value_copy);
 
     if (variables.map.getEntry(name)) |entry| {
-        variables.gpa.free(entry.value_ptr.*);
-        entry.value_ptr.* = value_copy;
+        variables.gpa.free(entry.value_ptr.bytes);
+        entry.value_ptr.bytes = value_copy;
         return;
     }
 
     const name_copy = try variables.gpa.dupe(u8, name);
     errdefer variables.gpa.free(name_copy);
-    try variables.map.putNoClobber(variables.gpa, name_copy, value_copy);
+    try variables.map.putNoClobber(variables.gpa, name_copy, .{ .bytes = value_copy });
+}
+
+/// Changes whether a variable is included in the child process environment.
+/// Exporting an unset name creates it with an empty value; clearing an unset
+/// name is a no-op.
+pub fn setExported(variables: *VariableStore, name: []const u8, exported: bool) Error!void {
+    if (!isValidName(name)) return error.InvalidName;
+    if (variables.map.getEntry(name)) |entry| {
+        entry.value_ptr.exported = exported;
+        return;
+    }
+    if (!exported) return;
+    try variables.set(name, "");
+    variables.map.getEntry(name).?.value_ptr.exported = true;
 }
 
 pub fn unset(variables: *VariableStore, name: []const u8) bool {
     const index = variables.map.getIndex(name) orelse return false;
     const owned_name = variables.map.keys()[index];
-    const owned_value = variables.map.values()[index];
+    const owned_value = variables.map.values()[index].bytes;
     variables.map.orderedRemoveAt(index);
     variables.gpa.free(owned_name);
     variables.gpa.free(owned_value);
@@ -139,6 +166,26 @@ test "variable store iterates in insertion order" {
     try std.testing.expect(iterator_value.next() == null);
 }
 
+test "variable store preserves export attributes across assignment" {
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+    try variables.set("name", "first");
+    try std.testing.expect(!variables.isExported("name"));
+
+    try variables.setExported("name", true);
+    try variables.set("name", "second");
+    try std.testing.expect(variables.isExported("name"));
+    try std.testing.expectEqualStrings("second", variables.get("name").?);
+
+    try variables.setExported("name", false);
+    try std.testing.expect(!variables.isExported("name"));
+    try variables.setExported("missing", false);
+    try std.testing.expect(variables.get("missing") == null);
+    try variables.setExported("created", true);
+    try std.testing.expectEqualStrings("", variables.get("created").?);
+    try std.testing.expect(variables.isExported("created"));
+}
+
 test "failed replacement preserves the previous value" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     var variables = VariableStore.init(failing.allocator());
@@ -174,6 +221,7 @@ fn setWithAllocator(gpa: std.mem.Allocator) !void {
     try variables.set("first", "one");
     try variables.set("second", "two");
     try variables.set("first", "replacement");
+    try variables.setExported("third", true);
 }
 
 test {
