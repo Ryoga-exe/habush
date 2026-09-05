@@ -54,6 +54,37 @@ test "expands named parameters inside double quotes" {
     try std.testing.expectEqualStrings("pre:value with spaces::post", fields[0]);
 }
 
+test "expands assignment values without field or pathname expansion" {
+    var hir = try generate("result=pre$name:${missing}:*.zig");
+    defer hir.deinit(std.testing.allocator);
+    const assignment = hir.assignment(firstCommandParts(hir)[0]);
+
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+    try variables.set("name", "value with spaces");
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const value = try Expander.initWithContext(arena.allocator(), .{
+        .variables = &variables,
+    }).expandAssignment(hir, assignment.value);
+
+    try std.testing.expectEqualStrings("prevalue with spaces::*.zig", value);
+}
+
+test "classifies unsupported assignment expansion" {
+    var hir = try generate("result=~/work");
+    defer hir.deinit(std.testing.allocator);
+    const assignment = hir.assignment(firstCommandParts(hir)[0]);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(
+        error.TildeExpansionUnsupported,
+        Expander.init(arena.allocator()).expandAssignment(hir, assignment.value),
+    );
+}
+
 test "argument expansion handles every allocation failure" {
     var hir = try generate("command pre\"mid\"'post'\\ end");
     defer hir.deinit(std.testing.allocator);

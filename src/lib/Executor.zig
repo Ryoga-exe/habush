@@ -16,12 +16,14 @@ sandbox: CommandPlan.Sandbox,
 resolver: ?CommandResolver,
 search_path: []const []const u8,
 cwd: ?[]const u8,
-variables: ?*const VariableStore,
+variables: ?*VariableStore,
 
-pub const Error = Host.Error || Expander.Error || CommandResolver.Error || error{
+pub const Error = Host.Error || Expander.Error || CommandResolver.Error || VariableStore.Error || error{
+    CommandLocalAssignmentUnsupported,
     UnsupportedInstruction,
     CommandResolutionUnavailable,
     UnexpectedTermination,
+    VariableStateUnavailable,
 };
 
 pub const Options = struct {
@@ -29,7 +31,7 @@ pub const Options = struct {
     resolver: ?CommandResolver = null,
     search_path: []const []const u8 = &.{},
     cwd: ?[]const u8 = null,
-    variables: ?*const VariableStore = null,
+    variables: ?*VariableStore = null,
 };
 
 pub const Result = struct {
@@ -94,11 +96,26 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
     });
 
     var argv: std.ArrayList([]const u8) = .empty;
-    for (hir.simpleCommandParts(index)) |part| {
-        if (hir.instructionTag(part) != .word) return error.UnsupportedInstruction;
-        try argv.appendSlice(allocator, try expander.expandArgument(hir, part));
+    const parts = hir.simpleCommandParts(index);
+    var has_assignments = false;
+    for (parts) |part| {
+        switch (hir.instructionTag(part)) {
+            .assignment => has_assignments = true,
+            .word => try argv.appendSlice(allocator, try expander.expandArgument(hir, part)),
+            else => return error.UnsupportedInstruction,
+        }
     }
-    if (argv.items.len == 0) return error.UnsupportedInstruction;
+    if (argv.items.len == 0) {
+        if (!has_assignments) return error.UnsupportedInstruction;
+        const variables = executor.variables orelse return error.VariableStateUnavailable;
+        for (parts) |part| {
+            const assignment = hir.assignment(part);
+            const value = try expander.expandAssignment(hir, assignment.value);
+            try variables.set(assignment.name, value);
+        }
+        return .{ .status = 0, .sandbox_coverage = .not_requested };
+    }
+    if (has_assignments) return error.CommandLocalAssignmentUnsupported;
     const executable = if (CommandPlan.isExplicitPath(argv.items[0]))
         argv.items[0]
     else if (executor.resolver) |resolver|

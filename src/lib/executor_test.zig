@@ -5,6 +5,7 @@ const FakeResolver = @import("CommandResolver/FakeResolver.zig");
 const Executor = @import("Executor.zig");
 const FakeHost = @import("Host/FakeHost.zig");
 const SandboxPolicy = @import("SandboxPolicy.zig");
+const VariableStore = @import("VariableStore.zig");
 
 test "executes static simple commands through the host" {
     var hir = try generate("/bin/echo 'hello world' x\\ y \"\"");
@@ -56,6 +57,72 @@ test "empty HIR succeeds without host calls" {
     try std.testing.expectEqual(@as(u8, 0), result.status);
     try std.testing.expectEqual(.not_requested, result.sandbox_coverage);
     try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+}
+
+test "persists standalone assignments in source order" {
+    var hir = try generate("first=one empty= second=\"$first two\"");
+    defer hir.deinit(std.testing.allocator);
+
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+
+    const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .variables = &variables,
+    }).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqualStrings("one", variables.get("first").?);
+    try std.testing.expectEqualStrings("", variables.get("empty").?);
+    try std.testing.expectEqualStrings("one two", variables.get("second").?);
+    try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+}
+
+test "standalone assignment execution handles every allocation failure" {
+    var hir = try generate("first=one second=\"$first two\"");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        executeAssignmentsWithAllocator,
+        .{ hir, fake.host() },
+    );
+}
+
+test "command-local assignments do not mutate session variables" {
+    var hir = try generate("name=temporary /bin/env");
+    defer hir.deinit(std.testing.allocator);
+
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+    try variables.set("name", "persistent");
+
+    try std.testing.expectError(
+        error.CommandLocalAssignmentUnsupported,
+        Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+            .variables = &variables,
+        }).execute(hir),
+    );
+    try std.testing.expectEqualStrings("persistent", variables.get("name").?);
+    try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+}
+
+test "standalone assignments require mutable variable state" {
+    var hir = try generate("name=value");
+    defer hir.deinit(std.testing.allocator);
+
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+
+    try std.testing.expectError(
+        error.VariableStateUnavailable,
+        Executor.init(std.testing.allocator, fake.host()).execute(hir),
+    );
 }
 
 test "unsupported expansion has no host side effects" {
@@ -201,4 +268,16 @@ fn generate(source: [:0]const u8) !@import("Hir.zig") {
     var tree = try Ast.parse(std.testing.allocator, source);
     defer tree.deinit(std.testing.allocator);
     return AstGen.generate(std.testing.allocator, tree);
+}
+
+fn executeAssignmentsWithAllocator(
+    gpa: std.mem.Allocator,
+    hir: @import("Hir.zig"),
+    host: @import("Host.zig"),
+) !void {
+    var variables = VariableStore.init(gpa);
+    defer variables.deinit();
+    _ = try Executor.initWithOptions(gpa, host, .{
+        .variables = &variables,
+    }).execute(hir);
 }

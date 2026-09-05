@@ -58,14 +58,7 @@ pub fn expandArgument(
             .parameter, .braced_parameter => return error.FieldSplittingUnsupported,
             .double_quoted_parameter,
             .double_quoted_braced_parameter,
-            => {
-                if (!VariableStore.isValidName(value))
-                    return error.ParameterExpansionUnsupported;
-                if (expander.context.variables) |variables| {
-                    if (variables.get(value)) |parameter_value|
-                        try bytes.appendSlice(expander.allocator, parameter_value);
-                }
-            },
+            => try expander.appendNamedParameter(&bytes, value),
             else => unreachable,
         }
     }
@@ -75,6 +68,53 @@ pub fn expandArgument(
     const fields = try expander.allocator.alloc([]const u8, 1);
     fields[0] = field;
     return fields;
+}
+
+/// Expands an assignment value without field splitting or pathname expansion.
+///
+/// The returned slice is owned by `allocator`.
+pub fn expandAssignment(
+    expander: Expander,
+    hir: Hir,
+    word: Hir.Inst.Index,
+) Error![]const u8 {
+    var bytes: std.ArrayList(u8) = .empty;
+    errdefer bytes.deinit(expander.allocator);
+    for (hir.wordParts(word), 0..) |part, part_index| {
+        const tag = hir.instructionTag(part);
+        const value = hir.wordPart(part);
+        switch (tag) {
+            .literal => {
+                if (part_index == 0 and std.mem.startsWith(u8, value, "~"))
+                    return error.TildeExpansionUnsupported;
+                try bytes.appendSlice(expander.allocator, value);
+            },
+            .escaped,
+            .single_quoted,
+            .double_quoted,
+            .double_quoted_escaped,
+            => try bytes.appendSlice(expander.allocator, value),
+            .parameter,
+            .braced_parameter,
+            .double_quoted_parameter,
+            .double_quoted_braced_parameter,
+            => try expander.appendNamedParameter(&bytes, value),
+            else => unreachable,
+        }
+    }
+    return bytes.toOwnedSlice(expander.allocator);
+}
+
+fn appendNamedParameter(
+    expander: Expander,
+    bytes: *std.ArrayList(u8),
+    name: []const u8,
+) Error!void {
+    if (!VariableStore.isValidName(name)) return error.ParameterExpansionUnsupported;
+    if (expander.context.variables) |variables| {
+        if (variables.get(name)) |value|
+            try bytes.appendSlice(expander.allocator, value);
+    }
 }
 
 test {

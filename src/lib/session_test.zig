@@ -91,6 +91,23 @@ test "session replaces owned runtime configuration" {
     try std.testing.expect(session.variable("name") == null);
 }
 
+test "session persists assignments across commands" {
+    var fake_host = FakeHost.init(std.testing.allocator);
+    defer fake_host.deinit();
+    var session = try Session.init(std.testing.allocator, fake_host.host(), .{});
+    defer session.deinit();
+
+    var hir = try generate("first=one; second=\"$first two\"");
+    defer hir.deinit(std.testing.allocator);
+    const result = try session.execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqualStrings("one", session.variable("first").?);
+    try std.testing.expectEqualStrings("one two", session.variable("second").?);
+    try std.testing.expectEqualDeep(result, session.lastResult());
+    try std.testing.expectEqual(@as(usize, 0), fake_host.spawn_calls.items.len);
+}
+
 test "session initialization handles every allocation failure" {
     var fake_host = FakeHost.init(std.testing.allocator);
     defer fake_host.deinit();
