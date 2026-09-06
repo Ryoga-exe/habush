@@ -59,6 +59,74 @@ test "empty HIR succeeds without host calls" {
     try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
 }
 
+test "executes expanded core builtin names without external lookup" {
+    var false_hir = try generate("true; false");
+    defer false_hir.deinit(std.testing.allocator);
+    var colon_hir = try generate("':' ignored");
+    defer colon_hir.deinit(std.testing.allocator);
+    var expanded_hir = try generate("\"$command\"");
+    defer expanded_hir.deinit(std.testing.allocator);
+
+    var fake_host = FakeHost.init(std.testing.allocator);
+    defer fake_host.deinit();
+    var fake_resolver = FakeResolver.init(std.testing.allocator);
+    defer fake_resolver.deinit();
+    fake_resolver.result = "/bin/external";
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+    try variables.set("command", "false");
+    const executor = Executor.initWithOptions(std.testing.allocator, fake_host.host(), .{
+        .resolver = fake_resolver.resolver(),
+        .variables = &variables,
+    });
+
+    try std.testing.expectEqual(@as(u8, 1), (try executor.execute(false_hir)).status);
+    try std.testing.expectEqual(@as(u8, 0), (try executor.execute(colon_hir)).status);
+    try std.testing.expectEqual(@as(u8, 1), (try executor.execute(expanded_hir)).status);
+    try std.testing.expectEqual(@as(usize, 0), fake_resolver.calls.items.len);
+    try std.testing.expectEqual(@as(usize, 0), fake_host.spawn_calls.items.len);
+}
+
+test "special builtin assignments persist in session state" {
+    var hir = try generate("name=temporary next=\"$name value\" :");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+    try variables.set("name", "persistent");
+    try variables.setExported("name", true);
+
+    const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .variables = &variables,
+    }).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqualStrings("temporary", variables.get("name").?);
+    try std.testing.expect(variables.isExported("name"));
+    try std.testing.expectEqualStrings("temporary value", variables.get("next").?);
+    try std.testing.expect(!variables.isExported("next"));
+    try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+}
+
+test "regular builtin assignments remain command-local" {
+    var hir = try generate("name=temporary true");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+    try variables.set("name", "persistent");
+
+    const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .variables = &variables,
+    }).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqualStrings("persistent", variables.get("name").?);
+    try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+}
+
 test "persists standalone assignments in source order" {
     var hir = try generate("first=one empty= second=\"$first two\"");
     defer hir.deinit(std.testing.allocator);

@@ -1,6 +1,7 @@
 //! Executes Habush HIR through a `Host`.
 
 const std = @import("std");
+const Builtin = @import("Builtin.zig");
 const CommandPlan = @import("CommandPlan.zig");
 const CommandResolver = @import("CommandResolver.zig");
 const Executor = @This();
@@ -131,6 +132,15 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
             try command_variables.set(assignment.name, value);
         }
     }
+    if (Builtin.lookup(argv.items[0])) |builtin| {
+        if (builtin.kind == .special and has_assignments) {
+            const variables = executor.variables orelse return error.VariableStateUnavailable;
+            try applyAssignments(variables, &command_variables);
+        }
+        const result = builtin.run(argv.items);
+        return .{ .status = result.status, .sandbox_coverage = .not_requested };
+    }
+
     var process_environment = VariableStore.init(allocator);
     defer process_environment.deinit();
     const environment = try prepareEnvironment(
@@ -162,6 +172,15 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
         .status = try terminationStatus(try executor.host.wait(spawned.process)),
         .sandbox_coverage = spawned.sandbox_coverage,
     };
+}
+
+fn applyAssignments(
+    variables: *VariableStore,
+    assignments: *const VariableStore,
+) VariableStore.Error!void {
+    var iterator = assignments.iterator();
+    while (iterator.next()) |binding|
+        try variables.set(binding.name, binding.value);
 }
 
 fn environmentVariables(

@@ -4,6 +4,7 @@ const std = @import("std");
 
 pub const Ast = @import("Ast.zig");
 pub const AstGen = @import("AstGen.zig");
+pub const Builtin = @import("Builtin.zig");
 pub const CommandPlan = @import("CommandPlan.zig");
 pub const CommandResolver = @import("CommandResolver.zig");
 pub const Executor = @import("Executor.zig");
