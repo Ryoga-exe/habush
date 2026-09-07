@@ -1,4 +1,9 @@
 //! Executes Habush HIR through a `Host`.
+//!
+//! The current runtime foundation executes empty units, foreground sequential
+//! lists, standalone assignments, builtins, and external simple commands.
+//! Redirections, background execution, pipelines, compound commands, and
+//! control flow remain explicit `UnsupportedInstruction` boundaries.
 
 const std = @import("std");
 const Builtin = @import("Builtin.zig");
@@ -22,6 +27,9 @@ variables: ?*VariableStore,
 runtime_state: ?*runtime.State,
 io: runtime.Io,
 
+/// Failures that prevent the runtime from producing a shell-visible `Result`.
+/// Expected command failures are reported through `Result.status` and, when
+/// appropriate, a diagnostic written to `Io.stderr`.
 pub const Error = Builtin.Error || Host.Error || Expander.Error || CommandResolver.Error || VariableStore.Error || error{
     UnsupportedInstruction,
     CommandResolutionUnavailable,
@@ -40,6 +48,7 @@ pub const Options = struct {
     io: runtime.Io = .{},
 };
 
+/// The shell-visible outcome of a completed HIR unit.
 pub const Result = struct {
     status: u8,
     sandbox_coverage: SandboxPolicy.Coverage,

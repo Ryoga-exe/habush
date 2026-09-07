@@ -5,6 +5,7 @@ const CommandResolver = @import("CommandResolver.zig");
 const FakeResolver = @import("CommandResolver/FakeResolver.zig");
 const Executor = @import("Executor.zig");
 const FakeHost = @import("Host/FakeHost.zig");
+const Hir = @import("Hir.zig");
 const SandboxPolicy = @import("SandboxPolicy.zig");
 const VariableStore = @import("VariableStore.zig");
 
@@ -280,18 +281,58 @@ test "pathname expansion is not executed as a literal argument" {
     try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
 }
 
-test "background execution has no host side effects" {
-    var hir = try generate("/bin/sleep &");
-    defer hir.deinit(std.testing.allocator);
+test "unsupported execution forms fail before the current command has side effects" {
+    const Case = struct {
+        source: [:0]const u8,
+        command_tag: Hir.Inst.Tag,
+    };
+    const cases = [_]Case{
+        .{ .source = "left | right", .command_tag = .pipe },
+        .{ .source = "left |& right", .command_tag = .pipe_and },
+        .{ .source = "! left", .command_tag = .negated_pipeline },
+        .{ .source = "left && right", .command_tag = .and_if },
+        .{ .source = "left || right", .command_tag = .or_if },
+        .{ .source = "(left)", .command_tag = .subshell },
+        .{ .source = "{ left; }", .command_tag = .brace_group },
+        .{ .source = "if true; then left; fi", .command_tag = .if_clause },
+        .{ .source = "while true; do left; done", .command_tag = .while_clause },
+        .{ .source = "until true; do left; done", .command_tag = .until_clause },
+        .{ .source = "for item in one; do left; done", .command_tag = .for_clause },
+        .{ .source = "build() { left; }", .command_tag = .function_definition },
+        .{ .source = "persisted=changed >out", .command_tag = .simple_command },
+        .{ .source = "left &", .command_tag = .simple_command },
+    };
 
-    var fake = FakeHost.init(std.testing.allocator);
-    defer fake.deinit();
+    for (cases) |case| {
+        var hir = try generate(case.source);
+        defer hir.deinit(std.testing.allocator);
+        const root = hir.root().?;
+        try std.testing.expectEqual(
+            case.command_tag,
+            hir.instructionTag(hir.listItem(root, 0).command),
+        );
 
-    try std.testing.expectError(
-        error.UnsupportedInstruction,
-        Executor.init(std.testing.allocator, fake.host()).execute(hir),
-    );
-    try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+        var fake_host = FakeHost.init(std.testing.allocator);
+        defer fake_host.deinit();
+        var fake_resolver = FakeResolver.init(std.testing.allocator);
+        defer fake_resolver.deinit();
+        fake_resolver.result = "/bin/left";
+        var variables = VariableStore.init(std.testing.allocator);
+        defer variables.deinit();
+        try variables.set("persisted", "original");
+
+        try std.testing.expectError(
+            error.UnsupportedInstruction,
+            Executor.initWithOptions(std.testing.allocator, fake_host.host(), .{
+                .resolver = fake_resolver.resolver(),
+                .variables = &variables,
+            }).execute(hir),
+        );
+        try std.testing.expectEqualStrings("original", variables.get("persisted").?);
+        try std.testing.expectEqual(@as(usize, 0), fake_resolver.calls.items.len);
+        try std.testing.expectEqual(@as(usize, 0), fake_host.spawn_calls.items.len);
+        try std.testing.expectEqual(@as(usize, 0), fake_host.wait_calls.items.len);
+    }
 }
 
 test "command names are not resolved by the host" {
