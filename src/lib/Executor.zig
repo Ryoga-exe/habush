@@ -158,7 +158,11 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
             const mutable_variables = variables orelse return error.VariableStateUnavailable;
             try applyAssignments(mutable_variables, &command_variables);
         }
-        const result = try builtin.run(.{ .runtime_state = executor.runtime_state }, argv.items);
+        const result = try builtin.run(.{
+            .host = executor.host,
+            .runtime_state = executor.runtime_state,
+            .variable_overrides = &command_variables,
+        }, argv.items);
         return .{ .status = result.status, .sandbox_coverage = .not_requested };
     }
 

@@ -148,6 +148,35 @@ test "session executes export and unset builtins" {
     try std.testing.expectEqual(@as(usize, 0), fake_host.spawn_calls.items.len);
 }
 
+test "cd changes resolution and spawn directories for later commands" {
+    var fake_host = FakeHost.init(std.testing.allocator);
+    defer fake_host.deinit();
+    fake_host.working_directory_result = "/workspace/project";
+    var fake_resolver = FakeResolver.init(std.testing.allocator);
+    defer fake_resolver.deinit();
+    fake_resolver.result = "/bin/echo";
+    var session = try Session.init(std.testing.allocator, fake_host.host(), .{
+        .resolver = fake_resolver.resolver(),
+        .cwd = "/workspace",
+    });
+    defer session.deinit();
+
+    var hir = try generate("cd project; echo done");
+    defer hir.deinit(std.testing.allocator);
+    const result = try session.execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqualStrings("/workspace/project", session.workingDirectory().?);
+    try std.testing.expectEqualStrings(
+        "/workspace/project",
+        fake_resolver.calls.items[0].cwd.?,
+    );
+    try std.testing.expectEqualStrings(
+        "/workspace/project",
+        fake_host.spawn_calls.items[0].cwd.path,
+    );
+}
+
 test "session initialization handles every allocation failure" {
     var fake_host = FakeHost.init(std.testing.allocator);
     defer fake_host.deinit();

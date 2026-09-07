@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const Builtin = @This();
+const Host = @import("Host.zig");
 const RuntimeState = @import("RuntimeState.zig");
 const VariableStore = @import("VariableStore.zig");
 
@@ -12,6 +13,7 @@ pub const Tag = enum {
     @":",
     true,
     false,
+    cd,
     @"export",
     unset,
 };
@@ -21,15 +23,21 @@ pub const Result = struct {
 };
 
 pub const Context = struct {
+    host: ?Host = null,
     runtime_state: ?*RuntimeState = null,
+    variable_overrides: ?*const VariableStore = null,
 };
 
-pub const Error = std.mem.Allocator.Error || error{RuntimeStateUnavailable};
+pub const Error = std.mem.Allocator.Error || error{
+    HostUnavailable,
+    RuntimeStateUnavailable,
+};
 
 const definitions = std.StaticStringMap(Builtin).initComptime(.{
     .{ ":", Builtin{ .tag = .@":", .special = true } },
     .{ "true", Builtin{ .tag = .true } },
     .{ "false", Builtin{ .tag = .false } },
+    .{ "cd", Builtin{ .tag = .cd } },
     .{ "export", Builtin{ .tag = .@"export", .special = true } },
     .{ "unset", Builtin{ .tag = .unset, .special = true } },
 });
@@ -43,9 +51,45 @@ pub fn run(builtin: Builtin, context: Context, argv: []const []const u8) Error!R
     return switch (builtin.tag) {
         .@":", .true => .{ .status = 0 },
         .false => .{ .status = 1 },
+        .cd => runCd(context, argv),
         .@"export" => runExport(context, argv),
         .unset => runUnset(context, argv),
     };
+}
+
+fn runCd(context: Context, argv: []const []const u8) Error!Result {
+    const state = context.runtime_state orelse return error.RuntimeStateUnavailable;
+    const host = context.host orelse return error.HostUnavailable;
+    var operands = argv[1..];
+    if (operands.len != 0 and std.mem.eql(u8, operands[0], "--")) {
+        operands = operands[1..];
+    } else if (operands.len != 0 and operands[0].len != 0 and operands[0][0] == '-') {
+        // TODO: Support `cd -` after builtin output and OLDPWD handling exist.
+        return .{ .status = 2 };
+    }
+    if (operands.len > 1) return .{ .status = 2 };
+
+    const path = if (operands.len == 1)
+        operands[0]
+    else
+        variable(context, "HOME") orelse return .{ .status = 1 };
+    const resolved = host.resolveWorkingDirectory(state.allocator(), .{
+        .current = state.workingDirectory(),
+        .path = path,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .{ .status = 1 },
+    };
+    defer state.allocator().free(resolved);
+    try state.setWorkingDirectory(resolved);
+    return .{ .status = 0 };
+}
+
+fn variable(context: Context, name: []const u8) ?[]const u8 {
+    if (context.variable_overrides) |overrides|
+        if (overrides.get(name)) |value| return value;
+    if (context.runtime_state) |state| return state.variable(name);
+    return null;
 }
 
 fn runExport(context: Context, argv: []const []const u8) Error!Result {
@@ -106,6 +150,8 @@ test "looks up core builtins by command name" {
     try std.testing.expect(lookup(":").?.special);
     try std.testing.expectEqual(Tag.true, lookup("true").?.tag);
     try std.testing.expect(!lookup("false").?.special);
+    try std.testing.expectEqual(Tag.cd, lookup("cd").?.tag);
+    try std.testing.expect(!lookup("cd").?.special);
     try std.testing.expectEqual(Tag.@"export", lookup("export").?.tag);
     try std.testing.expect(lookup("export").?.special);
     try std.testing.expect(lookup("unset").?.special);
@@ -157,6 +203,99 @@ test "stateful builtins report invalid operands as command status" {
         error.RuntimeStateUnavailable,
         lookup("export").?.run(.{}, &.{ "export", "NAME" }),
     );
+}
+
+test "cd resolves and persists the working directory" {
+    const FakeHost = @import("Host/FakeHost.zig");
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    fake.working_directory_result = "/workspace/project";
+    var state = try RuntimeState.init(std.testing.allocator, .{ .cwd = "/workspace" });
+    defer state.deinit();
+
+    const result = try lookup("cd").?.run(.{
+        .host = fake.host(),
+        .runtime_state = &state,
+    }, &.{ "cd", "project" });
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqualStrings("/workspace/project", state.workingDirectory().?);
+    const request = fake.resolve_working_directory_calls.items[0];
+    try std.testing.expectEqualStrings("/workspace", request.current.?);
+    try std.testing.expectEqualStrings("project", request.path);
+}
+
+test "cd uses command-local HOME without persisting it" {
+    const FakeHost = @import("Host/FakeHost.zig");
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    fake.working_directory_result = "/temporary";
+    var state = try RuntimeState.init(std.testing.allocator, .{
+        .variables = &.{.{ .name = "HOME", .value = "/home/user" }},
+    });
+    defer state.deinit();
+    var overrides = VariableStore.init(std.testing.allocator);
+    defer overrides.deinit();
+    try overrides.set("HOME", "/temporary");
+
+    const result = try lookup("cd").?.run(.{
+        .host = fake.host(),
+        .runtime_state = &state,
+        .variable_overrides = &overrides,
+    }, &.{"cd"});
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqualStrings("/temporary", state.workingDirectory().?);
+    try std.testing.expectEqualStrings("/home/user", state.variable("HOME").?);
+    try std.testing.expectEqualStrings(
+        "/temporary",
+        fake.resolve_working_directory_calls.items[0].path,
+    );
+}
+
+test "cd reports usage and host failures as command status" {
+    const FakeHost = @import("Host/FakeHost.zig");
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    fake.resolve_working_directory_error = error.AccessDenied;
+    var state = try RuntimeState.init(std.testing.allocator, .{});
+    defer state.deinit();
+    const context: Context = .{ .host = fake.host(), .runtime_state = &state };
+
+    try std.testing.expectEqual(
+        @as(u8, 2),
+        (try lookup("cd").?.run(context, &.{ "cd", "one", "two" })).status,
+    );
+    try std.testing.expectEqual(
+        @as(u8, 1),
+        (try lookup("cd").?.run(context, &.{ "cd", "/denied" })).status,
+    );
+    try std.testing.expectEqual(
+        @as(u8, 1),
+        (try lookup("cd").?.run(context, &.{"cd"})).status,
+    );
+}
+
+test "cd execution handles every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        runCdWithAllocator,
+        .{},
+    );
+}
+
+fn runCdWithAllocator(gpa: std.mem.Allocator) !void {
+    const FakeHost = @import("Host/FakeHost.zig");
+    var fake = FakeHost.init(gpa);
+    defer fake.deinit();
+    fake.working_directory_result = "/workspace/project";
+    var state = try RuntimeState.init(gpa, .{ .cwd = "/workspace" });
+    defer state.deinit();
+
+    _ = try lookup("cd").?.run(.{
+        .host = fake.host(),
+        .runtime_state = &state,
+    }, &.{ "cd", "project" });
 }
 
 test {
