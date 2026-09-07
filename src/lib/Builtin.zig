@@ -3,6 +3,7 @@
 const std = @import("std");
 const Builtin = @This();
 const Host = @import("Host.zig");
+const RuntimeDiagnostic = @import("RuntimeDiagnostic.zig");
 const RuntimeState = @import("RuntimeState.zig");
 const VariableStore = @import("VariableStore.zig");
 
@@ -78,29 +79,27 @@ fn runCd(context: Context, argv: []const []const u8) Error!Result {
     } else if (operands.len != 0 and std.mem.eql(u8, operands[0], "-")) {
         write_directory = true;
     } else if (operands.len != 0 and operands[0].len != 0 and operands[0][0] == '-') {
-        return commandFailureWithOperand(context, argv[0], 2, "unsupported option", operands[0]);
+        return commandFailure(context, argv[0], .{ .unsupported_option = operands[0] });
     }
-    if (operands.len > 1) return commandFailure(context, argv[0], 2, "too many arguments");
+    if (operands.len > 1) return commandFailure(context, argv[0], .too_many_arguments);
 
     const path = if (write_directory)
         variable(context, "OLDPWD") orelse
-            return commandFailure(context, argv[0], 1, "OLDPWD not set")
+            return commandFailure(context, argv[0], .{ .variable_not_set = "OLDPWD" })
     else if (operands.len == 1)
         operands[0]
     else
         variable(context, "HOME") orelse
-            return commandFailure(context, argv[0], 1, "HOME not set");
+            return commandFailure(context, argv[0], .{ .variable_not_set = "HOME" });
     const resolved = host.resolveWorkingDirectory(state.allocator(), .{
         .current = state.workingDirectory(),
         .path = path,
     }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return commandFailureWithOperand(
+        else => return commandFailure(
             context,
             argv[0],
-            1,
-            "cannot change directory",
-            path,
+            .{ .cannot_change_directory = path },
         ),
     };
     defer state.allocator().free(resolved);
@@ -126,15 +125,15 @@ fn runPwd(context: Context, argv: []const []const u8) Error!Result {
     var operands = argv[1..];
     if (operands.len != 0 and std.mem.eql(u8, operands[0], "--")) operands = operands[1..];
     if (operands.len != 0) {
-        const message = if (operands[0].len != 0 and operands[0][0] == '-')
-            "unsupported option"
+        const kind: RuntimeDiagnostic.Kind = if (operands[0].len != 0 and operands[0][0] == '-')
+            .{ .unsupported_option = operands[0] }
         else
-            "unexpected argument";
-        return commandFailureWithOperand(context, argv[0], 2, message, operands[0]);
+            .{ .unexpected_argument = operands[0] };
+        return commandFailure(context, argv[0], kind);
     }
 
     const cwd = state.workingDirectory() orelse
-        return commandFailure(context, argv[0], 1, "working directory unavailable");
+        return commandFailure(context, argv[0], .working_directory_unavailable);
     if (context.io.stdout) |stdout| {
         try stdout.writeAll(cwd);
         try stdout.writeByte('\n');
@@ -150,15 +149,21 @@ fn runExport(context: Context, argv: []const []const u8) Error!Result {
     if (operands.len == 0) try writeExportedVariables(context.io.stdout, state.variableStore());
     for (operands) |operand| {
         if (operand.len != 0 and operand[0] == '-') {
-            status = @max(status, 2);
-            try writeDiagnosticWithOperand(context.io.stderr, argv[0], "unsupported option", operand);
+            status = @max(status, try reportCommandDiagnostic(
+                context,
+                argv[0],
+                .{ .unsupported_option = operand },
+            ));
             continue;
         }
         const equals = std.mem.indexOfScalar(u8, operand, '=');
         const name = if (equals) |index| operand[0..index] else operand;
         if (!VariableStore.isValidName(name)) {
-            status = @max(status, 1);
-            try writeDiagnosticWithOperand(context.io.stderr, argv[0], "invalid name", name);
+            status = @max(status, try reportCommandDiagnostic(
+                context,
+                argv[0],
+                .{ .invalid_name = name },
+            ));
             continue;
         }
         if (equals) |index|
@@ -204,11 +209,17 @@ fn runUnset(context: Context, argv: []const []const u8) Error!Result {
     for (operands) |name| {
         if (!VariableStore.isValidName(name)) {
             if (name.len != 0 and name[0] == '-') {
-                status = @max(status, 2);
-                try writeDiagnosticWithOperand(context.io.stderr, argv[0], "unsupported option", name);
+                status = @max(status, try reportCommandDiagnostic(
+                    context,
+                    argv[0],
+                    .{ .unsupported_option = name },
+                ));
             } else {
-                status = @max(status, 1);
-                try writeDiagnosticWithOperand(context.io.stderr, argv[0], "invalid name", name);
+                status = @max(status, try reportCommandDiagnostic(
+                    context,
+                    argv[0],
+                    .{ .invalid_name = name },
+                ));
             }
             continue;
         }
@@ -234,49 +245,25 @@ fn setVariableExported(state: *RuntimeState, name: []const u8) Error!void {
 fn commandFailure(
     context: Context,
     command: []const u8,
-    status: u8,
-    message: []const u8,
+    kind: RuntimeDiagnostic.Kind,
 ) Error!Result {
-    try writeDiagnostic(context.io.stderr, command, message);
-    return .{ .status = status };
+    return .{ .status = try reportCommandDiagnostic(context, command, kind) };
 }
 
-fn commandFailureWithOperand(
+fn reportCommandDiagnostic(
     context: Context,
     command: []const u8,
-    status: u8,
-    message: []const u8,
-    operand: []const u8,
-) Error!Result {
-    try writeDiagnosticWithOperand(context.io.stderr, command, message, operand);
-    return .{ .status = status };
-}
-
-fn writeDiagnostic(
-    optional_writer: ?*std.Io.Writer,
-    command: []const u8,
-    message: []const u8,
-) std.Io.Writer.Error!void {
-    const writer = optional_writer orelse return;
-    try writer.writeAll(command);
-    try writer.writeAll(": ");
-    try writer.writeAll(message);
-    try writer.writeByte('\n');
-}
-
-fn writeDiagnosticWithOperand(
-    optional_writer: ?*std.Io.Writer,
-    command: []const u8,
-    message: []const u8,
-    operand: []const u8,
-) std.Io.Writer.Error!void {
-    const writer = optional_writer orelse return;
-    try writer.writeAll(command);
-    try writer.writeAll(": ");
-    try writer.writeAll(message);
-    try writer.writeAll(": ");
-    try writer.writeAll(operand);
-    try writer.writeByte('\n');
+    kind: RuntimeDiagnostic.Kind,
+) std.Io.Writer.Error!u8 {
+    const diagnostic: RuntimeDiagnostic = .{
+        .subject = .{ .command = command },
+        .kind = kind,
+    };
+    if (context.io.stderr) |stderr| {
+        try diagnostic.render(stderr, .{});
+        try stderr.writeByte('\n');
+    }
+    return diagnostic.status();
 }
 
 test "looks up core builtins by command name" {
