@@ -15,6 +15,11 @@ vtable: *const VTable,
 pub const VTable = struct {
     spawn: *const fn (?*anyopaque, CommandPlan) Error!SpawnResult,
     wait: *const fn (?*anyopaque, Process) Error!Termination,
+    resolve_working_directory: ?*const fn (
+        ?*anyopaque,
+        std.mem.Allocator,
+        WorkingDirectoryRequest,
+    ) Error![]u8 = null,
 };
 
 pub const Error = error{
@@ -41,6 +46,11 @@ pub const SpawnResult = struct {
     sandbox_coverage: SandboxPolicy.Coverage,
 };
 
+pub const WorkingDirectoryRequest = struct {
+    current: ?[]const u8,
+    path: []const u8,
+};
+
 pub const Termination = union(enum) {
     exited: u8,
     signal: u32,
@@ -55,6 +65,18 @@ pub fn spawn(host: Host, plan: CommandPlan) Error!SpawnResult {
 
 pub fn wait(host: Host, process: Process) Error!Termination {
     return host.vtable.wait(host.userdata, process);
+}
+
+/// Resolves and validates a directory using the host platform's path rules.
+/// The returned path is owned by `allocator`.
+pub fn resolveWorkingDirectory(
+    host: Host,
+    allocator: std.mem.Allocator,
+    request: WorkingDirectoryRequest,
+) Error![]u8 {
+    if (request.path.len == 0) return error.InvalidArguments;
+    const resolve = host.vtable.resolve_working_directory orelse return error.Unsupported;
+    return resolve(host.userdata, allocator, request);
 }
 
 test {

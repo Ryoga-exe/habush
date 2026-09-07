@@ -145,6 +145,38 @@ test "fake host returns configured errors" {
     );
 }
 
+test "host resolves working directories with platform-specific semantics" {
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    fake.working_directory_result = "/workspace/project";
+
+    const resolved = try fake.host().resolveWorkingDirectory(std.testing.allocator, .{
+        .current = "/workspace",
+        .path = "project",
+    });
+    defer std.testing.allocator.free(resolved);
+
+    try std.testing.expectEqualStrings("/workspace/project", resolved);
+    try std.testing.expectEqual(@as(usize, 1), fake.resolve_working_directory_calls.items.len);
+    const request = fake.resolve_working_directory_calls.items[0];
+    try std.testing.expectEqualStrings("/workspace", request.current.?);
+    try std.testing.expectEqualStrings("project", request.path);
+}
+
+test "host rejects empty working directory paths before dispatch" {
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+
+    try std.testing.expectError(
+        error.InvalidArguments,
+        fake.host().resolveWorkingDirectory(std.testing.allocator, .{
+            .current = null,
+            .path = "",
+        }),
+    );
+    try std.testing.expectEqual(@as(usize, 0), fake.resolve_working_directory_calls.items.len);
+}
+
 test "fake host recording handles every allocation failure" {
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,

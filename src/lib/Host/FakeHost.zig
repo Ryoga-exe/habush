@@ -7,11 +7,14 @@ const FakeHost = @This();
 arena: std.heap.ArenaAllocator,
 spawn_calls: std.ArrayList(CommandPlan) = .empty,
 wait_calls: std.ArrayList(Host.Process) = .empty,
+resolve_working_directory_calls: std.ArrayList(Host.WorkingDirectoryRequest) = .empty,
 next_process: u32 = 1,
 next_process_group: u32 = 1,
 termination: Host.Termination = .{ .exited = 0 },
 spawn_error: ?Host.Error = null,
 wait_error: ?Host.Error = null,
+resolve_working_directory_error: ?Host.Error = null,
+working_directory_result: ?[]const u8 = null,
 sandbox_coverage: ?SandboxPolicy.Coverage = null,
 
 pub fn init(gpa: std.mem.Allocator) FakeHost {
@@ -33,6 +36,7 @@ pub fn host(fake: *FakeHost) Host {
 const vtable: Host.VTable = .{
     .spawn = spawn,
     .wait = wait,
+    .resolve_working_directory = resolveWorkingDirectory,
 };
 
 fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.Error!Host.SpawnResult {
@@ -128,4 +132,24 @@ fn wait(userdata: ?*anyopaque, process: Host.Process) Host.Error!Host.Terminatio
     if (fake.wait_error) |err| return err;
     try fake.wait_calls.append(fake.arena.allocator(), process);
     return fake.termination;
+}
+
+fn resolveWorkingDirectory(
+    userdata: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    request: Host.WorkingDirectoryRequest,
+) Host.Error![]u8 {
+    const fake: *FakeHost = @ptrCast(@alignCast(userdata.?));
+    if (fake.resolve_working_directory_error) |err| return err;
+    const result = fake.working_directory_result orelse return error.Unsupported;
+
+    const record_allocator = fake.arena.allocator();
+    try fake.resolve_working_directory_calls.append(record_allocator, .{
+        .current = if (request.current) |current|
+            try record_allocator.dupe(u8, current)
+        else
+            null,
+        .path = try record_allocator.dupe(u8, request.path),
+    });
+    return allocator.dupe(u8, result);
 }
