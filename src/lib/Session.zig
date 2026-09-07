@@ -6,15 +6,14 @@ const CommandResolver = @import("CommandResolver.zig");
 const Executor = @import("Executor.zig");
 const Hir = @import("Hir.zig");
 const Host = @import("Host.zig");
-const RuntimeIo = @import("RuntimeIo.zig");
-const RuntimeState = @import("RuntimeState.zig");
+const runtime = @import("runtime.zig");
 const VariableStore = @import("VariableStore.zig");
 const Session = @This();
 
 host: Host,
 resolver: ?CommandResolver,
-io: RuntimeIo,
-state: RuntimeState,
+io: runtime.Io,
+state: runtime.State,
 last_result: Executor.Result = .{
     .status = 0,
     .sandbox_coverage = .not_requested,
@@ -28,7 +27,7 @@ pub const Options = struct {
     /// Complete initial shell variable state. The caller should import the
     /// host environment here and mark those bindings exported when desired.
     variables: []const VariableStore.Binding = &.{},
-    io: RuntimeIo = .{},
+    io: runtime.Io = .{},
 };
 
 pub fn init(
@@ -40,7 +39,7 @@ pub fn init(
         .host = host,
         .resolver = options.resolver,
         .io = options.io,
-        .state = try RuntimeState.init(gpa, .{
+        .state = try runtime.State.init(gpa, .{
             .cwd = options.cwd,
             .search_path = options.search_path,
             .sandbox = options.sandbox,

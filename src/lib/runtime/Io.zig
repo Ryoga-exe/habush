@@ -1,18 +1,18 @@
 //! Standard streams and diagnostic output shared by runtime commands.
 
 const std = @import("std");
-const RuntimeDiagnostic = @import("RuntimeDiagnostic.zig");
-const RuntimeIo = @This();
+const Diagnostic = @import("Diagnostic.zig");
+const Io = @This();
 
 /// A null stream discards output. Non-null writers must remain valid for every
 /// execution using this value.
 stdout: ?*std.Io.Writer = null,
 stderr: ?*std.Io.Writer = null,
-diagnostic_options: RuntimeDiagnostic.RenderOptions = .{},
+diagnostic_options: Diagnostic.RenderOptions = .{},
 
 pub fn reportDiagnostic(
-    runtime_io: RuntimeIo,
-    diagnostic: RuntimeDiagnostic,
+    runtime_io: Io,
+    diagnostic: Diagnostic,
 ) std.Io.Writer.Error!void {
     const writer = runtime_io.stderr orelse return;
     try diagnostic.render(writer, runtime_io.diagnostic_options);
@@ -22,7 +22,7 @@ pub fn reportDiagnostic(
 test "reports diagnostics to stderr" {
     var diagnostics: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer diagnostics.deinit();
-    const runtime_io: RuntimeIo = .{
+    const runtime_io: Io = .{
         .stderr = &diagnostics.writer,
         .diagnostic_options = .{ .program_name = "habush" },
     };

@@ -3,9 +3,7 @@
 const std = @import("std");
 const Builtin = @This();
 const Host = @import("Host.zig");
-const RuntimeDiagnostic = @import("RuntimeDiagnostic.zig");
-const RuntimeIo = @import("RuntimeIo.zig");
-const RuntimeState = @import("RuntimeState.zig");
+const runtime = @import("runtime.zig");
 const VariableStore = @import("VariableStore.zig");
 
 tag: Tag,
@@ -27,9 +25,9 @@ pub const Result = struct {
 
 pub const Context = struct {
     host: ?Host = null,
-    runtime_state: ?*RuntimeState = null,
+    runtime_state: ?*runtime.State = null,
     variable_overrides: ?*const VariableStore = null,
-    io: RuntimeIo = .{},
+    io: runtime.Io = .{},
 };
 
 pub const Error = std.mem.Allocator.Error || std.Io.Writer.Error || error{
@@ -119,7 +117,7 @@ fn runPwd(context: Context, argv: []const []const u8) Error!Result {
     var operands = argv[1..];
     if (operands.len != 0 and std.mem.eql(u8, operands[0], "--")) operands = operands[1..];
     if (operands.len != 0) {
-        const kind: RuntimeDiagnostic.Kind = if (operands[0].len != 0 and operands[0][0] == '-')
+        const kind: runtime.Diagnostic.Kind = if (operands[0].len != 0 and operands[0][0] == '-')
             .{ .unsupported_option = operands[0] }
         else
             .{ .unexpected_argument = operands[0] };
@@ -222,14 +220,14 @@ fn runUnset(context: Context, argv: []const []const u8) Error!Result {
     return .{ .status = status };
 }
 
-fn setVariable(state: *RuntimeState, name: []const u8, value: []const u8) Error!void {
+fn setVariable(state: *runtime.State, name: []const u8, value: []const u8) Error!void {
     state.setVariable(name, value) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidName => unreachable,
     };
 }
 
-fn setVariableExported(state: *RuntimeState, name: []const u8) Error!void {
+fn setVariableExported(state: *runtime.State, name: []const u8) Error!void {
     state.setVariableExported(name, true) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidName => unreachable,
@@ -239,7 +237,7 @@ fn setVariableExported(state: *RuntimeState, name: []const u8) Error!void {
 fn commandFailure(
     context: Context,
     command: []const u8,
-    kind: RuntimeDiagnostic.Kind,
+    kind: runtime.Diagnostic.Kind,
 ) Error!Result {
     return .{ .status = try reportCommandDiagnostic(context, command, kind) };
 }
@@ -247,9 +245,9 @@ fn commandFailure(
 fn reportCommandDiagnostic(
     context: Context,
     command: []const u8,
-    kind: RuntimeDiagnostic.Kind,
+    kind: runtime.Diagnostic.Kind,
 ) std.Io.Writer.Error!u8 {
-    const diagnostic: RuntimeDiagnostic = .{
+    const diagnostic: runtime.Diagnostic = .{
         .subject = .{ .command = command },
         .kind = kind,
     };
@@ -280,7 +278,7 @@ test "runs status-only core builtins" {
 }
 
 test "export and unset mutate runtime state" {
-    var state = try RuntimeState.init(std.testing.allocator, .{});
+    var state = try runtime.State.init(std.testing.allocator, .{});
     defer state.deinit();
     const context: Context = .{ .runtime_state = &state };
 
@@ -301,7 +299,7 @@ test "export and unset mutate runtime state" {
 }
 
 test "export without operands writes exported variables" {
-    var state = try RuntimeState.init(std.testing.allocator, .{
+    var state = try runtime.State.init(std.testing.allocator, .{
         .variables = &.{
             .{ .name = "PLAIN", .value = "value", .exported = true },
             .{ .name = "LOCAL", .value = "hidden" },
@@ -326,7 +324,7 @@ test "export without operands writes exported variables" {
 }
 
 test "export propagates output failures" {
-    var state = try RuntimeState.init(std.testing.allocator, .{
+    var state = try runtime.State.init(std.testing.allocator, .{
         .variables = &.{.{ .name = "NAME", .value = "value", .exported = true }},
     });
     defer state.deinit();
@@ -340,7 +338,7 @@ test "export propagates output failures" {
 }
 
 test "stateful builtins report invalid operands as command status" {
-    var state = try RuntimeState.init(std.testing.allocator, .{});
+    var state = try runtime.State.init(std.testing.allocator, .{});
     defer state.deinit();
     var diagnostics: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer diagnostics.deinit();
@@ -373,7 +371,7 @@ test "cd resolves and persists the working directory" {
     var fake = FakeHost.init(std.testing.allocator);
     defer fake.deinit();
     fake.working_directory_result = "/workspace/project";
-    var state = try RuntimeState.init(std.testing.allocator, .{ .cwd = "/workspace" });
+    var state = try runtime.State.init(std.testing.allocator, .{ .cwd = "/workspace" });
     defer state.deinit();
 
     const result = try lookup("cd").?.run(.{
@@ -393,7 +391,7 @@ test "cd uses command-local HOME without persisting it" {
     var fake = FakeHost.init(std.testing.allocator);
     defer fake.deinit();
     fake.working_directory_result = "/temporary";
-    var state = try RuntimeState.init(std.testing.allocator, .{
+    var state = try runtime.State.init(std.testing.allocator, .{
         .variables = &.{.{ .name = "HOME", .value = "/home/user" }},
     });
     defer state.deinit();
@@ -421,7 +419,7 @@ test "cd updates directory variables and dash uses OLDPWD" {
     var fake = FakeHost.init(std.testing.allocator);
     defer fake.deinit();
     fake.working_directory_result = "/previous";
-    var state = try RuntimeState.init(std.testing.allocator, .{
+    var state = try runtime.State.init(std.testing.allocator, .{
         .cwd = "/current",
         .variables = &.{
             .{ .name = "PWD", .value = "/current", .exported = true },
@@ -456,7 +454,7 @@ test "cd reports usage and host failures as command status" {
     var fake = FakeHost.init(std.testing.allocator);
     defer fake.deinit();
     fake.resolve_working_directory_error = error.AccessDenied;
-    var state = try RuntimeState.init(std.testing.allocator, .{});
+    var state = try runtime.State.init(std.testing.allocator, .{});
     defer state.deinit();
     var diagnostics: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer diagnostics.deinit();
@@ -487,7 +485,7 @@ test "cd reports usage and host failures as command status" {
 }
 
 test "pwd writes the logical working directory" {
-    var state = try RuntimeState.init(std.testing.allocator, .{ .cwd = "/workspace/project" });
+    var state = try runtime.State.init(std.testing.allocator, .{ .cwd = "/workspace/project" });
     defer state.deinit();
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
@@ -517,7 +515,7 @@ test "pwd writes the logical working directory" {
 }
 
 test "builtin diagnostics propagate output failures" {
-    var state = try RuntimeState.init(std.testing.allocator, .{ .cwd = "/workspace" });
+    var state = try runtime.State.init(std.testing.allocator, .{ .cwd = "/workspace" });
     defer state.deinit();
     var buffer: [1]u8 = undefined;
     var diagnostics: std.Io.Writer = .fixed(&buffer);
@@ -541,7 +539,7 @@ fn runCdWithAllocator(gpa: std.mem.Allocator) !void {
     var fake = FakeHost.init(gpa);
     defer fake.deinit();
     fake.working_directory_result = "/workspace/project";
-    var state = try RuntimeState.init(gpa, .{ .cwd = "/workspace" });
+    var state = try runtime.State.init(gpa, .{ .cwd = "/workspace" });
     defer state.deinit();
 
     _ = try lookup("cd").?.run(.{

@@ -4,7 +4,7 @@
 //! needs to outlive the command that produced it.
 
 const std = @import("std");
-const RuntimeDiagnostic = @This();
+const Diagnostic = @This();
 
 subject: Subject,
 kind: Kind,
@@ -30,7 +30,7 @@ pub const RenderOptions = struct {
     program_name: ?[]const u8 = null,
 };
 
-pub fn status(diagnostic: RuntimeDiagnostic) u8 {
+pub fn status(diagnostic: Diagnostic) u8 {
     return switch (diagnostic.kind) {
         .unsupported_option, .unexpected_argument, .too_many_arguments => 2,
         .variable_not_set,
@@ -44,7 +44,7 @@ pub fn status(diagnostic: RuntimeDiagnostic) u8 {
 
 /// Renders one diagnostic without a trailing newline.
 pub fn render(
-    diagnostic: RuntimeDiagnostic,
+    diagnostic: Diagnostic,
     writer: *std.Io.Writer,
     options: RenderOptions,
 ) std.Io.Writer.Error!void {
@@ -72,7 +72,7 @@ pub fn render(
 }
 
 test "renders a command diagnostic with an optional program name" {
-    const diagnostic: RuntimeDiagnostic = .{
+    const diagnostic: Diagnostic = .{
         .subject = .{ .command = "cd" },
         .kind = .{ .variable_not_set = "HOME" },
     };
@@ -86,7 +86,7 @@ test "renders a command diagnostic with an optional program name" {
 }
 
 test "usage diagnostics have status two" {
-    const diagnostic: RuntimeDiagnostic = .{
+    const diagnostic: Diagnostic = .{
         .subject = .{ .command = "pwd" },
         .kind = .{ .unsupported_option = "-P" },
     };
@@ -95,7 +95,7 @@ test "usage diagnostics have status two" {
 }
 
 test "missing command diagnostics have status 127" {
-    const diagnostic: RuntimeDiagnostic = .{
+    const diagnostic: Diagnostic = .{
         .subject = .{ .command = "missing" },
         .kind = .command_not_found,
     };

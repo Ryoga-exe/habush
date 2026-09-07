@@ -8,9 +8,7 @@ const Executor = @This();
 const Expander = @import("Expander.zig");
 const Hir = @import("Hir.zig");
 const Host = @import("Host.zig");
-const RuntimeDiagnostic = @import("RuntimeDiagnostic.zig");
-const RuntimeIo = @import("RuntimeIo.zig");
-const RuntimeState = @import("RuntimeState.zig");
+const runtime = @import("runtime.zig");
 const SandboxPolicy = @import("SandboxPolicy.zig");
 const VariableStore = @import("VariableStore.zig");
 
@@ -21,8 +19,8 @@ resolver: ?CommandResolver,
 search_path: []const []const u8,
 cwd: ?[]const u8,
 variables: ?*VariableStore,
-runtime_state: ?*RuntimeState,
-io: RuntimeIo,
+runtime_state: ?*runtime.State,
+io: runtime.Io,
 
 pub const Error = Builtin.Error || Host.Error || Expander.Error || CommandResolver.Error || VariableStore.Error || error{
     UnsupportedInstruction,
@@ -39,7 +37,7 @@ pub const Options = struct {
     /// Complete shell variable state. When present, exported bindings become
     /// an exact replacement environment; `null` preserves host inheritance.
     variables: ?*VariableStore = null,
-    io: RuntimeIo = .{},
+    io: runtime.Io = .{},
 };
 
 pub const Result = struct {
@@ -68,8 +66,8 @@ pub fn initWithOptions(gpa: std.mem.Allocator, host: Host, options: Options) Exe
 pub fn initWithState(
     host: Host,
     resolver: ?CommandResolver,
-    state: *RuntimeState,
-    io: RuntimeIo,
+    state: *runtime.State,
+    io: runtime.Io,
 ) Executor {
     return .{
         .gpa = state.allocator(),
@@ -189,7 +187,7 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
         .search_path = executor.commandSearchPath(),
         .cwd = executor.workingDirectory(),
     })) orelse {
-        const diagnostic: RuntimeDiagnostic = .{
+        const diagnostic: runtime.Diagnostic = .{
             .subject = .{ .command = argv.items[0] },
             .kind = .command_not_found,
         };

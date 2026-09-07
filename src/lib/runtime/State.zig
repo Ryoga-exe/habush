@@ -1,10 +1,10 @@
 //! Owned mutable state shared by commands in one shell session.
 
 const std = @import("std");
-const CommandPlan = @import("CommandPlan.zig");
-const RuntimeState = @This();
-const SandboxPolicy = @import("SandboxPolicy.zig");
-const VariableStore = @import("VariableStore.zig");
+const CommandPlan = @import("../CommandPlan.zig");
+const State = @This();
+const SandboxPolicy = @import("../SandboxPolicy.zig");
+const VariableStore = @import("../VariableStore.zig");
 
 gpa: std.mem.Allocator,
 cwd: ?[]u8,
@@ -23,7 +23,7 @@ pub const Options = struct {
 
 pub const Error = VariableStore.Error;
 
-pub fn init(gpa: std.mem.Allocator, options: Options) Error!RuntimeState {
+pub fn init(gpa: std.mem.Allocator, options: Options) Error!State {
     const cwd = if (options.cwd) |path| try gpa.dupe(u8, path) else null;
     errdefer if (cwd) |path| gpa.free(path);
 
@@ -46,7 +46,7 @@ pub fn init(gpa: std.mem.Allocator, options: Options) Error!RuntimeState {
     };
 }
 
-pub fn deinit(state: *RuntimeState) void {
+pub fn deinit(state: *State) void {
     if (state.cwd) |cwd| state.gpa.free(cwd);
     deinitStrings(state.gpa, state.search_path);
     state.sandbox.deinit(state.gpa);
@@ -54,55 +54,55 @@ pub fn deinit(state: *RuntimeState) void {
     state.* = undefined;
 }
 
-pub fn allocator(state: RuntimeState) std.mem.Allocator {
+pub fn allocator(state: State) std.mem.Allocator {
     return state.gpa;
 }
 
-pub fn workingDirectory(state: RuntimeState) ?[]const u8 {
+pub fn workingDirectory(state: State) ?[]const u8 {
     return state.cwd;
 }
 
-pub fn commandSearchPath(state: RuntimeState) []const []const u8 {
+pub fn commandSearchPath(state: State) []const []const u8 {
     return state.search_path;
 }
 
-pub fn activeSandbox(state: RuntimeState) CommandPlan.Sandbox {
+pub fn activeSandbox(state: State) CommandPlan.Sandbox {
     return state.sandbox;
 }
 
-pub fn variableStore(state: *RuntimeState) *VariableStore {
+pub fn variableStore(state: *State) *VariableStore {
     return &state.variables;
 }
 
-pub fn variable(state: RuntimeState, name: []const u8) ?[]const u8 {
+pub fn variable(state: State, name: []const u8) ?[]const u8 {
     return state.variables.get(name);
 }
 
 pub fn setVariable(
-    state: *RuntimeState,
+    state: *State,
     name: []const u8,
     value: []const u8,
 ) VariableStore.Error!void {
     return state.variables.set(name, value);
 }
 
-pub fn unsetVariable(state: *RuntimeState, name: []const u8) bool {
+pub fn unsetVariable(state: *State, name: []const u8) bool {
     return state.variables.unset(name);
 }
 
-pub fn isVariableExported(state: RuntimeState, name: []const u8) bool {
+pub fn isVariableExported(state: State, name: []const u8) bool {
     return state.variables.isExported(name);
 }
 
 pub fn setVariableExported(
-    state: *RuntimeState,
+    state: *State,
     name: []const u8,
     exported: bool,
 ) VariableStore.Error!void {
     return state.variables.setExported(name, exported);
 }
 
-pub fn setWorkingDirectory(state: *RuntimeState, cwd: ?[]const u8) std.mem.Allocator.Error!void {
+pub fn setWorkingDirectory(state: *State, cwd: ?[]const u8) std.mem.Allocator.Error!void {
     const copy = if (cwd) |path| try state.gpa.dupe(u8, path) else null;
     if (state.cwd) |previous| state.gpa.free(previous);
     state.cwd = copy;
@@ -110,7 +110,7 @@ pub fn setWorkingDirectory(state: *RuntimeState, cwd: ?[]const u8) std.mem.Alloc
 
 /// Applies a successful `cd` while keeping the directory and its shell
 /// variables unchanged if any allocation fails.
-pub fn changeWorkingDirectory(state: *RuntimeState, cwd: []const u8) std.mem.Allocator.Error!void {
+pub fn changeWorkingDirectory(state: *State, cwd: []const u8) std.mem.Allocator.Error!void {
     const cwd_copy = try state.gpa.dupe(u8, cwd);
     errdefer state.gpa.free(cwd_copy);
 
@@ -137,7 +137,7 @@ fn setKnownVariable(
 }
 
 pub fn setCommandSearchPath(
-    state: *RuntimeState,
+    state: *State,
     search_path: []const []const u8,
 ) std.mem.Allocator.Error!void {
     const copy = try cloneStrings(state.gpa, search_path);
@@ -146,7 +146,7 @@ pub fn setCommandSearchPath(
 }
 
 pub fn setSandbox(
-    state: *RuntimeState,
+    state: *State,
     sandbox: CommandPlan.Sandbox,
 ) std.mem.Allocator.Error!void {
     const copy = try sandbox.clone(state.gpa);
@@ -181,7 +181,7 @@ test "runtime state owns mutable session values" {
     var search = [_]u8{ '/', 'b', 'i', 'n' };
     var name = [_]u8{ 'n', 'a', 'm', 'e' };
     var value = [_]u8{ 'v', 'a', 'l', 'u', 'e' };
-    var state = try RuntimeState.init(std.testing.allocator, .{
+    var state = try State.init(std.testing.allocator, .{
         .cwd = &cwd,
         .search_path = &.{&search},
         .variables = &.{.{ .name = &name, .value = &value, .exported = true }},
@@ -208,7 +208,7 @@ test "runtime state initialization handles every allocation failure" {
 }
 
 test "directory change updates PWD and OLDPWD atomically" {
-    var state = try RuntimeState.init(std.testing.allocator, .{
+    var state = try State.init(std.testing.allocator, .{
         .cwd = "/old",
         .variables = &.{
             .{ .name = "PWD", .value = "/old", .exported = true },
@@ -237,7 +237,7 @@ test "directory change handles every allocation failure" {
 }
 
 fn changeWorkingDirectoryWithAllocator(gpa: std.mem.Allocator) !void {
-    var state = try RuntimeState.init(gpa, .{
+    var state = try State.init(gpa, .{
         .cwd = "/old",
         .variables = &.{
             .{ .name = "PWD", .value = "/old", .exported = true },
@@ -261,7 +261,7 @@ fn initWithAllocator(gpa: std.mem.Allocator) !void {
     const rules = [_]SandboxPolicy.PathRule{
         .{ .path = "/workspace", .access = .{ .read = true } },
     };
-    var state = try RuntimeState.init(gpa, .{
+    var state = try State.init(gpa, .{
         .cwd = "/workspace",
         .search_path = &search_path,
         .sandbox = .{ .restrict = .{ .file_system = .{ .allow = &rules } } },
