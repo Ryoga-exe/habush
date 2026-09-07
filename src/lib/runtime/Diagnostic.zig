@@ -24,6 +24,15 @@ pub const Kind = union(enum) {
     cannot_change_directory: []const u8,
     working_directory_unavailable,
     command_not_found,
+    cannot_execute: CannotExecuteReason,
+};
+
+pub const CannotExecuteReason = enum {
+    access_denied,
+    invalid_executable,
+    resource_unavailable,
+    sandbox_unavailable,
+    unsupported,
 };
 
 pub const RenderOptions = struct {
@@ -39,6 +48,7 @@ pub fn status(diagnostic: Diagnostic) u8 {
         .working_directory_unavailable,
         => 1,
         .command_not_found => 127,
+        .cannot_execute => 126,
     };
 }
 
@@ -68,6 +78,13 @@ pub fn render(
         .cannot_change_directory => |path| try writer.print("cannot change directory: {s}", .{path}),
         .working_directory_unavailable => try writer.writeAll("working directory unavailable"),
         .command_not_found => try writer.writeAll("command not found"),
+        .cannot_execute => |reason| switch (reason) {
+            .access_denied => try writer.writeAll("permission denied"),
+            .invalid_executable => try writer.writeAll("invalid executable"),
+            .resource_unavailable => try writer.writeAll("system resources unavailable"),
+            .sandbox_unavailable => try writer.writeAll("required sandbox unavailable"),
+            .unsupported => try writer.writeAll("operation not supported"),
+        },
     }
 }
 
@@ -101,6 +118,20 @@ test "missing command diagnostics have status 127" {
     };
 
     try std.testing.expectEqual(@as(u8, 127), diagnostic.status());
+}
+
+test "commands that cannot be executed have status 126" {
+    const diagnostic: Diagnostic = .{
+        .subject = .{ .command = "tool" },
+        .kind = .{ .cannot_execute = .access_denied },
+    };
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try diagnostic.render(&output.writer, .{});
+
+    try std.testing.expectEqual(@as(u8, 126), diagnostic.status());
+    try std.testing.expectEqualStrings("tool: permission denied", output.written());
 }
 
 test {

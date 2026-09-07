@@ -380,6 +380,89 @@ test "does not spawn when command resolution finds no executable" {
     try std.testing.expectEqual(@as(usize, 0), fake_host.spawn_calls.items.len);
 }
 
+test "reports denied command resolution as not executable" {
+    var hir = try generate("denied");
+    defer hir.deinit(std.testing.allocator);
+    var fake_host = FakeHost.init(std.testing.allocator);
+    defer fake_host.deinit();
+    var fake_resolver = FakeResolver.init(std.testing.allocator);
+    defer fake_resolver.deinit();
+    fake_resolver.resolve_error = error.AccessDenied;
+    var diagnostics: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer diagnostics.deinit();
+
+    const result = try Executor.initWithOptions(std.testing.allocator, fake_host.host(), .{
+        .resolver = fake_resolver.resolver(),
+        .io = .{ .stderr = &diagnostics.writer },
+    }).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 126), result.status);
+    try std.testing.expectEqualStrings("denied: permission denied\n", diagnostics.written());
+    try std.testing.expectEqual(@as(usize, 0), fake_host.spawn_calls.items.len);
+}
+
+test "reports host spawn failures as command diagnostics" {
+    const Case = struct {
+        host_error: @import("Host.zig").Error,
+        status: u8,
+        message: []const u8,
+    };
+    const cases = [_]Case{
+        .{
+            .host_error = error.CommandNotFound,
+            .status = 127,
+            .message = "tool: command not found\n",
+        },
+        .{
+            .host_error = error.AccessDenied,
+            .status = 126,
+            .message = "tool: permission denied\n",
+        },
+        .{
+            .host_error = error.InvalidExecutable,
+            .status = 126,
+            .message = "tool: invalid executable\n",
+        },
+        .{
+            .host_error = error.ResourceUnavailable,
+            .status = 126,
+            .message = "tool: system resources unavailable\n",
+        },
+        .{
+            .host_error = error.SandboxUnavailable,
+            .status = 126,
+            .message = "tool: required sandbox unavailable\n",
+        },
+        .{
+            .host_error = error.Unsupported,
+            .status = 126,
+            .message = "tool: operation not supported\n",
+        },
+    };
+
+    var hir = try generate("tool");
+    defer hir.deinit(std.testing.allocator);
+    for (cases) |case| {
+        var fake_host = FakeHost.init(std.testing.allocator);
+        defer fake_host.deinit();
+        fake_host.spawn_error = case.host_error;
+        var fake_resolver = FakeResolver.init(std.testing.allocator);
+        defer fake_resolver.deinit();
+        fake_resolver.result = "/bin/tool";
+        var diagnostics: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer diagnostics.deinit();
+
+        const result = try Executor.initWithOptions(std.testing.allocator, fake_host.host(), .{
+            .resolver = fake_resolver.resolver(),
+            .io = .{ .stderr = &diagnostics.writer },
+        }).execute(hir);
+
+        try std.testing.expectEqual(case.status, result.status);
+        try std.testing.expectEqualStrings(case.message, diagnostics.written());
+        try std.testing.expectEqual(@as(usize, 0), fake_host.spawn_calls.items.len);
+    }
+}
+
 test "forwards the active sandbox policy to the host" {
     var hir = try generate("/bin/echo hello");
     defer hir.deinit(std.testing.allocator);

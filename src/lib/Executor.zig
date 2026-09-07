@@ -182,29 +182,51 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
     );
 
     const resolver = executor.resolver orelse return error.CommandResolutionUnavailable;
-    const executable = (try resolver.resolve(allocator, .{
+    const executable = (resolver.resolve(allocator, .{
         .name = argv.items[0],
         .search_path = executor.commandSearchPath(),
         .cwd = executor.workingDirectory(),
-    })) orelse {
-        const diagnostic: runtime.Diagnostic = .{
-            .subject = .{ .command = argv.items[0] },
-            .kind = .command_not_found,
-        };
-        try executor.io.reportDiagnostic(diagnostic);
-        return .{
-            .status = diagnostic.status(),
-            .sandbox_coverage = .not_requested,
-        };
-    };
+    }) catch |err| switch (err) {
+        error.AccessDenied => return executor.commandFailure(
+            argv.items[0],
+            .{ .cannot_execute = .access_denied },
+        ),
+        error.OutOfMemory, error.Unexpected => return err,
+    }) orelse return executor.commandFailure(argv.items[0], .command_not_found);
 
-    const spawned = try executor.host.spawn(.{
+    const spawned = executor.host.spawn(.{
         .executable = executable,
         .argv = argv.items,
         .environment = environment,
         .cwd = if (executor.workingDirectory()) |cwd| .{ .path = cwd } else .inherit,
         .sandbox = executor.activeSandbox(),
-    });
+    }) catch |err| switch (err) {
+        error.CommandNotFound => return executor.commandFailure(argv.items[0], .command_not_found),
+        error.AccessDenied => return executor.commandFailure(
+            argv.items[0],
+            .{ .cannot_execute = .access_denied },
+        ),
+        error.InvalidExecutable => return executor.commandFailure(
+            argv.items[0],
+            .{ .cannot_execute = .invalid_executable },
+        ),
+        error.ResourceUnavailable => return executor.commandFailure(
+            argv.items[0],
+            .{ .cannot_execute = .resource_unavailable },
+        ),
+        error.SandboxUnavailable => return executor.commandFailure(
+            argv.items[0],
+            .{ .cannot_execute = .sandbox_unavailable },
+        ),
+        error.Unsupported => return executor.commandFailure(
+            argv.items[0],
+            .{ .cannot_execute = .unsupported },
+        ),
+        error.OutOfMemory,
+        error.InvalidArguments,
+        error.Unexpected,
+        => return err,
+    };
     return .{
         .status = try terminationStatus(try executor.host.wait(spawned.process)),
         .sandbox_coverage = spawned.sandbox_coverage,
@@ -229,6 +251,22 @@ fn commandSearchPath(executor: Executor) []const []const u8 {
 fn activeSandbox(executor: Executor) CommandPlan.Sandbox {
     if (executor.runtime_state) |state| return state.activeSandbox();
     return executor.sandbox;
+}
+
+fn commandFailure(
+    executor: Executor,
+    command: []const u8,
+    kind: runtime.Diagnostic.Kind,
+) std.Io.Writer.Error!Result {
+    const diagnostic: runtime.Diagnostic = .{
+        .subject = .{ .command = command },
+        .kind = kind,
+    };
+    try executor.io.reportDiagnostic(diagnostic);
+    return .{
+        .status = diagnostic.status(),
+        .sandbox_coverage = .not_requested,
+    };
 }
 
 fn applyAssignments(
