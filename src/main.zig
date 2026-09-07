@@ -1,6 +1,6 @@
 const std = @import("std");
 const Io = std.Io;
-const posix = std.posix;
+const platform = @import("platform.zig");
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
@@ -15,7 +15,7 @@ pub fn main(init: std.process.Init) !void {
     const interactive = try Io.File.stdin().isTty(io) and try Io.File.stderr().isTty(io);
 
     if (interactive) {
-        ignoreSigint();
+        try platform.ignoreInteractiveInterrupt();
     }
 
     var stdin_buffer: [4096]u8 = undefined;
@@ -90,15 +90,6 @@ const Shell = struct {
         return .@"continue";
     }
 };
-
-fn ignoreSigint() void {
-    const sigint_ignore: posix.Sigaction = .{
-        .handler = .{ .handler = posix.SIG.IGN },
-        .mask = posix.sigemptyset(),
-        .flags = 0,
-    };
-    posix.sigaction(posix.SIG.INT, &sigint_ignore, null);
-}
 
 fn readLineAlloc(reader: *Io.Reader, allocator: std.mem.Allocator) !?[]u8 {
     var out: Io.Writer.Allocating = .init(allocator);
