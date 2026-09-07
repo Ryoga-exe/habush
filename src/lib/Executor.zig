@@ -20,6 +20,7 @@ search_path: []const []const u8,
 cwd: ?[]const u8,
 variables: ?*VariableStore,
 runtime_state: ?*RuntimeState,
+builtin_io: Builtin.Io,
 
 pub const Error = Builtin.Error || Host.Error || Expander.Error || CommandResolver.Error || VariableStore.Error || error{
     UnsupportedInstruction,
@@ -36,6 +37,7 @@ pub const Options = struct {
     /// Complete shell variable state. When present, exported bindings become
     /// an exact replacement environment; `null` preserves host inheritance.
     variables: ?*VariableStore = null,
+    builtin_io: Builtin.Io = .{},
 };
 
 pub const Result = struct {
@@ -57,6 +59,7 @@ pub fn initWithOptions(gpa: std.mem.Allocator, host: Host, options: Options) Exe
         .cwd = options.cwd,
         .variables = options.variables,
         .runtime_state = null,
+        .builtin_io = options.builtin_io,
     };
 }
 
@@ -64,6 +67,7 @@ pub fn initWithState(
     host: Host,
     resolver: ?CommandResolver,
     state: *RuntimeState,
+    builtin_io: Builtin.Io,
 ) Executor {
     return .{
         .gpa = state.allocator(),
@@ -74,6 +78,7 @@ pub fn initWithState(
         .cwd = null,
         .variables = null,
         .runtime_state = state,
+        .builtin_io = builtin_io,
     };
 }
 
@@ -162,6 +167,7 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
             .host = executor.host,
             .runtime_state = executor.runtime_state,
             .variable_overrides = &command_variables,
+            .io = executor.builtin_io,
         }, argv.items);
         return .{ .status = result.status, .sandbox_coverage = .not_requested };
     }

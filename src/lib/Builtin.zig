@@ -22,13 +22,21 @@ pub const Result = struct {
     status: u8,
 };
 
+/// Standard I/O endpoints available to builtins. A null stream discards
+/// output. Non-null writers must remain valid for every execution using them.
+pub const Io = struct {
+    stdout: ?*std.Io.Writer = null,
+    stderr: ?*std.Io.Writer = null,
+};
+
 pub const Context = struct {
     host: ?Host = null,
     runtime_state: ?*RuntimeState = null,
     variable_overrides: ?*const VariableStore = null,
+    io: Io = .{},
 };
 
-pub const Error = std.mem.Allocator.Error || error{
+pub const Error = std.mem.Allocator.Error || std.Io.Writer.Error || error{
     HostUnavailable,
     RuntimeStateUnavailable,
 };
@@ -97,6 +105,7 @@ fn runExport(context: Context, argv: []const []const u8) Error!Result {
     var status: u8 = 0;
     var operands = argv[1..];
     if (operands.len != 0 and std.mem.eql(u8, operands[0], "--")) operands = operands[1..];
+    if (operands.len == 0) try writeExportedVariables(context.io.stdout, state.variableStore());
     for (operands) |operand| {
         if (operand.len != 0 and operand[0] == '-') {
             status = 2;
@@ -112,8 +121,35 @@ fn runExport(context: Context, argv: []const []const u8) Error!Result {
             try setVariable(state, name, operand[index + 1 ..]);
         try setVariableExported(state, name);
     }
-    // TODO: Render exported variables when the builtin I/O abstraction exists.
     return .{ .status = status };
+}
+
+fn writeExportedVariables(
+    optional_writer: ?*std.Io.Writer,
+    variables: *const VariableStore,
+) std.Io.Writer.Error!void {
+    const writer = optional_writer orelse return;
+    var iterator = variables.iterator();
+    while (iterator.next()) |binding| {
+        if (!binding.exported) continue;
+        try writer.writeAll("export ");
+        try writer.writeAll(binding.name);
+        try writer.writeAll("=");
+        try writeShellQuoted(writer, binding.value);
+        try writer.writeByte('\n');
+    }
+}
+
+fn writeShellQuoted(writer: *std.Io.Writer, value: []const u8) std.Io.Writer.Error!void {
+    try writer.writeByte('\'');
+    var remaining = value;
+    while (std.mem.indexOfScalar(u8, remaining, '\'')) |index| {
+        try writer.writeAll(remaining[0..index]);
+        try writer.writeAll("'\\''");
+        remaining = remaining[index + 1 ..];
+    }
+    try writer.writeAll(remaining);
+    try writer.writeByte('\'');
 }
 
 fn runUnset(context: Context, argv: []const []const u8) Error!Result {
@@ -184,6 +220,45 @@ test "export and unset mutate runtime state" {
         (try lookup("unset").?.run(context, &.{ "unset", "NAME", "missing" })).status,
     );
     try std.testing.expect(state.variable("NAME") == null);
+}
+
+test "export without operands writes exported variables" {
+    var state = try RuntimeState.init(std.testing.allocator, .{
+        .variables = &.{
+            .{ .name = "PLAIN", .value = "value", .exported = true },
+            .{ .name = "LOCAL", .value = "hidden" },
+            .{ .name = "QUOTED", .value = "one'two", .exported = true },
+        },
+    });
+    defer state.deinit();
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    const result = try lookup("export").?.run(.{
+        .runtime_state = &state,
+        .io = .{ .stdout = &output.writer },
+    }, &.{"export"});
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqualStrings(
+        \\export PLAIN='value'
+        \\export QUOTED='one'\''two'
+        \\
+    , output.written());
+}
+
+test "export propagates output failures" {
+    var state = try RuntimeState.init(std.testing.allocator, .{
+        .variables = &.{.{ .name = "NAME", .value = "value", .exported = true }},
+    });
+    defer state.deinit();
+    var buffer: [1]u8 = undefined;
+    var output: std.Io.Writer = .fixed(&buffer);
+
+    try std.testing.expectError(error.WriteFailed, lookup("export").?.run(.{
+        .runtime_state = &state,
+        .io = .{ .stdout = &output },
+    }, &.{"export"}));
 }
 
 test "stateful builtins report invalid operands as command status" {

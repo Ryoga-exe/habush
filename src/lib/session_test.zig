@@ -148,6 +148,28 @@ test "session executes export and unset builtins" {
     try std.testing.expectEqual(@as(usize, 0), fake_host.spawn_calls.items.len);
 }
 
+test "session routes builtin output" {
+    var fake_host = FakeHost.init(std.testing.allocator);
+    defer fake_host.deinit();
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var session = try Session.init(std.testing.allocator, fake_host.host(), .{
+        .builtin_io = .{ .stdout = &output.writer },
+        .variables = &.{
+            .{ .name = "EXPORTED", .value = "value", .exported = true },
+            .{ .name = "LOCAL", .value = "hidden" },
+        },
+    });
+    defer session.deinit();
+
+    var hir = try generate("export");
+    defer hir.deinit(std.testing.allocator);
+    const result = try session.execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqualStrings("export EXPORTED='value'\n", output.written());
+}
+
 test "cd changes resolution and spawn directories for later commands" {
     var fake_host = FakeHost.init(std.testing.allocator);
     defer fake_host.deinit();
