@@ -69,15 +69,19 @@ fn runCd(context: Context, argv: []const []const u8) Error!Result {
     const state = context.runtime_state orelse return error.RuntimeStateUnavailable;
     const host = context.host orelse return error.HostUnavailable;
     var operands = argv[1..];
+    var write_directory = false;
     if (operands.len != 0 and std.mem.eql(u8, operands[0], "--")) {
         operands = operands[1..];
+    } else if (operands.len != 0 and std.mem.eql(u8, operands[0], "-")) {
+        write_directory = true;
     } else if (operands.len != 0 and operands[0].len != 0 and operands[0][0] == '-') {
-        // TODO: Support `cd -` after builtin output and OLDPWD handling exist.
         return .{ .status = 2 };
     }
     if (operands.len > 1) return .{ .status = 2 };
 
-    const path = if (operands.len == 1)
+    const path = if (write_directory)
+        variable(context, "OLDPWD") orelse return .{ .status = 1 }
+    else if (operands.len == 1)
         operands[0]
     else
         variable(context, "HOME") orelse return .{ .status = 1 };
@@ -89,7 +93,13 @@ fn runCd(context: Context, argv: []const []const u8) Error!Result {
         else => return .{ .status = 1 },
     };
     defer state.allocator().free(resolved);
-    try state.setWorkingDirectory(resolved);
+    try state.changeWorkingDirectory(resolved);
+    if (write_directory) {
+        if (context.io.stdout) |stdout| {
+            try stdout.writeAll(resolved);
+            try stdout.writeByte('\n');
+        }
+    }
     return .{ .status = 0 };
 }
 
@@ -324,6 +334,41 @@ test "cd uses command-local HOME without persisting it" {
     try std.testing.expectEqualStrings("/home/user", state.variable("HOME").?);
     try std.testing.expectEqualStrings(
         "/temporary",
+        fake.resolve_working_directory_calls.items[0].path,
+    );
+}
+
+test "cd updates directory variables and dash uses OLDPWD" {
+    const FakeHost = @import("Host/FakeHost.zig");
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    fake.working_directory_result = "/previous";
+    var state = try RuntimeState.init(std.testing.allocator, .{
+        .cwd = "/current",
+        .variables = &.{
+            .{ .name = "PWD", .value = "/current", .exported = true },
+            .{ .name = "OLDPWD", .value = "/previous", .exported = true },
+        },
+    });
+    defer state.deinit();
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    const result = try lookup("cd").?.run(.{
+        .host = fake.host(),
+        .runtime_state = &state,
+        .io = .{ .stdout = &output.writer },
+    }, &.{ "cd", "-" });
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqualStrings("/previous", state.workingDirectory().?);
+    try std.testing.expectEqualStrings("/previous", state.variable("PWD").?);
+    try std.testing.expectEqualStrings("/current", state.variable("OLDPWD").?);
+    try std.testing.expect(state.isVariableExported("PWD"));
+    try std.testing.expect(state.isVariableExported("OLDPWD"));
+    try std.testing.expectEqualStrings("/previous\n", output.written());
+    try std.testing.expectEqualStrings(
+        "/previous",
         fake.resolve_working_directory_calls.items[0].path,
     );
 }

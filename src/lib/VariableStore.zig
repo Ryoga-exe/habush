@@ -47,6 +47,24 @@ pub fn deinit(variables: *VariableStore) void {
     variables.* = undefined;
 }
 
+pub fn clone(variables: VariableStore, gpa: std.mem.Allocator) std.mem.Allocator.Error!VariableStore {
+    var copy = VariableStore.init(gpa);
+    errdefer copy.deinit();
+
+    var iter = variables.iterator();
+    while (iter.next()) |binding| {
+        copy.set(binding.name, binding.value) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidName => unreachable,
+        };
+        if (binding.exported) copy.setExported(binding.name, true) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidName => unreachable,
+        };
+    }
+    return copy;
+}
+
 pub fn get(variables: VariableStore, name: []const u8) ?[]const u8 {
     const value = variables.map.get(name) orelse return null;
     return value.bytes;
@@ -184,6 +202,24 @@ test "variable store preserves export attributes across assignment" {
     try variables.setExported("created", true);
     try std.testing.expectEqualStrings("", variables.get("created").?);
     try std.testing.expect(variables.isExported("created"));
+}
+
+test "variable store clone owns bindings and preserves attributes" {
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+    try variables.set("exported", "first");
+    try variables.setExported("exported", true);
+    try variables.set("local", "second");
+
+    var copy = try variables.clone(std.testing.allocator);
+    defer copy.deinit();
+    try variables.set("exported", "changed");
+    _ = variables.unset("local");
+
+    try std.testing.expectEqualStrings("first", copy.get("exported").?);
+    try std.testing.expect(copy.isExported("exported"));
+    try std.testing.expectEqualStrings("second", copy.get("local").?);
+    try std.testing.expect(!copy.isExported("local"));
 }
 
 test "failed replacement preserves the previous value" {

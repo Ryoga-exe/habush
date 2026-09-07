@@ -108,6 +108,34 @@ pub fn setWorkingDirectory(state: *RuntimeState, cwd: ?[]const u8) std.mem.Alloc
     state.cwd = copy;
 }
 
+/// Applies a successful `cd` while keeping the directory and its shell
+/// variables unchanged if any allocation fails.
+pub fn changeWorkingDirectory(state: *RuntimeState, cwd: []const u8) std.mem.Allocator.Error!void {
+    const cwd_copy = try state.gpa.dupe(u8, cwd);
+    errdefer state.gpa.free(cwd_copy);
+
+    var variables = try state.variables.clone(state.gpa);
+    errdefer variables.deinit();
+    if (state.cwd) |previous| try setKnownVariable(&variables, "OLDPWD", previous);
+    try setKnownVariable(&variables, "PWD", cwd);
+
+    if (state.cwd) |previous| state.gpa.free(previous);
+    state.cwd = cwd_copy;
+    state.variables.deinit();
+    state.variables = variables;
+}
+
+fn setKnownVariable(
+    variables: *VariableStore,
+    name: []const u8,
+    value: []const u8,
+) std.mem.Allocator.Error!void {
+    variables.set(name, value) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidName => unreachable,
+    };
+}
+
 pub fn setCommandSearchPath(
     state: *RuntimeState,
     search_path: []const []const u8,
@@ -177,6 +205,55 @@ test "runtime state initialization handles every allocation failure" {
         initWithAllocator,
         .{},
     );
+}
+
+test "directory change updates PWD and OLDPWD atomically" {
+    var state = try RuntimeState.init(std.testing.allocator, .{
+        .cwd = "/old",
+        .variables = &.{
+            .{ .name = "PWD", .value = "/old", .exported = true },
+            .{ .name = "OLDPWD", .value = "/older", .exported = true },
+            .{ .name = "LOCAL", .value = "value" },
+        },
+    });
+    defer state.deinit();
+
+    try state.changeWorkingDirectory("/new");
+
+    try std.testing.expectEqualStrings("/new", state.workingDirectory().?);
+    try std.testing.expectEqualStrings("/new", state.variable("PWD").?);
+    try std.testing.expectEqualStrings("/old", state.variable("OLDPWD").?);
+    try std.testing.expect(state.isVariableExported("PWD"));
+    try std.testing.expect(state.isVariableExported("OLDPWD"));
+    try std.testing.expectEqualStrings("value", state.variable("LOCAL").?);
+}
+
+test "directory change handles every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        changeWorkingDirectoryWithAllocator,
+        .{},
+    );
+}
+
+fn changeWorkingDirectoryWithAllocator(gpa: std.mem.Allocator) !void {
+    var state = try RuntimeState.init(gpa, .{
+        .cwd = "/old",
+        .variables = &.{
+            .{ .name = "PWD", .value = "/old", .exported = true },
+            .{ .name = "OLDPWD", .value = "/older", .exported = true },
+            .{ .name = "LOCAL", .value = "value" },
+        },
+    });
+    defer state.deinit();
+
+    state.changeWorkingDirectory("/new") catch |err| {
+        try std.testing.expectEqualStrings("/old", state.workingDirectory().?);
+        try std.testing.expectEqualStrings("/old", state.variable("PWD").?);
+        try std.testing.expectEqualStrings("/older", state.variable("OLDPWD").?);
+        try std.testing.expectEqualStrings("value", state.variable("LOCAL").?);
+        return err;
+    };
 }
 
 fn initWithAllocator(gpa: std.mem.Allocator) !void {

@@ -189,6 +189,8 @@ test "cd changes resolution and spawn directories for later commands" {
 
     try std.testing.expectEqual(@as(u8, 0), result.status);
     try std.testing.expectEqualStrings("/workspace/project", session.workingDirectory().?);
+    try std.testing.expectEqualStrings("/workspace/project", session.variable("PWD").?);
+    try std.testing.expectEqualStrings("/workspace", session.variable("OLDPWD").?);
     try std.testing.expectEqualStrings(
         "/workspace/project",
         fake_resolver.calls.items[0].cwd.?,
