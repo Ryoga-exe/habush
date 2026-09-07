@@ -3,6 +3,8 @@
 const std = @import("std");
 const CommandResolver = @This();
 
+pub const System = @import("CommandResolver/System.zig");
+
 userdata: ?*anyopaque,
 vtable: *const VTable,
 
