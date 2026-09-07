@@ -10,10 +10,6 @@ const System = @This();
 
 io: std.Io,
 
-pub fn init(io: std.Io) System {
-    return .{ .io = io };
-}
-
 pub fn host(system: *System) Host {
     return .{
         .userdata = system,
@@ -113,7 +109,7 @@ test "system host resolves and validates working directories" {
     const expected = try std.fs.path.resolve(std.testing.allocator, &.{ root_path, "child" });
     defer std.testing.allocator.free(expected);
 
-    var system = System.init(std.testing.io);
+    var system: System = .{ .io = std.testing.io };
     const resolved = try system.host().resolveWorkingDirectory(std.testing.allocator, .{
         .current = root_path,
         .path = "child" ++ std.fs.path.sep_str ++ ".." ++ std.fs.path.sep_str ++ "child",
@@ -130,7 +126,7 @@ test "system host accepts absolute directories independently of shell state" {
     const path_len = try tmp.dir.realPath(std.testing.io, &path_buffer);
     const path = path_buffer[0..path_len];
 
-    var system = System.init(std.testing.io);
+    var system: System = .{ .io = std.testing.io };
     const resolved = try system.host().resolveWorkingDirectory(std.testing.allocator, .{
         .current = "relative-shell-directory",
         .path = path,
@@ -144,7 +140,7 @@ test "system host uses the process directory when shell state is unavailable" {
     const expected = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
     defer std.testing.allocator.free(expected);
 
-    var system = System.init(std.testing.io);
+    var system: System = .{ .io = std.testing.io };
     const resolved = try system.host().resolveWorkingDirectory(std.testing.allocator, .{
         .current = null,
         .path = ".",
@@ -163,7 +159,7 @@ test "system host rejects missing paths and non-directories" {
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
     const root_path = root_buffer[0..root_len];
 
-    var system = System.init(std.testing.io);
+    var system: System = .{ .io = std.testing.io };
     const system_host = system.host();
     try std.testing.expectError(
         error.InvalidArguments,
@@ -187,7 +183,7 @@ test "system host working-directory resolution handles every allocation failure"
     var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
 
-    var system = System.init(std.testing.io);
+    var system: System = .{ .io = std.testing.io };
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         resolveWithAllocator,
