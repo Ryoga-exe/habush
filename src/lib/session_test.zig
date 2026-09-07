@@ -153,8 +153,13 @@ test "session routes builtin output" {
     defer fake_host.deinit();
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
+    var diagnostics: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer diagnostics.deinit();
     var session = try Session.init(std.testing.allocator, fake_host.host(), .{
-        .builtin_io = .{ .stdout = &output.writer },
+        .builtin_io = .{
+            .stdout = &output.writer,
+            .stderr = &diagnostics.writer,
+        },
         .variables = &.{
             .{ .name = "EXPORTED", .value = "value", .exported = true },
             .{ .name = "LOCAL", .value = "hidden" },
@@ -168,6 +173,13 @@ test "session routes builtin output" {
 
     try std.testing.expectEqual(@as(u8, 0), result.status);
     try std.testing.expectEqualStrings("export EXPORTED='value'\n", output.written());
+
+    var invalid_hir = try generate("pwd -P");
+    defer invalid_hir.deinit(std.testing.allocator);
+    const invalid_result = try session.execute(invalid_hir);
+
+    try std.testing.expectEqual(@as(u8, 2), invalid_result.status);
+    try std.testing.expectEqualStrings("pwd: unsupported option: -P\n", diagnostics.written());
 }
 
 test "cd changes resolution and spawn directories for later commands" {

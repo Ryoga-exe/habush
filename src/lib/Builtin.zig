@@ -78,22 +78,30 @@ fn runCd(context: Context, argv: []const []const u8) Error!Result {
     } else if (operands.len != 0 and std.mem.eql(u8, operands[0], "-")) {
         write_directory = true;
     } else if (operands.len != 0 and operands[0].len != 0 and operands[0][0] == '-') {
-        return .{ .status = 2 };
+        return commandFailureWithOperand(context, argv[0], 2, "unsupported option", operands[0]);
     }
-    if (operands.len > 1) return .{ .status = 2 };
+    if (operands.len > 1) return commandFailure(context, argv[0], 2, "too many arguments");
 
     const path = if (write_directory)
-        variable(context, "OLDPWD") orelse return .{ .status = 1 }
+        variable(context, "OLDPWD") orelse
+            return commandFailure(context, argv[0], 1, "OLDPWD not set")
     else if (operands.len == 1)
         operands[0]
     else
-        variable(context, "HOME") orelse return .{ .status = 1 };
+        variable(context, "HOME") orelse
+            return commandFailure(context, argv[0], 1, "HOME not set");
     const resolved = host.resolveWorkingDirectory(state.allocator(), .{
         .current = state.workingDirectory(),
         .path = path,
     }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return .{ .status = 1 },
+        else => return commandFailureWithOperand(
+            context,
+            argv[0],
+            1,
+            "cannot change directory",
+            path,
+        ),
     };
     defer state.allocator().free(resolved);
     try state.changeWorkingDirectory(resolved);
@@ -117,9 +125,16 @@ fn runPwd(context: Context, argv: []const []const u8) Error!Result {
     const state = context.runtime_state orelse return error.RuntimeStateUnavailable;
     var operands = argv[1..];
     if (operands.len != 0 and std.mem.eql(u8, operands[0], "--")) operands = operands[1..];
-    if (operands.len != 0) return .{ .status = 2 };
+    if (operands.len != 0) {
+        const message = if (operands[0].len != 0 and operands[0][0] == '-')
+            "unsupported option"
+        else
+            "unexpected argument";
+        return commandFailureWithOperand(context, argv[0], 2, message, operands[0]);
+    }
 
-    const cwd = state.workingDirectory() orelse return .{ .status = 1 };
+    const cwd = state.workingDirectory() orelse
+        return commandFailure(context, argv[0], 1, "working directory unavailable");
     if (context.io.stdout) |stdout| {
         try stdout.writeAll(cwd);
         try stdout.writeByte('\n');
@@ -135,13 +150,15 @@ fn runExport(context: Context, argv: []const []const u8) Error!Result {
     if (operands.len == 0) try writeExportedVariables(context.io.stdout, state.variableStore());
     for (operands) |operand| {
         if (operand.len != 0 and operand[0] == '-') {
-            status = 2;
+            status = @max(status, 2);
+            try writeDiagnosticWithOperand(context.io.stderr, argv[0], "unsupported option", operand);
             continue;
         }
         const equals = std.mem.indexOfScalar(u8, operand, '=');
         const name = if (equals) |index| operand[0..index] else operand;
         if (!VariableStore.isValidName(name)) {
-            status = 1;
+            status = @max(status, 1);
+            try writeDiagnosticWithOperand(context.io.stderr, argv[0], "invalid name", name);
             continue;
         }
         if (equals) |index|
@@ -186,7 +203,13 @@ fn runUnset(context: Context, argv: []const []const u8) Error!Result {
     if (operands.len != 0 and std.mem.eql(u8, operands[0], "--")) operands = operands[1..];
     for (operands) |name| {
         if (!VariableStore.isValidName(name)) {
-            status = if (name.len != 0 and name[0] == '-') 2 else 1;
+            if (name.len != 0 and name[0] == '-') {
+                status = @max(status, 2);
+                try writeDiagnosticWithOperand(context.io.stderr, argv[0], "unsupported option", name);
+            } else {
+                status = @max(status, 1);
+                try writeDiagnosticWithOperand(context.io.stderr, argv[0], "invalid name", name);
+            }
             continue;
         }
         _ = state.unsetVariable(name);
@@ -206,6 +229,54 @@ fn setVariableExported(state: *RuntimeState, name: []const u8) Error!void {
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidName => unreachable,
     };
+}
+
+fn commandFailure(
+    context: Context,
+    command: []const u8,
+    status: u8,
+    message: []const u8,
+) Error!Result {
+    try writeDiagnostic(context.io.stderr, command, message);
+    return .{ .status = status };
+}
+
+fn commandFailureWithOperand(
+    context: Context,
+    command: []const u8,
+    status: u8,
+    message: []const u8,
+    operand: []const u8,
+) Error!Result {
+    try writeDiagnosticWithOperand(context.io.stderr, command, message, operand);
+    return .{ .status = status };
+}
+
+fn writeDiagnostic(
+    optional_writer: ?*std.Io.Writer,
+    command: []const u8,
+    message: []const u8,
+) std.Io.Writer.Error!void {
+    const writer = optional_writer orelse return;
+    try writer.writeAll(command);
+    try writer.writeAll(": ");
+    try writer.writeAll(message);
+    try writer.writeByte('\n');
+}
+
+fn writeDiagnosticWithOperand(
+    optional_writer: ?*std.Io.Writer,
+    command: []const u8,
+    message: []const u8,
+    operand: []const u8,
+) std.Io.Writer.Error!void {
+    const writer = optional_writer orelse return;
+    try writer.writeAll(command);
+    try writer.writeAll(": ");
+    try writer.writeAll(message);
+    try writer.writeAll(": ");
+    try writer.writeAll(operand);
+    try writer.writeByte('\n');
 }
 
 test "looks up core builtins by command name" {
@@ -293,7 +364,12 @@ test "export propagates output failures" {
 test "stateful builtins report invalid operands as command status" {
     var state = try RuntimeState.init(std.testing.allocator, .{});
     defer state.deinit();
-    const context: Context = .{ .runtime_state = &state };
+    var diagnostics: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer diagnostics.deinit();
+    const context: Context = .{
+        .runtime_state = &state,
+        .io = .{ .stderr = &diagnostics.writer },
+    };
 
     try std.testing.expectEqual(
         @as(u8, 1),
@@ -303,6 +379,11 @@ test "stateful builtins report invalid operands as command status" {
         @as(u8, 2),
         (try lookup("unset").?.run(context, &.{ "unset", "-f" })).status,
     );
+    try std.testing.expectEqualStrings(
+        \\export: invalid name: not-valid
+        \\unset: unsupported option: -f
+        \\
+    , diagnostics.written());
     try std.testing.expectError(
         error.RuntimeStateUnavailable,
         lookup("export").?.run(.{}, &.{ "export", "NAME" }),
@@ -399,7 +480,13 @@ test "cd reports usage and host failures as command status" {
     fake.resolve_working_directory_error = error.AccessDenied;
     var state = try RuntimeState.init(std.testing.allocator, .{});
     defer state.deinit();
-    const context: Context = .{ .host = fake.host(), .runtime_state = &state };
+    var diagnostics: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer diagnostics.deinit();
+    const context: Context = .{
+        .host = fake.host(),
+        .runtime_state = &state,
+        .io = .{ .stderr = &diagnostics.writer },
+    };
 
     try std.testing.expectEqual(
         @as(u8, 2),
@@ -413,6 +500,12 @@ test "cd reports usage and host failures as command status" {
         @as(u8, 1),
         (try lookup("cd").?.run(context, &.{"cd"})).status,
     );
+    try std.testing.expectEqualStrings(
+        \\cd: too many arguments
+        \\cd: cannot change directory: /denied
+        \\cd: HOME not set
+        \\
+    , diagnostics.written());
 }
 
 test "pwd writes the logical working directory" {
@@ -420,9 +513,14 @@ test "pwd writes the logical working directory" {
     defer state.deinit();
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
+    var diagnostics: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer diagnostics.deinit();
     const context: Context = .{
         .runtime_state = &state,
-        .io = .{ .stdout = &output.writer },
+        .io = .{
+            .stdout = &output.writer,
+            .stderr = &diagnostics.writer,
+        },
     };
 
     const result = try lookup("pwd").?.run(context, &.{"pwd"});
@@ -437,6 +535,19 @@ test "pwd writes the logical working directory" {
         @as(u8, 2),
         (try lookup("pwd").?.run(context, &.{ "pwd", "-P" })).status,
     );
+    try std.testing.expectEqualStrings("pwd: unsupported option: -P\n", diagnostics.written());
+}
+
+test "builtin diagnostics propagate output failures" {
+    var state = try RuntimeState.init(std.testing.allocator, .{ .cwd = "/workspace" });
+    defer state.deinit();
+    var buffer: [1]u8 = undefined;
+    var diagnostics: std.Io.Writer = .fixed(&buffer);
+
+    try std.testing.expectError(error.WriteFailed, lookup("pwd").?.run(.{
+        .runtime_state = &state,
+        .io = .{ .stderr = &diagnostics },
+    }, &.{ "pwd", "-P" }));
 }
 
 test "cd execution handles every allocation failure" {
