@@ -133,7 +133,7 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
         }
     }
     if (Builtin.lookup(argv.items[0])) |builtin| {
-        if (builtin.kind == .special and has_assignments) {
+        if (builtin.special and has_assignments) {
             const variables = executor.variables orelse return error.VariableStateUnavailable;
             try applyAssignments(variables, &command_variables);
         }

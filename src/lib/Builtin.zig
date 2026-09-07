@@ -4,7 +4,7 @@ const std = @import("std");
 const Builtin = @This();
 
 tag: Tag,
-kind: Kind,
+special: bool = false,
 
 pub const Tag = enum {
     @":",
@@ -12,19 +12,14 @@ pub const Tag = enum {
     false,
 };
 
-pub const Kind = enum {
-    special,
-    regular,
-};
-
 pub const Result = struct {
     status: u8,
 };
 
 const definitions = std.StaticStringMap(Builtin).initComptime(.{
-    .{ ":", Builtin{ .tag = .@":", .kind = .special } },
-    .{ "true", Builtin{ .tag = .true, .kind = .regular } },
-    .{ "false", Builtin{ .tag = .false, .kind = .regular } },
+    .{ ":", Builtin{ .tag = .@":", .special = true } },
+    .{ "true", Builtin{ .tag = .true } },
+    .{ "false", Builtin{ .tag = .false } },
 });
 
 pub fn lookup(name: []const u8) ?Builtin {
@@ -41,9 +36,9 @@ pub fn run(builtin: Builtin, argv: []const []const u8) Result {
 
 test "looks up core builtins by command name" {
     try std.testing.expectEqual(Tag.@":", lookup(":").?.tag);
-    try std.testing.expectEqual(Kind.special, lookup(":").?.kind);
+    try std.testing.expect(lookup(":").?.special);
     try std.testing.expectEqual(Tag.true, lookup("true").?.tag);
-    try std.testing.expectEqual(Kind.regular, lookup("false").?.kind);
+    try std.testing.expect(!lookup("false").?.special);
     try std.testing.expect(lookup("missing") == null);
     try std.testing.expect(lookup("./true") == null);
 }
