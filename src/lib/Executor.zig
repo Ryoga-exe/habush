@@ -175,16 +175,12 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
         &process_environment,
     );
 
-    const executable = if (CommandPlan.isExplicitPath(argv.items[0]))
-        argv.items[0]
-    else if (executor.resolver) |resolver|
-        (try resolver.resolve(allocator, .{
-            .name = argv.items[0],
-            .search_path = executor.commandSearchPath(),
-            .cwd = executor.workingDirectory(),
-        })) orelse return error.CommandNotFound
-    else
-        return error.CommandResolutionUnavailable;
+    const resolver = executor.resolver orelse return error.CommandResolutionUnavailable;
+    const executable = (try resolver.resolve(allocator, .{
+        .name = argv.items[0],
+        .search_path = executor.commandSearchPath(),
+        .cwd = executor.workingDirectory(),
+    })) orelse return error.CommandNotFound;
 
     const spawned = try executor.host.spawn(.{
         .executable = executable,

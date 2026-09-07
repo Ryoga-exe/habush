@@ -79,19 +79,24 @@ test "fake host records owned spawn options and wait calls" {
     );
 }
 
-test "host rejects an empty command before dispatch" {
+test "host rejects an empty executable before dispatch" {
     var fake = FakeHost.init(std.testing.allocator);
     defer fake.deinit();
 
     try std.testing.expectError(
         error.InvalidArguments,
-        fake.host().spawn(.{ .executable = "", .argv = &.{} }),
-    );
-    try std.testing.expectError(
-        error.InvalidArguments,
-        fake.host().spawn(.{ .executable = "echo", .argv = &.{"echo"} }),
+        fake.host().spawn(.{ .executable = "", .argv = &.{"command"} }),
     );
     try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+}
+
+test "host accepts platform-defined executable representations" {
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+
+    _ = try fake.host().spawn(.{ .executable = "command.exe", .argv = &.{"command"} });
+
+    try std.testing.expectEqualStrings("command.exe", fake.spawn_calls.items[0].executable);
 }
 
 test "host rejects an invalid portable sandbox policy before dispatch" {

@@ -4,7 +4,8 @@ const std = @import("std");
 const CommandPlan = @This();
 const SandboxPolicy = @import("SandboxPolicy.zig");
 
-/// Resolved executable path. `Host` does not perform `PATH` lookup.
+/// Resolved executable representation accepted by `Host`. `Host` does not
+/// perform command search.
 executable: []const u8,
 argv: []const []const u8,
 environment: Environment = .inherit,
@@ -117,7 +118,6 @@ pub const Sandbox = union(enum) {
 pub fn validate(plan: CommandPlan) error{InvalidArguments}!void {
     if (plan.executable.len == 0 or plan.argv.len == 0 or plan.argv[0].len == 0)
         return error.InvalidArguments;
-    if (!isExplicitPath(plan.executable)) return error.InvalidArguments;
     switch (plan.environment) {
         .inherit => {},
         .overlay, .replace => |variables| for (variables) |variable| {
@@ -134,11 +134,4 @@ pub fn validate(plan: CommandPlan) error{InvalidArguments}!void {
         .inherit => {},
         .restrict => |policy| policy.validate() catch return error.InvalidArguments,
     }
-}
-
-pub fn isExplicitPath(path: []const u8) bool {
-    for (path) |byte| {
-        if (byte == '/' or byte == '\\') return true;
-    }
-    return false;
 }

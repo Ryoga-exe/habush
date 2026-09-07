@@ -41,6 +41,18 @@ test "resolver skips empty command names" {
     try std.testing.expectEqual(@as(usize, 0), fake.calls.items.len);
 }
 
+test "pre-resolved resolver preserves host-specific executable forms" {
+    const windows_path = "C:\\tools\\command.exe";
+    const resolved = (try CommandResolver.preResolved().resolve(std.testing.allocator, .{
+        .name = windows_path,
+        .search_path = &.{},
+        .cwd = null,
+    })).?;
+    defer std.testing.allocator.free(resolved);
+
+    try std.testing.expectEqualStrings(windows_path, resolved);
+}
+
 test "fake resolver handles every allocation failure" {
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,

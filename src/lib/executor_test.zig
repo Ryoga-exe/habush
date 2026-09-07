@@ -1,6 +1,7 @@
 const std = @import("std");
 const Ast = @import("Ast.zig");
 const AstGen = @import("AstGen.zig");
+const CommandResolver = @import("CommandResolver.zig");
 const FakeResolver = @import("CommandResolver/FakeResolver.zig");
 const Executor = @import("Executor.zig");
 const FakeHost = @import("Host/FakeHost.zig");
@@ -15,7 +16,7 @@ test "executes static simple commands through the host" {
     defer fake.deinit();
     fake.termination = .{ .exited = 7 };
 
-    const result = try Executor.init(std.testing.allocator, fake.host()).execute(hir);
+    const result = try preResolvedExecutor(std.testing.allocator, fake.host()).execute(hir);
 
     try std.testing.expectEqual(@as(u32, 7), result.status);
     try std.testing.expectEqual(@as(usize, 1), fake.spawn_calls.items.len);
@@ -35,7 +36,7 @@ test "preserves wide native process exit codes" {
     defer fake.deinit();
     fake.termination = .{ .exited = 0x80000001 };
 
-    const result = try Executor.init(std.testing.allocator, fake.host()).execute(hir);
+    const result = try preResolvedExecutor(std.testing.allocator, fake.host()).execute(hir);
 
     try std.testing.expectEqual(@as(u32, 0x80000001), result.status);
 }
@@ -48,7 +49,7 @@ test "executes sequential lists and returns the last status" {
     defer fake.deinit();
     fake.termination = .{ .signal = 9 };
 
-    const result = try Executor.init(std.testing.allocator, fake.host()).execute(hir);
+    const result = try preResolvedExecutor(std.testing.allocator, fake.host()).execute(hir);
 
     try std.testing.expectEqual(@as(u32, 137), result.status);
     try std.testing.expectEqual(@as(usize, 3), fake.spawn_calls.items.len);
@@ -186,6 +187,7 @@ test "command-local assignments overlay the inherited environment" {
     try variables.setExported("name", true);
 
     _ = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .resolver = CommandResolver.preResolved(),
         .variables = &variables,
     }).execute(hir);
 
@@ -214,6 +216,7 @@ test "exports session variables through an exact environment snapshot" {
     try variables.set("hidden", "no");
 
     _ = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .resolver = CommandResolver.preResolved(),
         .variables = &variables,
     }).execute(hir);
 
@@ -229,7 +232,7 @@ test "command-local assignments overlay the host environment without session sta
     var fake = FakeHost.init(std.testing.allocator);
     defer fake.deinit();
 
-    _ = try Executor.init(std.testing.allocator, fake.host()).execute(hir);
+    _ = try preResolvedExecutor(std.testing.allocator, fake.host()).execute(hir);
 
     const environment = fake.spawn_calls.items[0].environment.overlay;
     try std.testing.expectEqual(@as(usize, 1), environment.len);
@@ -346,6 +349,28 @@ test "resolves command names from explicit session state" {
     try std.testing.expectEqualStrings("/workspace", plan.cwd.path);
 }
 
+test "resolves explicit paths with platform-specific rules" {
+    var hir = try generate("/requested/command");
+    defer hir.deinit(std.testing.allocator);
+    var fake_host = FakeHost.init(std.testing.allocator);
+    defer fake_host.deinit();
+    var fake_resolver = FakeResolver.init(std.testing.allocator);
+    defer fake_resolver.deinit();
+    fake_resolver.result = "/canonical/command";
+
+    _ = try Executor.initWithOptions(std.testing.allocator, fake_host.host(), .{
+        .resolver = fake_resolver.resolver(),
+        .cwd = "/workspace",
+    }).execute(hir);
+
+    try std.testing.expectEqual(@as(usize, 1), fake_resolver.calls.items.len);
+    try std.testing.expectEqualStrings("/requested/command", fake_resolver.calls.items[0].name);
+    try std.testing.expectEqualStrings(
+        "/canonical/command",
+        fake_host.spawn_calls.items[0].executable,
+    );
+}
+
 test "does not spawn when command resolution finds no executable" {
     var hir = try generate("missing");
     defer hir.deinit(std.testing.allocator);
@@ -374,6 +399,7 @@ test "forwards the active sandbox policy to the host" {
         .{ .path = "/usr", .access = .{ .read = true } },
     };
     const executor = Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .resolver = CommandResolver.preResolved(),
         .sandbox = .{ .restrict = .{
             .enforcement = .required,
             .file_system = .{ .allow = &rules },
@@ -395,7 +421,7 @@ test "reports partial best-effort sandbox coverage" {
     defer fake.deinit();
     fake.sandbox_coverage = .partial;
 
-    const result = try Executor.init(std.testing.allocator, fake.host()).execute(hir);
+    const result = try preResolvedExecutor(std.testing.allocator, fake.host()).execute(hir);
 
     try std.testing.expectEqual(.partial, result.sandbox_coverage);
 }
@@ -404,6 +430,12 @@ fn generate(source: [:0]const u8) !@import("Hir.zig") {
     var tree = try Ast.parse(std.testing.allocator, source);
     defer tree.deinit(std.testing.allocator);
     return AstGen.generate(std.testing.allocator, tree);
+}
+
+fn preResolvedExecutor(gpa: std.mem.Allocator, host: @import("Host.zig")) Executor {
+    return Executor.initWithOptions(gpa, host, .{
+        .resolver = CommandResolver.preResolved(),
+    });
 }
 
 fn executeAssignmentsWithAllocator(
@@ -429,6 +461,7 @@ fn executeCommandAssignmentsWithAllocator(
     try variables.set("inherited", "value");
     try variables.setExported("inherited", true);
     _ = try Executor.initWithOptions(gpa, fake.host(), .{
+        .resolver = CommandResolver.preResolved(),
         .variables = &variables,
     }).execute(hir);
 }
