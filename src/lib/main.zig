@@ -11,6 +11,7 @@ pub const Executor = @import("Executor.zig");
 pub const Expander = @import("Expander.zig");
 pub const Host = @import("Host.zig");
 pub const Hir = @import("Hir.zig");
+pub const RuntimeState = @import("RuntimeState.zig");
 pub const SandboxPolicy = @import("SandboxPolicy.zig");
 pub const Session = @import("Session.zig");
 pub const VariableStore = @import("VariableStore.zig");
