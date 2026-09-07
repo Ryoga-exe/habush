@@ -57,7 +57,7 @@ test "session owns runtime configuration and executes with it" {
     defer hir.deinit(std.testing.allocator);
     const result = try session.execute(hir);
 
-    try std.testing.expectEqual(@as(u32, 4), result.status);
+    try std.testing.expectEqual(@as(u8, 4), result.status);
     try std.testing.expectEqualDeep(result, session.lastResult());
     try std.testing.expectEqualStrings("/work", fake_resolver.calls.items[0].cwd.?);
     try std.testing.expectEqualStrings("/usr/bin/echo", fake_host.spawn_calls.items[0].executable);
@@ -114,7 +114,7 @@ test "session persists assignments across commands" {
     defer hir.deinit(std.testing.allocator);
     const result = try session.execute(hir);
 
-    try std.testing.expectEqual(@as(u32, 0), result.status);
+    try std.testing.expectEqual(@as(u8, 0), result.status);
     try std.testing.expectEqualStrings("one", session.variable("first").?);
     try std.testing.expectEqualStrings("one two", session.variable("second").?);
     try std.testing.expectEqualDeep(result, session.lastResult());
@@ -131,7 +131,7 @@ test "session executes export and unset builtins" {
     defer export_hir.deinit(std.testing.allocator);
     const export_result = try session.execute(export_hir);
 
-    try std.testing.expectEqual(@as(u32, 0), export_result.status);
+    try std.testing.expectEqual(@as(u8, 0), export_result.status);
     try std.testing.expectEqualStrings("one", session.variable("PREFIX").?);
     try std.testing.expect(session.isVariableExported("PREFIX"));
     try std.testing.expectEqualStrings("two", session.variable("DIRECT").?);
@@ -141,7 +141,7 @@ test "session executes export and unset builtins" {
     defer unset_hir.deinit(std.testing.allocator);
     const unset_result = try session.execute(unset_hir);
 
-    try std.testing.expectEqual(@as(u32, 0), unset_result.status);
+    try std.testing.expectEqual(@as(u8, 0), unset_result.status);
     try std.testing.expect(session.variable("PREFIX") == null);
     try std.testing.expect(session.variable("DIRECT") == null);
     try std.testing.expectEqualDeep(unset_result, session.lastResult());
@@ -165,7 +165,7 @@ test "cd changes resolution and spawn directories for later commands" {
     defer hir.deinit(std.testing.allocator);
     const result = try session.execute(hir);
 
-    try std.testing.expectEqual(@as(u32, 0), result.status);
+    try std.testing.expectEqual(@as(u8, 0), result.status);
     try std.testing.expectEqualStrings("/workspace/project", session.workingDirectory().?);
     try std.testing.expectEqualStrings(
         "/workspace/project",

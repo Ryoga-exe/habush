@@ -39,7 +39,7 @@ pub const Options = struct {
 };
 
 pub const Result = struct {
-    status: u32,
+    status: u8,
     sandbox_coverage: SandboxPolicy.Coverage,
 };
 
@@ -271,12 +271,13 @@ fn combineSandboxCoverage(
     return .not_requested;
 }
 
-fn terminationStatus(termination: Host.Termination) Error!u32 {
+fn terminationStatus(termination: Host.Termination) Error!u8 {
     return switch (termination) {
         .exited => |status| status,
         .signal => |signal| status: {
             const capped_signal: u32 = @min(signal, 127);
-            break :status 128 + capped_signal;
+            const status: u32 = 128 + capped_signal;
+            break :status @intCast(status);
         },
         .stopped, .unknown => error.UnexpectedTermination,
     };

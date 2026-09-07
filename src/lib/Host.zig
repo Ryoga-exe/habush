@@ -52,9 +52,9 @@ pub const WorkingDirectoryRequest = struct {
 };
 
 pub const Termination = union(enum) {
-    /// Native process exit code. POSIX hosts generally report an 8-bit value,
-    /// while Windows hosts can preserve the full 32-bit exit code.
-    exited: u32,
+    /// Portable shell exit status. System hosts normalize native process
+    /// results to the range 0...255.
+    exited: u8,
     signal: u32,
     stopped: u32,
     unknown: u32,

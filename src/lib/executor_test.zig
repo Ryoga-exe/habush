@@ -18,7 +18,7 @@ test "executes static simple commands through the host" {
 
     const result = try preResolvedExecutor(std.testing.allocator, fake.host()).execute(hir);
 
-    try std.testing.expectEqual(@as(u32, 7), result.status);
+    try std.testing.expectEqual(@as(u8, 7), result.status);
     try std.testing.expectEqual(@as(usize, 1), fake.spawn_calls.items.len);
     const argv = fake.spawn_calls.items[0].argv;
     try std.testing.expectEqual(@as(usize, 4), argv.len);
@@ -27,18 +27,6 @@ test "executes static simple commands through the host" {
     try std.testing.expectEqualStrings("x y", argv[2]);
     try std.testing.expectEqualStrings("", argv[3]);
     try std.testing.expectEqual(@as(usize, 1), fake.wait_calls.items.len);
-}
-
-test "preserves wide native process exit codes" {
-    var hir = try generate("/bin/command");
-    defer hir.deinit(std.testing.allocator);
-    var fake = FakeHost.init(std.testing.allocator);
-    defer fake.deinit();
-    fake.termination = .{ .exited = 0x80000001 };
-
-    const result = try preResolvedExecutor(std.testing.allocator, fake.host()).execute(hir);
-
-    try std.testing.expectEqual(@as(u32, 0x80000001), result.status);
 }
 
 test "executes sequential lists and returns the last status" {
@@ -51,7 +39,7 @@ test "executes sequential lists and returns the last status" {
 
     const result = try preResolvedExecutor(std.testing.allocator, fake.host()).execute(hir);
 
-    try std.testing.expectEqual(@as(u32, 137), result.status);
+    try std.testing.expectEqual(@as(u8, 137), result.status);
     try std.testing.expectEqual(@as(usize, 3), fake.spawn_calls.items.len);
     try std.testing.expectEqualStrings("/bin/first", fake.spawn_calls.items[0].argv[0]);
     try std.testing.expectEqualStrings("/bin/second", fake.spawn_calls.items[1].argv[0]);
@@ -67,7 +55,7 @@ test "empty HIR succeeds without host calls" {
 
     const result = try Executor.init(std.testing.allocator, fake.host()).execute(hir);
 
-    try std.testing.expectEqual(@as(u32, 0), result.status);
+    try std.testing.expectEqual(@as(u8, 0), result.status);
     try std.testing.expectEqual(.not_requested, result.sandbox_coverage);
     try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
 }
@@ -93,9 +81,9 @@ test "executes expanded core builtin names without external lookup" {
         .variables = &variables,
     });
 
-    try std.testing.expectEqual(@as(u32, 1), (try executor.execute(false_hir)).status);
-    try std.testing.expectEqual(@as(u32, 0), (try executor.execute(colon_hir)).status);
-    try std.testing.expectEqual(@as(u32, 1), (try executor.execute(expanded_hir)).status);
+    try std.testing.expectEqual(@as(u8, 1), (try executor.execute(false_hir)).status);
+    try std.testing.expectEqual(@as(u8, 0), (try executor.execute(colon_hir)).status);
+    try std.testing.expectEqual(@as(u8, 1), (try executor.execute(expanded_hir)).status);
     try std.testing.expectEqual(@as(usize, 0), fake_resolver.calls.items.len);
     try std.testing.expectEqual(@as(usize, 0), fake_host.spawn_calls.items.len);
 }
@@ -114,7 +102,7 @@ test "special builtin assignments persist in session state" {
         .variables = &variables,
     }).execute(hir);
 
-    try std.testing.expectEqual(@as(u32, 0), result.status);
+    try std.testing.expectEqual(@as(u8, 0), result.status);
     try std.testing.expectEqualStrings("temporary", variables.get("name").?);
     try std.testing.expect(variables.isExported("name"));
     try std.testing.expectEqualStrings("temporary value", variables.get("next").?);
@@ -135,7 +123,7 @@ test "regular builtin assignments remain command-local" {
         .variables = &variables,
     }).execute(hir);
 
-    try std.testing.expectEqual(@as(u32, 0), result.status);
+    try std.testing.expectEqual(@as(u8, 0), result.status);
     try std.testing.expectEqualStrings("persistent", variables.get("name").?);
     try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
 }
@@ -153,7 +141,7 @@ test "persists standalone assignments in source order" {
         .variables = &variables,
     }).execute(hir);
 
-    try std.testing.expectEqual(@as(u32, 0), result.status);
+    try std.testing.expectEqual(@as(u8, 0), result.status);
     try std.testing.expectEqualStrings("one", variables.get("first").?);
     try std.testing.expectEqualStrings("", variables.get("empty").?);
     try std.testing.expectEqualStrings("one two", variables.get("second").?);

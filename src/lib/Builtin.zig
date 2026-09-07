@@ -19,7 +19,7 @@ pub const Tag = enum {
 };
 
 pub const Result = struct {
-    status: u32,
+    status: u8,
 };
 
 pub const Context = struct {
@@ -94,7 +94,7 @@ fn variable(context: Context, name: []const u8) ?[]const u8 {
 
 fn runExport(context: Context, argv: []const []const u8) Error!Result {
     const state = context.runtime_state orelse return error.RuntimeStateUnavailable;
-    var status: u32 = 0;
+    var status: u8 = 0;
     var operands = argv[1..];
     if (operands.len != 0 and std.mem.eql(u8, operands[0], "--")) operands = operands[1..];
     for (operands) |operand| {
@@ -118,7 +118,7 @@ fn runExport(context: Context, argv: []const []const u8) Error!Result {
 
 fn runUnset(context: Context, argv: []const []const u8) Error!Result {
     const state = context.runtime_state orelse return error.RuntimeStateUnavailable;
-    var status: u32 = 0;
+    var status: u8 = 0;
     var operands = argv[1..];
     if (operands.len != 0 and std.mem.eql(u8, operands[0], "--")) operands = operands[1..];
     for (operands) |name| {
@@ -160,9 +160,9 @@ test "looks up core builtins by command name" {
 }
 
 test "runs status-only core builtins" {
-    try std.testing.expectEqual(@as(u32, 0), (try lookup(":").?.run(.{}, &.{":"})).status);
-    try std.testing.expectEqual(@as(u32, 0), (try lookup("true").?.run(.{}, &.{"true"})).status);
-    try std.testing.expectEqual(@as(u32, 1), (try lookup("false").?.run(.{}, &.{"false"})).status);
+    try std.testing.expectEqual(@as(u8, 0), (try lookup(":").?.run(.{}, &.{":"})).status);
+    try std.testing.expectEqual(@as(u8, 0), (try lookup("true").?.run(.{}, &.{"true"})).status);
+    try std.testing.expectEqual(@as(u8, 1), (try lookup("false").?.run(.{}, &.{"false"})).status);
 }
 
 test "export and unset mutate runtime state" {
@@ -171,7 +171,7 @@ test "export and unset mutate runtime state" {
     const context: Context = .{ .runtime_state = &state };
 
     try std.testing.expectEqual(
-        @as(u32, 0),
+        @as(u8, 0),
         (try lookup("export").?.run(context, &.{ "export", "NAME=value", "EMPTY" })).status,
     );
     try std.testing.expectEqualStrings("value", state.variable("NAME").?);
@@ -180,7 +180,7 @@ test "export and unset mutate runtime state" {
     try std.testing.expect(state.isVariableExported("EMPTY"));
 
     try std.testing.expectEqual(
-        @as(u32, 0),
+        @as(u8, 0),
         (try lookup("unset").?.run(context, &.{ "unset", "NAME", "missing" })).status,
     );
     try std.testing.expect(state.variable("NAME") == null);
@@ -192,11 +192,11 @@ test "stateful builtins report invalid operands as command status" {
     const context: Context = .{ .runtime_state = &state };
 
     try std.testing.expectEqual(
-        @as(u32, 1),
+        @as(u8, 1),
         (try lookup("export").?.run(context, &.{ "export", "not-valid" })).status,
     );
     try std.testing.expectEqual(
-        @as(u32, 2),
+        @as(u8, 2),
         (try lookup("unset").?.run(context, &.{ "unset", "-f" })).status,
     );
     try std.testing.expectError(
@@ -218,7 +218,7 @@ test "cd resolves and persists the working directory" {
         .runtime_state = &state,
     }, &.{ "cd", "project" });
 
-    try std.testing.expectEqual(@as(u32, 0), result.status);
+    try std.testing.expectEqual(@as(u8, 0), result.status);
     try std.testing.expectEqualStrings("/workspace/project", state.workingDirectory().?);
     const request = fake.resolve_working_directory_calls.items[0];
     try std.testing.expectEqualStrings("/workspace", request.current.?);
@@ -244,7 +244,7 @@ test "cd uses command-local HOME without persisting it" {
         .variable_overrides = &overrides,
     }, &.{"cd"});
 
-    try std.testing.expectEqual(@as(u32, 0), result.status);
+    try std.testing.expectEqual(@as(u8, 0), result.status);
     try std.testing.expectEqualStrings("/temporary", state.workingDirectory().?);
     try std.testing.expectEqualStrings("/home/user", state.variable("HOME").?);
     try std.testing.expectEqualStrings(
@@ -263,15 +263,15 @@ test "cd reports usage and host failures as command status" {
     const context: Context = .{ .host = fake.host(), .runtime_state = &state };
 
     try std.testing.expectEqual(
-        @as(u32, 2),
+        @as(u8, 2),
         (try lookup("cd").?.run(context, &.{ "cd", "one", "two" })).status,
     );
     try std.testing.expectEqual(
-        @as(u32, 1),
+        @as(u8, 1),
         (try lookup("cd").?.run(context, &.{ "cd", "/denied" })).status,
     );
     try std.testing.expectEqual(
-        @as(u32, 1),
+        @as(u8, 1),
         (try lookup("cd").?.run(context, &.{"cd"})).status,
     );
 }
