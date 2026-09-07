@@ -4,6 +4,7 @@ const std = @import("std");
 const Builtin = @This();
 const Host = @import("Host.zig");
 const RuntimeDiagnostic = @import("RuntimeDiagnostic.zig");
+const RuntimeIo = @import("RuntimeIo.zig");
 const RuntimeState = @import("RuntimeState.zig");
 const VariableStore = @import("VariableStore.zig");
 
@@ -24,18 +25,11 @@ pub const Result = struct {
     status: u8,
 };
 
-/// Standard I/O endpoints available to builtins. A null stream discards
-/// output. Non-null writers must remain valid for every execution using them.
-pub const Io = struct {
-    stdout: ?*std.Io.Writer = null,
-    stderr: ?*std.Io.Writer = null,
-};
-
 pub const Context = struct {
     host: ?Host = null,
     runtime_state: ?*RuntimeState = null,
     variable_overrides: ?*const VariableStore = null,
-    io: Io = .{},
+    io: RuntimeIo = .{},
 };
 
 pub const Error = std.mem.Allocator.Error || std.Io.Writer.Error || error{
@@ -259,10 +253,7 @@ fn reportCommandDiagnostic(
         .subject = .{ .command = command },
         .kind = kind,
     };
-    if (context.io.stderr) |stderr| {
-        try diagnostic.render(stderr, .{});
-        try stderr.writeByte('\n');
-    }
+    try context.io.reportDiagnostic(diagnostic);
     return diagnostic.status();
 }
 

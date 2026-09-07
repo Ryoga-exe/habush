@@ -367,13 +367,16 @@ test "does not spawn when command resolution finds no executable" {
     defer fake_host.deinit();
     var fake_resolver = FakeResolver.init(std.testing.allocator);
     defer fake_resolver.deinit();
+    var diagnostics: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer diagnostics.deinit();
 
-    try std.testing.expectError(
-        error.CommandNotFound,
-        Executor.initWithOptions(std.testing.allocator, fake_host.host(), .{
-            .resolver = fake_resolver.resolver(),
-        }).execute(hir),
-    );
+    const result = try Executor.initWithOptions(std.testing.allocator, fake_host.host(), .{
+        .resolver = fake_resolver.resolver(),
+        .io = .{ .stderr = &diagnostics.writer },
+    }).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 127), result.status);
+    try std.testing.expectEqualStrings("missing: command not found\n", diagnostics.written());
     try std.testing.expectEqual(@as(usize, 0), fake_host.spawn_calls.items.len);
 }
 

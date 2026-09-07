@@ -156,7 +156,7 @@ test "session routes builtin output" {
     var diagnostics: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer diagnostics.deinit();
     var session = try Session.init(std.testing.allocator, fake_host.host(), .{
-        .builtin_io = .{
+        .io = .{
             .stdout = &output.writer,
             .stderr = &diagnostics.writer,
         },

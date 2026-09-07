@@ -1,19 +1,19 @@
 //! Persistent state for evaluating HIR units.
 
 const std = @import("std");
-const Builtin = @import("Builtin.zig");
 const CommandPlan = @import("CommandPlan.zig");
 const CommandResolver = @import("CommandResolver.zig");
 const Executor = @import("Executor.zig");
 const Hir = @import("Hir.zig");
 const Host = @import("Host.zig");
+const RuntimeIo = @import("RuntimeIo.zig");
 const RuntimeState = @import("RuntimeState.zig");
 const VariableStore = @import("VariableStore.zig");
 const Session = @This();
 
 host: Host,
 resolver: ?CommandResolver,
-builtin_io: Builtin.Io,
+io: RuntimeIo,
 state: RuntimeState,
 last_result: Executor.Result = .{
     .status = 0,
@@ -28,7 +28,7 @@ pub const Options = struct {
     /// Complete initial shell variable state. The caller should import the
     /// host environment here and mark those bindings exported when desired.
     variables: []const VariableStore.Binding = &.{},
-    builtin_io: Builtin.Io = .{},
+    io: RuntimeIo = .{},
 };
 
 pub fn init(
@@ -39,7 +39,7 @@ pub fn init(
     return .{
         .host = host,
         .resolver = options.resolver,
-        .builtin_io = options.builtin_io,
+        .io = options.io,
         .state = try RuntimeState.init(gpa, .{
             .cwd = options.cwd,
             .search_path = options.search_path,
@@ -59,7 +59,7 @@ pub fn execute(session: *Session, hir: Hir) Executor.Error!Executor.Result {
         session.host,
         session.resolver,
         &session.state,
-        session.builtin_io,
+        session.io,
     ).execute(hir);
     session.last_result = result;
     return result;

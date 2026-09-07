@@ -23,6 +23,7 @@ pub const Kind = union(enum) {
     invalid_name: []const u8,
     cannot_change_directory: []const u8,
     working_directory_unavailable,
+    command_not_found,
 };
 
 pub const RenderOptions = struct {
@@ -37,6 +38,7 @@ pub fn status(diagnostic: RuntimeDiagnostic) u8 {
         .cannot_change_directory,
         .working_directory_unavailable,
         => 1,
+        .command_not_found => 127,
     };
 }
 
@@ -65,6 +67,7 @@ pub fn render(
         .invalid_name => |name| try writer.print("invalid name: {s}", .{name}),
         .cannot_change_directory => |path| try writer.print("cannot change directory: {s}", .{path}),
         .working_directory_unavailable => try writer.writeAll("working directory unavailable"),
+        .command_not_found => try writer.writeAll("command not found"),
     }
 }
 
@@ -89,6 +92,15 @@ test "usage diagnostics have status two" {
     };
 
     try std.testing.expectEqual(@as(u8, 2), diagnostic.status());
+}
+
+test "missing command diagnostics have status 127" {
+    const diagnostic: RuntimeDiagnostic = .{
+        .subject = .{ .command = "missing" },
+        .kind = .command_not_found,
+    };
+
+    try std.testing.expectEqual(@as(u8, 127), diagnostic.status());
 }
 
 test {

@@ -8,6 +8,8 @@ const Executor = @This();
 const Expander = @import("Expander.zig");
 const Hir = @import("Hir.zig");
 const Host = @import("Host.zig");
+const RuntimeDiagnostic = @import("RuntimeDiagnostic.zig");
+const RuntimeIo = @import("RuntimeIo.zig");
 const RuntimeState = @import("RuntimeState.zig");
 const SandboxPolicy = @import("SandboxPolicy.zig");
 const VariableStore = @import("VariableStore.zig");
@@ -20,7 +22,7 @@ search_path: []const []const u8,
 cwd: ?[]const u8,
 variables: ?*VariableStore,
 runtime_state: ?*RuntimeState,
-builtin_io: Builtin.Io,
+io: RuntimeIo,
 
 pub const Error = Builtin.Error || Host.Error || Expander.Error || CommandResolver.Error || VariableStore.Error || error{
     UnsupportedInstruction,
@@ -37,7 +39,7 @@ pub const Options = struct {
     /// Complete shell variable state. When present, exported bindings become
     /// an exact replacement environment; `null` preserves host inheritance.
     variables: ?*VariableStore = null,
-    builtin_io: Builtin.Io = .{},
+    io: RuntimeIo = .{},
 };
 
 pub const Result = struct {
@@ -59,7 +61,7 @@ pub fn initWithOptions(gpa: std.mem.Allocator, host: Host, options: Options) Exe
         .cwd = options.cwd,
         .variables = options.variables,
         .runtime_state = null,
-        .builtin_io = options.builtin_io,
+        .io = options.io,
     };
 }
 
@@ -67,7 +69,7 @@ pub fn initWithState(
     host: Host,
     resolver: ?CommandResolver,
     state: *RuntimeState,
-    builtin_io: Builtin.Io,
+    io: RuntimeIo,
 ) Executor {
     return .{
         .gpa = state.allocator(),
@@ -78,7 +80,7 @@ pub fn initWithState(
         .cwd = null,
         .variables = null,
         .runtime_state = state,
-        .builtin_io = builtin_io,
+        .io = io,
     };
 }
 
@@ -167,7 +169,7 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
             .host = executor.host,
             .runtime_state = executor.runtime_state,
             .variable_overrides = &command_variables,
-            .io = executor.builtin_io,
+            .io = executor.io,
         }, argv.items);
         return .{ .status = result.status, .sandbox_coverage = .not_requested };
     }
@@ -186,7 +188,17 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
         .name = argv.items[0],
         .search_path = executor.commandSearchPath(),
         .cwd = executor.workingDirectory(),
-    })) orelse return error.CommandNotFound;
+    })) orelse {
+        const diagnostic: RuntimeDiagnostic = .{
+            .subject = .{ .command = argv.items[0] },
+            .kind = .command_not_found,
+        };
+        try executor.io.reportDiagnostic(diagnostic);
+        return .{
+            .status = diagnostic.status(),
+            .sandbox_coverage = .not_requested,
+        };
+    };
 
     const spawned = try executor.host.spawn(.{
         .executable = executable,
