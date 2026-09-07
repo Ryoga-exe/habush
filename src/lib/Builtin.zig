@@ -14,6 +14,7 @@ pub const Tag = enum {
     true,
     false,
     cd,
+    pwd,
     @"export",
     unset,
 };
@@ -46,6 +47,7 @@ const definitions = std.StaticStringMap(Builtin).initComptime(.{
     .{ "true", Builtin{ .tag = .true } },
     .{ "false", Builtin{ .tag = .false } },
     .{ "cd", Builtin{ .tag = .cd } },
+    .{ "pwd", Builtin{ .tag = .pwd } },
     .{ "export", Builtin{ .tag = .@"export", .special = true } },
     .{ "unset", Builtin{ .tag = .unset, .special = true } },
 });
@@ -60,6 +62,7 @@ pub fn run(builtin: Builtin, context: Context, argv: []const []const u8) Error!R
         .@":", .true => .{ .status = 0 },
         .false => .{ .status = 1 },
         .cd => runCd(context, argv),
+        .pwd => runPwd(context, argv),
         .@"export" => runExport(context, argv),
         .unset => runUnset(context, argv),
     };
@@ -108,6 +111,20 @@ fn variable(context: Context, name: []const u8) ?[]const u8 {
         if (overrides.get(name)) |value| return value;
     if (context.runtime_state) |state| return state.variable(name);
     return null;
+}
+
+fn runPwd(context: Context, argv: []const []const u8) Error!Result {
+    const state = context.runtime_state orelse return error.RuntimeStateUnavailable;
+    var operands = argv[1..];
+    if (operands.len != 0 and std.mem.eql(u8, operands[0], "--")) operands = operands[1..];
+    if (operands.len != 0) return .{ .status = 2 };
+
+    const cwd = state.workingDirectory() orelse return .{ .status = 1 };
+    if (context.io.stdout) |stdout| {
+        try stdout.writeAll(cwd);
+        try stdout.writeByte('\n');
+    }
+    return .{ .status = 0 };
 }
 
 fn runExport(context: Context, argv: []const []const u8) Error!Result {
@@ -198,6 +215,8 @@ test "looks up core builtins by command name" {
     try std.testing.expect(!lookup("false").?.special);
     try std.testing.expectEqual(Tag.cd, lookup("cd").?.tag);
     try std.testing.expect(!lookup("cd").?.special);
+    try std.testing.expectEqual(Tag.pwd, lookup("pwd").?.tag);
+    try std.testing.expect(!lookup("pwd").?.special);
     try std.testing.expectEqual(Tag.@"export", lookup("export").?.tag);
     try std.testing.expect(lookup("export").?.special);
     try std.testing.expect(lookup("unset").?.special);
@@ -393,6 +412,30 @@ test "cd reports usage and host failures as command status" {
     try std.testing.expectEqual(
         @as(u8, 1),
         (try lookup("cd").?.run(context, &.{"cd"})).status,
+    );
+}
+
+test "pwd writes the logical working directory" {
+    var state = try RuntimeState.init(std.testing.allocator, .{ .cwd = "/workspace/project" });
+    defer state.deinit();
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    const context: Context = .{
+        .runtime_state = &state,
+        .io = .{ .stdout = &output.writer },
+    };
+
+    const result = try lookup("pwd").?.run(context, &.{"pwd"});
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqualStrings("/workspace/project\n", output.written());
+    try std.testing.expectEqual(
+        @as(u8, 0),
+        (try lookup("pwd").?.run(context, &.{ "pwd", "--" })).status,
+    );
+    try std.testing.expectEqual(
+        @as(u8, 2),
+        (try lookup("pwd").?.run(context, &.{ "pwd", "-P" })).status,
     );
 }
 
