@@ -1,4 +1,5 @@
 const std = @import("std");
+const habush = @import("habush");
 const Io = std.Io;
 const platform = @import("platform.zig");
 
@@ -48,20 +49,19 @@ const Shell = struct {
                 try self.printPrompt();
             }
 
-            const line = try readLineAlloc(self.stdin, self.allocator) orelse {
+            const source = try readLineAlloc(self.stdin, self.allocator) orelse {
                 if (self.interactive) {
                     try Io.File.stderr().writeStreamingAll(self.io, "\n");
                 }
                 break;
             };
-            defer self.allocator.free(line);
+            defer self.allocator.free(source);
 
-            const input = std.mem.trim(u8, line, &std.ascii.whitespace);
-            if (input.len == 0) {
+            if (std.mem.trim(u8, source, &std.ascii.whitespace).len == 0) {
                 continue;
             }
 
-            switch (try self.handleInput(input)) {
+            switch (try self.handleInput(source)) {
                 .@"continue" => continue,
                 .exit => break,
             }
@@ -72,26 +72,29 @@ const Shell = struct {
         try Io.File.stderr().writeStreamingAll(self.io, "habush> ");
     }
 
-    fn handleInput(self: *Shell, input: []const u8) !LoopAction {
+    fn handleInput(self: *Shell, source: [:0]const u8) !LoopAction {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
 
         const allocator = arena.allocator();
-        _ = allocator; // autofix
 
-        // tokenizer
-        // parser
-
-        if (std.mem.eql(u8, input, "exit")) {
+        if (std.mem.eql(u8, std.mem.trim(u8, source, &std.ascii.whitespace), "exit")) {
             return .exit;
         }
 
-        std.log.info("input: {s}", .{input});
+        var tree = try habush.Ast.parse(allocator, source);
+        defer tree.deinit(allocator);
+
+        var dump: Io.Writer.Allocating = .init(allocator);
+        defer dump.deinit();
+        try tree.dump(&dump.writer);
+        try Io.File.stdout().writeStreamingAll(self.io, dump.written());
+
         return .@"continue";
     }
 };
 
-fn readLineAlloc(reader: *Io.Reader, allocator: std.mem.Allocator) !?[]u8 {
+fn readLineAlloc(reader: *Io.Reader, allocator: std.mem.Allocator) !?[:0]u8 {
     var out: Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
 
@@ -107,12 +110,12 @@ fn readLineAlloc(reader: *Io.Reader, allocator: std.mem.Allocator) !?[]u8 {
         return null;
     }
 
-    const line = out.written();
+    const written = out.written();
 
     // CRLF
-    if (line.len > 0 and line[line.len - 1] == '\r') {
-        out.shrinkRetainingCapacity(line.len - 1);
+    if (written.len > 0 and written[written.len - 1] == '\r') {
+        out.shrinkRetainingCapacity(written.len - 1);
     }
 
-    return try out.toOwnedSlice();
+    return try out.toOwnedSliceSentinel(0);
 }
