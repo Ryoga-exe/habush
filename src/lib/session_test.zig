@@ -121,6 +121,33 @@ test "session persists assignments across commands" {
     try std.testing.expectEqual(@as(usize, 0), fake_host.spawn_calls.items.len);
 }
 
+test "session executes export and unset builtins" {
+    var fake_host = FakeHost.init(std.testing.allocator);
+    defer fake_host.deinit();
+    var session = try Session.init(std.testing.allocator, fake_host.host(), .{});
+    defer session.deinit();
+
+    var export_hir = try generate("PREFIX=one export PREFIX DIRECT=two");
+    defer export_hir.deinit(std.testing.allocator);
+    const export_result = try session.execute(export_hir);
+
+    try std.testing.expectEqual(@as(u8, 0), export_result.status);
+    try std.testing.expectEqualStrings("one", session.variable("PREFIX").?);
+    try std.testing.expect(session.isVariableExported("PREFIX"));
+    try std.testing.expectEqualStrings("two", session.variable("DIRECT").?);
+    try std.testing.expect(session.isVariableExported("DIRECT"));
+
+    var unset_hir = try generate("unset PREFIX DIRECT missing");
+    defer unset_hir.deinit(std.testing.allocator);
+    const unset_result = try session.execute(unset_hir);
+
+    try std.testing.expectEqual(@as(u8, 0), unset_result.status);
+    try std.testing.expect(session.variable("PREFIX") == null);
+    try std.testing.expect(session.variable("DIRECT") == null);
+    try std.testing.expectEqualDeep(unset_result, session.lastResult());
+    try std.testing.expectEqual(@as(usize, 0), fake_host.spawn_calls.items.len);
+}
+
 test "session initialization handles every allocation failure" {
     var fake_host = FakeHost.init(std.testing.allocator);
     defer fake_host.deinit();

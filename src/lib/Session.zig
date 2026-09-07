@@ -51,13 +51,11 @@ pub fn deinit(session: *Session) void {
 }
 
 pub fn execute(session: *Session, hir: Hir) Executor.Error!Executor.Result {
-    const result = try Executor.initWithOptions(session.state.allocator(), session.host, .{
-        .sandbox = session.state.activeSandbox(),
-        .resolver = session.resolver,
-        .search_path = session.state.commandSearchPath(),
-        .cwd = session.state.workingDirectory(),
-        .variables = session.state.variableStore(),
-    }).execute(hir);
+    const result = try Executor.initWithState(
+        session.host,
+        session.resolver,
+        &session.state,
+    ).execute(hir);
     session.last_result = result;
     return result;
 }

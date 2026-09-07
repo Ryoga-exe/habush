@@ -8,6 +8,7 @@ const Executor = @This();
 const Expander = @import("Expander.zig");
 const Hir = @import("Hir.zig");
 const Host = @import("Host.zig");
+const RuntimeState = @import("RuntimeState.zig");
 const SandboxPolicy = @import("SandboxPolicy.zig");
 const VariableStore = @import("VariableStore.zig");
 
@@ -18,8 +19,9 @@ resolver: ?CommandResolver,
 search_path: []const []const u8,
 cwd: ?[]const u8,
 variables: ?*VariableStore,
+runtime_state: ?*RuntimeState,
 
-pub const Error = Host.Error || Expander.Error || CommandResolver.Error || VariableStore.Error || error{
+pub const Error = Builtin.Error || Host.Error || Expander.Error || CommandResolver.Error || VariableStore.Error || error{
     UnsupportedInstruction,
     CommandResolutionUnavailable,
     UnexpectedTermination,
@@ -54,6 +56,24 @@ pub fn initWithOptions(gpa: std.mem.Allocator, host: Host, options: Options) Exe
         .search_path = options.search_path,
         .cwd = options.cwd,
         .variables = options.variables,
+        .runtime_state = null,
+    };
+}
+
+pub fn initWithState(
+    host: Host,
+    resolver: ?CommandResolver,
+    state: *RuntimeState,
+) Executor {
+    return .{
+        .gpa = state.allocator(),
+        .host = host,
+        .sandbox = .inherit,
+        .resolver = resolver,
+        .search_path = &.{},
+        .cwd = null,
+        .variables = null,
+        .runtime_state = state,
     };
 }
 
@@ -93,8 +113,9 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
     var arena = std.heap.ArenaAllocator.init(executor.gpa);
     defer arena.deinit();
     const allocator = arena.allocator();
+    const variables = executor.variableStore();
     const expander = Expander.initWithContext(allocator, .{
-        .variables = executor.variables,
+        .variables = variables,
     });
 
     var argv: std.ArrayList([]const u8) = .empty;
@@ -109,11 +130,11 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
     }
     if (argv.items.len == 0) {
         if (!has_assignments) return error.UnsupportedInstruction;
-        const variables = executor.variables orelse return error.VariableStateUnavailable;
+        const mutable_variables = variables orelse return error.VariableStateUnavailable;
         for (parts) |part| {
             const assignment = hir.assignment(part);
             const value = try expander.expandAssignment(hir, assignment.value);
-            try variables.set(assignment.name, value);
+            try mutable_variables.set(assignment.name, value);
         }
         return .{ .status = 0, .sandbox_coverage = .not_requested };
     }
@@ -125,7 +146,7 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
             if (hir.instructionTag(part) != .assignment) continue;
             const assignment = hir.assignment(part);
             const assignment_expander = Expander.initWithContext(allocator, .{
-                .variables = executor.variables,
+                .variables = variables,
                 .overrides = &command_variables,
             });
             const value = try assignment_expander.expandAssignment(hir, assignment.value);
@@ -134,10 +155,10 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
     }
     if (Builtin.lookup(argv.items[0])) |builtin| {
         if (builtin.special and has_assignments) {
-            const variables = executor.variables orelse return error.VariableStateUnavailable;
-            try applyAssignments(variables, &command_variables);
+            const mutable_variables = variables orelse return error.VariableStateUnavailable;
+            try applyAssignments(mutable_variables, &command_variables);
         }
-        const result = builtin.run(argv.items);
+        const result = try builtin.run(.{ .runtime_state = executor.runtime_state }, argv.items);
         return .{ .status = result.status, .sandbox_coverage = .not_requested };
     }
 
@@ -145,7 +166,7 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
     defer process_environment.deinit();
     const environment = try prepareEnvironment(
         allocator,
-        executor.variables,
+        variables,
         &command_variables,
         &process_environment,
     );
@@ -155,8 +176,8 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
     else if (executor.resolver) |resolver|
         (try resolver.resolve(allocator, .{
             .name = argv.items[0],
-            .search_path = executor.search_path,
-            .cwd = executor.cwd,
+            .search_path = executor.commandSearchPath(),
+            .cwd = executor.workingDirectory(),
         })) orelse return error.CommandNotFound
     else
         return error.CommandResolutionUnavailable;
@@ -165,13 +186,33 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
         .executable = executable,
         .argv = argv.items,
         .environment = environment,
-        .cwd = if (executor.cwd) |cwd| .{ .path = cwd } else .inherit,
-        .sandbox = executor.sandbox,
+        .cwd = if (executor.workingDirectory()) |cwd| .{ .path = cwd } else .inherit,
+        .sandbox = executor.activeSandbox(),
     });
     return .{
         .status = try terminationStatus(try executor.host.wait(spawned.process)),
         .sandbox_coverage = spawned.sandbox_coverage,
     };
+}
+
+fn variableStore(executor: Executor) ?*VariableStore {
+    if (executor.runtime_state) |state| return state.variableStore();
+    return executor.variables;
+}
+
+fn workingDirectory(executor: Executor) ?[]const u8 {
+    if (executor.runtime_state) |state| return state.workingDirectory();
+    return executor.cwd;
+}
+
+fn commandSearchPath(executor: Executor) []const []const u8 {
+    if (executor.runtime_state) |state| return state.commandSearchPath();
+    return executor.search_path;
+}
+
+fn activeSandbox(executor: Executor) CommandPlan.Sandbox {
+    if (executor.runtime_state) |state| return state.activeSandbox();
+    return executor.sandbox;
 }
 
 fn applyAssignments(
