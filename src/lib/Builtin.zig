@@ -14,6 +14,7 @@ pub const Tag = enum {
     true,
     false,
     cd,
+    exit,
     pwd,
     @"export",
     unset,
@@ -21,6 +22,7 @@ pub const Tag = enum {
 
 pub const Result = struct {
     status: u8,
+    control_flow: runtime.ControlFlow = .none,
 };
 
 pub const Context = struct {
@@ -28,6 +30,7 @@ pub const Context = struct {
     runtime_state: ?*runtime.State = null,
     variable_overrides: ?*const VariableStore = null,
     io: runtime.Io = .{},
+    last_status: u8 = 0,
 };
 
 pub const Error = std.mem.Allocator.Error || std.Io.Writer.Error || error{
@@ -40,6 +43,7 @@ const definitions = std.StaticStringMap(Builtin).initComptime(.{
     .{ "true", Builtin{ .tag = .true } },
     .{ "false", Builtin{ .tag = .false } },
     .{ "cd", Builtin{ .tag = .cd } },
+    .{ "exit", Builtin{ .tag = .exit, .special = true } },
     .{ "pwd", Builtin{ .tag = .pwd } },
     .{ "export", Builtin{ .tag = .@"export", .special = true } },
     .{ "unset", Builtin{ .tag = .unset, .special = true } },
@@ -55,10 +59,30 @@ pub fn run(builtin: Builtin, context: Context, argv: []const []const u8) Error!R
         .@":", .true => .{ .status = 0 },
         .false => .{ .status = 1 },
         .cd => runCd(context, argv),
+        .exit => runExit(context, argv),
         .pwd => runPwd(context, argv),
         .@"export" => runExport(context, argv),
         .unset => runUnset(context, argv),
     };
+}
+
+fn runExit(context: Context, argv: []const []const u8) Error!Result {
+    if (argv.len > 2) return commandFailure(context, argv[0], .too_many_arguments);
+    if (argv.len == 1) {
+        return .{ .status = context.last_status, .control_flow = .exit };
+    }
+
+    const value = std.fmt.parseInt(i64, argv[1], 10) catch {
+        const failure = try commandFailure(
+            context,
+            argv[0],
+            .{ .numeric_argument_required = argv[1] },
+        );
+        return .{ .status = failure.status, .control_flow = .exit };
+    };
+    // Shell statuses expose the low eight bits of a valid integer operand.
+    const status: u8 = @truncate(@as(u64, @bitCast(value)));
+    return .{ .status = status, .control_flow = .exit };
 }
 
 fn runCd(context: Context, argv: []const []const u8) Error!Result {
@@ -262,6 +286,8 @@ test "looks up core builtins by command name" {
     try std.testing.expect(!lookup("false").?.special);
     try std.testing.expectEqual(Tag.cd, lookup("cd").?.tag);
     try std.testing.expect(!lookup("cd").?.special);
+    try std.testing.expectEqual(Tag.exit, lookup("exit").?.tag);
+    try std.testing.expect(lookup("exit").?.special);
     try std.testing.expectEqual(Tag.pwd, lookup("pwd").?.tag);
     try std.testing.expect(!lookup("pwd").?.special);
     try std.testing.expectEqual(Tag.@"export", lookup("export").?.tag);
@@ -275,6 +301,46 @@ test "runs status-only core builtins" {
     try std.testing.expectEqual(@as(u8, 0), (try lookup(":").?.run(.{}, &.{":"})).status);
     try std.testing.expectEqual(@as(u8, 0), (try lookup("true").?.run(.{}, &.{"true"})).status);
     try std.testing.expectEqual(@as(u8, 1), (try lookup("false").?.run(.{}, &.{"false"})).status);
+}
+
+test "exit requests shell termination with selected status" {
+    const inherited = try lookup("exit").?.run(.{ .last_status = 23 }, &.{"exit"});
+    try std.testing.expectEqual(@as(u8, 23), inherited.status);
+    try std.testing.expectEqual(runtime.ControlFlow.exit, inherited.control_flow);
+
+    const explicit = try lookup("exit").?.run(.{}, &.{ "exit", "7" });
+    try std.testing.expectEqual(@as(u8, 7), explicit.status);
+    try std.testing.expectEqual(runtime.ControlFlow.exit, explicit.control_flow);
+
+    const truncated = try lookup("exit").?.run(.{}, &.{ "exit", "1010101010" });
+    try std.testing.expectEqual(@as(u8, 18), truncated.status);
+    try std.testing.expectEqual(runtime.ControlFlow.exit, truncated.control_flow);
+
+    const negative = try lookup("exit").?.run(.{}, &.{ "exit", "-1" });
+    try std.testing.expectEqual(@as(u8, 255), negative.status);
+    try std.testing.expectEqual(runtime.ControlFlow.exit, negative.control_flow);
+}
+
+test "exit diagnoses invalid operands" {
+    var diagnostics: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer diagnostics.deinit();
+    const context: Context = .{ .io = .{ .stderr = &diagnostics.writer } };
+
+    const invalid = try lookup("exit").?.run(
+        context,
+        &.{ "exit", "999999999999999999999999999999" },
+    );
+    try std.testing.expectEqual(@as(u8, 2), invalid.status);
+    try std.testing.expectEqual(runtime.ControlFlow.exit, invalid.control_flow);
+
+    const too_many = try lookup("exit").?.run(context, &.{ "exit", "1", "2" });
+    try std.testing.expectEqual(@as(u8, 2), too_many.status);
+    try std.testing.expectEqual(runtime.ControlFlow.none, too_many.control_flow);
+    try std.testing.expectEqualStrings(
+        "exit: numeric argument required: 999999999999999999999999999999\n" ++
+            "exit: too many arguments\n",
+        diagnostics.written(),
+    );
 }
 
 test "export and unset mutate runtime state" {

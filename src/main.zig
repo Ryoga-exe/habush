@@ -107,11 +107,6 @@ const Shell = struct {
     interactive: bool,
     last_status: u8 = 0,
 
-    const LoopAction = enum {
-        @"continue",
-        exit,
-    };
-
     fn run(self: *Shell) !u8 {
         while (true) {
             const source = try self.readCommand() orelse return self.last_status;
@@ -122,7 +117,7 @@ const Shell = struct {
             }
 
             switch (try self.handleInput(source)) {
-                .@"continue" => continue,
+                .none => continue,
                 .exit => return self.last_status,
             }
         }
@@ -181,14 +176,10 @@ const Shell = struct {
         try self.stderr.flush();
     }
 
-    fn handleInput(self: *Shell, source: [:0]const u8) !LoopAction {
+    fn handleInput(self: *Shell, source: [:0]const u8) !habush.runtime.ControlFlow {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const allocator = arena.allocator();
-
-        if (std.mem.eql(u8, std.mem.trim(u8, source, &std.ascii.whitespace), "exit")) {
-            return .exit;
-        }
 
         var tree = try habush.Ast.parse(allocator, source);
         defer tree.deinit(allocator);
@@ -203,20 +194,22 @@ const Shell = struct {
                 try self.stderr.writeByte('\n');
             }
             self.last_status = 2;
-            return .@"continue";
+            return .none;
         }
         switch (tree.status) {
             .complete => {},
             .incomplete => {
                 try self.stderr.writeAll("habush: incomplete input\n");
                 self.last_status = 2;
-                return .@"continue";
+                return .none;
             },
         }
 
         var hir = try habush.AstGen.generate(allocator, tree);
         defer hir.deinit(allocator);
-        const result = self.session.execute(hir) catch |err| switch (err) {
+        const result = self.session.executeWithOptions(hir, .{
+            .last_status = self.last_status,
+        }) catch |err| switch (err) {
             error.UnsupportedInstruction,
             error.FieldSplittingUnsupported,
             error.PathnameExpansionUnsupported,
@@ -227,13 +220,13 @@ const Shell = struct {
                     @errorName(err),
                 });
                 self.last_status = 2;
-                return .@"continue";
+                return .none;
             },
             else => |other| return other,
         };
         self.last_status = result.status;
 
-        return .@"continue";
+        return result.control_flow;
     }
 };
 

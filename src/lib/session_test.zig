@@ -123,6 +123,28 @@ test "session persists assignments across commands" {
     try std.testing.expectEqual(@as(usize, 0), fake_host.spawn_calls.items.len);
 }
 
+test "session carries the previous status into exit" {
+    var fake_host = FakeHost.init(std.testing.allocator);
+    defer fake_host.deinit();
+    var session = try Session.init(std.testing.allocator, fake_host.host(), .{});
+    defer session.deinit();
+
+    var false_hir = try generate("false");
+    defer false_hir.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 1), (try session.execute(false_hir)).status);
+
+    var exit_hir = try generate("exit");
+    defer exit_hir.deinit(std.testing.allocator);
+    const result = try session.execute(exit_hir);
+
+    try std.testing.expectEqual(@as(u8, 1), result.status);
+    try std.testing.expectEqual(.exit, result.control_flow);
+
+    const overridden = try session.executeWithOptions(exit_hir, .{ .last_status = 2 });
+    try std.testing.expectEqual(@as(u8, 2), overridden.status);
+    try std.testing.expectEqual(.exit, overridden.control_flow);
+}
+
 test "session executes export and unset builtins" {
     var fake_host = FakeHost.init(std.testing.allocator);
     defer fake_host.deinit();

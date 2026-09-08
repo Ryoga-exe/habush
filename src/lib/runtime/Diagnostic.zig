@@ -19,6 +19,7 @@ pub const Kind = union(enum) {
     unsupported_option: []const u8,
     unexpected_argument: []const u8,
     too_many_arguments,
+    numeric_argument_required: []const u8,
     variable_not_set: []const u8,
     invalid_name: []const u8,
     cannot_change_directory: []const u8,
@@ -41,7 +42,11 @@ pub const RenderOptions = struct {
 
 pub fn status(diagnostic: Diagnostic) u8 {
     return switch (diagnostic.kind) {
-        .unsupported_option, .unexpected_argument, .too_many_arguments => 2,
+        .unsupported_option,
+        .unexpected_argument,
+        .too_many_arguments,
+        .numeric_argument_required,
+        => 2,
         .variable_not_set,
         .invalid_name,
         .cannot_change_directory,
@@ -73,6 +78,7 @@ pub fn render(
         .unsupported_option => |option| try writer.print("unsupported option: {s}", .{option}),
         .unexpected_argument => |argument| try writer.print("unexpected argument: {s}", .{argument}),
         .too_many_arguments => try writer.writeAll("too many arguments"),
+        .numeric_argument_required => |argument| try writer.print("numeric argument required: {s}", .{argument}),
         .variable_not_set => |name| try writer.print("{s} not set", .{name}),
         .invalid_name => |name| try writer.print("invalid name: {s}", .{name}),
         .cannot_change_directory => |path| try writer.print("cannot change directory: {s}", .{path}),
