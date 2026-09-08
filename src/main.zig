@@ -9,16 +9,15 @@ pub fn main(init: std.process.Init) !void {
     if (status != 0) std.process.exit(status);
 }
 
+const Invocation = union(enum) {
+    stream,
+    command: []const u8,
+};
+
 fn runApplication(init: std.process.Init) !u8 {
     const arena = init.arena.allocator();
     const gpa = init.gpa;
     const io = init.io;
-
-    const interactive = try Io.File.stdin().isTty(io) and try Io.File.stderr().isTty(io);
-
-    if (interactive) {
-        try platform.ignoreInteractiveInterrupt();
-    }
 
     var stdin_buffer: [4096]u8 = undefined;
     var stdin_file_reader: Io.File.Reader = .initStreaming(.stdin(), io, &stdin_buffer);
@@ -26,6 +25,19 @@ fn runApplication(init: std.process.Init) !u8 {
     var stdout_file_writer = Io.File.stdout().writerStreaming(io, &stdout_buffer);
     var stderr_buffer: [0]u8 = .{};
     var stderr_file_writer = Io.File.stderr().writerStreaming(io, &stderr_buffer);
+
+    const args = try init.minimal.args.toSlice(arena);
+    const invocation = parseInvocation(args) orelse {
+        try stderr_file_writer.interface.writeAll("habush: usage: habush [-c command]\n");
+        return 2;
+    };
+    const interactive = invocation == .stream and
+        try Io.File.stdin().isTty(io) and
+        try Io.File.stderr().isTty(io);
+
+    if (interactive) {
+        try platform.ignoreInteractiveInterrupt();
+    }
 
     const cwd = try std.process.currentPathAlloc(io, arena);
     const variables = try environmentBindings(arena, init.environ_map);
@@ -72,7 +84,19 @@ fn runApplication(init: std.process.Init) !u8 {
         .interactive = interactive,
     };
 
-    return shell.run();
+    return switch (invocation) {
+        .stream => shell.run(),
+        .command => |command| shell.runCommand(command),
+    };
+}
+
+fn parseInvocation(args: []const [:0]const u8) ?Invocation {
+    if (args.len <= 1) return .stream;
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--")) return .stream;
+    if (args.len == 3 and std.mem.eql(u8, args[1], "-c")) {
+        return .{ .command = args[2] };
+    }
+    return null;
 }
 
 const Shell = struct {
@@ -102,6 +126,15 @@ const Shell = struct {
                 .exit => return self.last_status,
             }
         }
+    }
+
+    fn runCommand(self: *Shell, command: []const u8) !u8 {
+        if (std.mem.trim(u8, command, &std.ascii.whitespace).len == 0) return 0;
+
+        const source = try self.allocator.dupeZ(u8, command);
+        defer self.allocator.free(source);
+        _ = try self.handleInput(source);
+        return self.last_status;
     }
 
     fn readCommand(self: *Shell) !?[:0]u8 {
