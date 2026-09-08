@@ -1,8 +1,8 @@
 //! Native `Host` implementation backed by Zig's cross-platform standard APIs.
 //!
 //! The initial process backend supports foreground commands with inherited
-//! standard streams and environment. File actions, process groups, environment
-//! replacement, and sandbox restrictions remain explicit `Unsupported` boundaries.
+//! standard streams. File actions, process groups, and sandbox restrictions
+//! remain explicit `Unsupported` boundaries.
 
 const std = @import("std");
 const CommandPlan = @import("../CommandPlan.zig");
@@ -11,6 +11,9 @@ const System = @This();
 
 gpa: std.mem.Allocator,
 io: std.Io,
+/// Parent process environment used as the base for `.overlay` plans.
+/// The caller retains ownership and must keep it alive while this host is used.
+environ_map: ?*const std.process.Environ.Map = null,
 children: std.AutoHashMapUnmanaged(Host.Process, std.process.Child) = .empty,
 next_process: u32 = 1,
 
@@ -37,7 +40,6 @@ const vtable: Host.VTable = .{
 fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.Error!Host.SpawnResult {
     const system: *System = @ptrCast(@alignCast(userdata.?));
     if (plan.file_actions.len != 0 or
-        plan.environment != .inherit or
         plan.process_group != .inherit or
         plan.sandbox != .inherit)
     {
@@ -58,6 +60,9 @@ fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.Error!Host.SpawnResult {
         break :argv copy;
     };
 
+    var environment = try system.prepareEnvironment(plan.environment);
+    defer if (environment) |*map| map.deinit();
+
     try system.children.ensureUnusedCapacity(system.gpa, 1);
     const child = std.process.spawn(system.io, .{
         .argv = argv,
@@ -65,6 +70,7 @@ fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.Error!Host.SpawnResult {
             .inherit => .inherit,
             .path => |path| .{ .path = path },
         },
+        .environ_map = if (environment) |*map| map else null,
     }) catch |err| return mapSpawnError(err);
 
     const process = system.nextProcess();
@@ -73,6 +79,40 @@ fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.Error!Host.SpawnResult {
         .process = process,
         .sandbox_coverage = .not_requested,
     };
+}
+
+fn prepareEnvironment(
+    system: *System,
+    environment: CommandPlan.Environment,
+) Host.Error!?std.process.Environ.Map {
+    return switch (environment) {
+        .inherit => null,
+        .overlay => |variables| map: {
+            if (variables.len == 0) break :map null;
+            const parent = system.environ_map orelse return error.InvalidArguments;
+            var map = parent.clone(system.gpa) catch return error.OutOfMemory;
+            errdefer map.deinit();
+            try applyEnvironmentVariables(&map, variables);
+            break :map map;
+        },
+        .replace => |variables| map: {
+            var map = std.process.Environ.Map.init(system.gpa);
+            errdefer map.deinit();
+            try applyEnvironmentVariables(&map, variables);
+            break :map map;
+        },
+    };
+}
+
+fn applyEnvironmentVariables(
+    map: *std.process.Environ.Map,
+    variables: []const CommandPlan.EnvironmentVariable,
+) Host.Error!void {
+    for (variables) |variable| {
+        if (!std.process.Environ.Map.validateKeyForPut(variable.name))
+            return error.InvalidArguments;
+        map.put(variable.name, variable.value) catch return error.OutOfMemory;
+    }
 }
 
 fn wait(userdata: ?*anyopaque, process: Host.Process) Host.Error!Host.Termination {
@@ -113,6 +153,12 @@ fn mapSpawnError(err: std.process.SpawnError) Host.Error {
         error.ResourceLimitReached,
         => error.ResourceUnavailable,
         error.OperationUnsupported => error.Unsupported,
+        error.InvalidWtf8,
+        error.InvalidBatchScriptArg,
+        error.InvalidName,
+        error.BadPathName,
+        error.NameTooLong,
+        => error.InvalidArguments,
         else => error.Unexpected,
     };
 }
@@ -329,18 +375,6 @@ test "system host rejects process features before spawning" {
     const system_host = system.host();
     const executable = exitCommand(0).executable;
     const argv = exitCommand(0).argv;
-    const environment = [_]CommandPlan.EnvironmentVariable{
-        .{ .name = "NAME", .value = "value" },
-    };
-
-    try std.testing.expectError(
-        error.Unsupported,
-        system_host.spawn(.{
-            .executable = executable,
-            .argv = argv,
-            .environment = .{ .replace = &environment },
-        }),
-    );
     try std.testing.expectError(
         error.Unsupported,
         system_host.spawn(.{
@@ -368,6 +402,68 @@ test "system host rejects process features before spawning" {
     try std.testing.expectEqual(@as(usize, 0), system.children.count());
 }
 
+test "system host prepares replacement and overlay environments" {
+    var parent = std.process.Environ.Map.init(std.testing.allocator);
+    defer parent.deinit();
+    try parent.put("PARENT", "visible");
+    try parent.put("SHARED", "parent");
+    var system: System = .{
+        .gpa = std.testing.allocator,
+        .io = std.testing.io,
+        .environ_map = &parent,
+    };
+    defer system.deinit();
+
+    var overlay = (try system.prepareEnvironment(.{ .overlay = &.{
+        .{ .name = "CHILD", .value = "visible" },
+        .{ .name = "SHARED", .value = "child" },
+    } })).?;
+    defer overlay.deinit();
+    try std.testing.expectEqualStrings("visible", overlay.get("PARENT").?);
+    try std.testing.expectEqualStrings("visible", overlay.get("CHILD").?);
+    try std.testing.expectEqualStrings("child", overlay.get("SHARED").?);
+    try std.testing.expectEqualStrings("parent", parent.get("SHARED").?);
+
+    var replacement = (try system.prepareEnvironment(.{ .replace = &.{
+        .{ .name = "ONLY", .value = "replacement" },
+    } })).?;
+    defer replacement.deinit();
+    try std.testing.expectEqual(@as(usize, 1), replacement.count());
+    try std.testing.expectEqualStrings("replacement", replacement.get("ONLY").?);
+    try std.testing.expect(replacement.get("PARENT") == null);
+}
+
+test "system host passes replacement environments to child processes" {
+    var system: System = .{ .gpa = std.testing.allocator, .io = std.testing.io };
+    defer system.deinit();
+    const variables = [_]CommandPlan.EnvironmentVariable{
+        .{ .name = "HABUSH_SYSTEM_HOST", .value = "expected" },
+    };
+    var plan = environmentCheckCommand();
+    plan.environment = .{ .replace = &variables };
+
+    const spawned = try system.host().spawn(plan);
+    try std.testing.expectEqualDeep(
+        Host.Termination{ .exited = 0 },
+        try system.host().wait(spawned.process),
+    );
+}
+
+test "system host requires a parent environment for overlays" {
+    var system: System = .{ .gpa = std.testing.allocator, .io = std.testing.io };
+    defer system.deinit();
+
+    try std.testing.expectError(
+        error.InvalidArguments,
+        system.host().spawn(.{
+            .executable = exitCommand(0).executable,
+            .argv = exitCommand(0).argv,
+            .environment = .{ .overlay = &.{.{ .name = "NAME", .value = "value" }} },
+        }),
+    );
+    try std.testing.expectEqual(@as(usize, 0), system.children.count());
+}
+
 fn exitCommand(comptime status: u8) CommandPlan {
     const script = std.fmt.comptimePrint("exit {d}", .{status});
     return switch (@import("builtin").os.tag) {
@@ -378,6 +474,28 @@ fn exitCommand(comptime status: u8) CommandPlan {
         else => .{
             .executable = "/bin/sh",
             .argv = &.{ "shell-spelling", "-c", script },
+        },
+    };
+}
+
+fn environmentCheckCommand() CommandPlan {
+    return switch (@import("builtin").os.tag) {
+        .windows => .{
+            .executable = "cmd.exe",
+            .argv = &.{
+                "shell-spelling",
+                "/D",
+                "/C",
+                "if \"%HABUSH_SYSTEM_HOST%\"==\"expected\" (exit 0) else (exit 1)",
+            },
+        },
+        else => .{
+            .executable = "/bin/sh",
+            .argv = &.{
+                "shell-spelling",
+                "-c",
+                "test \"$HABUSH_SYSTEM_HOST\" = expected",
+            },
         },
     };
 }
