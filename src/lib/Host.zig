@@ -9,6 +9,8 @@ const Host = @This();
 const CommandPlan = @import("CommandPlan.zig");
 const SandboxPolicy = @import("SandboxPolicy.zig");
 
+pub const System = @import("Host/System.zig");
+
 userdata: ?*anyopaque,
 vtable: *const VTable,
 

@@ -2,7 +2,9 @@ const std = @import("std");
 const Ast = @import("Ast.zig");
 const AstGen = @import("AstGen.zig");
 const CommandPlan = @import("CommandPlan.zig");
+const CommandResolver = @import("CommandResolver.zig");
 const FakeResolver = @import("CommandResolver/FakeResolver.zig");
+const Host = @import("Host.zig");
 const FakeHost = @import("Host/FakeHost.zig");
 const Hir = @import("Hir.zig");
 const SandboxPolicy = @import("SandboxPolicy.zig");
@@ -211,6 +213,65 @@ test "cd changes resolution and spawn directories for later commands" {
         "/workspace/project",
         fake_host.spawn_calls.items[0].cwd.path,
     );
+}
+
+test "session executes HIR through the system resolver and host" {
+    var environ_map = try std.process.Environ.createMap(
+        std.testing.environ,
+        std.testing.allocator,
+    );
+    defer environ_map.deinit();
+    var system_host: Host.System = .{
+        .gpa = std.testing.allocator,
+        .io = std.testing.io,
+        .environ_map = &environ_map,
+    };
+    defer system_host.deinit();
+    var system_resolver: CommandResolver.System = .{
+        .io = std.testing.io,
+        .executable_extensions = &.{},
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const cwd_len = try tmp.dir.realPath(std.testing.io, &cwd_buffer);
+    const cwd = cwd_buffer[0..cwd_len];
+
+    var search_path_storage: [1][]const u8 = undefined;
+    const source: [:0]const u8 = switch (@import("builtin").os.tag) {
+        .windows => source: {
+            const command = environ_map.get("ComSpec") orelse return error.SkipZigTest;
+            search_path_storage[0] = std.fs.path.dirname(command) orelse
+                return error.SkipZigTest;
+            break :source
+            \\cmd.exe /D /C 'if /I "%CD%"=="%EXPECTED%" (exit /B %STATUS%) else (exit /B 99)'
+            ;
+        },
+        else => source: {
+            search_path_storage[0] = "/bin";
+            break :source
+            \\sh -c 'test "$(pwd)" = "$EXPECTED" || exit 99; exit "$STATUS"'
+            ;
+        },
+    };
+    var session = try Session.init(std.testing.allocator, system_host.host(), .{
+        .resolver = system_resolver.resolver(),
+        .cwd = cwd,
+        .search_path = &search_path_storage,
+        .variables = &.{
+            .{ .name = "EXPECTED", .value = cwd, .exported = true },
+            .{ .name = "STATUS", .value = "23", .exported = true },
+        },
+    });
+    defer session.deinit();
+    var hir = try generate(source);
+    defer hir.deinit(std.testing.allocator);
+
+    const result = try session.execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 23), result.status);
+    try std.testing.expectEqualDeep(result, session.lastResult());
 }
 
 test "session initialization handles every allocation failure" {
