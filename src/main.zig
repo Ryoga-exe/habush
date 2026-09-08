@@ -90,16 +90,7 @@ const Shell = struct {
 
     fn run(self: *Shell) !u8 {
         while (true) {
-            if (self.interactive) {
-                try self.printPrompt();
-            }
-
-            const source = try readLineAlloc(self.stdin, self.allocator) orelse {
-                if (self.interactive) {
-                    try self.stderr.writeByte('\n');
-                }
-                return self.last_status;
-            };
+            const source = try self.readCommand() orelse return self.last_status;
             defer self.allocator.free(source);
 
             if (std.mem.trim(u8, source, &std.ascii.whitespace).len == 0) {
@@ -113,8 +104,47 @@ const Shell = struct {
         }
     }
 
-    fn printPrompt(self: *Shell) !void {
-        try self.stderr.writeAll("habush> ");
+    fn readCommand(self: *Shell) !?[:0]u8 {
+        var command: Io.Writer.Allocating = .init(self.allocator);
+        errdefer command.deinit();
+        var continuation = false;
+
+        while (true) {
+            if (self.interactive) try self.printPrompt(continuation);
+            const line = try readLineAlloc(self.stdin, self.allocator) orelse {
+                if (self.interactive) try self.stderr.writeByte('\n');
+                if (command.written().len == 0) {
+                    command.deinit();
+                    return null;
+                }
+                return try command.toOwnedSliceSentinel(0);
+            };
+            defer self.allocator.free(line);
+
+            try command.writer.writeAll(line);
+            try command.writer.writeByte('\n');
+
+            const source_len = command.written().len;
+            try command.writer.writeByte(0);
+            const source = command.written()[0..source_len :0];
+            const ready = try self.commandIsReady(source);
+            command.shrinkRetainingCapacity(source_len);
+            if (ready) return try command.toOwnedSliceSentinel(0);
+            continuation = true;
+        }
+    }
+
+    fn commandIsReady(self: *Shell, source: [:0]const u8) !bool {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        var tree = try habush.Ast.parse(arena.allocator(), source);
+        defer tree.deinit(arena.allocator());
+        if (tree.errors.len != 0) return true;
+        return tree.status == .complete;
+    }
+
+    fn printPrompt(self: *Shell, continuation: bool) !void {
+        try self.stderr.writeAll(if (continuation) "> " else "habush> ");
         try self.stderr.flush();
     }
 
