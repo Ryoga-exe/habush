@@ -12,6 +12,7 @@ pub fn main(init: std.process.Init) !void {
 const Invocation = union(enum) {
     stream,
     command: []const u8,
+    script: []const u8,
 };
 
 fn runApplication(init: std.process.Init) !u8 {
@@ -28,7 +29,9 @@ fn runApplication(init: std.process.Init) !u8 {
 
     const args = try init.minimal.args.toSlice(arena);
     const invocation = parseInvocation(args) orelse {
-        try stderr_file_writer.interface.writeAll("habush: usage: habush [-c command]\n");
+        try stderr_file_writer.interface.writeAll(
+            "habush: usage: habush [-c command | script]\n",
+        );
         return 2;
     };
     const interactive = invocation == .stream and
@@ -87,16 +90,53 @@ fn runApplication(init: std.process.Init) !u8 {
     return switch (invocation) {
         .stream => shell.run(),
         .command => |command| shell.runCommand(command),
+        .script => |path| {
+            const source = Io.Dir.cwd().readFileAllocOptions(
+                io,
+                path,
+                gpa,
+                .unlimited,
+                .of(u8),
+                0,
+            ) catch |err| {
+                try reportScriptReadError(&stderr_file_writer.interface, path, err);
+                return 1;
+            };
+            defer gpa.free(source);
+            return shell.runSource(source, path);
+        },
     };
 }
 
 fn parseInvocation(args: []const [:0]const u8) ?Invocation {
     if (args.len <= 1) return .stream;
-    if (args.len == 2 and std.mem.eql(u8, args[1], "--")) return .stream;
+    if (args.len == 2) {
+        if (std.mem.eql(u8, args[1], "--")) return .stream;
+        if (std.mem.startsWith(u8, args[1], "-")) return null;
+        return .{ .script = args[1] };
+    }
     if (args.len == 3 and std.mem.eql(u8, args[1], "-c")) {
         return .{ .command = args[2] };
     }
+    if (args.len == 3 and std.mem.eql(u8, args[1], "--")) {
+        return .{ .script = args[2] };
+    }
     return null;
+}
+
+fn reportScriptReadError(
+    writer: *Io.Writer,
+    path: []const u8,
+    err: anyerror,
+) Io.Writer.Error!void {
+    const message = switch (err) {
+        error.FileNotFound => "no such file or directory",
+        error.AccessDenied => "permission denied",
+        error.IsDir => "is a directory",
+        error.StreamTooLong => "file too large",
+        else => @errorName(err),
+    };
+    try writer.print("habush: {s}: {s}\n", .{ path, message });
 }
 
 const Shell = struct {
@@ -116,7 +156,7 @@ const Shell = struct {
                 continue;
             }
 
-            switch (try self.handleInput(source)) {
+            switch (try self.handleInput(source, null)) {
                 .none => continue,
                 .exit => return self.last_status,
             }
@@ -128,7 +168,13 @@ const Shell = struct {
 
         const source = try self.allocator.dupeZ(u8, command);
         defer self.allocator.free(source);
-        _ = try self.handleInput(source);
+        return self.runSource(source, null);
+    }
+
+    fn runSource(self: *Shell, source: [:0]const u8, source_name: ?[]const u8) !u8 {
+        if (std.mem.trim(u8, source, &std.ascii.whitespace).len == 0) return 0;
+
+        _ = try self.handleInput(source, source_name);
         return self.last_status;
     }
 
@@ -176,7 +222,11 @@ const Shell = struct {
         try self.stderr.flush();
     }
 
-    fn handleInput(self: *Shell, source: [:0]const u8) !habush.runtime.ControlFlow {
+    fn handleInput(
+        self: *Shell,
+        source: [:0]const u8,
+        source_name: ?[]const u8,
+    ) !habush.runtime.ControlFlow {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const allocator = arena.allocator();
@@ -186,7 +236,9 @@ const Shell = struct {
         if (tree.errors.len != 0) {
             for (tree.errors) |parse_error| {
                 const location = tree.tokenLocation(0, parse_error.token);
-                try self.stderr.print("habush: {d}:{d}: ", .{
+                try self.stderr.writeAll("habush: ");
+                if (source_name) |name| try self.stderr.print("{s}:", .{name});
+                try self.stderr.print("{d}:{d}: ", .{
                     location.line + 1,
                     location.column + 1,
                 });
