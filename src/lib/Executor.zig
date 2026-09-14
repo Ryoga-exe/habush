@@ -1,7 +1,8 @@
 //! Executes Habush HIR through a `Host`.
 //!
 //! The current runtime foundation executes empty units, foreground sequential
-//! lists, standalone assignments, builtins, and external simple commands.
+//! lists, and-or commands, standalone assignments, builtins, and external
+//! simple commands.
 //! Redirections, background execution, pipelines, compound commands, and
 //! compound control flow remain explicit `UnsupportedInstruction` boundaries.
 
@@ -110,6 +111,7 @@ pub fn execute(executor: Executor, hir: Hir) Error!Result {
 fn executeInstruction(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
     return switch (hir.instructionTag(index)) {
         .list => executor.executeList(hir, index),
+        .and_if, .or_if => executor.executeAndOr(hir, index),
         .simple_command => executor.executeSimpleCommand(hir, index),
         else => error.UnsupportedInstruction,
     };
@@ -134,6 +136,28 @@ fn executeList(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result
         if (command_result.control_flow != .none) break;
     }
     return result;
+}
+
+fn executeAndOr(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
+    const operands = hir.andOr(index);
+    const lhs_result = try executor.executeInstruction(hir, operands.lhs);
+    if (lhs_result.control_flow != .none) return lhs_result;
+
+    const execute_rhs = switch (hir.instructionTag(index)) {
+        .and_if => lhs_result.status == 0,
+        .or_if => lhs_result.status != 0,
+        else => unreachable,
+    };
+    if (!execute_rhs) return lhs_result;
+
+    var rhs_executor = executor;
+    rhs_executor.last_status = lhs_result.status;
+    var rhs_result = try rhs_executor.executeInstruction(hir, operands.rhs);
+    rhs_result.sandbox_coverage = combineSandboxCoverage(
+        lhs_result.sandbox_coverage,
+        rhs_result.sandbox_coverage,
+    );
+    return rhs_result;
 }
 
 fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {

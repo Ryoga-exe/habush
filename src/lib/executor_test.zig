@@ -102,6 +102,56 @@ test "exit stops a sequential list and inherits the previous status" {
     try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
 }
 
+test "and-or commands execute and short-circuit by status" {
+    const cases = [_]struct { [:0]const u8, u8 }{
+        .{ "true && false", 1 },
+        .{ "false || true", 0 },
+        .{ "false && /bin/skipped", 1 },
+        .{ "true || /bin/skipped", 0 },
+        .{ "false && false || true", 0 },
+        .{ "true || true && false", 1 },
+    };
+
+    for (cases) |case| {
+        var hir = try generate(case[0]);
+        defer hir.deinit(std.testing.allocator);
+        var fake = FakeHost.init(std.testing.allocator);
+        defer fake.deinit();
+
+        const result = try Executor.init(std.testing.allocator, fake.host()).execute(hir);
+
+        try std.testing.expectEqual(case[1], result.status);
+        try std.testing.expectEqual(.none, result.control_flow);
+        try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+    }
+}
+
+test "and-or commands propagate exit without executing remaining commands" {
+    var hir = try generate("false || exit; /bin/skipped");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+
+    const result = try Executor.init(std.testing.allocator, fake.host()).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 1), result.status);
+    try std.testing.expectEqual(.exit, result.control_flow);
+    try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+}
+
+test "short-circuiting an exit leaves control flow unchanged" {
+    var hir = try generate("false && exit 9; true");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+
+    const result = try Executor.init(std.testing.allocator, fake.host()).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqual(.none, result.control_flow);
+    try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+}
+
 test "special builtin assignments persist in session state" {
     var hir = try generate("name=temporary next=\"$name value\" :");
     defer hir.deinit(std.testing.allocator);
