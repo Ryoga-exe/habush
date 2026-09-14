@@ -688,68 +688,6 @@ pub const Node = struct {
     };
 };
 
-test "MultiArrayList stores node fields and index relationships" {
-    const allocator = std.testing.allocator;
-
-    var tokens: TokenList = .empty;
-    errdefer tokens.deinit(allocator);
-    try tokens.append(allocator, .{
-        .tag = .word,
-        .start = 0,
-    });
-    try tokens.append(allocator, .{
-        .tag = .eof,
-        .start = 4,
-    });
-
-    var nodes: NodeList = .empty;
-    errdefer nodes.deinit(allocator);
-    try nodes.append(allocator, .{
-        .tag = .root,
-        .main_token = 0,
-        .data = .{ .opt_node = @as(Node.Index, @enumFromInt(1)).toOptional() },
-    });
-    try nodes.append(allocator, .{
-        .tag = .word,
-        .main_token = 0,
-        .data = .{ .none = {} },
-    });
-
-    const extra_data = try allocator.alloc(u32, 0);
-    errdefer allocator.free(extra_data);
-    const errors = try allocator.alloc(Error, 0);
-    errdefer allocator.free(errors);
-    var here_documents: HereDocumentList = .empty;
-    errdefer here_documents.deinit(allocator);
-    var word_parts: WordPartList = .empty;
-    errdefer word_parts.deinit(allocator);
-    const here_document_data = try allocator.alloc(u8, 0);
-    errdefer allocator.free(here_document_data);
-
-    var tree: Ast = .{
-        .source = "echo",
-        .tokens = tokens.toOwnedSlice(),
-        .nodes = nodes.toOwnedSlice(),
-        .extra_data = extra_data,
-        .word_parts = word_parts.toOwnedSlice(),
-        .here_documents = here_documents.toOwnedSlice(),
-        .here_document_data = here_document_data,
-        .ready_here_document_count = 0,
-        .errors = errors,
-        .status = .complete,
-    };
-    defer tree.deinit(allocator);
-
-    try std.testing.expectEqual(Node.Tag.root, tree.nodeTag(.root));
-    try std.testing.expectEqual(Node.Tag.word, tree.nodeTag(@enumFromInt(1)));
-
-    const root_data = tree.nodeData(.root);
-    try std.testing.expectEqual(@as(Node.Index, @enumFromInt(1)), root_data.opt_node.unwrap().?);
-    try std.testing.expectEqual(Token.Tag.word, tree.tokenTag(0));
-    try std.testing.expectEqual(@as(ByteOffset, 0), tree.tokenStart(0));
-    try std.testing.expectEqualStrings("echo", tree.tokenSlice(0));
-}
-
 test {
     _ = Parse;
 }

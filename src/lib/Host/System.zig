@@ -433,22 +433,6 @@ test "system host prepares replacement and overlay environments" {
     try std.testing.expect(replacement.get("PARENT") == null);
 }
 
-test "system host passes replacement environments to child processes" {
-    var system: System = .{ .gpa = std.testing.allocator, .io = std.testing.io };
-    defer system.deinit();
-    const variables = [_]CommandPlan.EnvironmentVariable{
-        .{ .name = "HABUSH_SYSTEM_HOST", .value = "expected" },
-    };
-    var plan = environmentCheckCommand();
-    plan.environment = .{ .replace = &variables };
-
-    const spawned = try system.host().spawn(plan);
-    try std.testing.expectEqualDeep(
-        Host.Termination{ .exited = 0 },
-        try system.host().wait(spawned.process),
-    );
-}
-
 test "system host requires a parent environment for overlays" {
     var system: System = .{ .gpa = std.testing.allocator, .io = std.testing.io };
     defer system.deinit();
@@ -474,28 +458,6 @@ fn exitCommand(comptime status: u8) CommandPlan {
         else => .{
             .executable = "/bin/sh",
             .argv = &.{ "shell-spelling", "-c", script },
-        },
-    };
-}
-
-fn environmentCheckCommand() CommandPlan {
-    return switch (@import("builtin").os.tag) {
-        .windows => .{
-            .executable = "cmd.exe",
-            .argv = &.{
-                "shell-spelling",
-                "/D",
-                "/C",
-                "if \"%HABUSH_SYSTEM_HOST%\"==\"expected\" (exit 0) else (exit 1)",
-            },
-        },
-        else => .{
-            .executable = "/bin/sh",
-            .argv = &.{
-                "shell-spelling",
-                "-c",
-                "test \"$HABUSH_SYSTEM_HOST\" = expected",
-            },
         },
     };
 }

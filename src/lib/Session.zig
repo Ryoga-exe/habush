@@ -30,6 +30,12 @@ pub const Options = struct {
     io: runtime.Io = .{},
 };
 
+pub const ExecutionOptions = struct {
+    /// Overrides the previous successful execution status. Frontends use this
+    /// after failures, such as parse errors, that occur outside the runtime.
+    last_status: ?u8 = null,
+};
+
 pub fn init(
     gpa: std.mem.Allocator,
     host: Host,
@@ -54,11 +60,20 @@ pub fn deinit(session: *Session) void {
 }
 
 pub fn execute(session: *Session, hir: Hir) Executor.Error!Executor.Result {
+    return session.executeWithOptions(hir, .{});
+}
+
+pub fn executeWithOptions(
+    session: *Session,
+    hir: Hir,
+    options: ExecutionOptions,
+) Executor.Error!Executor.Result {
     const result = try Executor.initWithState(
         session.host,
         session.resolver,
         &session.state,
         session.io,
+        options.last_status orelse session.last_result.status,
     ).execute(hir);
     session.last_result = result;
     return result;

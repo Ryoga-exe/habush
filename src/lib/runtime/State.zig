@@ -179,22 +179,32 @@ fn deinitStrings(allocator_value: std.mem.Allocator, strings: []const []const u8
 test "runtime state owns mutable session values" {
     var cwd = [_]u8{ '/', 'o', 'l', 'd' };
     var search = [_]u8{ '/', 'b', 'i', 'n' };
+    var allowed = [_]u8{ '/', 'o', 'l', 'd' };
     var name = [_]u8{ 'n', 'a', 'm', 'e' };
     var value = [_]u8{ 'v', 'a', 'l', 'u', 'e' };
+    const rules = [_]SandboxPolicy.PathRule{
+        .{ .path = &allowed, .access = .{ .read = true } },
+    };
     var state = try State.init(std.testing.allocator, .{
         .cwd = &cwd,
         .search_path = &.{&search},
+        .sandbox = .{ .restrict = .{ .file_system = .{ .allow = &rules } } },
         .variables = &.{.{ .name = &name, .value = &value, .exported = true }},
     });
     defer state.deinit();
 
     cwd[1] = 'x';
     search[1] = 'x';
+    allowed[1] = 'x';
     name[0] = 'x';
     value[0] = 'x';
 
     try std.testing.expectEqualStrings("/old", state.workingDirectory().?);
     try std.testing.expectEqualStrings("/bin", state.commandSearchPath()[0]);
+    try std.testing.expectEqualStrings(
+        "/old",
+        state.activeSandbox().restrict.file_system.allow[0].path,
+    );
     try std.testing.expectEqualStrings("value", state.variable("name").?);
     try std.testing.expect(state.isVariableExported("name"));
 }

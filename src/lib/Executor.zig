@@ -3,7 +3,7 @@
 //! The current runtime foundation executes empty units, foreground sequential
 //! lists, standalone assignments, builtins, and external simple commands.
 //! Redirections, background execution, pipelines, compound commands, and
-//! control flow remain explicit `UnsupportedInstruction` boundaries.
+//! compound control flow remain explicit `UnsupportedInstruction` boundaries.
 
 const std = @import("std");
 const Builtin = @import("Builtin.zig");
@@ -26,6 +26,7 @@ cwd: ?[]const u8,
 variables: ?*VariableStore,
 runtime_state: ?*runtime.State,
 io: runtime.Io,
+last_status: u8,
 
 /// Failures that prevent the runtime from producing a shell-visible `Result`.
 /// Expected command failures are reported through `Result.status` and, when
@@ -46,12 +47,15 @@ pub const Options = struct {
     /// an exact replacement environment; `null` preserves host inheritance.
     variables: ?*VariableStore = null,
     io: runtime.Io = .{},
+    /// Status visible to a command such as `exit` when no operand is given.
+    last_status: u8 = 0,
 };
 
 /// The shell-visible outcome of a completed HIR unit.
 pub const Result = struct {
     status: u8,
     sandbox_coverage: SandboxPolicy.Coverage,
+    control_flow: runtime.ControlFlow = .none,
 };
 
 pub fn init(gpa: std.mem.Allocator, host: Host) Executor {
@@ -69,6 +73,7 @@ pub fn initWithOptions(gpa: std.mem.Allocator, host: Host, options: Options) Exe
         .variables = options.variables,
         .runtime_state = null,
         .io = options.io,
+        .last_status = options.last_status,
     };
 }
 
@@ -77,6 +82,7 @@ pub fn initWithState(
     resolver: ?CommandResolver,
     state: *runtime.State,
     io: runtime.Io,
+    last_status: u8,
 ) Executor {
     return .{
         .gpa = state.allocator(),
@@ -88,6 +94,7 @@ pub fn initWithState(
         .variables = null,
         .runtime_state = state,
         .io = io,
+        .last_status = last_status,
     };
 }
 
@@ -110,15 +117,21 @@ fn executeInstruction(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error
 
 fn executeList(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
     var result: Result = .{ .status = 0, .sandbox_coverage = .not_requested };
+    var last_status = executor.last_status;
     for (0..hir.listItemCount(index)) |item_index| {
         const item = hir.listItem(index, item_index);
         if (item.separator == .background) return error.UnsupportedInstruction;
-        const command_result = try executor.executeInstruction(hir, item.command);
+        var command_executor = executor;
+        command_executor.last_status = last_status;
+        const command_result = try command_executor.executeInstruction(hir, item.command);
         result.status = command_result.status;
         result.sandbox_coverage = combineSandboxCoverage(
             result.sandbox_coverage,
             command_result.sandbox_coverage,
         );
+        result.control_flow = command_result.control_flow;
+        last_status = command_result.status;
+        if (command_result.control_flow != .none) break;
     }
     return result;
 }
@@ -177,8 +190,13 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
             .runtime_state = executor.runtime_state,
             .variable_overrides = &command_variables,
             .io = executor.io,
+            .last_status = executor.last_status,
         }, argv.items);
-        return .{ .status = result.status, .sandbox_coverage = .not_requested };
+        return .{
+            .status = result.status,
+            .sandbox_coverage = .not_requested,
+            .control_flow = result.control_flow,
+        };
     }
 
     var process_environment = VariableStore.init(allocator);

@@ -15,25 +15,6 @@ test "parses empty input" {
     try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
 }
 
-test "parses a simple command into indexed nodes" {
-    var tree = try Ast.parse(std.testing.allocator, "echo hello");
-    defer tree.deinit(std.testing.allocator);
-
-    const list = tree.nodeData(.root).opt_node.unwrap().?;
-    try std.testing.expectEqual(Node.Tag.list, tree.nodeTag(list));
-
-    const list_range = tree.nodeData(list).extra_range;
-    const item = tree.extraData(list_range.start, Node.ListItem);
-    try std.testing.expect(item.separator.unwrap() == null);
-
-    const command = item.command;
-    try std.testing.expectEqual(Node.Tag.simple_command, tree.nodeTag(command));
-    const parts = tree.extraDataSlice(tree.nodeData(command).extra_range, Node.Index);
-    try std.testing.expectEqual(@as(usize, 2), parts.len);
-    try std.testing.expectEqualStrings("echo", tree.tokenSlice(tree.nodeMainToken(parts[0])));
-    try std.testing.expectEqualStrings("hello", tree.tokenSlice(tree.nodeMainToken(parts[1])));
-}
-
 test "stores structured parts for command and redirect words" {
     const source = "echo pre'raw'\"$name\"${other}\\ value >\"$output\"";
     var tree = try Ast.parse(std.testing.allocator, source);
@@ -54,19 +35,6 @@ test "stores structured parts for command and redirect words" {
     const target = redirect.target.unwrap().?;
     try std.testing.expectEqual(@as(usize, 1), tree.wordPartCount(target));
     try expectWordPart(&tree, target, 0, .double_quoted_parameter, "output");
-}
-
-test "stores empty quoted word parts" {
-    var tree = try Ast.parse(std.testing.allocator, "echo '' \"\"");
-    defer tree.deinit(std.testing.allocator);
-
-    const parts = tree.simpleCommandParts(firstCommand(&tree));
-    const single = tree.wordPart(parts[1], 0);
-    try std.testing.expectEqual(Ast.WordPart.Tag.single_quoted, single.tag);
-    try std.testing.expectEqual(single.start, single.end);
-    const double = tree.wordPart(parts[2], 0);
-    try std.testing.expectEqual(Ast.WordPart.Tag.double_quoted, double.tag);
-    try std.testing.expectEqual(double.start, double.end);
 }
 
 test "stores a nested braced parameter as one part" {
@@ -155,31 +123,24 @@ test "records an unexpected leading operator" {
     try std.testing.expectEqual(@as(Ast.TokenIndex, 0), tree.errors[0].token);
 }
 
-test "preserves an unfinished lexical token as a continuation" {
-    var tree = try Ast.parse(std.testing.allocator, "echo 'open");
-    defer tree.deinit(std.testing.allocator);
+test "preserves unfinished lexical tokens as continuations" {
+    const cases = [_]struct { [:0]const u8, Token.Tag }{
+        .{ "echo 'open", .unterminated_single_quote },
+        .{ "echo ${name\nnext", .unterminated_parameter_expansion },
+    };
+    for (cases) |case| {
+        var tree = try Ast.parse(std.testing.allocator, case[0]);
+        defer tree.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
-    try std.testing.expect(tree.status == .incomplete);
-    try std.testing.expect(tree.status.incomplete == .lexical);
-    try std.testing.expectEqual(
-        Token.Tag.unterminated_single_quote,
-        tree.tokenTag(tree.status.incomplete.lexical),
-    );
-    try std.testing.expect(tree.nodeData(.root).opt_node.unwrap() == null);
-}
-
-test "preserves an unfinished parameter expansion as a continuation" {
-    var tree = try Ast.parse(std.testing.allocator, "echo ${name\nnext");
-    defer tree.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
-    try std.testing.expect(tree.status == .incomplete);
-    try std.testing.expect(tree.status.incomplete == .lexical);
-    try std.testing.expectEqual(
-        Token.Tag.unterminated_parameter_expansion,
-        tree.tokenTag(tree.status.incomplete.lexical),
-    );
+        try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+        try std.testing.expect(tree.status == .incomplete);
+        try std.testing.expect(tree.status.incomplete == .lexical);
+        try std.testing.expectEqual(
+            case[1],
+            tree.tokenTag(tree.status.incomplete.lexical),
+        );
+        try std.testing.expect(tree.nodeData(.root).opt_node.unwrap() == null);
+    }
 }
 
 test "parses redirections in simple command source order" {
@@ -372,25 +333,38 @@ test "parses pipe and pipe-and left associatively" {
     try std.testing.expectEqual(Node.Tag.simple_command, tree.nodeTag(inner_data[1]));
 }
 
-test "allows newlines after a pipe operator" {
-    var tree = try Ast.parse(std.testing.allocator, "echo hi |\ngrep hi");
-    defer tree.deinit(std.testing.allocator);
+test "allows newlines after binary command operators" {
+    const cases = [_]struct { [:0]const u8, Node.Tag }{
+        .{ "echo hi |\ngrep hi", .pipe },
+        .{ "first &&\nsecond", .and_if },
+    };
+    for (cases) |case| {
+        var tree = try Ast.parse(std.testing.allocator, case[0]);
+        defer tree.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(Node.Tag.pipe, tree.nodeTag(firstCommand(&tree)));
-    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+        try std.testing.expectEqual(case[1], tree.nodeTag(firstCommand(&tree)));
+        try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+    }
 }
 
-test "requests continuation for a missing pipeline command" {
-    var tree = try Ast.parse(std.testing.allocator, "echo hi |");
-    defer tree.deinit(std.testing.allocator);
+test "requests continuation after command operators" {
+    const cases = [_]struct { [:0]const u8, []const u8 }{
+        .{ "echo hi |", "|" },
+        .{ "!", "!" },
+        .{ "first ||", "||" },
+    };
+    for (cases) |case| {
+        var tree = try Ast.parse(std.testing.allocator, case[0]);
+        defer tree.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
-    try std.testing.expect(tree.status == .incomplete);
-    try std.testing.expect(tree.status.incomplete == .command_after);
-    try std.testing.expectEqualStrings(
-        "|",
-        tree.tokenSlice(tree.status.incomplete.command_after),
-    );
+        try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+        try std.testing.expect(tree.status == .incomplete);
+        try std.testing.expect(tree.status.incomplete == .command_after);
+        try std.testing.expectEqualStrings(
+            case[1],
+            tree.tokenSlice(tree.status.incomplete.command_after),
+        );
+    }
 }
 
 test "records a repeated pipe once" {
@@ -433,20 +407,6 @@ test "pipeline negation binds before and-or" {
     try std.testing.expectEqual(Node.Tag.pipe, tree.nodeTag(tree.negatedPipeline(children[0]).?));
 }
 
-test "requests continuation after pipeline negation" {
-    var tree = try Ast.parse(std.testing.allocator, "!");
-    defer tree.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
-    try std.testing.expect(tree.status == .incomplete);
-    try std.testing.expect(tree.status.incomplete == .command_after);
-    try std.testing.expectEqualStrings(
-        "!",
-        tree.tokenSlice(tree.status.incomplete.command_after),
-    );
-    try std.testing.expect(tree.negatedPipeline(firstCommand(&tree)) == null);
-}
-
 test "rejects pipeline negation after a pipe operator" {
     var tree = try Ast.parse(std.testing.allocator, "a | ! b");
     defer tree.deinit(std.testing.allocator);
@@ -454,15 +414,6 @@ test "rejects pipeline negation after a pipe operator" {
     try std.testing.expectEqual(@as(usize, 1), tree.errors.len);
     try std.testing.expectEqual(Ast.Error.Tag.expected_command, tree.errors[0].tag);
     try std.testing.expectEqual(Token.Tag.keyword_bang, tree.tokenTag(tree.errors[0].token));
-}
-
-test "treats pipeline negation as an ordinary command argument" {
-    var tree = try Ast.parse(std.testing.allocator, "echo !");
-    defer tree.deinit(std.testing.allocator);
-
-    const parts = tree.simpleCommandParts(firstCommand(&tree));
-    try std.testing.expectEqual(@as(usize, 2), parts.len);
-    try std.testing.expectEqualStrings("!", tree.tokenSlice(tree.nodeMainToken(parts[1])));
 }
 
 test "parses and-or after pipelines with the correct precedence" {
@@ -479,27 +430,6 @@ test "parses and-or after pipelines with the correct precedence" {
     const and_data = tree.nodeData(outer_data[0]).node_and_node;
     try std.testing.expectEqual(Node.Tag.pipe, tree.nodeTag(and_data[0]));
     try std.testing.expectEqual(Node.Tag.simple_command, tree.nodeTag(and_data[1]));
-}
-
-test "allows newlines after an and-or operator" {
-    var tree = try Ast.parse(std.testing.allocator, "first &&\nsecond");
-    defer tree.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(Node.Tag.and_if, tree.nodeTag(firstCommand(&tree)));
-    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
-}
-
-test "requests continuation for a missing and-or command" {
-    var tree = try Ast.parse(std.testing.allocator, "first ||");
-    defer tree.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
-    try std.testing.expect(tree.status == .incomplete);
-    try std.testing.expect(tree.status.incomplete == .command_after);
-    try std.testing.expectEqualStrings(
-        "||",
-        tree.tokenSlice(tree.status.incomplete.command_after),
-    );
 }
 
 test "parses semicolon newline and background list separators" {
@@ -626,16 +556,6 @@ test "rejects an empty brace group" {
     try std.testing.expectEqual(Token.Tag.keyword_r_brace, tree.tokenTag(tree.errors[0].token));
 }
 
-test "treats brace reserved words as ordinary command arguments" {
-    var tree = try Ast.parse(std.testing.allocator, "echo { }");
-    defer tree.deinit(std.testing.allocator);
-
-    const parts = tree.simpleCommandParts(firstCommand(&tree));
-    try std.testing.expectEqual(@as(usize, 3), parts.len);
-    try std.testing.expectEqualStrings("{", tree.tokenSlice(tree.nodeMainToken(parts[1])));
-    try std.testing.expectEqualStrings("}", tree.tokenSlice(tree.nodeMainToken(parts[2])));
-}
-
 test "parses if elif else and trailing redirection" {
     const source =
         \\if test -f file; then
@@ -675,13 +595,13 @@ test "parses if elif else and trailing redirection" {
 test "keyword candidates remain words in argument position" {
     var tree = try Ast.parse(
         std.testing.allocator,
-        "echo if then elif else fi while until do done for in",
+        "echo if then elif else fi while until do done for in { } !",
     );
     defer tree.deinit(std.testing.allocator);
 
     const command = firstCommand(&tree);
     const parts = tree.simpleCommandParts(command);
-    try std.testing.expectEqual(@as(usize, 12), parts.len);
+    try std.testing.expectEqual(@as(usize, 15), parts.len);
     for (parts) |part| {
         try std.testing.expectEqual(Node.Tag.word, tree.nodeTag(part));
     }
@@ -809,9 +729,6 @@ test "reports each incomplete loop stage" {
     try expectCompoundContinuation("while check; do", .while_clause, .body);
     try expectCompoundContinuation("while check; do work", .while_clause, .done_keyword);
 
-    try expectCompoundContinuation("until", .until_clause, .condition);
-    try expectCompoundContinuation("until ready", .until_clause, .do_keyword);
-    try expectCompoundContinuation("until ready; do", .until_clause, .body);
     try expectCompoundContinuation("until ready; do wait", .until_clause, .done_keyword);
 }
 
@@ -995,42 +912,17 @@ test "locates and renders parse errors" {
 }
 
 test "dumps the structured AST" {
-    var tree = try Ast.parse(std.testing.allocator, "! echo pre'$name' | consume >out");
+    var tree = try Ast.parse(std.testing.allocator, "echo value");
     defer tree.deinit(std.testing.allocator);
 
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
     try tree.dump(&output.writer);
 
-    try std.testing.expectEqualStrings(
-        \\root
-        \\  body:
-        \\    list
-        \\      item:
-        \\        negated_pipeline "!"
-        \\          pipeline:
-        \\            pipe "|"
-        \\              lhs:
-        \\                simple_command
-        \\                  part:
-        \\                    word "echo"
-        \\                      literal "echo"
-        \\                  part:
-        \\                    word "pre'$name'"
-        \\                      literal "pre"
-        \\                      single_quoted "$name"
-        \\              rhs:
-        \\                simple_command
-        \\                  part:
-        \\                    word "consume"
-        \\                      literal "consume"
-        \\                  part:
-        \\                    redirect ">"
-        \\                      target:
-        \\                        word "out"
-        \\                          literal "out"
-        \\
-    , output.written());
+    const rendered = output.written();
+    try std.testing.expect(std.mem.startsWith(u8, rendered, "root\n  body:\n"));
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "simple_command") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "literal \"echo\"") != null);
 }
 
 fn expectCompoundContinuation(

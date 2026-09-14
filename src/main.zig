@@ -1,121 +1,171 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const habush = @import("habush");
 const Io = std.Io;
 const platform = @import("platform.zig");
+const Shell = @import("Shell.zig");
 
-pub fn main(init: std.process.Init) !void {
+pub fn main(init: std.process.Init) !u8 {
     const arena = init.arena.allocator();
     const gpa = init.gpa;
     const io = init.io;
 
-    const args = try init.minimal.args.toSlice(arena);
-    for (args) |arg| {
-        std.log.info("arg: {s}", .{arg});
-    }
-
-    const interactive = try Io.File.stdin().isTty(io) and try Io.File.stderr().isTty(io);
-
-    if (interactive) {
-        try platform.ignoreInteractiveInterrupt();
-    }
+    const stdin_file = Io.File.stdin();
+    const stdout_file = Io.File.stdout();
+    const stderr_file = Io.File.stderr();
 
     var stdin_buffer: [4096]u8 = undefined;
-    var stdin_file_reader: Io.File.Reader = .initStreaming(.stdin(), io, &stdin_buffer);
+    var stdout_buffer: [0]u8 = undefined; // TODO: add buffer
+
+    var stdin_reader = stdin_file.readerStreaming(io, &stdin_buffer);
+    var stdout_writer = stdout_file.writerStreaming(io, &stdout_buffer);
+    var stderr_writer = stderr_file.writerStreaming(io, &.{});
+
+    const stdin = &stdin_reader.interface;
+    const stdout = &stdout_writer.interface;
+    const stderr = &stderr_writer.interface;
+
+    const args = try init.minimal.args.toSlice(arena);
+    const invocation = Invocation.parse(args) orelse {
+        try stderr.print("habush: usage: {s}\n", .{Invocation.usage});
+        return 2;
+    };
+    const interactive = invocation == .stream and try stdin_file.isTty(io) and try stderr_file.isTty(io);
+
+    if (interactive) try platform.ignoreInteractiveInterrupt();
+
+    var cwd_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_len = std.process.currentPath(io, &cwd_buffer) catch |err| switch (err) {
+        error.NameTooLong => unreachable,
+        else => |e| return e,
+    };
+    const cwd = cwd_buffer[0..cwd_len];
+    const variables = try environmentBindings(arena, init.environ_map);
+    const search_path = if (init.environ_map.get("PATH")) |path|
+        try splitEnvironmentList(arena, path, std.fs.path.delimiter)
+    else
+        &.{};
+    const resolver_options: habush.CommandResolver.System.Options = if (builtin.os.tag == .windows)
+        if (init.environ_map.get("PATHEXT")) |extensions|
+            .{ .executable_extensions = try splitEnvironmentList(
+                arena,
+                extensions,
+                std.fs.path.delimiter,
+            ) }
+        else
+            .{}
+    else
+        .{};
+
+    var system_host: habush.Host.System = .{
+        .gpa = gpa,
+        .io = io,
+        .environ_map = init.environ_map,
+    };
+    defer system_host.deinit();
+    var system_resolver = habush.CommandResolver.System.init(io, resolver_options);
+    var session = try habush.Session.init(gpa, system_host.host(), .{
+        .resolver = system_resolver.resolver(),
+        .cwd = cwd,
+        .search_path = search_path,
+        .variables = variables,
+        .io = .{
+            .stdout = stdout,
+            .stderr = stderr,
+            .diagnostic_options = .{ .program_name = "habush" },
+        },
+    });
+    defer session.deinit();
 
     var shell: Shell = .{
-        .io = io,
         .allocator = gpa,
-        .stdin = &stdin_file_reader.interface,
+        .stdin = stdin,
+        .stderr = stderr,
+        .session = &session,
         .interactive = interactive,
     };
 
-    try shell.run();
+    return switch (invocation) {
+        .stream => shell.run(),
+        .command => |command| shell.runCommand(command),
+        .script => |path| {
+            const source = Io.Dir.cwd().readFileAllocOptions(
+                io,
+                path,
+                gpa,
+                .unlimited,
+                .of(u8),
+                0,
+            ) catch |err| {
+                try reportScriptReadError(stderr, path, err);
+                return 1;
+            };
+            defer gpa.free(source);
+            return shell.runSource(source, path);
+        },
+    };
 }
 
-const Shell = struct {
-    io: Io,
-    allocator: std.mem.Allocator,
-    stdin: *Io.Reader,
-    interactive: bool,
+const Invocation = union(enum) {
+    stream,
+    command: []const u8,
+    script: []const u8,
 
-    const LoopAction = enum {
-        @"continue",
-        exit,
-    };
+    const usage = "habush [-c command | script]";
 
-    fn run(self: *Shell) !void {
-        while (true) {
-            if (self.interactive) {
-                try self.printPrompt();
-            }
-
-            const source = try readLineAlloc(self.stdin, self.allocator) orelse {
-                if (self.interactive) {
-                    try Io.File.stderr().writeStreamingAll(self.io, "\n");
-                }
-                break;
-            };
-            defer self.allocator.free(source);
-
-            if (std.mem.trim(u8, source, &std.ascii.whitespace).len == 0) {
-                continue;
-            }
-
-            switch (try self.handleInput(source)) {
-                .@"continue" => continue,
-                .exit => break,
-            }
+    fn parse(args: []const [:0]const u8) ?Invocation {
+        if (args.len <= 1) return .stream;
+        if (args.len == 2) {
+            if (std.mem.eql(u8, args[1], "--")) return .stream;
+            if (std.mem.startsWith(u8, args[1], "-")) return null;
+            return .{ .script = args[1] };
         }
-    }
-
-    fn printPrompt(self: *Shell) !void {
-        try Io.File.stderr().writeStreamingAll(self.io, "habush> ");
-    }
-
-    fn handleInput(self: *Shell, source: [:0]const u8) !LoopAction {
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena.deinit();
-
-        const allocator = arena.allocator();
-
-        if (std.mem.eql(u8, std.mem.trim(u8, source, &std.ascii.whitespace), "exit")) {
-            return .exit;
+        if (args.len == 3 and std.mem.eql(u8, args[1], "-c")) {
+            return .{ .command = args[2] };
         }
-
-        var tree = try habush.Ast.parse(allocator, source);
-        defer tree.deinit(allocator);
-
-        var dump: Io.Writer.Allocating = .init(allocator);
-        defer dump.deinit();
-        try tree.dump(&dump.writer);
-        try Io.File.stdout().writeStreamingAll(self.io, dump.written());
-
-        return .@"continue";
+        if (args.len == 3 and std.mem.eql(u8, args[1], "--")) {
+            return .{ .script = args[2] };
+        }
+        return null;
     }
 };
 
-fn readLineAlloc(reader: *Io.Reader, allocator: std.mem.Allocator) !?[:0]u8 {
-    var out: Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
+fn reportScriptReadError(
+    writer: *Io.Writer,
+    path: []const u8,
+    err: anyerror,
+) Io.Writer.Error!void {
+    const message = switch (err) {
+        error.FileNotFound => "no such file or directory",
+        error.AccessDenied => "permission denied",
+        error.IsDir => "is a directory",
+        error.StreamTooLong => "file too large",
+        else => @errorName(err),
+    };
+    try writer.print("habush: {s}: {s}\n", .{ path, message });
+}
 
-    const n = try reader.streamDelimiterEnding(&out.writer, '\n');
-
-    const found_newline = reader.bufferedLen() > 0;
-    if (found_newline) {
-        // consume new line
-        reader.toss(1);
-    } else if (n == 0) {
-        // EOF
-        out.deinit();
-        return null;
+fn environmentBindings(
+    allocator: std.mem.Allocator,
+    environ_map: *const std.process.Environ.Map,
+) ![]const habush.VariableStore.Binding {
+    const bindings = try allocator.alloc(habush.VariableStore.Binding, environ_map.count());
+    var len: usize = 0;
+    for (environ_map.keys(), environ_map.values()) |name, value| {
+        if (!habush.VariableStore.isValidName(name)) continue;
+        bindings[len] = .{ .name = name, .value = value, .exported = true };
+        len += 1;
     }
+    return bindings[0..len];
+}
 
-    const written = out.written();
-
-    // CRLF
-    if (written.len > 0 and written[written.len - 1] == '\r') {
-        out.shrinkRetainingCapacity(written.len - 1);
-    }
-
-    return try out.toOwnedSliceSentinel(0);
+fn splitEnvironmentList(
+    allocator: std.mem.Allocator,
+    value: []const u8,
+    delimiter: u8,
+) ![]const []const u8 {
+    var result: std.ArrayList([]const u8) = .empty;
+    var iterator = std.mem.splitScalar(u8, value, delimiter);
+    while (iterator.next()) |item| try result.append(allocator, item);
+    return result.toOwnedSlice(allocator);
 }
