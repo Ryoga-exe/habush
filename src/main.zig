@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const habush = @import("habush");
 const Io = std.Io;
 const platform = @import("platform.zig");
+const Shell = @import("Shell.zig");
 
 pub fn main(init: std.process.Init) !u8 {
     const arena = init.arena.allocator();
@@ -25,8 +26,8 @@ pub fn main(init: std.process.Init) !u8 {
     const stderr = &stderr_writer.interface;
 
     const args = try init.minimal.args.toSlice(arena);
-    const invocation = parseInvocation(args) orelse {
-        try stderr_writer.interface.writeAll("habush: usage: habush [-c command | script]\n");
+    const invocation = Invocation.parse(args) orelse {
+        try stderr.print("habush: usage: {s}\n", .{Invocation.usage});
         return 2;
     };
     const interactive = invocation == .stream and try stdin_file.isTty(io) and try stderr_file.isTty(io);
@@ -44,13 +45,17 @@ pub fn main(init: std.process.Init) !u8 {
         try splitEnvironmentList(arena, path, std.fs.path.delimiter)
     else
         &.{};
-    const executable_extensions = if (builtin.os.tag == .windows)
+    const resolver_options: habush.CommandResolver.System.Options = if (builtin.os.tag == .windows)
         if (init.environ_map.get("PATHEXT")) |extensions|
-            try splitEnvironmentList(arena, extensions, std.fs.path.delimiter)
+            .{ .executable_extensions = try splitEnvironmentList(
+                arena,
+                extensions,
+                std.fs.path.delimiter,
+            ) }
         else
-            default_executable_extensions
+            .{}
     else
-        &.{};
+        .{};
 
     var system_host: habush.Host.System = .{
         .gpa = gpa,
@@ -58,10 +63,7 @@ pub fn main(init: std.process.Init) !u8 {
         .environ_map = init.environ_map,
     };
     defer system_host.deinit();
-    var system_resolver: habush.CommandResolver.System = .{
-        .io = io,
-        .executable_extensions = executable_extensions,
-    };
+    var system_resolver = habush.CommandResolver.System.init(io, resolver_options);
     var session = try habush.Session.init(gpa, system_host.host(), .{
         .resolver = system_resolver.resolver(),
         .cwd = cwd,
@@ -108,23 +110,25 @@ const Invocation = union(enum) {
     stream,
     command: []const u8,
     script: []const u8,
-};
 
-fn parseInvocation(args: []const [:0]const u8) ?Invocation {
-    if (args.len <= 1) return .stream;
-    if (args.len == 2) {
-        if (std.mem.eql(u8, args[1], "--")) return .stream;
-        if (std.mem.startsWith(u8, args[1], "-")) return null;
-        return .{ .script = args[1] };
+    const usage = "habush [-c command | script]";
+
+    fn parse(args: []const [:0]const u8) ?Invocation {
+        if (args.len <= 1) return .stream;
+        if (args.len == 2) {
+            if (std.mem.eql(u8, args[1], "--")) return .stream;
+            if (std.mem.startsWith(u8, args[1], "-")) return null;
+            return .{ .script = args[1] };
+        }
+        if (args.len == 3 and std.mem.eql(u8, args[1], "-c")) {
+            return .{ .command = args[2] };
+        }
+        if (args.len == 3 and std.mem.eql(u8, args[1], "--")) {
+            return .{ .script = args[2] };
+        }
+        return null;
     }
-    if (args.len == 3 and std.mem.eql(u8, args[1], "-c")) {
-        return .{ .command = args[2] };
-    }
-    if (args.len == 3 and std.mem.eql(u8, args[1], "--")) {
-        return .{ .script = args[2] };
-    }
-    return null;
-}
+};
 
 fn reportScriptReadError(
     writer: *Io.Writer,
@@ -140,149 +144,6 @@ fn reportScriptReadError(
     };
     try writer.print("habush: {s}: {s}\n", .{ path, message });
 }
-
-const Shell = struct {
-    allocator: std.mem.Allocator,
-    stdin: *Io.Reader,
-    stderr: *Io.Writer,
-    session: *habush.Session,
-    interactive: bool,
-    last_status: u8 = 0,
-
-    fn run(self: *Shell) !u8 {
-        while (true) {
-            const source = try self.readCommand() orelse return self.last_status;
-            defer self.allocator.free(source);
-
-            if (std.mem.trim(u8, source, &std.ascii.whitespace).len == 0) {
-                continue;
-            }
-
-            switch (try self.handleInput(source, null)) {
-                .none => continue,
-                .exit => return self.last_status,
-            }
-        }
-    }
-
-    fn runCommand(self: *Shell, command: []const u8) !u8 {
-        if (std.mem.trim(u8, command, &std.ascii.whitespace).len == 0) return 0;
-
-        const source = try self.allocator.dupeZ(u8, command);
-        defer self.allocator.free(source);
-        return self.runSource(source, null);
-    }
-
-    fn runSource(self: *Shell, source: [:0]const u8, source_name: ?[]const u8) !u8 {
-        if (std.mem.trim(u8, source, &std.ascii.whitespace).len == 0) return 0;
-
-        _ = try self.handleInput(source, source_name);
-        return self.last_status;
-    }
-
-    fn readCommand(self: *Shell) !?[:0]u8 {
-        var command: Io.Writer.Allocating = .init(self.allocator);
-        errdefer command.deinit();
-        var continuation = false;
-
-        while (true) {
-            if (self.interactive) try self.printPrompt(continuation);
-            const line = try readLineAlloc(self.stdin, self.allocator) orelse {
-                if (self.interactive) try self.stderr.writeByte('\n');
-                if (command.written().len == 0) {
-                    command.deinit();
-                    return null;
-                }
-                return try command.toOwnedSliceSentinel(0);
-            };
-            defer self.allocator.free(line);
-
-            try command.writer.writeAll(line);
-            try command.writer.writeByte('\n');
-
-            const source_len = command.written().len;
-            try command.writer.writeByte(0);
-            const source = command.written()[0..source_len :0];
-            const ready = try self.commandIsReady(source);
-            command.shrinkRetainingCapacity(source_len);
-            if (ready) return try command.toOwnedSliceSentinel(0);
-            continuation = true;
-        }
-    }
-
-    fn commandIsReady(self: *Shell, source: [:0]const u8) !bool {
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena.deinit();
-        var tree = try habush.Ast.parse(arena.allocator(), source);
-        defer tree.deinit(arena.allocator());
-        if (tree.errors.len != 0) return true;
-        return tree.status == .complete;
-    }
-
-    fn printPrompt(self: *Shell, continuation: bool) !void {
-        try self.stderr.writeAll(if (continuation) "> " else "habush> ");
-        try self.stderr.flush();
-    }
-
-    fn handleInput(
-        self: *Shell,
-        source: [:0]const u8,
-        source_name: ?[]const u8,
-    ) !habush.runtime.ControlFlow {
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena.deinit();
-        const allocator = arena.allocator();
-
-        var tree = try habush.Ast.parse(allocator, source);
-        defer tree.deinit(allocator);
-        if (tree.errors.len != 0) {
-            for (tree.errors) |parse_error| {
-                const location = tree.tokenLocation(0, parse_error.token);
-                try self.stderr.writeAll("habush: ");
-                if (source_name) |name| try self.stderr.print("{s}:", .{name});
-                try self.stderr.print("{d}:{d}: ", .{
-                    location.line + 1,
-                    location.column + 1,
-                });
-                try tree.renderError(parse_error, self.stderr);
-                try self.stderr.writeByte('\n');
-            }
-            self.last_status = 2;
-            return .none;
-        }
-        switch (tree.status) {
-            .complete => {},
-            .incomplete => {
-                try self.stderr.writeAll("habush: incomplete input\n");
-                self.last_status = 2;
-                return .none;
-            },
-        }
-
-        var hir = try habush.AstGen.generate(allocator, tree);
-        defer hir.deinit(allocator);
-        const result = self.session.executeWithOptions(hir, .{
-            .last_status = self.last_status,
-        }) catch |err| switch (err) {
-            error.UnsupportedInstruction,
-            error.FieldSplittingUnsupported,
-            error.PathnameExpansionUnsupported,
-            error.TildeExpansionUnsupported,
-            error.ParameterExpansionUnsupported,
-            => {
-                try self.stderr.print("habush: unsupported runtime feature: {s}\n", .{
-                    @errorName(err),
-                });
-                self.last_status = 2;
-                return .none;
-            },
-            else => |other| return other,
-        };
-        self.last_status = result.status;
-
-        return result.control_flow;
-    }
-};
 
 fn environmentBindings(
     allocator: std.mem.Allocator,
@@ -307,37 +168,4 @@ fn splitEnvironmentList(
     var iterator = std.mem.splitScalar(u8, value, delimiter);
     while (iterator.next()) |item| try result.append(allocator, item);
     return result.toOwnedSlice(allocator);
-}
-
-const default_executable_extensions: []const []const u8 = &.{
-    ".COM",
-    ".EXE",
-    ".BAT",
-    ".CMD",
-};
-
-fn readLineAlloc(reader: *Io.Reader, allocator: std.mem.Allocator) !?[:0]u8 {
-    var out: Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-
-    const n = try reader.streamDelimiterEnding(&out.writer, '\n');
-
-    const found_newline = reader.bufferedLen() > 0;
-    if (found_newline) {
-        // consume new line
-        reader.toss(1);
-    } else if (n == 0) {
-        // EOF
-        out.deinit();
-        return null;
-    }
-
-    const written = out.written();
-
-    // CRLF
-    if (written.len > 0 and written[written.len - 1] == '\r') {
-        out.shrinkRetainingCapacity(written.len - 1);
-    }
-
-    return try out.toOwnedSliceSentinel(0);
 }
