@@ -94,50 +94,56 @@ pub fn render(
     }
 }
 
-test "renders a command diagnostic with an optional program name" {
-    const diagnostic: Diagnostic = .{
-        .subject = .{ .command = "cd" },
-        .kind = .{ .variable_not_set = "HOME" },
+test "renders the shell status classes" {
+    const Case = struct {
+        diagnostic: Diagnostic,
+        options: RenderOptions = .{},
+        status: u8,
+        rendered: []const u8,
     };
-    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer output.deinit();
-
-    try diagnostic.render(&output.writer, .{ .program_name = "habush" });
-
-    try std.testing.expectEqualStrings("habush: cd: HOME not set", output.written());
-    try std.testing.expectEqual(@as(u8, 1), diagnostic.status());
-}
-
-test "usage diagnostics have status two" {
-    const diagnostic: Diagnostic = .{
-        .subject = .{ .command = "pwd" },
-        .kind = .{ .unsupported_option = "-P" },
+    const cases = [_]Case{
+        .{
+            .diagnostic = .{
+                .subject = .{ .command = "cd" },
+                .kind = .{ .variable_not_set = "HOME" },
+            },
+            .options = .{ .program_name = "habush" },
+            .status = 1,
+            .rendered = "habush: cd: HOME not set",
+        },
+        .{
+            .diagnostic = .{
+                .subject = .{ .command = "pwd" },
+                .kind = .{ .unsupported_option = "-P" },
+            },
+            .status = 2,
+            .rendered = "pwd: unsupported option: -P",
+        },
+        .{
+            .diagnostic = .{
+                .subject = .{ .command = "missing" },
+                .kind = .command_not_found,
+            },
+            .status = 127,
+            .rendered = "missing: command not found",
+        },
+        .{
+            .diagnostic = .{
+                .subject = .{ .command = "tool" },
+                .kind = .{ .cannot_execute = .access_denied },
+            },
+            .status = 126,
+            .rendered = "tool: permission denied",
+        },
     };
 
-    try std.testing.expectEqual(@as(u8, 2), diagnostic.status());
-}
-
-test "missing command diagnostics have status 127" {
-    const diagnostic: Diagnostic = .{
-        .subject = .{ .command = "missing" },
-        .kind = .command_not_found,
-    };
-
-    try std.testing.expectEqual(@as(u8, 127), diagnostic.status());
-}
-
-test "commands that cannot be executed have status 126" {
-    const diagnostic: Diagnostic = .{
-        .subject = .{ .command = "tool" },
-        .kind = .{ .cannot_execute = .access_denied },
-    };
-    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer output.deinit();
-
-    try diagnostic.render(&output.writer, .{});
-
-    try std.testing.expectEqual(@as(u8, 126), diagnostic.status());
-    try std.testing.expectEqualStrings("tool: permission denied", output.written());
+    for (cases) |case| {
+        var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer output.deinit();
+        try case.diagnostic.render(&output.writer, case.options);
+        try std.testing.expectEqual(case.status, case.diagnostic.status());
+        try std.testing.expectEqualStrings(case.rendered, output.written());
+    }
 }
 
 test {

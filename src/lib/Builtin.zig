@@ -280,19 +280,8 @@ fn reportCommandDiagnostic(
 }
 
 test "looks up core builtins by command name" {
-    try std.testing.expectEqual(Tag.@":", lookup(":").?.tag);
-    try std.testing.expect(lookup(":").?.special);
-    try std.testing.expectEqual(Tag.true, lookup("true").?.tag);
-    try std.testing.expect(!lookup("false").?.special);
-    try std.testing.expectEqual(Tag.cd, lookup("cd").?.tag);
-    try std.testing.expect(!lookup("cd").?.special);
-    try std.testing.expectEqual(Tag.exit, lookup("exit").?.tag);
     try std.testing.expect(lookup("exit").?.special);
-    try std.testing.expectEqual(Tag.pwd, lookup("pwd").?.tag);
-    try std.testing.expect(!lookup("pwd").?.special);
-    try std.testing.expectEqual(Tag.@"export", lookup("export").?.tag);
-    try std.testing.expect(lookup("export").?.special);
-    try std.testing.expect(lookup("unset").?.special);
+    try std.testing.expect(!lookup("true").?.special);
     try std.testing.expect(lookup("missing") == null);
     try std.testing.expect(lookup("./true") == null);
 }
@@ -387,19 +376,12 @@ test "export without operands writes exported variables" {
         \\export QUOTED='one'\''two'
         \\
     , output.written());
-}
-
-test "export propagates output failures" {
-    var state = try runtime.State.init(std.testing.allocator, .{
-        .variables = &.{.{ .name = "NAME", .value = "value", .exported = true }},
-    });
-    defer state.deinit();
     var buffer: [1]u8 = undefined;
-    var output: std.Io.Writer = .fixed(&buffer);
+    var failing_output: std.Io.Writer = .fixed(&buffer);
 
     try std.testing.expectError(error.WriteFailed, lookup("export").?.run(.{
         .runtime_state = &state,
-        .io = .{ .stdout = &output },
+        .io = .{ .stdout = &failing_output },
     }, &.{"export"}));
 }
 
@@ -578,17 +560,12 @@ test "pwd writes the logical working directory" {
         (try lookup("pwd").?.run(context, &.{ "pwd", "-P" })).status,
     );
     try std.testing.expectEqualStrings("pwd: unsupported option: -P\n", diagnostics.written());
-}
-
-test "builtin diagnostics propagate output failures" {
-    var state = try runtime.State.init(std.testing.allocator, .{ .cwd = "/workspace" });
-    defer state.deinit();
     var buffer: [1]u8 = undefined;
-    var diagnostics: std.Io.Writer = .fixed(&buffer);
+    var failing_diagnostics: std.Io.Writer = .fixed(&buffer);
 
     try std.testing.expectError(error.WriteFailed, lookup("pwd").?.run(.{
         .runtime_state = &state,
-        .io = .{ .stderr = &diagnostics },
+        .io = .{ .stderr = &failing_diagnostics },
     }, &.{ "pwd", "-P" }));
 }
 

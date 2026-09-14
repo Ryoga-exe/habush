@@ -150,7 +150,7 @@ const default_executable_extensions: []const []const u8 = switch (builtin.os.tag
     else => &.{},
 };
 
-test "system resolver searches native paths" {
+test "system resolver handles search paths, explicit paths, and missing commands" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var file = try tmp.dir.createFile(std.testing.io, "tool", .{
@@ -172,27 +172,15 @@ test "system resolver searches native paths" {
     const expected = try std.fs.path.resolve(std.testing.allocator, &.{ directory, "tool" });
     defer std.testing.allocator.free(expected);
     try std.testing.expectEqualStrings(expected, executable);
-}
-
-test "system resolver handles explicit relative paths and missing commands" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var file = try tmp.dir.createFile(std.testing.io, "tool", .{
-        .permissions = .executable_file,
-    });
-    file.close(std.testing.io);
-    var directory_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const directory_len = try tmp.dir.realPath(std.testing.io, &directory_buffer);
-    const directory = directory_buffer[0..directory_len];
-    var system = System.init(std.testing.io, .{});
     const resolver_value = system.resolver();
 
-    const executable = (try resolver_value.resolve(std.testing.allocator, .{
+    const explicit = (try resolver_value.resolve(std.testing.allocator, .{
         .name = "." ++ std.fs.path.sep_str ++ "tool",
         .search_path = &.{},
         .cwd = directory,
     })).?;
-    defer std.testing.allocator.free(executable);
+    defer std.testing.allocator.free(explicit);
+    try std.testing.expectEqualStrings(expected, explicit);
     try std.testing.expect(try resolver_value.resolve(std.testing.allocator, .{
         .name = "missing",
         .search_path = &.{directory},

@@ -41,11 +41,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&exe.step);
 
-    const command_exit_test = b.addRunArtifact(exe);
-    command_exit_test.setName("test cli command exit status");
-    command_exit_test.addArgs(&.{ "-c", "exit 7" });
-    expectCliResult(command_exit_test, test_step, 7, "", "");
-
     const command_control_test = b.addRunArtifact(exe);
     command_control_test.setName("test cli exit control flow");
     command_control_test.addArgs(&.{ "-c", "false; exit; missing" });

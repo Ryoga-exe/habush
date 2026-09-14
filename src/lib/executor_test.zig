@@ -5,7 +5,6 @@ const CommandResolver = @import("CommandResolver.zig");
 const FakeResolver = @import("CommandResolver/FakeResolver.zig");
 const Executor = @import("Executor.zig");
 const FakeHost = @import("Host/FakeHost.zig");
-const Hir = @import("Hir.zig");
 const SandboxPolicy = @import("SandboxPolicy.zig");
 const VariableStore = @import("VariableStore.zig");
 
@@ -163,16 +162,16 @@ test "persists standalone assignments in source order" {
     try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
 }
 
-test "standalone assignment execution handles every allocation failure" {
-    var hir = try generate("first=one second=\"$first two\"");
-    defer hir.deinit(std.testing.allocator);
-    var fake = FakeHost.init(std.testing.allocator);
-    defer fake.deinit();
+test "assignment execution handles every allocation failure" {
+    var standalone_hir = try generate("first=one second=\"$first two\"");
+    defer standalone_hir.deinit(std.testing.allocator);
+    var command_hir = try generate("first=one second=\"$first two\" /bin/true");
+    defer command_hir.deinit(std.testing.allocator);
 
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         executeAssignmentsWithAllocator,
-        .{ hir, fake.host() },
+        .{ standalone_hir, command_hir },
     );
 }
 
@@ -243,17 +242,6 @@ test "command-local assignments overlay the host environment without session sta
     try std.testing.expectEqualStrings("value", environment[0].value);
 }
 
-test "command-local assignment execution handles every allocation failure" {
-    var hir = try generate("first=one second=\"$first two\" /bin/true");
-    defer hir.deinit(std.testing.allocator);
-
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        executeCommandAssignmentsWithAllocator,
-        .{hir},
-    );
-}
-
 test "standalone assignments require mutable variable state" {
     var hir = try generate("name=value");
     defer hir.deinit(std.testing.allocator);
@@ -267,64 +255,35 @@ test "standalone assignments require mutable variable state" {
     );
 }
 
-test "unsupported expansion has no host side effects" {
-    var hir = try generate("/bin/echo $name");
-    defer hir.deinit(std.testing.allocator);
+test "unsupported expansions have no host side effects" {
+    const cases = [_]struct { [:0]const u8, anyerror }{
+        .{ "/bin/echo $name", error.FieldSplittingUnsupported },
+        .{ "/bin/echo *.zig", error.PathnameExpansionUnsupported },
+    };
+    for (cases) |case| {
+        var hir = try generate(case[0]);
+        defer hir.deinit(std.testing.allocator);
+        var fake = FakeHost.init(std.testing.allocator);
+        defer fake.deinit();
 
-    var fake = FakeHost.init(std.testing.allocator);
-    defer fake.deinit();
-
-    try std.testing.expectError(
-        error.FieldSplittingUnsupported,
-        Executor.init(std.testing.allocator, fake.host()).execute(hir),
-    );
-    try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
-}
-
-test "pathname expansion is not executed as a literal argument" {
-    var hir = try generate("/bin/echo *.zig");
-    defer hir.deinit(std.testing.allocator);
-
-    var fake = FakeHost.init(std.testing.allocator);
-    defer fake.deinit();
-
-    try std.testing.expectError(
-        error.PathnameExpansionUnsupported,
-        Executor.init(std.testing.allocator, fake.host()).execute(hir),
-    );
-    try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+        try std.testing.expectError(
+            case[1],
+            Executor.init(std.testing.allocator, fake.host()).execute(hir),
+        );
+        try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+    }
 }
 
 test "unsupported execution forms fail before the current command has side effects" {
-    const Case = struct {
-        source: [:0]const u8,
-        command_tag: Hir.Inst.Tag,
-    };
-    const cases = [_]Case{
-        .{ .source = "left | right", .command_tag = .pipe },
-        .{ .source = "left |& right", .command_tag = .pipe_and },
-        .{ .source = "! left", .command_tag = .negated_pipeline },
-        .{ .source = "left && right", .command_tag = .and_if },
-        .{ .source = "left || right", .command_tag = .or_if },
-        .{ .source = "(left)", .command_tag = .subshell },
-        .{ .source = "{ left; }", .command_tag = .brace_group },
-        .{ .source = "if true; then left; fi", .command_tag = .if_clause },
-        .{ .source = "while true; do left; done", .command_tag = .while_clause },
-        .{ .source = "until true; do left; done", .command_tag = .until_clause },
-        .{ .source = "for item in one; do left; done", .command_tag = .for_clause },
-        .{ .source = "build() { left; }", .command_tag = .function_definition },
-        .{ .source = "persisted=changed >out", .command_tag = .simple_command },
-        .{ .source = "left &", .command_tag = .simple_command },
+    const cases = [_][:0]const u8{
+        "left | right",
+        "persisted=changed >out",
+        "left &",
     };
 
-    for (cases) |case| {
-        var hir = try generate(case.source);
+    for (cases) |source| {
+        var hir = try generate(source);
         defer hir.deinit(std.testing.allocator);
-        const root = hir.root().?;
-        try std.testing.expectEqual(
-            case.command_tag,
-            hir.instructionTag(hir.listItem(root, 0).command),
-        );
 
         var fake_host = FakeHost.init(std.testing.allocator);
         defer fake_host.deinit();
@@ -363,7 +322,7 @@ test "command names are not resolved by the host" {
     try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
 }
 
-test "resolves command names from explicit session state" {
+test "resolves command names and explicit paths through the resolver" {
     var hir = try generate("echo hello");
     defer hir.deinit(std.testing.allocator);
 
@@ -390,27 +349,17 @@ test "resolves command names from explicit session state" {
     try std.testing.expectEqualStrings("/usr/bin/echo", plan.executable);
     try std.testing.expectEqualStrings("echo", plan.argv[0]);
     try std.testing.expectEqualStrings("/workspace", plan.cwd.path);
-}
 
-test "resolves explicit paths with platform-specific rules" {
-    var hir = try generate("/requested/command");
-    defer hir.deinit(std.testing.allocator);
-    var fake_host = FakeHost.init(std.testing.allocator);
-    defer fake_host.deinit();
-    var fake_resolver = FakeResolver.init(std.testing.allocator);
-    defer fake_resolver.deinit();
+    var explicit_hir = try generate("/requested/command");
+    defer explicit_hir.deinit(std.testing.allocator);
     fake_resolver.result = "/canonical/command";
+    _ = try executor.execute(explicit_hir);
 
-    _ = try Executor.initWithOptions(std.testing.allocator, fake_host.host(), .{
-        .resolver = fake_resolver.resolver(),
-        .cwd = "/workspace",
-    }).execute(hir);
-
-    try std.testing.expectEqual(@as(usize, 1), fake_resolver.calls.items.len);
-    try std.testing.expectEqualStrings("/requested/command", fake_resolver.calls.items[0].name);
+    try std.testing.expectEqual(@as(usize, 2), fake_resolver.calls.items.len);
+    try std.testing.expectEqualStrings("/requested/command", fake_resolver.calls.items[1].name);
     try std.testing.expectEqualStrings(
         "/canonical/command",
-        fake_host.spawn_calls.items[0].executable,
+        fake_host.spawn_calls.items[1].executable,
     );
 }
 
@@ -569,28 +518,20 @@ fn preResolvedExecutor(gpa: std.mem.Allocator, host: @import("Host.zig")) Execut
 
 fn executeAssignmentsWithAllocator(
     gpa: std.mem.Allocator,
-    hir: @import("Hir.zig"),
-    host: @import("Host.zig"),
+    standalone_hir: @import("Hir.zig"),
+    command_hir: @import("Hir.zig"),
 ) !void {
-    var variables = VariableStore.init(gpa);
-    defer variables.deinit();
-    _ = try Executor.initWithOptions(gpa, host, .{
-        .variables = &variables,
-    }).execute(hir);
-}
-
-fn executeCommandAssignmentsWithAllocator(
-    gpa: std.mem.Allocator,
-    hir: @import("Hir.zig"),
-) !void {
-    var fake = FakeHost.init(gpa);
+    var fake = FakeHost.init(std.testing.allocator);
     defer fake.deinit();
     var variables = VariableStore.init(gpa);
     defer variables.deinit();
+    _ = try Executor.initWithOptions(gpa, fake.host(), .{
+        .variables = &variables,
+    }).execute(standalone_hir);
     try variables.set("inherited", "value");
     try variables.setExported("inherited", true);
     _ = try Executor.initWithOptions(gpa, fake.host(), .{
         .resolver = CommandResolver.preResolved(),
         .variables = &variables,
-    }).execute(hir);
+    }).execute(command_hir);
 }

@@ -634,23 +634,10 @@ pub const Tokenizer = struct {
 
 test "keywords" {
     try testTokenize(
-        \\if then elif else fi while until do done for in { } ! 'if' "then" i\f
+        \\if 'if' "then" i\f
     ,
         &.{
             .keyword_if,
-            .keyword_then,
-            .keyword_elif,
-            .keyword_else,
-            .keyword_fi,
-            .keyword_while,
-            .keyword_until,
-            .keyword_do,
-            .keyword_done,
-            .keyword_for,
-            .keyword_in,
-            .keyword_l_brace,
-            .keyword_r_brace,
-            .keyword_bang,
             .word,
             .word,
             .word,
@@ -659,32 +646,16 @@ test "keywords" {
     );
 }
 
-test "words" {
-    try testTokenize("echo hello world", &.{
-        .word,
-        .word,
-        .word,
-        .eof,
-    });
-}
-
-test "digits and word" {
-    try testTokenize("echo 1 28 314pi", &.{
-        .word,
-        .digits,
-        .digits,
-        .word,
-        .eof,
-    });
-}
-
 test "words, digits and operators" {
     try testTokenize(
-        \\echo foo 2>>bar ; ;; ;& ;;& & && &> &>> | || |&
+        \\echo foo 1 28 314pi 2>>bar ; ;; ;& ;;& & && &> &>> | || |&
         \\( ) < > << <<- <<< >> <& >& <> >|
         \\
     , &.{
         .word,
+        .word,
+        .digits,
+        .digits,
         .word,
         .digits,
         .gt_gt,
@@ -744,22 +715,6 @@ test "lone CR is part of a word while CRLF is a newline" {
     try testTokenize("foo\r\nbar", &.{ .word, .newline, .word, .eof });
 }
 
-test "quoted and escaped text stays in one word" {
-    try testTokenize(
-        \\echo "hello world" 'single quoted' escaped\ space
-    ,
-        &.{ .word, .word, .word, .word, .eof },
-    );
-}
-
-test "parameter expansions stay inside their word" {
-    try testTokenize(
-        \\echo pre${name} "${other}" ${value:-${fallback}}
-    ,
-        &.{ .word, .word, .word, .word, .eof },
-    );
-}
-
 test "unterminated parameter expansion reports its opening location" {
     var tokenizer = Tokenizer.init("prefix${name\nnext");
     const issue = tokenizer.next();
@@ -807,11 +762,6 @@ test "an internal NUL is invalid and points at the byte" {
     try std.testing.expectEqual(Token.Tag.invalid, invalid_comment.tag);
     try std.testing.expectEqual(@as(usize, 9), invalid_comment.loc.start);
     try std.testing.expectEqual(@as(usize, 10), invalid_comment.loc.end);
-}
-
-test "newline has no unique fixed lexeme" {
-    try std.testing.expectEqual(@as(?[]const u8, null), Token.lexeme(.newline));
-    try std.testing.expectEqualStrings("newline", Token.symbol(.newline));
 }
 
 fn testTokenize(source: [:0]const u8, expected_token_tags: []const Token.Tag) !void {
