@@ -4,45 +4,41 @@ const habush = @import("habush");
 const Io = std.Io;
 const platform = @import("platform.zig");
 
-pub fn main(init: std.process.Init) !void {
-    const status = try runApplication(init);
-    if (status != 0) std.process.exit(status);
-}
-
-const Invocation = union(enum) {
-    stream,
-    command: []const u8,
-    script: []const u8,
-};
-
-fn runApplication(init: std.process.Init) !u8 {
+pub fn main(init: std.process.Init) !u8 {
     const arena = init.arena.allocator();
     const gpa = init.gpa;
     const io = init.io;
 
+    const stdin_file = Io.File.stdin();
+    const stdout_file = Io.File.stdout();
+    const stderr_file = Io.File.stderr();
+
     var stdin_buffer: [4096]u8 = undefined;
-    var stdin_file_reader: Io.File.Reader = .initStreaming(.stdin(), io, &stdin_buffer);
-    var stdout_buffer: [0]u8 = .{};
-    var stdout_file_writer = Io.File.stdout().writerStreaming(io, &stdout_buffer);
-    var stderr_buffer: [0]u8 = .{};
-    var stderr_file_writer = Io.File.stderr().writerStreaming(io, &stderr_buffer);
+    var stdout_buffer: [0]u8 = undefined; // TODO: add buffer
+
+    var stdin_reader = stdin_file.readerStreaming(io, &stdin_buffer);
+    var stdout_writer = stdout_file.writerStreaming(io, &stdout_buffer);
+    var stderr_writer = stderr_file.writerStreaming(io, &.{});
+
+    const stdin = &stdin_reader.interface;
+    const stdout = &stdout_writer.interface;
+    const stderr = &stderr_writer.interface;
 
     const args = try init.minimal.args.toSlice(arena);
     const invocation = parseInvocation(args) orelse {
-        try stderr_file_writer.interface.writeAll(
-            "habush: usage: habush [-c command | script]\n",
-        );
+        try stderr_writer.interface.writeAll("habush: usage: habush [-c command | script]\n");
         return 2;
     };
-    const interactive = invocation == .stream and
-        try Io.File.stdin().isTty(io) and
-        try Io.File.stderr().isTty(io);
+    const interactive = invocation == .stream and try stdin_file.isTty(io) and try stderr_file.isTty(io);
 
-    if (interactive) {
-        try platform.ignoreInteractiveInterrupt();
-    }
+    if (interactive) try platform.ignoreInteractiveInterrupt();
 
-    const cwd = try std.process.currentPathAlloc(io, arena);
+    var cwd_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_len = std.process.currentPath(io, &cwd_buffer) catch |err| switch (err) {
+        error.NameTooLong => unreachable,
+        else => |e| return e,
+    };
+    const cwd = cwd_buffer[0..cwd_len];
     const variables = try environmentBindings(arena, init.environ_map);
     const search_path = if (init.environ_map.get("PATH")) |path|
         try splitEnvironmentList(arena, path, std.fs.path.delimiter)
@@ -72,8 +68,8 @@ fn runApplication(init: std.process.Init) !u8 {
         .search_path = search_path,
         .variables = variables,
         .io = .{
-            .stdout = &stdout_file_writer.interface,
-            .stderr = &stderr_file_writer.interface,
+            .stdout = stdout,
+            .stderr = stderr,
             .diagnostic_options = .{ .program_name = "habush" },
         },
     });
@@ -81,8 +77,8 @@ fn runApplication(init: std.process.Init) !u8 {
 
     var shell: Shell = .{
         .allocator = gpa,
-        .stdin = &stdin_file_reader.interface,
-        .stderr = &stderr_file_writer.interface,
+        .stdin = stdin,
+        .stderr = stderr,
         .session = &session,
         .interactive = interactive,
     };
@@ -99,7 +95,7 @@ fn runApplication(init: std.process.Init) !u8 {
                 .of(u8),
                 0,
             ) catch |err| {
-                try reportScriptReadError(&stderr_file_writer.interface, path, err);
+                try reportScriptReadError(stderr, path, err);
                 return 1;
             };
             defer gpa.free(source);
@@ -107,6 +103,12 @@ fn runApplication(init: std.process.Init) !u8 {
         },
     };
 }
+
+const Invocation = union(enum) {
+    stream,
+    command: []const u8,
+    script: []const u8,
+};
 
 fn parseInvocation(args: []const [:0]const u8) ?Invocation {
     if (args.len <= 1) return .stream;
