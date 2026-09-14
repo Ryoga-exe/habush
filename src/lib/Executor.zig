@@ -1,8 +1,8 @@
 //! Executes Habush HIR through a `Host`.
 //!
 //! The current runtime foundation executes empty units, foreground sequential
-//! lists, and-or commands, standalone assignments, builtins, and external
-//! simple commands.
+//! lists, and-or commands, pipeline negation, standalone assignments,
+//! builtins, and external simple commands.
 //! Redirections, background execution, pipelines, compound commands, and
 //! compound control flow remain explicit `UnsupportedInstruction` boundaries.
 
@@ -112,6 +112,7 @@ fn executeInstruction(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error
     return switch (hir.instructionTag(index)) {
         .list => executor.executeList(hir, index),
         .and_if, .or_if => executor.executeAndOr(hir, index),
+        .negated_pipeline => executor.executeNegatedPipeline(hir, index),
         .simple_command => executor.executeSimpleCommand(hir, index),
         else => error.UnsupportedInstruction,
     };
@@ -158,6 +159,13 @@ fn executeAndOr(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Resul
         rhs_result.sandbox_coverage,
     );
     return rhs_result;
+}
+
+fn executeNegatedPipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
+    var result = try executor.executeInstruction(hir, hir.negatedPipeline(index));
+    if (result.control_flow != .none) return result;
+    result.status = if (result.status == 0) 1 else 0;
+    return result;
 }
 
 fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {

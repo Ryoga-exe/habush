@@ -152,6 +152,42 @@ test "short-circuiting an exit leaves control flow unchanged" {
     try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
 }
 
+test "pipeline negation inverts command status" {
+    const cases = [_]struct { [:0]const u8, u8 }{
+        .{ "! true", 1 },
+        .{ "! false", 0 },
+        .{ "! ! true", 0 },
+        .{ "! true || false", 1 },
+        .{ "! false && true", 0 },
+    };
+
+    for (cases) |case| {
+        var hir = try generate(case[0]);
+        defer hir.deinit(std.testing.allocator);
+        var fake = FakeHost.init(std.testing.allocator);
+        defer fake.deinit();
+
+        const result = try Executor.init(std.testing.allocator, fake.host()).execute(hir);
+
+        try std.testing.expectEqual(case[1], result.status);
+        try std.testing.expectEqual(.none, result.control_flow);
+        try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+    }
+}
+
+test "pipeline negation preserves exit control flow and status" {
+    var hir = try generate("! exit 7; /bin/skipped");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+
+    const result = try Executor.init(std.testing.allocator, fake.host()).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 7), result.status);
+    try std.testing.expectEqual(.exit, result.control_flow);
+    try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+}
+
 test "special builtin assignments persist in session state" {
     var hir = try generate("name=temporary next=\"$name value\" :");
     defer hir.deinit(std.testing.allocator);
