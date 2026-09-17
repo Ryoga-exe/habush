@@ -56,9 +56,11 @@ test "session replaces owned runtime configuration" {
 
     var cwd = [_]u8{ '/', 'n', 'e', 'w' };
     var first_path = [_]u8{ '/', 'o', 'n', 'e' };
+    var positional = [_]u8{ 'v', 'a', 'l', 'u', 'e' };
     var allowed_path = [_]u8{ '/', 'n', 'e', 'w' };
     try session.setWorkingDirectory(&cwd);
     try session.setCommandSearchPath(&.{ &first_path, "/two" });
+    try session.setPositionalParameters(&.{&positional});
     const rules = [_]SandboxPolicy.PathRule{
         .{ .path = &allowed_path, .access = .{ .write = true } },
     };
@@ -70,11 +72,13 @@ test "session replaces owned runtime configuration" {
 
     cwd[1] = 'x';
     first_path[1] = 'x';
+    positional[0] = 'x';
     allowed_path[1] = 'x';
 
     try std.testing.expectEqualStrings("/new", session.workingDirectory().?);
     try std.testing.expectEqual(@as(usize, 2), session.commandSearchPath().len);
     try std.testing.expectEqualStrings("/one", session.commandSearchPath()[0]);
+    try std.testing.expectEqualStrings("value", session.positionalParameters()[0]);
     try std.testing.expectEqualStrings(
         "/new",
         session.activeSandbox().restrict.file_system.allow[0].path,

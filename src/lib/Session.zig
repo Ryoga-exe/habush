@@ -23,6 +23,7 @@ pub const Options = struct {
     resolver: ?CommandResolver = null,
     cwd: ?[]const u8 = null,
     search_path: []const []const u8 = &.{},
+    positional_parameters: []const []const u8 = &.{},
     sandbox: CommandPlan.Sandbox = .inherit,
     /// Complete initial shell variable state. The caller should import the
     /// host environment here and mark those bindings exported when desired.
@@ -48,6 +49,7 @@ pub fn init(
         .state = try runtime.State.init(gpa, .{
             .cwd = options.cwd,
             .search_path = options.search_path,
+            .positional_parameters = options.positional_parameters,
             .sandbox = options.sandbox,
             .variables = options.variables,
         }),
@@ -85,6 +87,10 @@ pub fn workingDirectory(session: Session) ?[]const u8 {
 
 pub fn commandSearchPath(session: Session) []const []const u8 {
     return session.state.commandSearchPath();
+}
+
+pub fn positionalParameters(session: Session) []const []const u8 {
+    return session.state.positionalParameters();
 }
 
 pub fn activeSandbox(session: Session) CommandPlan.Sandbox {
@@ -125,6 +131,13 @@ pub fn setWorkingDirectory(session: *Session, cwd: ?[]const u8) !void {
 
 pub fn setCommandSearchPath(session: *Session, search_path: []const []const u8) !void {
     return session.state.setCommandSearchPath(search_path);
+}
+
+pub fn setPositionalParameters(
+    session: *Session,
+    positional_parameters: []const []const u8,
+) !void {
+    return session.state.setPositionalParameters(positional_parameters);
 }
 
 pub fn setSandbox(session: *Session, sandbox: CommandPlan.Sandbox) !void {
