@@ -1,8 +1,8 @@
 //! Executes Habush HIR through a `Host`.
 //!
 //! The current runtime foundation executes empty units, foreground sequential
-//! lists, and-or commands, pipeline negation, standalone assignments,
-//! builtins, and external simple commands.
+//! lists, and-or commands, pipeline negation, if clauses, standalone
+//! assignments, builtins, and external simple commands.
 //! Redirections, background execution, pipelines, compound commands, and
 //! compound control flow remain explicit `UnsupportedInstruction` boundaries.
 
@@ -113,6 +113,7 @@ fn executeInstruction(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error
         .list => executor.executeList(hir, index),
         .and_if, .or_if => executor.executeAndOr(hir, index),
         .negated_pipeline => executor.executeNegatedPipeline(hir, index),
+        .if_clause => executor.executeIfClause(hir, index),
         .simple_command => executor.executeSimpleCommand(hir, index),
         else => error.UnsupportedInstruction,
     };
@@ -136,6 +137,31 @@ fn executeList(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result
         last_status = command_result.status;
         if (command_result.control_flow != .none) break;
     }
+    return result;
+}
+
+fn executeIfClause(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
+    const clause = hir.ifClause(index);
+    if (clause.redirects.len != 0) return error.UnsupportedInstruction;
+
+    const condition_result = try executor.executeInstruction(hir, clause.condition);
+    if (condition_result.control_flow != .none) return condition_result;
+
+    const branch = if (condition_result.status == 0)
+        clause.then_body
+    else
+        clause.else_body.unwrap() orelse return .{
+            .status = 0,
+            .sandbox_coverage = condition_result.sandbox_coverage,
+        };
+
+    var branch_executor = executor;
+    branch_executor.last_status = condition_result.status;
+    var result = try branch_executor.executeInstruction(hir, branch);
+    result.sandbox_coverage = combineSandboxCoverage(
+        condition_result.sandbox_coverage,
+        result.sandbox_coverage,
+    );
     return result;
 }
 
