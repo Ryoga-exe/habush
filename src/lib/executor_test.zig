@@ -236,6 +236,78 @@ test "if clauses propagate exit from conditions and branches" {
     }
 }
 
+test "while and until loops skip bodies when conditions are not met" {
+    const cases = [_][:0]const u8{
+        "while false; do /bin/skipped; done",
+        "until true; do /bin/skipped; done",
+    };
+
+    for (cases) |source| {
+        var hir = try generate(source);
+        defer hir.deinit(std.testing.allocator);
+        var fake = FakeHost.init(std.testing.allocator);
+        defer fake.deinit();
+
+        const result = try Executor.init(std.testing.allocator, fake.host()).execute(hir);
+
+        try std.testing.expectEqual(@as(u8, 0), result.status);
+        try std.testing.expectEqual(.none, result.control_flow);
+        try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+    }
+}
+
+test "while and until loops reevaluate conditions and return the last body status" {
+    const cases = [_]struct { [:0]const u8, []const u8 }{
+        .{
+            "command=true; while \"$command\"; do command=false; false; done",
+            "false",
+        },
+        .{
+            "command=false; until \"$command\"; do command=true; false; done",
+            "true",
+        },
+    };
+
+    for (cases) |case| {
+        var hir = try generate(case[0]);
+        defer hir.deinit(std.testing.allocator);
+        var fake = FakeHost.init(std.testing.allocator);
+        defer fake.deinit();
+        var variables = VariableStore.init(std.testing.allocator);
+        defer variables.deinit();
+
+        const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+            .variables = &variables,
+        }).execute(hir);
+
+        try std.testing.expectEqual(@as(u8, 1), result.status);
+        try std.testing.expectEqual(.none, result.control_flow);
+        try std.testing.expectEqualStrings(case[1], variables.get("command").?);
+        try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+    }
+}
+
+test "while and until loops propagate exit from conditions and bodies" {
+    const cases = [_]struct { [:0]const u8, u8 }{
+        .{ "false; while exit; do true; done; /bin/skipped", 1 },
+        .{ "while true; do exit 7; done; /bin/skipped", 7 },
+        .{ "until false; do exit; done; /bin/skipped", 1 },
+    };
+
+    for (cases) |case| {
+        var hir = try generate(case[0]);
+        defer hir.deinit(std.testing.allocator);
+        var fake = FakeHost.init(std.testing.allocator);
+        defer fake.deinit();
+
+        const result = try Executor.init(std.testing.allocator, fake.host()).execute(hir);
+
+        try std.testing.expectEqual(case[1], result.status);
+        try std.testing.expectEqual(.exit, result.control_flow);
+        try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+    }
+}
+
 test "special builtin assignments persist in session state" {
     var hir = try generate("name=temporary next=\"$name value\" :");
     defer hir.deinit(std.testing.allocator);
@@ -413,6 +485,7 @@ test "unsupported execution forms fail before the current command has side effec
         "left | right",
         "persisted=changed >out",
         "if persisted=changed; then true; fi >out",
+        "while persisted=changed; do true; done >out",
         "left &",
     };
 
