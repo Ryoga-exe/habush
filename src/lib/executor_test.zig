@@ -102,6 +102,140 @@ test "exit stops a sequential list and inherits the previous status" {
     try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
 }
 
+test "and-or commands execute and short-circuit by status" {
+    const cases = [_]struct { [:0]const u8, u8 }{
+        .{ "true && false", 1 },
+        .{ "false || true", 0 },
+        .{ "false && /bin/skipped", 1 },
+        .{ "true || /bin/skipped", 0 },
+        .{ "false && false || true", 0 },
+        .{ "true || true && false", 1 },
+    };
+
+    for (cases) |case| {
+        var hir = try generate(case[0]);
+        defer hir.deinit(std.testing.allocator);
+        var fake = FakeHost.init(std.testing.allocator);
+        defer fake.deinit();
+
+        const result = try Executor.init(std.testing.allocator, fake.host()).execute(hir);
+
+        try std.testing.expectEqual(case[1], result.status);
+        try std.testing.expectEqual(.none, result.control_flow);
+        try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+    }
+}
+
+test "and-or commands propagate exit without executing remaining commands" {
+    var hir = try generate("false || exit; /bin/skipped");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+
+    const result = try Executor.init(std.testing.allocator, fake.host()).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 1), result.status);
+    try std.testing.expectEqual(.exit, result.control_flow);
+    try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+}
+
+test "short-circuiting an exit leaves control flow unchanged" {
+    var hir = try generate("false && exit 9; true");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+
+    const result = try Executor.init(std.testing.allocator, fake.host()).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqual(.none, result.control_flow);
+    try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+}
+
+test "pipeline negation inverts command status" {
+    const cases = [_]struct { [:0]const u8, u8 }{
+        .{ "! true", 1 },
+        .{ "! false", 0 },
+        .{ "! ! true", 0 },
+        .{ "! true || false", 1 },
+        .{ "! false && true", 0 },
+    };
+
+    for (cases) |case| {
+        var hir = try generate(case[0]);
+        defer hir.deinit(std.testing.allocator);
+        var fake = FakeHost.init(std.testing.allocator);
+        defer fake.deinit();
+
+        const result = try Executor.init(std.testing.allocator, fake.host()).execute(hir);
+
+        try std.testing.expectEqual(case[1], result.status);
+        try std.testing.expectEqual(.none, result.control_flow);
+        try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+    }
+}
+
+test "pipeline negation preserves exit control flow and status" {
+    var hir = try generate("! exit 7; /bin/skipped");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+
+    const result = try Executor.init(std.testing.allocator, fake.host()).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 7), result.status);
+    try std.testing.expectEqual(.exit, result.control_flow);
+    try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+}
+
+test "if clauses execute the selected branch" {
+    const cases = [_]struct { [:0]const u8, u8 }{
+        .{ "if true; then false; else true; fi", 1 },
+        .{ "if false; then false; else true; fi", 0 },
+        .{ "if false; then false; fi", 0 },
+        .{
+            "if false; then true; elif true; then false; else true; fi",
+            1,
+        },
+        .{ "if true; then true; else /bin/skipped; fi", 0 },
+        .{ "if false; then /bin/skipped; else true; fi", 0 },
+    };
+
+    for (cases) |case| {
+        var hir = try generate(case[0]);
+        defer hir.deinit(std.testing.allocator);
+        var fake = FakeHost.init(std.testing.allocator);
+        defer fake.deinit();
+
+        const result = try Executor.init(std.testing.allocator, fake.host()).execute(hir);
+
+        try std.testing.expectEqual(case[1], result.status);
+        try std.testing.expectEqual(.none, result.control_flow);
+        try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+    }
+}
+
+test "if clauses propagate exit from conditions and branches" {
+    const cases = [_]struct { [:0]const u8, u8 }{
+        .{ "if exit 7; then true; fi; /bin/skipped", 7 },
+        .{ "if true; then exit 8; fi; /bin/skipped", 8 },
+        .{ "if false; then true; else exit; fi; /bin/skipped", 1 },
+    };
+
+    for (cases) |case| {
+        var hir = try generate(case[0]);
+        defer hir.deinit(std.testing.allocator);
+        var fake = FakeHost.init(std.testing.allocator);
+        defer fake.deinit();
+
+        const result = try Executor.init(std.testing.allocator, fake.host()).execute(hir);
+
+        try std.testing.expectEqual(case[1], result.status);
+        try std.testing.expectEqual(.exit, result.control_flow);
+        try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+    }
+}
+
 test "special builtin assignments persist in session state" {
     var hir = try generate("name=temporary next=\"$name value\" :");
     defer hir.deinit(std.testing.allocator);
@@ -278,6 +412,7 @@ test "unsupported execution forms fail before the current command has side effec
     const cases = [_][:0]const u8{
         "left | right",
         "persisted=changed >out",
+        "if persisted=changed; then true; fi >out",
         "left &",
     };
 

@@ -1,7 +1,8 @@
 //! Executes Habush HIR through a `Host`.
 //!
 //! The current runtime foundation executes empty units, foreground sequential
-//! lists, standalone assignments, builtins, and external simple commands.
+//! lists, and-or commands, pipeline negation, if clauses, standalone
+//! assignments, builtins, and external simple commands.
 //! Redirections, background execution, pipelines, compound commands, and
 //! compound control flow remain explicit `UnsupportedInstruction` boundaries.
 
@@ -110,6 +111,9 @@ pub fn execute(executor: Executor, hir: Hir) Error!Result {
 fn executeInstruction(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
     return switch (hir.instructionTag(index)) {
         .list => executor.executeList(hir, index),
+        .and_if, .or_if => executor.executeAndOr(hir, index),
+        .negated_pipeline => executor.executeNegatedPipeline(hir, index),
+        .if_clause => executor.executeIfClause(hir, index),
         .simple_command => executor.executeSimpleCommand(hir, index),
         else => error.UnsupportedInstruction,
     };
@@ -133,6 +137,60 @@ fn executeList(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result
         last_status = command_result.status;
         if (command_result.control_flow != .none) break;
     }
+    return result;
+}
+
+fn executeIfClause(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
+    const clause = hir.ifClause(index);
+    if (clause.redirects.len != 0) return error.UnsupportedInstruction;
+
+    const condition_result = try executor.executeInstruction(hir, clause.condition);
+    if (condition_result.control_flow != .none) return condition_result;
+
+    const branch = if (condition_result.status == 0)
+        clause.then_body
+    else
+        clause.else_body.unwrap() orelse return .{
+            .status = 0,
+            .sandbox_coverage = condition_result.sandbox_coverage,
+        };
+
+    var branch_executor = executor;
+    branch_executor.last_status = condition_result.status;
+    var result = try branch_executor.executeInstruction(hir, branch);
+    result.sandbox_coverage = combineSandboxCoverage(
+        condition_result.sandbox_coverage,
+        result.sandbox_coverage,
+    );
+    return result;
+}
+
+fn executeAndOr(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
+    const operands = hir.andOr(index);
+    const lhs_result = try executor.executeInstruction(hir, operands.lhs);
+    if (lhs_result.control_flow != .none) return lhs_result;
+
+    const execute_rhs = switch (hir.instructionTag(index)) {
+        .and_if => lhs_result.status == 0,
+        .or_if => lhs_result.status != 0,
+        else => unreachable,
+    };
+    if (!execute_rhs) return lhs_result;
+
+    var rhs_executor = executor;
+    rhs_executor.last_status = lhs_result.status;
+    var rhs_result = try rhs_executor.executeInstruction(hir, operands.rhs);
+    rhs_result.sandbox_coverage = combineSandboxCoverage(
+        lhs_result.sandbox_coverage,
+        rhs_result.sandbox_coverage,
+    );
+    return rhs_result;
+}
+
+fn executeNegatedPipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
+    var result = try executor.executeInstruction(hir, hir.negatedPipeline(index));
+    if (result.control_flow != .none) return result;
+    result.status = if (result.status == 0) 1 else 0;
     return result;
 }
 
