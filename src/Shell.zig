@@ -24,6 +24,7 @@ pub fn run(self: *Shell) !u8 {
         switch (try self.handleInput(source, null)) {
             .none => continue,
             .exit => return self.last_status,
+            .@"break", .@"continue" => unreachable,
         }
     }
 }

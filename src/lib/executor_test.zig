@@ -308,6 +308,99 @@ test "while and until loops propagate exit from conditions and bodies" {
     }
 }
 
+test "break exits a loop and continue starts its next condition" {
+    const cases = [_]struct { [:0]const u8, []const u8 }{
+        .{
+            "command=true; while \"$command\"; do command=false; break; /bin/skipped; done",
+            "false",
+        },
+        .{
+            "command=true; while \"$command\"; do command=false; continue; /bin/skipped; done",
+            "false",
+        },
+    };
+
+    for (cases) |case| {
+        var hir = try generate(case[0]);
+        defer hir.deinit(std.testing.allocator);
+        var fake = FakeHost.init(std.testing.allocator);
+        defer fake.deinit();
+        var variables = VariableStore.init(std.testing.allocator);
+        defer variables.deinit();
+
+        const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+            .variables = &variables,
+        }).execute(hir);
+
+        try std.testing.expectEqual(@as(u8, 0), result.status);
+        try std.testing.expect(result.control_flow.isNone());
+        try std.testing.expectEqualStrings(case[1], variables.get("command").?);
+        try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+    }
+}
+
+test "break and continue propagate across nested loops" {
+    const cases = [_][:0]const u8{
+        \\outer=true
+        \\while "$outer"; do
+        \\  outer=false
+        \\  while true; do
+        \\    break 2
+        \\    /bin/skipped
+        \\  done
+        \\  /bin/skipped
+        \\done
+        ,
+        \\outer=true
+        \\inner=true
+        \\while "$outer"; do
+        \\  outer=false
+        \\  while "$inner"; do
+        \\    inner=false
+        \\    continue 2
+        \\    /bin/skipped
+        \\  done
+        \\  /bin/skipped
+        \\done
+        ,
+    };
+
+    for (cases) |source| {
+        var hir = try generate(source);
+        defer hir.deinit(std.testing.allocator);
+        var fake = FakeHost.init(std.testing.allocator);
+        defer fake.deinit();
+        var variables = VariableStore.init(std.testing.allocator);
+        defer variables.deinit();
+
+        const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+            .variables = &variables,
+        }).execute(hir);
+
+        try std.testing.expectEqual(@as(u8, 0), result.status);
+        try std.testing.expect(result.control_flow.isNone());
+        try std.testing.expectEqualStrings("false", variables.get("outer").?);
+        try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+    }
+}
+
+test "break outside a loop reports a command failure" {
+    var hir = try generate("break");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var diagnostics: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer diagnostics.deinit();
+
+    const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .io = .{ .stderr = &diagnostics.writer },
+    }).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 1), result.status);
+    try std.testing.expect(result.control_flow.isNone());
+    try std.testing.expectEqualStrings("break: not in a loop\n", diagnostics.written());
+}
+
 test "special builtin assignments persist in session state" {
     var hir = try generate("name=temporary next=\"$name value\" :");
     defer hir.deinit(std.testing.allocator);

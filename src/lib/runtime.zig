@@ -8,9 +8,18 @@ pub const State = @import("runtime/State.zig");
 
 /// A request to transfer control out of the current shell execution unit.
 /// The accompanying command status is carried by the execution result.
-pub const ControlFlow = enum {
+pub const ControlFlow = union(enum) {
     none,
     exit,
+    @"break": u32,
+    @"continue": u32,
+
+    pub fn isNone(control_flow: ControlFlow) bool {
+        return switch (control_flow) {
+            .none => true,
+            else => false,
+        };
+    }
 };
 
 test {

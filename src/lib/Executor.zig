@@ -1,8 +1,9 @@
 //! Executes Habush HIR through a `Host`.
 //!
 //! The current runtime foundation executes empty units, foreground sequential
-//! lists, and-or commands, pipeline negation, if clauses, while/until loops,
-//! standalone assignments, builtins, and external simple commands.
+//! lists, and-or commands, pipeline negation, if clauses, while/until loops
+//! with break/continue control, standalone assignments, builtins, and external
+//! simple commands.
 //! Redirections, background execution, pipelines, compound commands, and
 //! compound control flow remain explicit `UnsupportedInstruction` boundaries.
 
@@ -28,6 +29,7 @@ variables: ?*VariableStore,
 runtime_state: ?*runtime.State,
 io: runtime.Io,
 last_status: u8,
+loop_depth: u32,
 
 /// Failures that prevent the runtime from producing a shell-visible `Result`.
 /// Expected command failures are reported through `Result.status` and, when
@@ -75,6 +77,7 @@ pub fn initWithOptions(gpa: std.mem.Allocator, host: Host, options: Options) Exe
         .runtime_state = null,
         .io = options.io,
         .last_status = options.last_status,
+        .loop_depth = 0,
     };
 }
 
@@ -96,6 +99,7 @@ pub fn initWithState(
         .runtime_state = state,
         .io = io,
         .last_status = last_status,
+        .loop_depth = 0,
     };
 }
 
@@ -136,7 +140,7 @@ fn executeList(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result
         );
         result.control_flow = command_result.control_flow;
         last_status = command_result.status;
-        if (command_result.control_flow != .none) break;
+        if (!command_result.control_flow.isNone()) break;
     }
     return result;
 }
@@ -147,18 +151,36 @@ fn executeLoopClause(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!
 
     var result: Result = .{ .status = 0, .sandbox_coverage = .not_requested };
     var last_status = executor.last_status;
-    while (true) {
+    loop: while (true) {
         var condition_executor = executor;
         condition_executor.last_status = last_status;
+        condition_executor.loop_depth += 1;
         const condition_result = try condition_executor.executeInstruction(hir, clause.condition);
         result.sandbox_coverage = combineSandboxCoverage(
             result.sandbox_coverage,
             condition_result.sandbox_coverage,
         );
-        if (condition_result.control_flow != .none) {
-            result.status = condition_result.status;
-            result.control_flow = condition_result.control_flow;
-            return result;
+        switch (condition_result.control_flow) {
+            .none => {},
+            .exit => {
+                result.status = condition_result.status;
+                result.control_flow = .exit;
+                return result;
+            },
+            .@"break" => |levels| {
+                result.status = condition_result.status;
+                if (levels > 1) result.control_flow = .{ .@"break" = levels - 1 };
+                return result;
+            },
+            .@"continue" => |levels| {
+                result.status = condition_result.status;
+                if (levels > 1) {
+                    result.control_flow = .{ .@"continue" = levels - 1 };
+                    return result;
+                }
+                last_status = condition_result.status;
+                continue :loop;
+            },
         }
 
         const execute_body = switch (hir.instructionTag(index)) {
@@ -170,15 +192,32 @@ fn executeLoopClause(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!
 
         var body_executor = executor;
         body_executor.last_status = condition_result.status;
+        body_executor.loop_depth += 1;
         const body_result = try body_executor.executeInstruction(hir, clause.body);
         result.status = body_result.status;
         result.sandbox_coverage = combineSandboxCoverage(
             result.sandbox_coverage,
             body_result.sandbox_coverage,
         );
-        result.control_flow = body_result.control_flow;
-        if (body_result.control_flow != .none) return result;
-        last_status = body_result.status;
+        switch (body_result.control_flow) {
+            .none => last_status = body_result.status,
+            .exit => {
+                result.control_flow = .exit;
+                return result;
+            },
+            .@"break" => |levels| {
+                if (levels > 1) result.control_flow = .{ .@"break" = levels - 1 };
+                return result;
+            },
+            .@"continue" => |levels| {
+                if (levels > 1) {
+                    result.control_flow = .{ .@"continue" = levels - 1 };
+                    return result;
+                }
+                last_status = body_result.status;
+                continue :loop;
+            },
+        }
     }
 }
 
@@ -187,7 +226,7 @@ fn executeIfClause(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
     if (clause.redirects.len != 0) return error.UnsupportedInstruction;
 
     const condition_result = try executor.executeInstruction(hir, clause.condition);
-    if (condition_result.control_flow != .none) return condition_result;
+    if (!condition_result.control_flow.isNone()) return condition_result;
 
     const branch = if (condition_result.status == 0)
         clause.then_body
@@ -210,7 +249,7 @@ fn executeIfClause(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
 fn executeAndOr(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
     const operands = hir.andOr(index);
     const lhs_result = try executor.executeInstruction(hir, operands.lhs);
-    if (lhs_result.control_flow != .none) return lhs_result;
+    if (!lhs_result.control_flow.isNone()) return lhs_result;
 
     const execute_rhs = switch (hir.instructionTag(index)) {
         .and_if => lhs_result.status == 0,
@@ -231,7 +270,7 @@ fn executeAndOr(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Resul
 
 fn executeNegatedPipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
     var result = try executor.executeInstruction(hir, hir.negatedPipeline(index));
-    if (result.control_flow != .none) return result;
+    if (!result.control_flow.isNone()) return result;
     result.status = if (result.status == 0) 1 else 0;
     return result;
 }
@@ -291,6 +330,7 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
             .variable_overrides = &command_variables,
             .io = executor.io,
             .last_status = executor.last_status,
+            .loop_depth = executor.loop_depth,
         }, argv.items);
         return .{
             .status = result.status,
