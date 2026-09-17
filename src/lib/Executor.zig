@@ -1,7 +1,7 @@
 //! Executes Habush HIR through a `Host`.
 //!
 //! The current runtime foundation executes empty units, foreground sequential
-//! lists, and-or commands, pipeline negation, if clauses, while/until loops
+//! lists, and-or commands, pipeline negation, if clauses, while/until/for loops
 //! with break/continue control, standalone assignments, builtins, and external
 //! simple commands.
 //! Redirections, background execution, pipelines, compound commands, and
@@ -24,6 +24,7 @@ host: Host,
 sandbox: CommandPlan.Sandbox,
 resolver: ?CommandResolver,
 search_path: []const []const u8,
+positional_parameters: []const []const u8,
 cwd: ?[]const u8,
 variables: ?*VariableStore,
 runtime_state: ?*runtime.State,
@@ -45,6 +46,7 @@ pub const Options = struct {
     sandbox: CommandPlan.Sandbox = .inherit,
     resolver: ?CommandResolver = null,
     search_path: []const []const u8 = &.{},
+    positional_parameters: []const []const u8 = &.{},
     cwd: ?[]const u8 = null,
     /// Complete shell variable state. When present, exported bindings become
     /// an exact replacement environment; `null` preserves host inheritance.
@@ -72,6 +74,7 @@ pub fn initWithOptions(gpa: std.mem.Allocator, host: Host, options: Options) Exe
         .sandbox = options.sandbox,
         .resolver = options.resolver,
         .search_path = options.search_path,
+        .positional_parameters = options.positional_parameters,
         .cwd = options.cwd,
         .variables = options.variables,
         .runtime_state = null,
@@ -94,6 +97,7 @@ pub fn initWithState(
         .sandbox = .inherit,
         .resolver = resolver,
         .search_path = &.{},
+        .positional_parameters = &.{},
         .cwd = null,
         .variables = null,
         .runtime_state = state,
@@ -119,9 +123,70 @@ fn executeInstruction(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error
         .negated_pipeline => executor.executeNegatedPipeline(hir, index),
         .if_clause => executor.executeIfClause(hir, index),
         .while_clause, .until_clause => executor.executeLoopClause(hir, index),
+        .for_clause => executor.executeForClause(hir, index),
         .simple_command => executor.executeSimpleCommand(hir, index),
         else => error.UnsupportedInstruction,
     };
+}
+
+fn executeForClause(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
+    const clause = hir.forClause(index);
+    if (clause.redirects.len != 0) return error.UnsupportedInstruction;
+    const variables = executor.variableStore();
+
+    var arena = std.heap.ArenaAllocator.init(executor.gpa);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var expanded_words: std.ArrayList([]const u8) = .empty;
+    const values = if (clause.implicit_positional_parameters)
+        executor.positionalParameters()
+    else values: {
+        const expander = Expander.initWithContext(allocator, .{ .variables = variables });
+        for (clause.words) |word|
+            try expanded_words.appendSlice(allocator, try expander.expandArgument(hir, word));
+        break :values expanded_words.items;
+    };
+
+    var result: Result = .{ .status = 0, .sandbox_coverage = .not_requested };
+    var last_status = executor.last_status;
+    iteration: for (values) |value| {
+        const mutable_variables = variables orelse return error.VariableStateUnavailable;
+        mutable_variables.set(clause.name, value) catch |err| switch (err) {
+            error.InvalidName => unreachable,
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+
+        var body_executor = executor;
+        body_executor.last_status = last_status;
+        body_executor.loop_depth += 1;
+        const body_result = try body_executor.executeInstruction(hir, clause.body);
+        result.status = body_result.status;
+        result.sandbox_coverage = combineSandboxCoverage(
+            result.sandbox_coverage,
+            body_result.sandbox_coverage,
+        );
+        switch (body_result.control_flow) {
+            .none => last_status = body_result.status,
+            .exit => {
+                result.control_flow = .exit;
+                return result;
+            },
+            .@"break" => |levels| {
+                if (levels > 1) result.control_flow = .{ .@"break" = levels - 1 };
+                return result;
+            },
+            .@"continue" => |levels| {
+                if (levels > 1) {
+                    result.control_flow = .{ .@"continue" = levels - 1 };
+                    return result;
+                }
+                last_status = body_result.status;
+                continue :iteration;
+            },
+        }
+    }
+    return result;
 }
 
 fn executeList(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
@@ -413,6 +478,11 @@ fn workingDirectory(executor: Executor) ?[]const u8 {
 fn commandSearchPath(executor: Executor) []const []const u8 {
     if (executor.runtime_state) |state| return state.commandSearchPath();
     return executor.search_path;
+}
+
+fn positionalParameters(executor: Executor) []const []const u8 {
+    if (executor.runtime_state) |state| return state.positionalParameters();
+    return executor.positional_parameters;
 }
 
 fn activeSandbox(executor: Executor) CommandPlan.Sandbox {

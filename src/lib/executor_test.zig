@@ -308,6 +308,101 @@ test "while and until loops propagate exit from conditions and bodies" {
     }
 }
 
+test "for loops expand explicit words once and retain the last iteration values" {
+    var hir = try generate(
+        \\source=one
+        \\for item in "$source" "two words" "$source"; do
+        \\  source=changed
+        \\  observed="$item"
+        \\done
+    );
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+
+    const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .variables = &variables,
+    }).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expect(result.control_flow.isNone());
+    try std.testing.expectEqualStrings("one", variables.get("item").?);
+    try std.testing.expectEqualStrings("one", variables.get("observed").?);
+    try std.testing.expectEqualStrings("changed", variables.get("source").?);
+    try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+}
+
+test "for loops without an in list iterate over positional parameters" {
+    var hir = try generate("for item; do observed=\"$item\"; done");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+
+    const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .positional_parameters = &.{ "one", "two words", "three" },
+        .variables = &variables,
+    }).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expect(result.control_flow.isNone());
+    try std.testing.expectEqualStrings("three", variables.get("item").?);
+    try std.testing.expectEqualStrings("three", variables.get("observed").?);
+}
+
+test "for loops with no values succeed without variable state" {
+    var hir = try generate("for item in; do /bin/skipped; done");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+
+    const result = try Executor.init(std.testing.allocator, fake.host()).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expect(result.control_flow.isNone());
+    try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+}
+
+test "for loops consume continue and propagate break across nested loops" {
+    const cases = [_][:0]const u8{
+        \\for command in continue false; do
+        \\  "$command"
+        \\  observed="$command"
+        \\done
+        ,
+        \\for outer in one; do
+        \\  for inner in two; do
+        \\    break 2
+        \\    /bin/skipped
+        \\  done
+        \\  /bin/skipped
+        \\done
+        ,
+    };
+
+    for (cases, 0..) |source, case_index| {
+        var hir = try generate(source);
+        defer hir.deinit(std.testing.allocator);
+        var fake = FakeHost.init(std.testing.allocator);
+        defer fake.deinit();
+        var variables = VariableStore.init(std.testing.allocator);
+        defer variables.deinit();
+
+        const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+            .variables = &variables,
+        }).execute(hir);
+
+        try std.testing.expectEqual(@as(u8, 0), result.status);
+        try std.testing.expect(result.control_flow.isNone());
+        try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+        if (case_index == 0)
+            try std.testing.expectEqualStrings("false", variables.get("observed").?);
+    }
+}
+
 test "break exits a loop and continue starts its next condition" {
     const cases = [_]struct { [:0]const u8, []const u8 }{
         .{
@@ -579,6 +674,7 @@ test "unsupported execution forms fail before the current command has side effec
         "persisted=changed >out",
         "if persisted=changed; then true; fi >out",
         "while persisted=changed; do true; done >out",
+        "for persisted in changed; do true; done >out",
         "left &",
     };
 

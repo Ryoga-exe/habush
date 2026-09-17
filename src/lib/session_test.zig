@@ -113,6 +113,23 @@ test "session carries the previous status into exit" {
     try std.testing.expectEqual(.exit, overridden.control_flow);
 }
 
+test "session supplies positional parameters to implicit for loops" {
+    var fake_host = FakeHost.init(std.testing.allocator);
+    defer fake_host.deinit();
+    var session = try Session.init(std.testing.allocator, fake_host.host(), .{
+        .positional_parameters = &.{ "one", "two words" },
+    });
+    defer session.deinit();
+
+    var hir = try generate("for item; do observed=\"$item\"; done");
+    defer hir.deinit(std.testing.allocator);
+    const result = try session.execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqualStrings("two words", session.variable("item").?);
+    try std.testing.expectEqualStrings("two words", session.variable("observed").?);
+}
+
 test "session routes builtin output" {
     var fake_host = FakeHost.init(std.testing.allocator);
     defer fake_host.deinit();
