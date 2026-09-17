@@ -56,6 +56,12 @@ pub fn build(b: *std.Build) void {
     script_test.addFileArg(b.path("test/cli/exit.hb"));
     expectCliResult(script_test, test_step, 37, "", "");
 
+    const script_arguments_test = b.addRunArtifact(exe);
+    script_arguments_test.setName("test cli script positional arguments");
+    script_arguments_test.addFileArg(b.path("test/cli/for-arguments.hb"));
+    script_arguments_test.addArgs(&.{ "true", "false" });
+    expectCliResult(script_arguments_test, test_step, 1, "", "");
+
     const script_diagnostic_test = b.addRunArtifact(exe);
     script_diagnostic_test.setName("test cli script diagnostic");
     script_diagnostic_test.addFileArg(b.path("test/cli/invalid.hb"));
@@ -72,7 +78,7 @@ pub fn build(b: *std.Build) void {
         test_step,
         2,
         "",
-        "habush: usage: habush [-c command | script]\n",
+        "habush: usage: habush [-c command | script [argument ...]]\n",
     );
 }
 
