@@ -107,6 +107,75 @@ test "expands external command redirect paths" {
     );
 }
 
+test "creates external command input resources from here-documents" {
+    const collected = [_]@import("heredoc.zig").Collected{.{
+        .delimiter = "EOF",
+        .strip_tabs = false,
+        .expand_body = false,
+        .body = "$name literally\n",
+    }};
+    var hir = try generateWithHereDocuments("/bin/cat <<'EOF'\n", &collected);
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+
+    const result = try preResolvedExecutor(std.testing.allocator, fake.host()).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqual(@as(usize, 1), fake.create_input_calls.items.len);
+    try std.testing.expectEqualStrings("$name literally\n", fake.create_input_calls.items[0]);
+    const action = fake.spawn_calls.items[0].file_actions[0].use_resource;
+    try std.testing.expectEqual(CommandPlan.FileDescriptor.stdin, action.target);
+    try std.testing.expectEqual(@as(usize, 1), fake.closed_resource_count);
+}
+
+test "expands unquoted here-document bodies as scalar input" {
+    const collected = [_]@import("heredoc.zig").Collected{.{
+        .delimiter = "EOF",
+        .strip_tabs = false,
+        .expand_body = true,
+        .body = "hello $name ${missing:-fallback} $?\n",
+    }};
+    var hir = try generateWithHereDocuments("/bin/cat <<EOF\n", &collected);
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+    try variables.set("name", "two words");
+
+    const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .resolver = CommandResolver.preResolved(),
+        .variables = &variables,
+        .last_status = 23,
+    }).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqualStrings(
+        "hello two words fallback 23\n",
+        fake.create_input_calls.items[0],
+    );
+}
+
+test "here-strings append a newline to scalar expansion" {
+    var hir = try generate("/bin/cat <<<\"$value\"");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+    try variables.set("value", "two words");
+
+    _ = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .resolver = CommandResolver.preResolved(),
+        .variables = &variables,
+    }).execute(hir);
+
+    try std.testing.expectEqualStrings("two words\n", fake.create_input_calls.items[0]);
+    try std.testing.expectEqual(CommandPlan.FileDescriptor.stdin, fake.spawn_calls.items[0]
+        .file_actions[0].use_resource.target);
+}
+
 test "diagnoses invalid external command redirects before spawning" {
     const Case = struct {
         source: [:0]const u8,
@@ -1421,6 +1490,17 @@ test "reports partial best-effort sandbox coverage" {
 
 fn generate(source: [:0]const u8) !@import("Hir.zig") {
     var tree = try Ast.parse(std.testing.allocator, source);
+    defer tree.deinit(std.testing.allocator);
+    return AstGen.generate(std.testing.allocator, tree);
+}
+
+fn generateWithHereDocuments(
+    source: [:0]const u8,
+    collected: []const @import("heredoc.zig").Collected,
+) !@import("Hir.zig") {
+    var tree = try Ast.parseWithOptions(std.testing.allocator, source, .{
+        .collected_here_documents = collected,
+    });
     defer tree.deinit(std.testing.allocator);
     return AstGen.generate(std.testing.allocator, tree);
 }

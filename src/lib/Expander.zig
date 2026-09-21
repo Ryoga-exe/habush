@@ -117,6 +117,104 @@ pub fn expandAssignment(
     return bytes.toOwnedSlice(expander.allocator);
 }
 
+/// Expands a here-document body without field splitting, pathname expansion,
+/// or quote removal. Quotes are ordinary bytes in a here-document; only
+/// parameter expansion and the restricted here-document backslash rules are
+/// applied here. Command and arithmetic substitutions remain unsupported by
+/// the language frontend.
+pub fn expandHereDocument(expander: Expander, source: []const u8) Error![]const u8 {
+    var bytes: std.ArrayList(u8) = .empty;
+    errdefer bytes.deinit(expander.allocator);
+
+    var index: usize = 0;
+    while (index < source.len) {
+        switch (source[index]) {
+            '\\' => {
+                if (index + 1 == source.len) {
+                    try bytes.append(expander.allocator, '\\');
+                    index += 1;
+                    continue;
+                }
+                const next = source[index + 1];
+                switch (next) {
+                    '$', '`', '\\' => try bytes.append(expander.allocator, next),
+                    '\n' => {},
+                    else => {
+                        try bytes.append(expander.allocator, '\\');
+                        try bytes.append(expander.allocator, next);
+                    },
+                }
+                index += 2;
+            },
+            '$' => {
+                const parameter_start = index + 1;
+                if (parameter_start == source.len) {
+                    try bytes.append(expander.allocator, '$');
+                    index += 1;
+                    continue;
+                }
+                if (source[parameter_start] == '{') {
+                    const content_start = parameter_start + 1;
+                    const content_end = findParameterEnd(source, content_start) orelse
+                        return error.ParameterExpansionUnsupported;
+                    try expander.appendBracedAssignmentParameter(
+                        &bytes,
+                        source[content_start..content_end],
+                        true,
+                    );
+                    index = content_end + 1;
+                    continue;
+                }
+
+                const first = source[parameter_start];
+                const parameter_end = if (Word.isSpecialParameter(first) or
+                    std.ascii.isDigit(first))
+                    parameter_start + 1
+                else if (Word.isNameStart(first)) name: {
+                    var end = parameter_start + 1;
+                    while (end < source.len and Word.isNameContinue(source[end])) : (end += 1) {}
+                    break :name end;
+                } else {
+                    try bytes.append(expander.allocator, '$');
+                    index += 1;
+                    continue;
+                };
+                try expander.appendParameter(&bytes, source[parameter_start..parameter_end]);
+                index = parameter_end;
+            },
+            else => {
+                try bytes.append(expander.allocator, source[index]);
+                index += 1;
+            },
+        }
+    }
+    return bytes.toOwnedSlice(expander.allocator);
+}
+
+fn findParameterEnd(source: []const u8, content_start: usize) ?usize {
+    var depth: usize = 1;
+    var index = content_start;
+    while (index < source.len) {
+        switch (source[index]) {
+            '$' => if (index + 1 < source.len and source[index + 1] == '{') {
+                depth += 1;
+                index += 2;
+                continue;
+            },
+            '}' => {
+                depth -= 1;
+                if (depth == 0) return index;
+            },
+            '\\' => {
+                if (index + 1 < source.len) index += 1;
+            },
+            else => {},
+        }
+        index += 1;
+    }
+    return null;
+}
+
 fn appendArgumentPart(
     expander: Expander,
     tag: Word.Part.Tag,

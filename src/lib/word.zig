@@ -386,15 +386,15 @@ pub const Iterator = struct {
     }
 };
 
-fn isNameStart(byte: u8) bool {
+pub fn isNameStart(byte: u8) bool {
     return std.ascii.isAlphabetic(byte) or byte == '_';
 }
 
-fn isNameContinue(byte: u8) bool {
+pub fn isNameContinue(byte: u8) bool {
     return isNameStart(byte) or std.ascii.isDigit(byte);
 }
 
-fn isSpecialParameter(byte: u8) bool {
+pub fn isSpecialParameter(byte: u8) bool {
     return switch (byte) {
         '@', '*', '#', '?', '-', '$', '!' => true,
         else => false,

@@ -28,6 +28,7 @@ pub const Kind = union(enum) {
     parameter_expansion: ParameterExpansion,
     ambiguous_redirect,
     invalid_file_descriptor: []const u8,
+    input_resource_unavailable,
     cannot_open: CannotOpenReason,
     invalid_name: []const u8,
     cannot_change_directory: []const u8,
@@ -77,6 +78,7 @@ pub fn status(diagnostic: Diagnostic) types.ExitStatus {
         .parameter_expansion,
         .ambiguous_redirect,
         .invalid_file_descriptor,
+        .input_resource_unavailable,
         .cannot_open,
         .invalid_name,
         .cannot_change_directory,
@@ -122,6 +124,9 @@ pub fn render(
         .invalid_file_descriptor => |descriptor| try writer.print(
             "invalid file descriptor: {s}",
             .{descriptor},
+        ),
+        .input_resource_unavailable => try writer.writeAll(
+            "cannot create redirection input: system resources unavailable",
         ),
         .cannot_open => |reason| switch (reason) {
             .not_found => try writer.writeAll("no such file or directory"),
