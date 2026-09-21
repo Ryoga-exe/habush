@@ -114,6 +114,7 @@ pub const Iterator = struct {
     state: State = .unquoted,
     quote_start: usize = 0,
     double_quote_has_part: bool = false,
+    implicit_double_quote: bool = false,
     status: Status = .running,
 
     const State = enum {
@@ -128,12 +129,29 @@ pub const Iterator = struct {
         };
     }
 
+    pub fn initExpansionWord(
+        source: []const u8,
+        source_start: ByteOffset,
+        double_quoted: bool,
+    ) Iterator {
+        var iterator = init(source, source_start);
+        if (double_quoted) {
+            iterator.state = .double_quoted;
+            iterator.implicit_double_quote = true;
+        }
+        return iterator;
+    }
+
     pub fn next(iterator: *Iterator) ?Part {
         if (iterator.status != .running) return null;
 
         while (true) switch (iterator.state) {
             .unquoted => {
                 if (iterator.index == iterator.source.len) {
+                    if (iterator.implicit_double_quote) {
+                        iterator.setIncomplete(.double_quote, iterator.quote_start);
+                        return null;
+                    }
                     iterator.status = .complete;
                     return null;
                 }
@@ -187,6 +205,10 @@ pub const Iterator = struct {
             },
             .double_quoted => {
                 if (iterator.index == iterator.source.len) {
+                    if (iterator.implicit_double_quote) {
+                        iterator.status = .complete;
+                        return null;
+                    }
                     iterator.setIncomplete(.double_quote, iterator.quote_start);
                     return null;
                 }
@@ -492,6 +514,20 @@ test "double quote backslash follows shell rules" {
     try std.testing.expectEqual(Part.Tag.double_quoted, literal.tag);
     try std.testing.expectEqualStrings("b\\q", source[literal.start..literal.end]);
     try std.testing.expect(iterator.next() == null);
+}
+
+test "expansion word can inherit a surrounding double quote" {
+    const source = "'literal' a\\qb $name";
+    var iterator = Iterator.initExpansionWord(source, 0, true);
+
+    const literal = iterator.next().?;
+    try std.testing.expectEqual(Part.Tag.double_quoted, literal.tag);
+    try std.testing.expectEqualStrings("'literal' a\\qb ", source[literal.start..literal.end]);
+    const parameter = iterator.next().?;
+    try std.testing.expectEqual(Part.Tag.double_quoted_parameter, parameter.tag);
+    try std.testing.expectEqualStrings("name", source[parameter.start..parameter.end]);
+    try std.testing.expect(iterator.next() == null);
+    try std.testing.expect(iterator.status == .complete);
 }
 
 test "reports an unclosed parameter brace" {
