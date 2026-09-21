@@ -1,8 +1,8 @@
 select_status() {
-    for status; do
-        return "$status"
-    done
-    return 0
+    argument_count=$#
+    false
+    previous_status=$?
+    return "$1"
 }
 
 select_status 23

@@ -156,6 +156,64 @@ test "session persists function definitions and scopes their positional paramete
     try std.testing.expectEqual(@as(usize, 0), fake_host.spawn_calls.items.len);
 }
 
+test "functions expand scalar parameters and restore the caller scope" {
+    var fake_host = FakeHost.init(std.testing.allocator);
+    defer fake_host.deinit();
+    var session = try Session.init(std.testing.allocator, fake_host.host(), .{
+        .positional_parameters = &.{"outer"},
+    });
+    defer session.deinit();
+
+    var hir = try generate(
+        "capture() { status=$? first=$1 count=$#; }; " ++
+            "false; capture one \"two words\"; " ++
+            "for item; do caller=\"$item\"; done",
+    );
+    defer hir.deinit(std.testing.allocator);
+    const result = try session.execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqualStrings("1", session.variable("status").?);
+    try std.testing.expectEqualStrings("one", session.variable("first").?);
+    try std.testing.expectEqualStrings("2", session.variable("count").?);
+    try std.testing.expectEqualStrings("outer", session.variable("caller").?);
+}
+
+test "double-quoted at forwards exact function arguments" {
+    var fake_host = FakeHost.init(std.testing.allocator);
+    defer fake_host.deinit();
+    var session = try Session.init(std.testing.allocator, fake_host.host(), .{
+        .resolver = CommandResolver.preResolved(),
+    });
+    defer session.deinit();
+
+    var hir = try generate("forward() { /bin/tool \"$@\"; }; forward one \"two words\" \"\"");
+    defer hir.deinit(std.testing.allocator);
+    const result = try session.execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqual(@as(usize, 1), fake_host.spawn_calls.items.len);
+    try std.testing.expectEqualDeep(
+        @as([]const []const u8, &.{ "/bin/tool", "one", "two words", "" }),
+        fake_host.spawn_calls.items[0].argv,
+    );
+}
+
+test "empty double-quoted at removes its command word" {
+    var fake_host = FakeHost.init(std.testing.allocator);
+    defer fake_host.deinit();
+    var session = try Session.init(std.testing.allocator, fake_host.host(), .{});
+    defer session.deinit();
+
+    var hir = try generate("empty() { \"$@\"; observed=after; }; empty");
+    defer hir.deinit(std.testing.allocator);
+    const result = try session.execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqualStrings("after", session.variable("observed").?);
+    try std.testing.expectEqual(@as(usize, 0), fake_host.spawn_calls.items.len);
+}
+
 test "shell functions override regular builtins but not special builtins" {
     var fake_host = FakeHost.init(std.testing.allocator);
     defer fake_host.deinit();

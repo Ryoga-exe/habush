@@ -198,7 +198,7 @@ fn executeForClause(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!R
     const values = if (clause.implicit_positional_parameters)
         executor.positionalParameters()
     else values: {
-        const expander = Expander.initWithContext(allocator, .{ .variables = variables });
+        const expander = executor.wordExpander(allocator, null);
         for (clause.words) |word|
             try expanded_words.appendSlice(allocator, try expander.expandArgument(hir, word));
         break :values expanded_words.items;
@@ -414,22 +414,27 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
     defer arena.deinit();
     const allocator = arena.allocator();
     const variables = executor.variableStore();
-    const expander = Expander.initWithContext(allocator, .{
-        .variables = variables,
-    });
+    const expander = executor.wordExpander(allocator, null);
 
     var argv: std.ArrayList([]const u8) = .empty;
     const parts = hir.simpleCommandParts(index);
     var has_assignments = false;
+    var has_words = false;
     for (parts) |part| {
         switch (hir.instructionTag(part)) {
             .assignment => has_assignments = true,
-            .word => try argv.appendSlice(allocator, try expander.expandArgument(hir, part)),
+            .word => {
+                has_words = true;
+                try argv.appendSlice(allocator, try expander.expandArgument(hir, part));
+            },
             else => return error.UnsupportedInstruction,
         }
     }
     if (argv.items.len == 0) {
-        if (!has_assignments) return error.UnsupportedInstruction;
+        if (!has_assignments) return if (has_words)
+            .{ .status = 0, .sandbox_coverage = .not_requested }
+        else
+            error.UnsupportedInstruction;
         const mutable_variables = variables orelse return error.VariableStateUnavailable;
         for (parts) |part| {
             const assignment = hir.assignment(part);
@@ -445,10 +450,7 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
         for (parts) |part| {
             if (hir.instructionTag(part) != .assignment) continue;
             const assignment = hir.assignment(part);
-            const assignment_expander = Expander.initWithContext(allocator, .{
-                .variables = variables,
-                .overrides = &command_variables,
-            });
+            const assignment_expander = executor.wordExpander(allocator, &command_variables);
             const value = try assignment_expander.expandAssignment(hir, assignment.value);
             try command_variables.set(assignment.name, value);
         }
@@ -589,6 +591,19 @@ fn executeFunction(executor: Executor, argv: []const []const u8) Error!Result {
 fn variableStore(executor: Executor) ?*VariableStore {
     if (executor.runtime_state) |state| return state.variableStore();
     return executor.variables;
+}
+
+fn wordExpander(
+    executor: Executor,
+    allocator: std.mem.Allocator,
+    overrides: ?*const VariableStore,
+) Expander {
+    return Expander.initWithContext(allocator, .{
+        .variables = executor.variableStore(),
+        .overrides = overrides,
+        .positional_parameters = executor.positionalParameters(),
+        .last_status = executor.last_status,
+    });
 }
 
 fn workingDirectory(executor: Executor) ?[]const u8 {
