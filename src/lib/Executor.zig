@@ -4,8 +4,8 @@
 //! lists, and-or commands, pipeline negation, brace groups, if clauses,
 //! while/until/for loops with break/continue control, standalone assignments,
 //! builtins, and external simple commands.
-//! Redirections, background execution, pipelines, subshells, and function
-//! definitions remain explicit `UnsupportedInstruction` boundaries.
+//! Redirections, background execution, pipelines, and function definitions
+//! remain explicit `UnsupportedInstruction` boundaries.
 
 const std = @import("std");
 const Builtin = @import("Builtin.zig");
@@ -121,6 +121,7 @@ fn executeInstruction(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error
         .list => executor.executeList(hir, index),
         .and_if, .or_if => executor.executeAndOr(hir, index),
         .negated_pipeline => executor.executeNegatedPipeline(hir, index),
+        .subshell => executor.executeSubshell(hir, index),
         .brace_group => executor.executeBraceGroup(hir, index),
         .if_clause => executor.executeIfClause(hir, index),
         .while_clause, .until_clause => executor.executeLoopClause(hir, index),
@@ -128,6 +129,37 @@ fn executeInstruction(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error
         .simple_command => executor.executeSimpleCommand(hir, index),
         else => error.UnsupportedInstruction,
     };
+}
+
+fn executeSubshell(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
+    const group = hir.groupedCommand(index);
+    if (group.redirects.len != 0) return error.UnsupportedInstruction;
+
+    var subshell_executor = executor;
+    subshell_executor.loop_depth = 0;
+    if (executor.runtime_state) |state| {
+        var state_copy = try state.clone();
+        defer state_copy.deinit();
+        subshell_executor.runtime_state = &state_copy;
+        return subshell_executor.executeSubshellBody(hir, group.body);
+    }
+    if (executor.variables) |variables| {
+        var variables_copy = try variables.clone(executor.gpa);
+        defer variables_copy.deinit();
+        subshell_executor.variables = &variables_copy;
+        return subshell_executor.executeSubshellBody(hir, group.body);
+    }
+    return subshell_executor.executeSubshellBody(hir, group.body);
+}
+
+fn executeSubshellBody(executor: Executor, hir: Hir, body: Hir.Inst.Index) Error!Result {
+    var result = try executor.executeInstruction(hir, body);
+    switch (result.control_flow) {
+        .none => {},
+        .exit => result.control_flow = .none,
+        .@"break", .@"continue" => unreachable,
+    }
+    return result;
 }
 
 fn executeBraceGroup(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {

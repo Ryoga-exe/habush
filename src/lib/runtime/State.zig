@@ -282,6 +282,7 @@ test "runtime state clone is independent" {
     try copy.setWorkingDirectory("/new");
     try copy.setCommandSearchPath(&.{"/usr/bin"});
     try copy.setPositionalParameters(&.{"changed"});
+    try copy.setSandbox(.inherit);
     try copy.setVariable("name", "changed");
 
     try std.testing.expectEqualStrings("/old", state.workingDirectory().?);
