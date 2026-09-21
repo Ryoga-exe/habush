@@ -746,7 +746,7 @@ test "standalone assignments require mutable variable state" {
 
 test "unsupported expansions have no host side effects" {
     const cases = [_]struct { [:0]const u8, anyerror }{
-        .{ "/bin/echo $name", error.FieldSplittingUnsupported },
+        .{ "/bin/echo $@", error.FieldSplittingUnsupported },
         .{ "/bin/echo *.zig", error.PathnameExpansionUnsupported },
     };
     for (cases) |case| {
@@ -761,6 +761,28 @@ test "unsupported expansions have no host side effects" {
         );
         try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
     }
+}
+
+test "field splitting contributes every expanded command argument" {
+    var hir = try generate("/bin/tool pre$name\"post\" \"$name\" $missing");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+    try variables.set("name", "one two");
+
+    const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .resolver = CommandResolver.preResolved(),
+        .variables = &variables,
+    }).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqual(@as(usize, 1), fake.spawn_calls.items.len);
+    try std.testing.expectEqualDeep(
+        @as([]const []const u8, &.{ "/bin/tool", "preone", "twopost", "one two" }),
+        fake.spawn_calls.items[0].argv,
+    );
 }
 
 test "unsupported execution forms fail before the current command has side effects" {

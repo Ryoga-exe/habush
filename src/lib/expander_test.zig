@@ -29,7 +29,7 @@ test "expands and joins static argument parts" {
 }
 
 test "classifies unsupported argument expansions" {
-    try expectExpansionError("command $name", error.FieldSplittingUnsupported);
+    try expectExpansionError("command $@", error.FieldSplittingUnsupported);
     try expectExpansionError("command \"${name:-fallback}\"", error.ParameterExpansionUnsupported);
     try expectExpansionError("command *.zig", error.PathnameExpansionUnsupported);
     try expectExpansionError("command ~/work", error.TildeExpansionUnsupported);
@@ -121,6 +121,98 @@ test "double-quoted at preserves positional parameter fields" {
 
     const empty = try Expander.init(arena.allocator()).expandArgument(hir, parts[2]);
     try std.testing.expectEqual(@as(usize, 0), empty.len);
+}
+
+test "splits unquoted parameters on default IFS whitespace" {
+    var hir = try generate("command pre$name\"post\" $missing \"$name\" $1");
+    defer hir.deinit(std.testing.allocator);
+    const parts = firstCommandParts(hir);
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+    try variables.set("name", " one  two ");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const expander = Expander.initWithContext(arena.allocator(), .{
+        .variables = &variables,
+        .positional_parameters = &.{"three four"},
+    });
+
+    try std.testing.expectEqualDeep(
+        @as([]const []const u8, &.{ "pre", "one", "two", "post" }),
+        try expander.expandArgument(hir, parts[1]),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        (try expander.expandArgument(hir, parts[2])).len,
+    );
+    try std.testing.expectEqualDeep(
+        @as([]const []const u8, &.{" one  two "}),
+        try expander.expandArgument(hir, parts[3]),
+    );
+    try std.testing.expectEqualDeep(
+        @as([]const []const u8, &.{ "three", "four" }),
+        try expander.expandArgument(hir, parts[4]),
+    );
+}
+
+test "non-whitespace IFS delimiters preserve interior empty fields" {
+    var hir = try generate("command pre$name\"post\"");
+    defer hir.deinit(std.testing.allocator);
+    const word = firstCommandParts(hir)[1];
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+    try variables.set("IFS", ":");
+    try variables.set("name", ":a::b:");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const fields = try Expander.initWithContext(arena.allocator(), .{
+        .variables = &variables,
+    }).expandArgument(hir, word);
+    try std.testing.expectEqualDeep(
+        @as([]const []const u8, &.{ "pre", "a", "", "b", "post" }),
+        fields,
+    );
+}
+
+test "empty IFS disables field splitting" {
+    var hir = try generate("command $name $missing");
+    defer hir.deinit(std.testing.allocator);
+    const parts = firstCommandParts(hir);
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+    try variables.set("IFS", "");
+    try variables.set("name", "one two");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const expander = Expander.initWithContext(arena.allocator(), .{ .variables = &variables });
+
+    try std.testing.expectEqualDeep(
+        @as([]const []const u8, &.{"one two"}),
+        try expander.expandArgument(hir, parts[1]),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        (try expander.expandArgument(hir, parts[2])).len,
+    );
+}
+
+test "unquoted expansion defers generated patterns to pathname expansion" {
+    var hir = try generate("command $pattern");
+    defer hir.deinit(std.testing.allocator);
+    const word = firstCommandParts(hir)[1];
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+    try variables.set("pattern", "*.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try std.testing.expectError(
+        error.PathnameExpansionUnsupported,
+        Expander.initWithContext(arena.allocator(), .{
+            .variables = &variables,
+        }).expandArgument(hir, word),
+    );
 }
 
 test "expands special parameters in assignment values" {

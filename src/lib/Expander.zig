@@ -56,7 +56,7 @@ pub fn expandArgument(
         for (fields.items) |field| expander.allocator.free(field);
         fields.deinit(expander.allocator);
     }
-    var preserves_empty_field = false;
+    var current_field_active = false;
     for (hir.wordParts(word), 0..) |part, part_index| {
         const tag = hir.instructionTag(part);
         const value = hir.wordPart(part);
@@ -67,7 +67,7 @@ pub fn expandArgument(
                 if (part_index == 0 and std.mem.startsWith(u8, value, "~"))
                     return error.TildeExpansionUnsupported;
                 try bytes.appendSlice(expander.allocator, value);
-                preserves_empty_field = true;
+                current_field_active = true;
             },
             .escaped,
             .single_quoted,
@@ -75,13 +75,19 @@ pub fn expandArgument(
             .double_quoted_escaped,
             => {
                 try bytes.appendSlice(expander.allocator, value);
-                preserves_empty_field = true;
+                current_field_active = true;
             },
             .parameter, .braced_parameter => {
-                if (!isFieldSplittingIndependent(value))
-                    return error.FieldSplittingUnsupported;
-                try expander.appendParameter(&bytes, value);
-                preserves_empty_field = true;
+                if (std.mem.eql(u8, value, "@")) return error.FieldSplittingUnsupported;
+                var expanded: std.ArrayList(u8) = .empty;
+                defer expanded.deinit(expander.allocator);
+                try expander.appendParameter(&expanded, value);
+                try expander.appendFieldSplit(
+                    &fields,
+                    &bytes,
+                    &current_field_active,
+                    expanded.items,
+                );
             },
             .double_quoted_parameter,
             .double_quoted_braced_parameter,
@@ -96,18 +102,18 @@ pub fn expandArgument(
                             try finishField(expander.allocator, &fields, &bytes);
                             try bytes.appendSlice(expander.allocator, parameter);
                         }
-                        preserves_empty_field = true;
+                        current_field_active = true;
                     }
                 } else {
                     try expander.appendParameter(&bytes, value);
-                    preserves_empty_field = true;
+                    current_field_active = true;
                 }
             },
             else => unreachable,
         }
     }
 
-    if (preserves_empty_field) try finishField(expander.allocator, &fields, &bytes);
+    if (current_field_active) try finishField(expander.allocator, &fields, &bytes);
     return fields.toOwnedSlice(expander.allocator);
 }
 
@@ -206,6 +212,53 @@ fn joinSeparator(expander: Expander) ?u8 {
     return if (ifs.len == 0) null else ifs[0];
 }
 
+fn appendFieldSplit(
+    expander: Expander,
+    fields: *std.ArrayList([]const u8),
+    bytes: *std.ArrayList(u8),
+    current_field_active: *bool,
+    value: []const u8,
+) Error!void {
+    if (std.mem.indexOfAny(u8, value, "*?[") != null)
+        return error.PathnameExpansionUnsupported;
+
+    const ifs = expander.context.variable("IFS") orelse " \t\n";
+    if (ifs.len == 0) {
+        if (value.len != 0) {
+            try bytes.appendSlice(expander.allocator, value);
+            current_field_active.* = true;
+        }
+        return;
+    }
+
+    var index: usize = 0;
+    while (index < value.len) {
+        if (!isIfsByte(ifs, value[index])) {
+            const start = index;
+            while (index < value.len and !isIfsByte(ifs, value[index])) : (index += 1) {}
+            try bytes.appendSlice(expander.allocator, value[start..index]);
+            current_field_active.* = true;
+            continue;
+        }
+
+        var non_whitespace_delimiter = !isIfsWhitespace(ifs, value[index]);
+        if (!non_whitespace_delimiter) {
+            while (index < value.len and isIfsWhitespace(ifs, value[index])) : (index += 1) {}
+            if (index < value.len and isIfsNonWhitespace(ifs, value[index])) {
+                non_whitespace_delimiter = true;
+                index += 1;
+            }
+        } else {
+            index += 1;
+        }
+        while (index < value.len and isIfsWhitespace(ifs, value[index])) : (index += 1) {}
+
+        if (non_whitespace_delimiter or current_field_active.*)
+            try finishField(expander.allocator, fields, bytes);
+        current_field_active.* = false;
+    }
+}
+
 fn finishField(
     allocator: std.mem.Allocator,
     fields: *std.ArrayList([]const u8),
@@ -216,8 +269,19 @@ fn finishField(
     try fields.append(allocator, field);
 }
 
-fn isFieldSplittingIndependent(name: []const u8) bool {
-    return std.mem.eql(u8, name, "?") or std.mem.eql(u8, name, "#");
+fn isIfsByte(ifs: []const u8, byte: u8) bool {
+    return std.mem.indexOfScalar(u8, ifs, byte) != null;
+}
+
+fn isIfsWhitespace(ifs: []const u8, byte: u8) bool {
+    return isIfsByte(ifs, byte) and switch (byte) {
+        ' ', '\t', '\n' => true,
+        else => false,
+    };
+}
+
+fn isIfsNonWhitespace(ifs: []const u8, byte: u8) bool {
+    return isIfsByte(ifs, byte) and !isIfsWhitespace(ifs, byte);
 }
 
 fn isDecimal(value: []const u8) bool {
