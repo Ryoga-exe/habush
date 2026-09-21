@@ -67,6 +67,22 @@ pub fn build(b: *std.Build) void {
     function_test.addFileArg(b.path("test/cli/function.hb"));
     expectCliResult(function_test, test_step, 23, "", "");
 
+    const word_expansion_test = b.addRunArtifact(exe);
+    word_expansion_test.setName("test cli word expansion");
+    word_expansion_test.addFileArg(b.path("test/cli/word-expansion.hb"));
+    expectCliResult(word_expansion_test, test_step, 23, "", "");
+
+    const parameter_diagnostic_test = b.addRunArtifact(exe);
+    parameter_diagnostic_test.setName("test cli parameter expansion diagnostic");
+    parameter_diagnostic_test.addArgs(&.{ "-c", "/bin/echo ${missing:?required value}" });
+    expectCliResult(
+        parameter_diagnostic_test,
+        test_step,
+        1,
+        "",
+        "habush: missing: required value\n",
+    );
+
     const script_diagnostic_test = b.addRunArtifact(exe);
     script_diagnostic_test.setName("test cli script diagnostic");
     script_diagnostic_test.addFileArg(b.path("test/cli/invalid.hb"));
