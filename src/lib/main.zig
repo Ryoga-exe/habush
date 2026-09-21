@@ -12,6 +12,7 @@ pub const Expander = @import("Expander.zig");
 pub const FunctionStore = @import("FunctionStore.zig");
 pub const Host = @import("Host.zig");
 pub const Hir = @import("Hir.zig");
+pub const heredoc = @import("heredoc.zig");
 pub const runtime = @import("runtime.zig");
 pub const SandboxPolicy = @import("SandboxPolicy.zig");
 pub const Session = @import("Session.zig");

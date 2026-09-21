@@ -72,6 +72,28 @@ pub fn build(b: *std.Build) void {
     word_expansion_test.addFileArg(b.path("test/cli/word-expansion.hb"));
     expectCliResult(word_expansion_test, test_step, 23, "", "");
 
+    if (target.result.os.tag != .windows) {
+        const heredoc_test = b.addRunArtifact(exe);
+        heredoc_test.setName("test cli here-document input");
+        heredoc_test.addFileArg(b.path("test/cli/heredoc.hb"));
+        expectCliResult(
+            heredoc_test,
+            test_step,
+            0,
+            "expanded two words\nliteral $value\ntwo words\n" ++
+                "compound input\nsecond input wins\ntabs stripped\n",
+            "",
+        );
+
+        const heredoc_diagnostic_test = b.addRunArtifact(exe);
+        heredoc_diagnostic_test.setName("test cli diagnostic after here-document");
+        heredoc_diagnostic_test.addFileArg(b.path("test/cli/invalid-after-heredoc.hb"));
+        heredoc_diagnostic_test.expectExitCode(2);
+        heredoc_diagnostic_test.expectStdOutEqual("");
+        heredoc_diagnostic_test.expectStdErrMatch(":4:1: expected command, found ')'\n");
+        test_step.dependOn(&heredoc_diagnostic_test.step);
+    }
+
     const parameter_diagnostic_test = b.addRunArtifact(exe);
     parameter_diagnostic_test.setName("test cli parameter expansion diagnostic");
     parameter_diagnostic_test.addArgs(&.{ "-c", "/bin/echo ${missing:?required value}" });
