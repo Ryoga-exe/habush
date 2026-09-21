@@ -713,6 +713,14 @@ test "parameter failure handles every allocation failure" {
     );
 }
 
+test "here-document expansion handles every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        expandHereDocumentWithAllocator,
+        .{},
+    );
+}
+
 fn expectExpansionError(source: [:0]const u8, expected: anyerror) !void {
     var hir = try generate(source);
     defer hir.deinit(std.testing.allocator);
@@ -770,6 +778,16 @@ fn expandFailureWithAllocator(
         else => |other| return other,
     };
     return error.ExpectedParameterExpansionFailure;
+}
+
+fn expandHereDocumentWithAllocator(gpa: std.mem.Allocator) !void {
+    var variables = VariableStore.init(gpa);
+    defer variables.deinit();
+    try variables.set("name", "two words");
+    const expanded = try Expander.initWithContext(gpa, .{
+        .variables = &variables,
+    }).expandHereDocument("$name ${missing:-fallback} escaped \\$name\n");
+    defer gpa.free(expanded);
 }
 
 fn firstCommandParts(hir: Hir) []const Hir.Inst.Index {

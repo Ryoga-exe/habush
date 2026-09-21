@@ -22,6 +22,8 @@ wait_error: ?Host.Error = null,
 resolve_working_directory_error: ?Host.Error = null,
 working_directory_result: ?[]const u8 = null,
 open_file_failure: ?Host.FileActionFailure.Reason = null,
+open_file_failure_after: usize = 0,
+create_input_error: ?Host.Error = null,
 sandbox_coverage: ?SandboxPolicy.Coverage = null,
 
 pub const OpenFileCall = struct {
@@ -61,6 +63,7 @@ const vtable: Host.VTable = .{
 
 fn createInput(userdata: ?*anyopaque, bytes: []const u8) Host.Error!CommandPlan.Resource {
     const fake: *FakeHost = @ptrCast(@alignCast(userdata.?));
+    if (fake.create_input_error) |err| return err;
     const allocator = fake.arena.allocator();
     try fake.create_input_calls.append(allocator, try allocator.dupe(u8, bytes));
     const resource: CommandPlan.Resource = @enumFromInt(fake.next_resource);
@@ -74,7 +77,10 @@ fn openFile(
     open: CommandPlan.FileAction.Open,
 ) Host.SpawnError!Host.OpenFileOutcome {
     const fake: *FakeHost = @ptrCast(@alignCast(userdata.?));
-    if (fake.open_file_failure) |reason| return .{ .failed = reason };
+    if (fake.open_file_failure) |reason| {
+        if (fake.open_file_calls.items.len >= fake.open_file_failure_after)
+            return .{ .failed = reason };
+    }
 
     const allocator = fake.arena.allocator();
     try fake.open_file_calls.append(allocator, .{

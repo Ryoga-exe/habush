@@ -732,11 +732,13 @@ fn appendRedirectActions(
     resources: *std.ArrayList(CommandPlan.Resource),
 ) Error!?Result {
     const redirect = hir.redirect(redirect_index);
-    const target = if (redirect.io_number) |io_number|
-        CommandPlan.FileDescriptor.parse(io_number) orelse
-            return try executor.redirectFailure(.{ .invalid_file_descriptor = io_number })
-    else
-        defaultRedirectDescriptor(redirect.operator);
+    const target = if (redirect.io_number) |io_number| target: {
+        const descriptor = CommandPlan.FileDescriptor.parse(io_number) orelse
+            return try executor.redirectFailure(.{ .invalid_file_descriptor = io_number });
+        _ = standardStreamIndex(descriptor) orelse
+            return try executor.redirectFailure(.{ .unsupported_file_descriptor = io_number });
+        break :target descriptor;
+    } else defaultRedirectDescriptor(redirect.operator);
 
     switch (redirect.operator) {
         .here_document, .here_document_strip_tabs => {
@@ -788,6 +790,10 @@ fn appendRedirectActions(
                 const source = CommandPlan.FileDescriptor.parse(paths[0]) orelse
                     return try executor.redirectFailure(.{
                         .invalid_file_descriptor = paths[0],
+                    });
+                _ = standardStreamIndex(source) orelse
+                    return try executor.redirectFailure(.{
+                        .unsupported_file_descriptor = paths[0],
                     });
                 try actions.append(allocator, .{ .duplicate = .{
                     .source = source,
@@ -1211,11 +1217,21 @@ fn spawnFailure(
             const action_index = std.math.cast(usize, file_action.action_index) orelse
                 return error.Unexpected;
             if (action_index >= file_actions.len) return error.Unexpected;
-            const path = switch (file_actions[action_index]) {
-                .open => |open| open.path,
-                else => return error.Unexpected,
+            const action = file_actions[action_index];
+            return switch (action) {
+                .open => |open| executor.fileOpenFailure(open.path, file_action.reason),
+                .duplicate, .close, .use_resource => switch (file_action.reason) {
+                    .resource_unavailable => executor.commandFailure(
+                        command,
+                        .{ .cannot_execute = .resource_unavailable },
+                    ),
+                    .unsupported => executor.commandFailure(
+                        command,
+                        .{ .cannot_execute = .unsupported },
+                    ),
+                    else => error.Unexpected,
+                },
             };
-            return executor.fileOpenFailure(path, file_action.reason);
         },
     };
 }

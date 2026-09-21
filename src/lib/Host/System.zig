@@ -1,8 +1,8 @@
 //! Native `Host` implementation backed by Zig's cross-platform standard APIs.
 //!
-//! The process backend supports foreground commands and path-backed standard
-//! stream file actions. Process groups, non-standard descriptors, descriptor
-//! duplication, and sandbox restrictions remain explicit unsupported boundaries.
+//! The process backend supports foreground commands and file actions for the
+//! three standard descriptors. Process groups, non-standard descriptors, and
+//! sandbox restrictions remain explicit unsupported boundaries.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -946,6 +946,51 @@ test "system host duplicates redirected standard streams" {
     );
     defer std.testing.allocator.free(output);
     try std.testing.expectEqualStrings("outerr", output);
+}
+
+test "system host preserves file action source order" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var directory_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const directory_len = try temporary.dir.realPath(std.testing.io, &directory_buffer);
+
+    var system: System = .{ .gpa = std.testing.allocator, .io = std.testing.io };
+    defer system.deinit();
+    var plan = outputBothCommand();
+    plan.cwd = .{ .path = directory_buffer[0..directory_len] };
+    plan.file_actions = &.{
+        .{ .open = .{
+            .path = "before.txt",
+            .target = .stdout,
+            .access = .write,
+            .disposition = .create_or_truncate,
+        } },
+        .{ .duplicate = .{ .source = .stdout, .target = .stderr } },
+        .{ .open = .{
+            .path = "after.txt",
+            .target = .stdout,
+            .access = .write,
+            .disposition = .create_or_truncate,
+        } },
+    };
+    try expectExitStatus(system.host(), plan, 0);
+
+    const before = try temporary.dir.readFileAlloc(
+        std.testing.io,
+        "before.txt",
+        std.testing.allocator,
+        .limited(64),
+    );
+    defer std.testing.allocator.free(before);
+    const after = try temporary.dir.readFileAlloc(
+        std.testing.io,
+        "after.txt",
+        std.testing.allocator,
+        .limited(64),
+    );
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualStrings("err", before);
+    try std.testing.expectEqualStrings("out", after);
 }
 
 test "system host identifies a failing input file action" {

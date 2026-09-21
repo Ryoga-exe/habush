@@ -28,6 +28,7 @@ pub const Kind = union(enum) {
     parameter_expansion: ParameterExpansion,
     ambiguous_redirect,
     invalid_file_descriptor: []const u8,
+    unsupported_file_descriptor: []const u8,
     input_resource_unavailable,
     cannot_open: CannotOpenReason,
     invalid_name: []const u8,
@@ -78,6 +79,7 @@ pub fn status(diagnostic: Diagnostic) types.ExitStatus {
         .parameter_expansion,
         .ambiguous_redirect,
         .invalid_file_descriptor,
+        .unsupported_file_descriptor,
         .input_resource_unavailable,
         .cannot_open,
         .invalid_name,
@@ -123,6 +125,10 @@ pub fn render(
         .ambiguous_redirect => try writer.writeAll("ambiguous redirect"),
         .invalid_file_descriptor => |descriptor| try writer.print(
             "invalid file descriptor: {s}",
+            .{descriptor},
+        ),
+        .unsupported_file_descriptor => |descriptor| try writer.print(
+            "unsupported file descriptor: {s}",
             .{descriptor},
         ),
         .input_resource_unavailable => try writer.writeAll(

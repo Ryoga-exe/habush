@@ -35,6 +35,8 @@ pub const WorkingDirectory = union(enum) {
 };
 
 /// A logical shell descriptor which the host maps to its native mechanism.
+/// The representation preserves arbitrary shell descriptor numbers for future
+/// platform backends; the current executor supports only stdin/stdout/stderr.
 pub const FileDescriptor = enum(u32) {
     stdin = 0,
     stdout = 1,

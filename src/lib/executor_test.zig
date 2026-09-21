@@ -32,7 +32,7 @@ test "executes static simple commands through the host" {
 }
 
 test "lowers external command file redirects in source order" {
-    var hir = try generate("/bin/tool 3<input >output 2>>error");
+    var hir = try generate("/bin/tool <input >output 2>>error");
     defer hir.deinit(std.testing.allocator);
 
     var fake = FakeHost.init(std.testing.allocator);
@@ -44,7 +44,7 @@ test "lowers external command file redirects in source order" {
     try std.testing.expectEqual(@as(usize, 3), actions.len);
 
     const input = actions[0].open;
-    try std.testing.expectEqual(@as(CommandPlan.FileDescriptor, @enumFromInt(3)), input.target);
+    try std.testing.expectEqual(CommandPlan.FileDescriptor.stdin, input.target);
     try std.testing.expectEqual(.read, input.access);
     try std.testing.expectEqual(.open_existing, input.disposition);
     try std.testing.expectEqualStrings("input", input.path);
@@ -213,6 +213,66 @@ test "closes earlier here-document resources when later expansion fails" {
     try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
 }
 
+test "reports here-document input resource creation failures" {
+    const collected = [_]@import("heredoc.zig").Collected{.{
+        .delimiter = "EOF",
+        .strip_tabs = false,
+        .expand_body = true,
+        .body = "body\n",
+    }};
+    var hir = try generateWithHereDocuments("/bin/cat <<EOF\n", &collected);
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    fake.create_input_error = error.ResourceUnavailable;
+    var diagnostics: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer diagnostics.deinit();
+
+    const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .resolver = CommandResolver.preResolved(),
+        .io = .{ .stderr = &diagnostics.writer },
+    }).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 1), result.status);
+    try std.testing.expectEqualStrings(
+        "cannot create redirection input: system resources unavailable\n",
+        diagnostics.written(),
+    );
+    try std.testing.expectEqual(@as(usize, 0), fake.create_input_calls.items.len);
+    try std.testing.expectEqual(@as(usize, 0), fake.closed_resource_count);
+    try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+}
+
+test "closes here-document resources after spawn failures" {
+    const collected = [_]@import("heredoc.zig").Collected{.{
+        .delimiter = "EOF",
+        .strip_tabs = false,
+        .expand_body = true,
+        .body = "body\n",
+    }};
+    var hir = try generateWithHereDocuments("/bin/cat <<EOF\n", &collected);
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    fake.spawn_failure = .resource_unavailable;
+    var diagnostics: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer diagnostics.deinit();
+
+    const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .resolver = CommandResolver.preResolved(),
+        .io = .{ .stderr = &diagnostics.writer },
+    }).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 126), result.status);
+    try std.testing.expectEqualStrings(
+        "/bin/cat: system resources unavailable\n",
+        diagnostics.written(),
+    );
+    try std.testing.expectEqual(@as(usize, 1), fake.create_input_calls.items.len);
+    try std.testing.expectEqual(@as(usize, 1), fake.closed_resource_count);
+    try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+}
+
 test "diagnoses invalid external command redirects before spawning" {
     const Case = struct {
         source: [:0]const u8,
@@ -226,6 +286,14 @@ test "diagnoses invalid external command redirects before spawning" {
         .{
             .source = "/bin/tool 4294967296>output",
             .message = "invalid file descriptor: 4294967296\n",
+        },
+        .{
+            .source = "/bin/tool 3>output",
+            .message = "unsupported file descriptor: 3\n",
+        },
+        .{
+            .source = "/bin/tool 2>&3",
+            .message = "unsupported file descriptor: 3\n",
         },
     };
 
@@ -272,6 +340,30 @@ test "reports the path and reason for host file action failures" {
     try std.testing.expectEqual(@as(u8, 1), result.status);
     try std.testing.expectEqualStrings(
         "input: no such file or directory\n",
+        diagnostics.written(),
+    );
+}
+
+test "reports unsupported non-open host file actions" {
+    var hir = try generate("/bin/tool 2>&1");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    fake.spawn_failure = .{ .file_action = .{
+        .action_index = 0,
+        .reason = .unsupported,
+    } };
+    var diagnostics: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer diagnostics.deinit();
+
+    const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .resolver = CommandResolver.preResolved(),
+        .io = .{ .stderr = &diagnostics.writer },
+    }).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 126), result.status);
+    try std.testing.expectEqualStrings(
+        "/bin/tool: operation not supported\n",
         diagnostics.written(),
     );
 }
@@ -562,6 +654,31 @@ test "failed scoped redirections prevent command side effects" {
     try std.testing.expectEqualStrings("original", variables.get("persisted").?);
     try std.testing.expectEqualStrings("missing: no such file or directory\n", diagnostics.written());
     try std.testing.expectEqual(@as(usize, 0), fake.closed_resource_count);
+}
+
+test "later scoped redirection failure closes earlier resources" {
+    var hir = try generate("{ persisted=changed; } >first >second");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    fake.open_file_failure = .not_found;
+    fake.open_file_failure_after = 1;
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+    try variables.set("persisted", "original");
+    var diagnostics: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer diagnostics.deinit();
+
+    const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .variables = &variables,
+        .io = .{ .stderr = &diagnostics.writer },
+    }).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 1), result.status);
+    try std.testing.expectEqualStrings("original", variables.get("persisted").?);
+    try std.testing.expectEqualStrings("second: no such file or directory\n", diagnostics.written());
+    try std.testing.expectEqual(@as(usize, 1), fake.open_file_calls.items.len);
+    try std.testing.expectEqual(@as(usize, 1), fake.closed_resource_count);
 }
 
 test "subshells isolate runtime state and contain exit control flow" {
