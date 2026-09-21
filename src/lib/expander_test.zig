@@ -29,7 +29,6 @@ test "expands and joins static argument parts" {
 }
 
 test "classifies unsupported argument expansions" {
-    try expectExpansionError("command $@", error.FieldSplittingUnsupported);
     try expectExpansionError("command \"${name:-fallback}\"", error.ParameterExpansionUnsupported);
     try expectExpansionError("command *.zig", error.PathnameExpansionUnsupported);
     try expectExpansionError("command ~/work", error.TildeExpansionUnsupported);
@@ -121,6 +120,45 @@ test "double-quoted at preserves positional parameter fields" {
 
     const empty = try Expander.init(arena.allocator()).expandArgument(hir, parts[2]);
     try std.testing.expectEqual(@as(usize, 0), empty.len);
+}
+
+test "unquoted at splits each positional parameter independently" {
+    var hir = try generate("command $@ pre$@post");
+    defer hir.deinit(std.testing.allocator);
+    const parts = firstCommandParts(hir);
+    const parameters = [_][]const u8{ "", "one two", "", "three", "" };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const expander = Expander.initWithContext(arena.allocator(), .{
+        .positional_parameters = &parameters,
+    });
+    try std.testing.expectEqualDeep(
+        @as([]const []const u8, &.{ "one", "two", "three" }),
+        try expander.expandArgument(hir, parts[1]),
+    );
+    try std.testing.expectEqualDeep(
+        @as([]const []const u8, &.{ "pre", "one", "two", "three", "post" }),
+        try expander.expandArgument(hir, parts[2]),
+    );
+}
+
+test "unquoted at with no positional parameters contributes no fields" {
+    var hir = try generate("command $@ pre$@post");
+    defer hir.deinit(std.testing.allocator);
+    const parts = firstCommandParts(hir);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const expander = Expander.init(arena.allocator());
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        (try expander.expandArgument(hir, parts[1])).len,
+    );
+    try std.testing.expectEqualDeep(
+        @as([]const []const u8, &.{"prepost"}),
+        try expander.expandArgument(hir, parts[2]),
+    );
 }
 
 test "splits unquoted parameters on default IFS whitespace" {

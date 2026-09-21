@@ -25,7 +25,6 @@ pub const Context = struct {
 };
 
 pub const Error = std.mem.Allocator.Error || error{
-    FieldSplittingUnsupported,
     ParameterExpansionUnsupported,
     PathnameExpansionUnsupported,
     TildeExpansionUnsupported,
@@ -41,9 +40,7 @@ pub fn initWithContext(allocator: std.mem.Allocator, context: Context) Expander 
 
 /// Expands one argument word to zero or more fields.
 ///
-/// Returned slices are owned by `allocator`. The initial implementation
-/// performs quote removal and parameter expansion inside double quotes. Field
-/// splitting remains a separate, unsupported stage.
+/// Returned slices are owned by `allocator`.
 pub fn expandArgument(
     expander: Expander,
     hir: Hir,
@@ -78,7 +75,14 @@ pub fn expandArgument(
                 current_field_active = true;
             },
             .parameter, .braced_parameter => {
-                if (std.mem.eql(u8, value, "@")) return error.FieldSplittingUnsupported;
+                if (std.mem.eql(u8, value, "@")) {
+                    try expander.appendUnquotedAt(
+                        &fields,
+                        &bytes,
+                        &current_field_active,
+                    );
+                    continue;
+                }
                 var expanded: std.ArrayList(u8) = .empty;
                 defer expanded.deinit(expander.allocator);
                 try expander.appendParameter(&expanded, value);
@@ -256,6 +260,21 @@ fn appendFieldSplit(
         if (non_whitespace_delimiter or current_field_active.*)
             try finishField(expander.allocator, fields, bytes);
         current_field_active.* = false;
+    }
+}
+
+fn appendUnquotedAt(
+    expander: Expander,
+    fields: *std.ArrayList([]const u8),
+    bytes: *std.ArrayList(u8),
+    current_field_active: *bool,
+) Error!void {
+    for (expander.context.positional_parameters, 0..) |parameter, index| {
+        if (index != 0 and current_field_active.*) {
+            try finishField(expander.allocator, fields, bytes);
+            current_field_active.* = false;
+        }
+        try expander.appendFieldSplit(fields, bytes, current_field_active, parameter);
     }
 }
 
