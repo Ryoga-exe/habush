@@ -29,9 +29,111 @@ test "expands and joins static argument parts" {
 }
 
 test "classifies unsupported argument expansions" {
-    try expectExpansionError("command \"${name:-fallback}\"", error.ParameterExpansionUnsupported);
+    try expectExpansionError("command \"${name:=fallback}\"", error.ParameterExpansionUnsupported);
     try expectExpansionError("command *.zig", error.PathnameExpansionUnsupported);
     try expectExpansionError("command ~/work", error.TildeExpansionUnsupported);
+}
+
+test "default parameter operators distinguish unset and null values" {
+    var hir = try generate(
+        "command \"${missing-fallback}\" \"${empty-fallback}\" " ++
+            "\"${empty:-fallback}\" \"${present:-fallback}\"",
+    );
+    defer hir.deinit(std.testing.allocator);
+    const parts = firstCommandParts(hir);
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+    try variables.set("empty", "");
+    try variables.set("present", "value");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const expander = Expander.initWithContext(arena.allocator(), .{
+        .variables = &variables,
+    });
+
+    const expected = [_][]const u8{ "fallback", "", "fallback", "value" };
+    for (parts[1..], expected) |part, value| {
+        try std.testing.expectEqualDeep(
+            @as([]const []const u8, &.{value}),
+            try expander.expandArgument(hir, part),
+        );
+    }
+}
+
+test "default parameter operators support positional parameters" {
+    var hir = try generate("command \"${0:-habush}\" \"${1:-first}\" \"${2:-second}\"");
+    defer hir.deinit(std.testing.allocator);
+    const parts = firstCommandParts(hir);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const expander = Expander.initWithContext(arena.allocator(), .{
+        .invocation_name = "script.hb",
+        .positional_parameters = &.{""},
+    });
+
+    const expected = [_][]const u8{ "script.hb", "first", "second" };
+    for (parts[1..], expected) |part, value| {
+        try std.testing.expectEqualDeep(
+            @as([]const []const u8, &.{value}),
+            try expander.expandArgument(hir, part),
+        );
+    }
+}
+
+test "unquoted default words retain their own quoting during field splitting" {
+    var hir = try generate(
+        "command ${missing:-one two} ${missing:-\"three four\"} " ++
+            "pre${missing:-five six}post",
+    );
+    defer hir.deinit(std.testing.allocator);
+    const parts = firstCommandParts(hir);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const expander = Expander.init(arena.allocator());
+
+    try std.testing.expectEqualDeep(
+        @as([]const []const u8, &.{ "one", "two" }),
+        try expander.expandArgument(hir, parts[1]),
+    );
+    try std.testing.expectEqualDeep(
+        @as([]const []const u8, &.{"three four"}),
+        try expander.expandArgument(hir, parts[2]),
+    );
+    try std.testing.expectEqualDeep(
+        @as([]const []const u8, &.{ "prefive", "sixpost" }),
+        try expander.expandArgument(hir, parts[3]),
+    );
+}
+
+test "default parameter words recursively expand parameters" {
+    var hir = try generate("command \"${missing:-${other:-nested value}}\"");
+    defer hir.deinit(std.testing.allocator);
+    const word_inst = firstCommandParts(hir)[1];
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try std.testing.expectEqualDeep(
+        @as([]const []const u8, &.{"nested value"}),
+        try Expander.init(arena.allocator()).expandArgument(hir, word_inst),
+    );
+}
+
+test "quoted default words inherit double quote parsing rules" {
+    var hir = try generate("command \"${missing:-'literal' a\\qb $name}\"");
+    defer hir.deinit(std.testing.allocator);
+    const word_inst = firstCommandParts(hir)[1];
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+    try variables.set("name", "value");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try std.testing.expectEqualDeep(
+        @as([]const []const u8, &.{"'literal' a\\qb value"}),
+        try Expander.initWithContext(arena.allocator(), .{
+            .variables = &variables,
+        }).expandArgument(hir, word_inst),
+    );
 }
 
 test "expands named parameters inside double quotes" {
@@ -291,6 +393,24 @@ test "expands assignment values without field or pathname expansion" {
     try std.testing.expectEqualStrings("prevalue with spaces::*.zig", value);
 }
 
+test "default parameter words expand in assignment values without field splitting" {
+    var hir = try generate("result=${missing:-pre\"$name\" post}");
+    defer hir.deinit(std.testing.allocator);
+    const assignment = hir.assignment(firstCommandParts(hir)[0]);
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+    try variables.set("name", "middle value");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try std.testing.expectEqualStrings(
+        "premiddle value post",
+        try Expander.initWithContext(arena.allocator(), .{
+            .variables = &variables,
+        }).expandAssignment(hir, assignment.value),
+    );
+}
+
 test "classifies unsupported assignment expansion" {
     var hir = try generate("result=~/work");
     defer hir.deinit(std.testing.allocator);
@@ -305,7 +425,7 @@ test "classifies unsupported assignment expansion" {
 }
 
 test "argument expansion handles every allocation failure" {
-    var hir = try generate("command pre\"mid\"'post'\\ end");
+    var hir = try generate("command pre\"${missing:-mid value}\"'post'\\ end");
     defer hir.deinit(std.testing.allocator);
     const word = firstCommandParts(hir)[1];
 

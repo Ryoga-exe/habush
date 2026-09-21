@@ -4,6 +4,7 @@ const std = @import("std");
 const Expander = @This();
 const Hir = @import("Hir.zig");
 const VariableStore = @import("VariableStore.zig");
+const Word = @import("word.zig");
 
 allocator: std.mem.Allocator,
 context: Context,
@@ -57,64 +58,16 @@ pub fn expandArgument(
     for (hir.wordParts(word), 0..) |part, part_index| {
         const tag = hir.instructionTag(part);
         const value = hir.wordPart(part);
-        switch (tag) {
-            .literal => {
-                if (std.mem.indexOfAny(u8, value, "*?[") != null)
-                    return error.PathnameExpansionUnsupported;
-                if (part_index == 0 and std.mem.startsWith(u8, value, "~"))
-                    return error.TildeExpansionUnsupported;
-                try bytes.appendSlice(expander.allocator, value);
-                current_field_active = true;
-            },
-            .escaped,
-            .single_quoted,
-            .double_quoted,
-            .double_quoted_escaped,
-            => {
-                try bytes.appendSlice(expander.allocator, value);
-                current_field_active = true;
-            },
-            .parameter, .braced_parameter => {
-                if (std.mem.eql(u8, value, "@")) {
-                    try expander.appendUnquotedAt(
-                        &fields,
-                        &bytes,
-                        &current_field_active,
-                    );
-                    continue;
-                }
-                var expanded: std.ArrayList(u8) = .empty;
-                defer expanded.deinit(expander.allocator);
-                try expander.appendParameter(&expanded, value);
-                try expander.appendFieldSplit(
-                    &fields,
-                    &bytes,
-                    &current_field_active,
-                    expanded.items,
-                );
-            },
-            .double_quoted_parameter,
-            .double_quoted_braced_parameter,
-            => {
-                if (std.mem.eql(u8, value, "@")) {
-                    if (expander.context.positional_parameters.len != 0) {
-                        try bytes.appendSlice(
-                            expander.allocator,
-                            expander.context.positional_parameters[0],
-                        );
-                        for (expander.context.positional_parameters[1..]) |parameter| {
-                            try finishField(expander.allocator, &fields, &bytes);
-                            try bytes.appendSlice(expander.allocator, parameter);
-                        }
-                        current_field_active = true;
-                    }
-                } else {
-                    try expander.appendParameter(&bytes, value);
-                    current_field_active = true;
-                }
-            },
-            else => unreachable,
-        }
+        try expander.appendArgumentPart(
+            hirPartTag(tag),
+            value,
+            part_index == 0,
+            false,
+            false,
+            &fields,
+            &bytes,
+            &current_field_active,
+        );
     }
 
     if (current_field_active) try finishField(expander.allocator, &fields, &bytes);
@@ -134,26 +87,254 @@ pub fn expandAssignment(
     for (hir.wordParts(word), 0..) |part, part_index| {
         const tag = hir.instructionTag(part);
         const value = hir.wordPart(part);
-        switch (tag) {
-            .literal => {
-                if (part_index == 0 and std.mem.startsWith(u8, value, "~"))
-                    return error.TildeExpansionUnsupported;
-                try bytes.appendSlice(expander.allocator, value);
-            },
-            .escaped,
-            .single_quoted,
-            .double_quoted,
-            .double_quoted_escaped,
-            => try bytes.appendSlice(expander.allocator, value),
-            .parameter,
-            .braced_parameter,
-            .double_quoted_parameter,
-            .double_quoted_braced_parameter,
-            => try expander.appendParameter(&bytes, value),
-            else => unreachable,
-        }
+        try expander.appendAssignmentPart(
+            hirPartTag(tag),
+            value,
+            part_index == 0,
+            &bytes,
+        );
     }
     return bytes.toOwnedSlice(expander.allocator);
+}
+
+fn appendArgumentPart(
+    expander: Expander,
+    tag: Word.Part.Tag,
+    value: []const u8,
+    is_first: bool,
+    force_quoted: bool,
+    expansion_word: bool,
+    fields: *std.ArrayList([]const u8),
+    bytes: *std.ArrayList(u8),
+    current_field_active: *bool,
+) Error!void {
+    switch (tag) {
+        .literal => {
+            if (!force_quoted and is_first and std.mem.startsWith(u8, value, "~"))
+                return error.TildeExpansionUnsupported;
+            if (force_quoted or !expansion_word) {
+                if (!force_quoted and std.mem.indexOfAny(u8, value, "*?[") != null)
+                    return error.PathnameExpansionUnsupported;
+                try bytes.appendSlice(expander.allocator, value);
+                current_field_active.* = true;
+            } else {
+                try expander.appendFieldSplit(fields, bytes, current_field_active, value);
+            }
+        },
+        .escaped,
+        .single_quoted,
+        .double_quoted,
+        .double_quoted_escaped,
+        => {
+            try bytes.appendSlice(expander.allocator, value);
+            current_field_active.* = true;
+        },
+        .parameter => try expander.appendArgumentParameter(
+            value,
+            force_quoted,
+            fields,
+            bytes,
+            current_field_active,
+        ),
+        .braced_parameter => try expander.appendBracedArgumentParameter(
+            value,
+            force_quoted,
+            fields,
+            bytes,
+            current_field_active,
+        ),
+        .double_quoted_parameter => try expander.appendArgumentParameter(
+            value,
+            true,
+            fields,
+            bytes,
+            current_field_active,
+        ),
+        .double_quoted_braced_parameter => try expander.appendBracedArgumentParameter(
+            value,
+            true,
+            fields,
+            bytes,
+            current_field_active,
+        ),
+    }
+}
+
+fn appendArgumentParameter(
+    expander: Expander,
+    parameter: []const u8,
+    quoted: bool,
+    fields: *std.ArrayList([]const u8),
+    bytes: *std.ArrayList(u8),
+    current_field_active: *bool,
+) Error!void {
+    if (std.mem.eql(u8, parameter, "@")) {
+        if (quoted) {
+            try expander.appendQuotedAt(fields, bytes, current_field_active);
+        } else {
+            try expander.appendUnquotedAt(fields, bytes, current_field_active);
+        }
+        return;
+    }
+    if (quoted) {
+        try expander.appendParameter(bytes, parameter);
+        current_field_active.* = true;
+        return;
+    }
+
+    var expanded: std.ArrayList(u8) = .empty;
+    defer expanded.deinit(expander.allocator);
+    try expander.appendParameter(&expanded, parameter);
+    try expander.appendFieldSplit(fields, bytes, current_field_active, expanded.items);
+}
+
+fn appendBracedArgumentParameter(
+    expander: Expander,
+    source: []const u8,
+    quoted: bool,
+    fields: *std.ArrayList([]const u8),
+    bytes: *std.ArrayList(u8),
+    current_field_active: *bool,
+) Error!void {
+    const expansion = Word.ParameterExpansion.parse(source) orelse
+        return error.ParameterExpansionUnsupported;
+    const operator = expansion.operator orelse
+        return expander.appendArgumentParameter(
+            expansion.parameter,
+            quoted,
+            fields,
+            bytes,
+            current_field_active,
+        );
+    const parameter_value = try expander.defaultParameterValue(expansion.parameter);
+    const use_word = switch (operator) {
+        .default_if_unset => parameter_value == null,
+        .default_if_unset_or_null => parameter_value == null or parameter_value.?.len == 0,
+        else => return error.ParameterExpansionUnsupported,
+    };
+    if (!use_word) {
+        return expander.appendScalarArgument(
+            parameter_value.?,
+            quoted,
+            fields,
+            bytes,
+            current_field_active,
+        );
+    }
+    if (expansion.word.len == 0 and quoted) {
+        current_field_active.* = true;
+        return;
+    }
+    try expander.appendExpansionWord(
+        expansion.word,
+        quoted,
+        fields,
+        bytes,
+        current_field_active,
+    );
+}
+
+fn appendScalarArgument(
+    expander: Expander,
+    value: []const u8,
+    quoted: bool,
+    fields: *std.ArrayList([]const u8),
+    bytes: *std.ArrayList(u8),
+    current_field_active: *bool,
+) Error!void {
+    if (quoted) {
+        try bytes.appendSlice(expander.allocator, value);
+        current_field_active.* = true;
+    } else {
+        try expander.appendFieldSplit(fields, bytes, current_field_active, value);
+    }
+}
+
+fn appendExpansionWord(
+    expander: Expander,
+    source: []const u8,
+    force_quoted: bool,
+    fields: *std.ArrayList([]const u8),
+    bytes: *std.ArrayList(u8),
+    current_field_active: *bool,
+) Error!void {
+    var iterator = Word.Iterator.initExpansionWord(source, 0, force_quoted);
+    var part_index: usize = 0;
+    while (iterator.next()) |part| : (part_index += 1) {
+        try expander.appendArgumentPart(
+            part.tag,
+            source[part.start..part.end],
+            part_index == 0,
+            force_quoted,
+            true,
+            fields,
+            bytes,
+            current_field_active,
+        );
+    }
+    if (iterator.status != .complete) return error.ParameterExpansionUnsupported;
+}
+
+fn appendAssignmentPart(
+    expander: Expander,
+    tag: Word.Part.Tag,
+    value: []const u8,
+    is_first: bool,
+    bytes: *std.ArrayList(u8),
+) Error!void {
+    switch (tag) {
+        .literal => {
+            if (is_first and std.mem.startsWith(u8, value, "~"))
+                return error.TildeExpansionUnsupported;
+            try bytes.appendSlice(expander.allocator, value);
+        },
+        .escaped,
+        .single_quoted,
+        .double_quoted,
+        .double_quoted_escaped,
+        => try bytes.appendSlice(expander.allocator, value),
+        .parameter, .double_quoted_parameter => try expander.appendParameter(bytes, value),
+        .braced_parameter => try expander.appendBracedAssignmentParameter(bytes, value, false),
+        .double_quoted_braced_parameter => try expander.appendBracedAssignmentParameter(
+            bytes,
+            value,
+            true,
+        ),
+    }
+}
+
+fn appendBracedAssignmentParameter(
+    expander: Expander,
+    bytes: *std.ArrayList(u8),
+    source: []const u8,
+    quoted: bool,
+) Error!void {
+    const expansion = Word.ParameterExpansion.parse(source) orelse
+        return error.ParameterExpansionUnsupported;
+    const operator = expansion.operator orelse
+        return expander.appendParameter(bytes, expansion.parameter);
+    const parameter_value = try expander.defaultParameterValue(expansion.parameter);
+    const use_word = switch (operator) {
+        .default_if_unset => parameter_value == null,
+        .default_if_unset_or_null => parameter_value == null or parameter_value.?.len == 0,
+        else => return error.ParameterExpansionUnsupported,
+    };
+    if (!use_word) {
+        try bytes.appendSlice(expander.allocator, parameter_value.?);
+        return;
+    }
+
+    var iterator = Word.Iterator.initExpansionWord(expansion.word, 0, quoted);
+    var part_index: usize = 0;
+    while (iterator.next()) |part| : (part_index += 1) {
+        try expander.appendAssignmentPart(
+            part.tag,
+            expansion.word[part.start..part.end],
+            part_index == 0,
+            bytes,
+        );
+    }
+    if (iterator.status != .complete) return error.ParameterExpansionUnsupported;
 }
 
 fn appendParameter(
@@ -211,6 +392,16 @@ fn appendParameter(
     return error.ParameterExpansionUnsupported;
 }
 
+fn defaultParameterValue(expander: Expander, parameter: []const u8) Error!?[]const u8 {
+    if (VariableStore.isValidName(parameter)) return expander.context.variable(parameter);
+    if (!isDecimal(parameter)) return error.ParameterExpansionUnsupported;
+
+    const position = std.fmt.parseUnsigned(usize, parameter, 10) catch return null;
+    if (position == 0) return expander.context.invocation_name;
+    if (position > expander.context.positional_parameters.len) return null;
+    return expander.context.positional_parameters[position - 1];
+}
+
 fn joinSeparator(expander: Expander) ?u8 {
     const ifs = expander.context.variable("IFS") orelse return ' ';
     return if (ifs.len == 0) null else ifs[0];
@@ -263,6 +454,24 @@ fn appendFieldSplit(
     }
 }
 
+fn appendQuotedAt(
+    expander: Expander,
+    fields: *std.ArrayList([]const u8),
+    bytes: *std.ArrayList(u8),
+    current_field_active: *bool,
+) Error!void {
+    if (expander.context.positional_parameters.len == 0) return;
+    try bytes.appendSlice(
+        expander.allocator,
+        expander.context.positional_parameters[0],
+    );
+    for (expander.context.positional_parameters[1..]) |parameter| {
+        try finishField(expander.allocator, fields, bytes);
+        try bytes.appendSlice(expander.allocator, parameter);
+    }
+    current_field_active.* = true;
+}
+
 fn appendUnquotedAt(
     expander: Expander,
     fields: *std.ArrayList([]const u8),
@@ -309,6 +518,21 @@ fn isDecimal(value: []const u8) bool {
         if (!std.ascii.isDigit(byte)) return false;
     }
     return true;
+}
+
+fn hirPartTag(tag: Hir.Inst.Tag) Word.Part.Tag {
+    return switch (tag) {
+        .literal => .literal,
+        .escaped => .escaped,
+        .single_quoted => .single_quoted,
+        .double_quoted => .double_quoted,
+        .double_quoted_escaped => .double_quoted_escaped,
+        .parameter => .parameter,
+        .braced_parameter => .braced_parameter,
+        .double_quoted_parameter => .double_quoted_parameter,
+        .double_quoted_braced_parameter => .double_quoted_braced_parameter,
+        else => unreachable,
+    };
 }
 
 test {

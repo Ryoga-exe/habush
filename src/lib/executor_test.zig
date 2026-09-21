@@ -744,6 +744,23 @@ test "standalone assignments require mutable variable state" {
     );
 }
 
+test "standalone assignments expand default parameter words" {
+    var hir = try generate("fallback='one two'; result=${missing:-$fallback three}");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+
+    const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .variables = &variables,
+    }).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqualStrings("one two three", variables.get("result").?);
+    try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+}
+
 test "unsupported expansions have no host side effects" {
     const cases = [_]struct { [:0]const u8, anyerror }{
         .{ "/bin/echo *.zig", error.PathnameExpansionUnsupported },
