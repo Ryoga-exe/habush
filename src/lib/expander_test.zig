@@ -334,7 +334,7 @@ test "expands named parameters inside double quotes" {
 
 test "expands scalar positional and special parameters" {
     var hir = try generate(
-        "command \"$0\" \"$1\" \"${2}\" \"${10}\" \"$#\" \"$?\" \"$*\" $#",
+        "command \"$0\" \"$1\" \"${2}\" \"${10}\" \"$#\" \"$?\" \"$*\" $# \"$-\" \"$!\"",
     );
     defer hir.deinit(std.testing.allocator);
     const parts = firstCommandParts(hir);
@@ -362,12 +362,32 @@ test "expands scalar positional and special parameters" {
         "23",
         "one:two words:three:four:five:six:seven:eight:nine:ten",
         "10",
+        "",
+        "",
     };
     for (parts[1..], expected) |word, value| {
         const fields = try expander.expandArgument(hir, word);
         try std.testing.expectEqual(@as(usize, 1), fields.len);
         try std.testing.expectEqualStrings(value, fields[0]);
     }
+}
+
+test "conditional operators recognize inactive shell special parameters" {
+    var hir = try generate("command \"${-:-options}\" \"${!-background}\"");
+    defer hir.deinit(std.testing.allocator);
+    const parts = firstCommandParts(hir);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const expander = Expander.init(arena.allocator());
+
+    try std.testing.expectEqualDeep(
+        @as([]const []const u8, &.{"options"}),
+        try expander.expandArgument(hir, parts[1]),
+    );
+    try std.testing.expectEqualDeep(
+        @as([]const []const u8, &.{"background"}),
+        try expander.expandArgument(hir, parts[2]),
+    );
 }
 
 test "double-quoted at preserves positional parameter fields" {

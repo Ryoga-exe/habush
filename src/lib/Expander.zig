@@ -470,6 +470,7 @@ fn appendParameter(
         }
         return;
     }
+    if (std.mem.eql(u8, name, "-") or std.mem.eql(u8, name, "!")) return;
     if (isDecimal(name)) {
         const position = std.fmt.parseUnsigned(usize, name, 10) catch return;
         if (position == 0) {
@@ -527,6 +528,8 @@ fn selectParameterExpansion(
 
 fn conditionalParameterValue(expander: Expander, parameter: []const u8) Error!?[]const u8 {
     if (VariableStore.isValidName(parameter)) return expander.context.variable(parameter);
+    if (std.mem.eql(u8, parameter, "-")) return "";
+    if (std.mem.eql(u8, parameter, "!")) return null;
     if (!isDecimal(parameter)) return error.ParameterExpansionUnsupported;
 
     const position = std.fmt.parseUnsigned(usize, parameter, 10) catch return null;
