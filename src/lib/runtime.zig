@@ -11,6 +11,7 @@ pub const State = @import("runtime/State.zig");
 pub const ControlFlow = union(enum) {
     none,
     exit,
+    @"return",
     @"break": u32,
     @"continue": u32,
 

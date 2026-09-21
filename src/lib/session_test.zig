@@ -209,6 +209,39 @@ test "recursive functions stop at the runtime call-depth limit" {
     );
 }
 
+test "return completes only the current function" {
+    var fake_host = FakeHost.init(std.testing.allocator);
+    defer fake_host.deinit();
+    var session = try Session.init(std.testing.allocator, fake_host.host(), .{});
+    defer session.deinit();
+
+    var hir = try generate(
+        "inner() { false; return; skipped=inner; }; " ++
+            "outer() { inner; after=outer; return 9; skipped=outer; }; outer",
+    );
+    defer hir.deinit(std.testing.allocator);
+    const result = try session.execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 9), result.status);
+    try std.testing.expect(result.control_flow.isNone());
+    try std.testing.expectEqualStrings("outer", session.variable("after").?);
+    try std.testing.expect(session.variable("skipped") == null);
+}
+
+test "subshells contain return control from their function" {
+    var fake_host = FakeHost.init(std.testing.allocator);
+    defer fake_host.deinit();
+    var session = try Session.init(std.testing.allocator, fake_host.host(), .{});
+    defer session.deinit();
+
+    var hir = try generate("work() { (return 7); observed=after; }; work");
+    defer hir.deinit(std.testing.allocator);
+    const result = try session.execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqualStrings("after", session.variable("observed").?);
+}
+
 test "session routes builtin output" {
     var fake_host = FakeHost.init(std.testing.allocator);
     defer fake_host.deinit();

@@ -173,7 +173,7 @@ fn executeSubshellBody(executor: Executor, hir: Hir, body: Hir.Inst.Index) Error
     var result = try executor.executeInstruction(hir, body);
     switch (result.control_flow) {
         .none => {},
-        .exit => result.control_flow = .none,
+        .exit, .@"return" => result.control_flow = .none,
         .@"break", .@"continue" => unreachable,
     }
     return result;
@@ -226,6 +226,10 @@ fn executeForClause(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!R
             .none => last_status = body_result.status,
             .exit => {
                 result.control_flow = .exit;
+                return result;
+            },
+            .@"return" => {
+                result.control_flow = .@"return";
                 return result;
             },
             .@"break" => |levels| {
@@ -288,6 +292,11 @@ fn executeLoopClause(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!
                 result.control_flow = .exit;
                 return result;
             },
+            .@"return" => {
+                result.status = condition_result.status;
+                result.control_flow = .@"return";
+                return result;
+            },
             .@"break" => |levels| {
                 result.status = condition_result.status;
                 if (levels > 1) result.control_flow = .{ .@"break" = levels - 1 };
@@ -324,6 +333,10 @@ fn executeLoopClause(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!
             .none => last_status = body_result.status,
             .exit => {
                 result.control_flow = .exit;
+                return result;
+            },
+            .@"return" => {
+                result.control_flow = .@"return";
                 return result;
             },
             .@"break" => |levels| {
@@ -547,6 +560,7 @@ fn executeBuiltin(
         .io = executor.io,
         .last_status = executor.last_status,
         .loop_depth = executor.loop_depth,
+        .function_depth = executor.function_depth,
     }, argv);
     return .{
         .status = result.status,
@@ -567,7 +581,9 @@ fn executeFunction(executor: Executor, argv: []const []const u8) Error!Result {
     function_executor.positional_parameters_override = argv[1..];
     function_executor.loop_depth = 0;
     function_executor.function_depth += 1;
-    return function_executor.executeInstruction(definition.hir, definition.body);
+    var result = try function_executor.executeInstruction(definition.hir, definition.body);
+    if (result.control_flow == .@"return") result.control_flow = .none;
+    return result;
 }
 
 fn variableStore(executor: Executor) ?*VariableStore {
