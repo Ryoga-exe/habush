@@ -744,9 +744,71 @@ test "standalone assignments require mutable variable state" {
     );
 }
 
+test "standalone assignments expand default parameter words" {
+    var hir = try generate("fallback='one two'; result=${missing:-$fallback three}");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+
+    const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .variables = &variables,
+    }).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqualStrings("one two three", variables.get("result").?);
+    try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+}
+
+test "parameter assignment persists in shell variable state" {
+    var hir = try generate("/bin/true ${assigned:=one two}");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+
+    _ = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .resolver = CommandResolver.preResolved(),
+        .variables = &variables,
+    }).execute(hir);
+
+    try std.testing.expectEqualStrings("one two", variables.get("assigned").?);
+    try std.testing.expectEqualDeep(
+        @as([]const []const u8, &.{ "/bin/true", "one", "two" }),
+        fake.spawn_calls.items[0].argv,
+    );
+}
+
+test "parameter expansion failures become shell diagnostics" {
+    var hir = try generate("/bin/not-run ${missing:?custom message}");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+    var diagnostics: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer diagnostics.deinit();
+
+    const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .variables = &variables,
+        .io = .{
+            .stderr = &diagnostics.writer,
+            .diagnostic_options = .{ .program_name = "habush" },
+        },
+    }).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 1), result.status);
+    try std.testing.expectEqualStrings(
+        "habush: missing: custom message\n",
+        diagnostics.written(),
+    );
+    try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+}
+
 test "unsupported expansions have no host side effects" {
     const cases = [_]struct { [:0]const u8, anyerror }{
-        .{ "/bin/echo $name", error.FieldSplittingUnsupported },
         .{ "/bin/echo *.zig", error.PathnameExpansionUnsupported },
     };
     for (cases) |case| {
@@ -761,6 +823,46 @@ test "unsupported expansions have no host side effects" {
         );
         try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
     }
+}
+
+test "field splitting contributes every expanded command argument" {
+    var hir = try generate("/bin/tool pre$name\"post\" \"$name\" $missing");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+    try variables.set("name", "one two");
+
+    const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .resolver = CommandResolver.preResolved(),
+        .variables = &variables,
+    }).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqual(@as(usize, 1), fake.spawn_calls.items.len);
+    try std.testing.expectEqualDeep(
+        @as([]const []const u8, &.{ "/bin/tool", "preone", "twopost", "one two" }),
+        fake.spawn_calls.items[0].argv,
+    );
+}
+
+test "unquoted at contributes each split positional parameter to argv" {
+    var hir = try generate("/bin/tool pre$@post");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+
+    const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .resolver = CommandResolver.preResolved(),
+        .positional_parameters = &.{ "", "one two", "", "three", "" },
+    }).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqualDeep(
+        @as([]const []const u8, &.{ "/bin/tool", "pre", "one", "two", "three", "post" }),
+        fake.spawn_calls.items[0].argv,
+    );
 }
 
 test "unsupported execution forms fail before the current command has side effects" {

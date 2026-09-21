@@ -41,6 +41,10 @@ pub fn main(init: std.process.Init) !u8 {
     };
     const cwd = cwd_buffer[0..cwd_len];
     const variables = try environmentBindings(arena, init.environ_map);
+    const invocation_name = switch (invocation) {
+        .script => |script| script.path,
+        else => args[0],
+    };
     const positional_parameters: []const []const u8 = switch (invocation) {
         .script => |script| try argumentSlices(arena, script.arguments),
         else => &.{},
@@ -71,6 +75,8 @@ pub fn main(init: std.process.Init) !u8 {
     var session = try habush.Session.init(gpa, system_host.host(), .{
         .resolver = system_resolver.resolver(),
         .cwd = cwd,
+        .invocation_name = invocation_name,
+        .shell_process_id = platform.processId(),
         .search_path = search_path,
         .positional_parameters = positional_parameters,
         .variables = variables,

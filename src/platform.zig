@@ -15,3 +15,4 @@ const implementation = switch (builtin.os.tag) {
 };
 
 pub const ignoreInteractiveInterrupt = implementation.ignoreInteractiveInterrupt;
+pub const processId = implementation.processId;

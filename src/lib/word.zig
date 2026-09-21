@@ -25,6 +25,70 @@ pub const Part = struct {
     };
 };
 
+pub const ParameterExpansion = struct {
+    parameter: []const u8,
+    operator: ?Operator = null,
+    word: []const u8 = "",
+
+    pub const Operator = enum {
+        default_if_unset,
+        default_if_unset_or_null,
+        assign_if_unset,
+        assign_if_unset_or_null,
+        error_if_unset,
+        error_if_unset_or_null,
+        alternative_if_set,
+        alternative_if_set_and_not_null,
+    };
+
+    pub fn parse(source: []const u8) ?ParameterExpansion {
+        const parameter_end = parameterEnd(source) orelse return null;
+        if (parameter_end == source.len) {
+            return .{ .parameter = source };
+        }
+
+        const operator_source = source[parameter_end..];
+        const operator: Operator, const operator_len: usize = if (std.mem.startsWith(
+            u8,
+            operator_source,
+            ":-",
+        ))
+            .{ .default_if_unset_or_null, 2 }
+        else if (std.mem.startsWith(u8, operator_source, ":="))
+            .{ .assign_if_unset_or_null, 2 }
+        else if (std.mem.startsWith(u8, operator_source, ":?"))
+            .{ .error_if_unset_or_null, 2 }
+        else if (std.mem.startsWith(u8, operator_source, ":+"))
+            .{ .alternative_if_set_and_not_null, 2 }
+        else switch (operator_source[0]) {
+            '-' => .{ .default_if_unset, 1 },
+            '=' => .{ .assign_if_unset, 1 },
+            '?' => .{ .error_if_unset, 1 },
+            '+' => .{ .alternative_if_set, 1 },
+            else => return null,
+        };
+        return .{
+            .parameter = source[0..parameter_end],
+            .operator = operator,
+            .word = source[parameter_end + operator_len ..],
+        };
+    }
+
+    fn parameterEnd(source: []const u8) ?usize {
+        if (source.len == 0) return null;
+        if (isSpecialParameter(source[0])) return 1;
+        if (std.ascii.isDigit(source[0])) {
+            var end: usize = 1;
+            while (end < source.len and std.ascii.isDigit(source[end])) : (end += 1) {}
+            return end;
+        }
+        if (!isNameStart(source[0])) return null;
+        var end: usize = 1;
+        while (end < source.len and isNameContinue(source[end])) : (end += 1) {}
+        return end;
+    }
+};
+
 pub const Incomplete = struct {
     tag: Tag,
     opened_at: ByteOffset,
@@ -50,6 +114,7 @@ pub const Iterator = struct {
     state: State = .unquoted,
     quote_start: usize = 0,
     double_quote_has_part: bool = false,
+    implicit_double_quote: bool = false,
     status: Status = .running,
 
     const State = enum {
@@ -64,12 +129,29 @@ pub const Iterator = struct {
         };
     }
 
+    pub fn initExpansionWord(
+        source: []const u8,
+        source_start: ByteOffset,
+        double_quoted: bool,
+    ) Iterator {
+        var iterator = init(source, source_start);
+        if (double_quoted) {
+            iterator.state = .double_quoted;
+            iterator.implicit_double_quote = true;
+        }
+        return iterator;
+    }
+
     pub fn next(iterator: *Iterator) ?Part {
         if (iterator.status != .running) return null;
 
         while (true) switch (iterator.state) {
             .unquoted => {
                 if (iterator.index == iterator.source.len) {
+                    if (iterator.implicit_double_quote) {
+                        iterator.setIncomplete(.double_quote, iterator.quote_start);
+                        return null;
+                    }
                     iterator.status = .complete;
                     return null;
                 }
@@ -123,6 +205,10 @@ pub const Iterator = struct {
             },
             .double_quoted => {
                 if (iterator.index == iterator.source.len) {
+                    if (iterator.implicit_double_quote) {
+                        iterator.status = .complete;
+                        return null;
+                    }
                     iterator.setIncomplete(.double_quote, iterator.quote_start);
                     return null;
                 }
@@ -389,6 +475,33 @@ test "iterates positional and special parameters" {
     try std.testing.expect(iterator.status == .complete);
 }
 
+test "parses braced parameter expansion operators" {
+    const expected = [_]struct { []const u8, ParameterExpansion.Operator }{
+        .{ "name-word", .default_if_unset },
+        .{ "name:-word", .default_if_unset_or_null },
+        .{ "name=word", .assign_if_unset },
+        .{ "name:=word", .assign_if_unset_or_null },
+        .{ "name?word", .error_if_unset },
+        .{ "name:?word", .error_if_unset_or_null },
+        .{ "name+word", .alternative_if_set },
+        .{ "name:+word", .alternative_if_set_and_not_null },
+    };
+    for (expected) |item| {
+        const expansion = ParameterExpansion.parse(item[0]).?;
+        try std.testing.expectEqualStrings("name", expansion.parameter);
+        try std.testing.expectEqual(item[1], expansion.operator.?);
+        try std.testing.expectEqualStrings("word", expansion.word);
+    }
+
+    const plain = ParameterExpansion.parse("10").?;
+    try std.testing.expectEqualStrings("10", plain.parameter);
+    try std.testing.expectEqual(null, plain.operator);
+    try std.testing.expectEqualStrings("", plain.word);
+
+    try std.testing.expect(ParameterExpansion.parse("") == null);
+    try std.testing.expect(ParameterExpansion.parse("name:word") == null);
+}
+
 test "double quote backslash follows shell rules" {
     const source = "\"a\\$b\\q\"";
     var iterator = Iterator.init(source, 0);
@@ -401,6 +514,20 @@ test "double quote backslash follows shell rules" {
     try std.testing.expectEqual(Part.Tag.double_quoted, literal.tag);
     try std.testing.expectEqualStrings("b\\q", source[literal.start..literal.end]);
     try std.testing.expect(iterator.next() == null);
+}
+
+test "expansion word can inherit a surrounding double quote" {
+    const source = "'literal' a\\qb $name";
+    var iterator = Iterator.initExpansionWord(source, 0, true);
+
+    const literal = iterator.next().?;
+    try std.testing.expectEqual(Part.Tag.double_quoted, literal.tag);
+    try std.testing.expectEqualStrings("'literal' a\\qb ", source[literal.start..literal.end]);
+    const parameter = iterator.next().?;
+    try std.testing.expectEqual(Part.Tag.double_quoted_parameter, parameter.tag);
+    try std.testing.expectEqualStrings("name", source[parameter.start..parameter.end]);
+    try std.testing.expect(iterator.next() == null);
+    try std.testing.expect(iterator.status == .complete);
 }
 
 test "reports an unclosed parameter brace" {

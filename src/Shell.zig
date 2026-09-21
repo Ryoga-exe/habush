@@ -127,7 +127,7 @@ fn handleInput(
         .last_status = self.last_status,
     }) catch |err| switch (err) {
         error.UnsupportedInstruction,
-        error.FieldSplittingUnsupported,
+        error.ParameterAssignmentUnavailable,
         error.PathnameExpansionUnsupported,
         error.TildeExpansionUnsupported,
         error.ParameterExpansionUnsupported,
