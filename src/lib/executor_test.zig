@@ -359,6 +359,105 @@ test "brace groups propagate control flow" {
     try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
 }
 
+test "brace group redirections are opened once and inherited by external commands" {
+    var hir = try generate("{ true; /bin/tool; } >out");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+
+    const result = try preResolvedExecutor(std.testing.allocator, fake.host()).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqual(@as(usize, 1), fake.open_file_calls.items.len);
+    try std.testing.expectEqualStrings("out", fake.open_file_calls.items[0].open.path);
+    try std.testing.expectEqual(@as(usize, 1), fake.spawn_calls.items.len);
+    const actions = fake.spawn_calls.items[0].file_actions;
+    try std.testing.expectEqual(@as(usize, 1), actions.len);
+    try std.testing.expectEqual(CommandPlan.FileDescriptor.stdout, actions[0].use_resource.target);
+    try std.testing.expectEqual(@as(usize, 1), fake.closed_resource_count);
+}
+
+test "scoped descriptor actions retain source order for child processes" {
+    var hir = try generate("{ /bin/tool; } 2>&1 >out");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+
+    _ = try preResolvedExecutor(std.testing.allocator, fake.host()).execute(hir);
+
+    const actions = fake.spawn_calls.items[0].file_actions;
+    try std.testing.expectEqual(@as(usize, 2), actions.len);
+    try std.testing.expectEqual(CommandPlan.FileDescriptor.stdout, actions[0].duplicate.source);
+    try std.testing.expectEqual(CommandPlan.FileDescriptor.stderr, actions[0].duplicate.target);
+    try std.testing.expectEqual(CommandPlan.FileDescriptor.stdout, actions[1].use_resource.target);
+}
+
+test "builtin redirections replace runtime output only for the command scope" {
+    var hir = try generate("pwd >out; pwd");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var state = try runtime.State.init(std.testing.allocator, .{ .cwd = "/workspace" });
+    defer state.deinit();
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    const result = try Executor.initWithState(
+        fake.host(),
+        null,
+        &state,
+        .{ .stdout = &output.writer },
+        0,
+    ).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqualStrings("/workspace\n", fake.redirected_output.written());
+    try std.testing.expectEqualStrings("/workspace\n", output.written());
+    try std.testing.expectEqual(@as(usize, 1), fake.closed_resource_count);
+}
+
+test "standalone assignment redirections preserve assignment side effects" {
+    var hir = try generate("persisted=changed >out");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+    try variables.set("persisted", "original");
+
+    const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .variables = &variables,
+    }).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqualStrings("changed", variables.get("persisted").?);
+    try std.testing.expectEqual(@as(usize, 1), fake.open_file_calls.items.len);
+    try std.testing.expectEqual(@as(usize, 1), fake.closed_resource_count);
+}
+
+test "failed scoped redirections prevent command side effects" {
+    var hir = try generate("{ persisted=changed; } >missing");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    fake.open_file_failure = .not_found;
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+    try variables.set("persisted", "original");
+    var diagnostics: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer diagnostics.deinit();
+
+    const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .variables = &variables,
+        .io = .{ .stderr = &diagnostics.writer },
+    }).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 1), result.status);
+    try std.testing.expectEqualStrings("original", variables.get("persisted").?);
+    try std.testing.expectEqualStrings("missing: no such file or directory\n", diagnostics.written());
+    try std.testing.expectEqual(@as(usize, 0), fake.closed_resource_count);
+}
+
 test "subshells isolate runtime state and contain exit control flow" {
     var hir = try generate("(name=inside; cd child; exit 7); observed=\"$name\"");
     defer hir.deinit(std.testing.allocator);
@@ -397,6 +496,27 @@ test "subshells return their body status without exiting the shell" {
 
     try std.testing.expectEqual(@as(u8, 7), result.status);
     try std.testing.expect(result.control_flow.isNone());
+}
+
+test "subshell redirections are inherited without leaking state" {
+    var hir = try generate("name=outside; (name=inside; /bin/tool) >out");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+
+    const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .resolver = CommandResolver.preResolved(),
+        .variables = &variables,
+    }).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqualStrings("outside", variables.get("name").?);
+    try std.testing.expectEqual(@as(usize, 1), fake.open_file_calls.items.len);
+    try std.testing.expectEqual(CommandPlan.FileDescriptor.stdout, fake.spawn_calls.items[0]
+        .file_actions[0].use_resource.target);
+    try std.testing.expectEqual(@as(usize, 1), fake.closed_resource_count);
 }
 
 test "subshells do not inherit the surrounding loop context" {
@@ -1008,12 +1128,9 @@ test "unquoted at contributes each split positional parameter to argv" {
 test "unsupported execution forms fail before the current command has side effects" {
     const cases = [_][:0]const u8{
         "left | right",
-        "persisted=changed >out",
         "if persisted=changed; then true; fi >out",
         "while persisted=changed; do true; done >out",
         "for persisted in changed; do true; done >out",
-        "{ persisted=changed; } >out",
-        "(persisted=changed) >out",
         "left &",
     };
 

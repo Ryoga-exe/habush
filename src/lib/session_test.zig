@@ -1,6 +1,7 @@
 const std = @import("std");
 const Ast = @import("Ast.zig");
 const AstGen = @import("AstGen.zig");
+const CommandPlan = @import("CommandPlan.zig");
 const CommandResolver = @import("CommandResolver.zig");
 const FakeResolver = @import("CommandResolver/FakeResolver.zig");
 const Host = @import("Host.zig");
@@ -154,6 +155,30 @@ test "session persists function definitions and scopes their positional paramete
     try std.testing.expectEqualStrings("two words", session.variable("observed").?);
     try std.testing.expectEqualStrings("inside", session.variable("name").?);
     try std.testing.expectEqual(@as(usize, 0), fake_host.spawn_calls.items.len);
+}
+
+test "function call redirections scope builtin and external output together" {
+    var fake_host = FakeHost.init(std.testing.allocator);
+    defer fake_host.deinit();
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var session = try Session.init(std.testing.allocator, fake_host.host(), .{
+        .resolver = CommandResolver.preResolved(),
+        .cwd = "/workspace",
+        .io = .{ .stdout = &output.writer },
+    });
+    defer session.deinit();
+
+    var hir = try generate("show() { pwd; /bin/tool; }; show >out; pwd");
+    defer hir.deinit(std.testing.allocator);
+    const result = try session.execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqualStrings("/workspace\n", fake_host.redirected_output.written());
+    try std.testing.expectEqualStrings("/workspace\n", output.written());
+    try std.testing.expectEqual(CommandPlan.FileDescriptor.stdout, fake_host.spawn_calls.items[0]
+        .file_actions[0].use_resource.target);
+    try std.testing.expectEqual(@as(usize, 1), fake_host.closed_resource_count);
 }
 
 test "functions expand scalar parameters and restore the caller scope" {

@@ -4,8 +4,10 @@
 //! lists, and-or commands, pipeline negation, brace groups, if clauses,
 //! while/until/for loops with break/continue control, standalone assignments,
 //! builtins, and external simple commands.
-//! Redirections, background execution, pipelines, and function definitions
-//! remain explicit `UnsupportedInstruction` boundaries.
+//! Standard-stream redirections are supported for simple commands, brace
+//! groups, and subshells. Redirects on conditional and loop clauses, here
+//! documents, background execution, and pipelines remain explicit
+//! `UnsupportedInstruction` boundaries.
 
 const std = @import("std");
 const Builtin = @import("Builtin.zig");
@@ -32,6 +34,7 @@ cwd: ?[]const u8,
 variables: ?*VariableStore,
 runtime_state: ?*runtime.State,
 io: runtime.Io,
+scoped_file_actions: []const CommandPlan.FileAction,
 last_status: runtime.ExitStatus,
 loop_depth: u32,
 function_depth: u32,
@@ -91,6 +94,7 @@ pub fn initWithOptions(gpa: std.mem.Allocator, host: Host, options: Options) Exe
         .variables = options.variables,
         .runtime_state = null,
         .io = options.io,
+        .scoped_file_actions = &.{},
         .last_status = options.last_status,
         .loop_depth = 0,
         .function_depth = 0,
@@ -118,6 +122,7 @@ pub fn initWithState(
         .variables = null,
         .runtime_state = state,
         .io = io,
+        .scoped_file_actions = &.{},
         .last_status = last_status,
         .loop_depth = 0,
         .function_depth = 0,
@@ -158,9 +163,19 @@ fn executeFunctionDefinition(executor: Executor, hir: Hir, index: Hir.Inst.Index
 
 fn executeSubshell(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
     const group = hir.groupedCommand(index);
-    if (group.redirects.len != 0) return error.UnsupportedInstruction;
-
     var subshell_executor = executor;
+    var arena = std.heap.ArenaAllocator.init(executor.gpa);
+    defer arena.deinit();
+    var scope = switch (try subshell_executor.beginHirRedirections(
+        hir,
+        group.redirects,
+        arena.allocator(),
+    )) {
+        .ready => |ready| ready,
+        .failed => |result| return result,
+    };
+    defer scope.deinit();
+    subshell_executor = scope.executor;
     subshell_executor.loop_depth = 0;
     if (executor.runtime_state) |state| {
         var state_copy = try state.clone();
@@ -189,8 +204,18 @@ fn executeSubshellBody(executor: Executor, hir: Hir, body: Hir.Inst.Index) Error
 
 fn executeBraceGroup(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
     const group = hir.groupedCommand(index);
-    if (group.redirects.len != 0) return error.UnsupportedInstruction;
-    return executor.executeInstruction(hir, group.body);
+    var arena = std.heap.ArenaAllocator.init(executor.gpa);
+    defer arena.deinit();
+    var scope = switch (try executor.beginHirRedirections(
+        hir,
+        group.redirects,
+        arena.allocator(),
+    )) {
+        .ready => |ready| ready,
+        .failed => |result| return result,
+    };
+    defer scope.deinit();
+    return scope.executor.executeInstruction(hir, group.body);
 }
 
 fn executeForClause(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
@@ -445,59 +470,14 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
             .assignment => has_assignments = true,
             .redirect => {
                 has_redirects = true;
-                const redirect = hir.redirect(part);
-                const paths = expander.expandArgument(hir, redirect.target) catch |err| switch (err) {
-                    error.ParameterExpansionFailed => return executor.parameterExpansionFailure(
-                        allocator,
-                        expansion_failure,
-                    ),
-                    else => |other| return other,
-                };
-                if (paths.len != 1)
-                    return executor.redirectFailure(.ambiguous_redirect);
-
-                const target = if (redirect.io_number) |io_number|
-                    CommandPlan.FileDescriptor.parse(io_number) orelse
-                        return executor.redirectFailure(.{ .invalid_file_descriptor = io_number })
-                else
-                    defaultRedirectDescriptor(redirect.operator) orelse
-                        return error.UnsupportedInstruction;
-                switch (redirect.operator) {
-                    .duplicate_input, .duplicate_output => {
-                        if (std.mem.eql(u8, paths[0], "-")) {
-                            try file_actions.append(allocator, .{ .close = target });
-                        } else {
-                            const source = CommandPlan.FileDescriptor.parse(paths[0]) orelse
-                                return executor.redirectFailure(.{
-                                    .invalid_file_descriptor = paths[0],
-                                });
-                            try file_actions.append(allocator, .{ .duplicate = .{
-                                .source = source,
-                                .target = target,
-                            } });
-                        }
-                    },
-                    .output_both, .append_both => {
-                        const action = openRedirectAction(
-                            redirect.operator,
-                            target,
-                            paths[0],
-                        ) orelse return error.UnsupportedInstruction;
-                        try file_actions.append(allocator, action);
-                        try file_actions.append(allocator, .{ .duplicate = .{
-                            .source = target,
-                            .target = .stderr,
-                        } });
-                    },
-                    else => {
-                        const action = openRedirectAction(
-                            redirect.operator,
-                            target,
-                            paths[0],
-                        ) orelse return error.UnsupportedInstruction;
-                        try file_actions.append(allocator, action);
-                    },
-                }
+                if (try executor.appendRedirectActions(
+                    hir,
+                    part,
+                    allocator,
+                    expander,
+                    &expansion_failure,
+                    &file_actions,
+                )) |failure| return failure;
             },
             .word => {
                 has_words = true;
@@ -514,13 +494,18 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
         }
     }
     if (argv.items.len == 0) {
-        if (has_redirects) return error.UnsupportedInstruction;
-        if (!has_assignments) return if (has_words)
+        var scope = switch (try executor.beginRedirections(file_actions.items, allocator)) {
+            .ready => |ready| ready,
+            .failed => |result| return result,
+        };
+        defer scope.deinit();
+        if (!has_assignments) return if (has_words or has_redirects)
             .{ .status = 0, .sandbox_coverage = .not_requested }
         else
             error.UnsupportedInstruction;
         const mutable_variables = variables orelse return error.VariableStateUnavailable;
         for (parts) |part| {
+            if (hir.instructionTag(part) != .assignment) continue;
             const assignment = hir.assignment(part);
             const value = expander.expandAssignment(hir, assignment.value) catch |err| switch (err) {
                 error.ParameterExpansionFailed => return executor.parameterExpansionFailure(
@@ -558,8 +543,12 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
     const builtin = Builtin.lookup(argv.items[0]);
     if (builtin) |candidate| {
         if (candidate.special) {
-            if (has_redirects) return error.UnsupportedInstruction;
-            return executor.executeBuiltin(
+            var scope = switch (try executor.beginRedirections(file_actions.items, allocator)) {
+                .ready => |ready| ready,
+                .failed => |result| return result,
+            };
+            defer scope.deinit();
+            return scope.executor.executeBuiltin(
                 candidate,
                 argv.items,
                 &command_variables,
@@ -569,17 +558,25 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
     }
     if (executor.runtime_state) |state| {
         if (state.functionStore().contains(argv.items[0])) {
-            if (has_redirects) return error.UnsupportedInstruction;
             if (has_assignments) {
                 const mutable_variables = variables orelse unreachable;
                 try applyAssignments(mutable_variables, &command_variables);
             }
-            return executor.executeFunction(argv.items);
+            var scope = switch (try executor.beginRedirections(file_actions.items, allocator)) {
+                .ready => |ready| ready,
+                .failed => |result| return result,
+            };
+            defer scope.deinit();
+            return scope.executor.executeFunction(argv.items);
         }
     }
     if (builtin) |candidate| {
-        if (has_redirects) return error.UnsupportedInstruction;
-        return executor.executeBuiltin(
+        var scope = switch (try executor.beginRedirections(file_actions.items, allocator)) {
+            .ready => |ready| ready,
+            .failed => |result| return result,
+        };
+        defer scope.deinit();
+        return scope.executor.executeBuiltin(
             candidate,
             argv.items,
             &command_variables,
@@ -609,12 +606,15 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
         error.OutOfMemory, error.Unexpected => return err,
     }) orelse return executor.commandFailure(argv.items[0], .command_not_found);
 
+    var effective_file_actions: std.ArrayList(CommandPlan.FileAction) = .empty;
+    try effective_file_actions.appendSlice(allocator, executor.scoped_file_actions);
+    try effective_file_actions.appendSlice(allocator, file_actions.items);
     const spawn_outcome = executor.host.spawn(.{
         .executable = executable,
         .argv = argv.items,
         .environment = environment,
         .cwd = if (executor.workingDirectory()) |cwd| .{ .path = cwd } else .inherit,
-        .file_actions = file_actions.items,
+        .file_actions = effective_file_actions.items,
         .sandbox = executor.activeSandbox(),
     }) catch |err| switch (err) {
         error.OutOfMemory, error.InvalidArguments, error.Unexpected => return err,
@@ -623,13 +623,219 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
         .spawned => |spawned| spawned,
         .failed => |failure| return executor.spawnFailure(
             argv.items[0],
-            file_actions.items,
+            effective_file_actions.items,
             failure,
         ),
     };
     return .{
         .status = try terminationStatus(try executor.host.wait(spawned.process)),
         .sandbox_coverage = spawned.sandbox_coverage,
+    };
+}
+
+const RedirectionStart = union(enum) {
+    ready: RedirectionScope,
+    failed: Result,
+};
+
+const RedirectionScope = struct {
+    executor: Executor,
+    resources: []const CommandPlan.Resource,
+
+    fn deinit(scope: *RedirectionScope) void {
+        var index = scope.resources.len;
+        while (index != 0) {
+            index -= 1;
+            scope.executor.host.closeResource(scope.resources[index]);
+        }
+        scope.* = undefined;
+    }
+};
+
+fn beginHirRedirections(
+    executor: Executor,
+    hir: Hir,
+    redirects: []const Hir.Inst.Index,
+    allocator: std.mem.Allocator,
+) Error!RedirectionStart {
+    var actions: std.ArrayList(CommandPlan.FileAction) = .empty;
+    var expansion_failure: Expander.Failure = undefined;
+    const expander = executor.wordExpander(allocator, null, &expansion_failure);
+    for (redirects) |redirect| {
+        if (try executor.appendRedirectActions(
+            hir,
+            redirect,
+            allocator,
+            expander,
+            &expansion_failure,
+            &actions,
+        )) |failure| return .{ .failed = failure };
+    }
+    return executor.beginRedirections(actions.items, allocator);
+}
+
+fn appendRedirectActions(
+    executor: Executor,
+    hir: Hir,
+    redirect_index: Hir.Inst.Index,
+    allocator: std.mem.Allocator,
+    expander: Expander,
+    expansion_failure: *Expander.Failure,
+    actions: *std.ArrayList(CommandPlan.FileAction),
+) Error!?Result {
+    const redirect = hir.redirect(redirect_index);
+    const paths = expander.expandArgument(hir, redirect.target) catch |err| switch (err) {
+        error.ParameterExpansionFailed => return try executor.parameterExpansionFailure(
+            allocator,
+            expansion_failure.*,
+        ),
+        else => |other| return other,
+    };
+    if (paths.len != 1)
+        return try executor.redirectFailure(.ambiguous_redirect);
+
+    const target = if (redirect.io_number) |io_number|
+        CommandPlan.FileDescriptor.parse(io_number) orelse
+            return try executor.redirectFailure(.{ .invalid_file_descriptor = io_number })
+    else
+        defaultRedirectDescriptor(redirect.operator) orelse
+            return error.UnsupportedInstruction;
+    switch (redirect.operator) {
+        .duplicate_input, .duplicate_output => {
+            if (std.mem.eql(u8, paths[0], "-")) {
+                try actions.append(allocator, .{ .close = target });
+            } else {
+                const source = CommandPlan.FileDescriptor.parse(paths[0]) orelse
+                    return try executor.redirectFailure(.{
+                        .invalid_file_descriptor = paths[0],
+                    });
+                try actions.append(allocator, .{ .duplicate = .{
+                    .source = source,
+                    .target = target,
+                } });
+            }
+        },
+        .output_both, .append_both => {
+            const action = openRedirectAction(
+                redirect.operator,
+                target,
+                paths[0],
+            ) orelse return error.UnsupportedInstruction;
+            try actions.append(allocator, action);
+            try actions.append(allocator, .{ .duplicate = .{
+                .source = target,
+                .target = .stderr,
+            } });
+        },
+        else => {
+            const action = openRedirectAction(
+                redirect.operator,
+                target,
+                paths[0],
+            ) orelse return error.UnsupportedInstruction;
+            try actions.append(allocator, action);
+        },
+    }
+    return null;
+}
+
+fn beginRedirections(
+    executor: Executor,
+    actions: []const CommandPlan.FileAction,
+    allocator: std.mem.Allocator,
+) Error!RedirectionStart {
+    var scoped_executor = executor;
+    var resources: std.ArrayList(CommandPlan.Resource) = .empty;
+    var scoped_actions: std.ArrayList(CommandPlan.FileAction) = .empty;
+    try scoped_actions.appendSlice(allocator, executor.scoped_file_actions);
+    var retain_resources = false;
+    defer if (!retain_resources) {
+        var index = resources.items.len;
+        while (index != 0) {
+            index -= 1;
+            executor.host.closeResource(resources.items[index]);
+        }
+    };
+
+    for (actions) |action| switch (action) {
+        .open => |open| {
+            _ = standardStreamIndex(open.target) orelse
+                return error.UnsupportedInstruction;
+            try resources.ensureUnusedCapacity(allocator, 1);
+            try scoped_actions.ensureUnusedCapacity(allocator, 1);
+            const outcome = try executor.host.openFile(
+                if (executor.workingDirectory()) |cwd| .{ .path = cwd } else .inherit,
+                open,
+            );
+            const resource = switch (outcome) {
+                .opened => |resource| resource,
+                .failed => |reason| return .{ .failed = try scoped_executor.fileOpenFailure(
+                    open.path,
+                    reason,
+                ) },
+            };
+            resources.appendAssumeCapacity(resource);
+            scoped_actions.appendAssumeCapacity(.{ .use_resource = .{
+                .resource = resource,
+                .target = open.target,
+            } });
+            scoped_executor.setRuntimeWriter(
+                open.target,
+                executor.host.resourceWriter(resource),
+            );
+        },
+        .duplicate => |duplicate| {
+            _ = standardStreamIndex(duplicate.source) orelse
+                return error.UnsupportedInstruction;
+            _ = standardStreamIndex(duplicate.target) orelse
+                return error.UnsupportedInstruction;
+            const writer = scoped_executor.runtimeWriter(duplicate.source);
+            scoped_executor.setRuntimeWriter(duplicate.target, writer);
+            try scoped_actions.append(allocator, action);
+        },
+        .close => |descriptor| {
+            _ = standardStreamIndex(descriptor) orelse
+                return error.UnsupportedInstruction;
+            scoped_executor.setRuntimeWriter(descriptor, null);
+            try scoped_actions.append(allocator, action);
+        },
+        .use_resource => return error.UnsupportedInstruction,
+    };
+
+    scoped_executor.scoped_file_actions = scoped_actions.items;
+    retain_resources = true;
+    return .{ .ready = .{
+        .executor = scoped_executor,
+        .resources = resources.items,
+    } };
+}
+
+fn runtimeWriter(executor: Executor, descriptor: CommandPlan.FileDescriptor) ?*std.Io.Writer {
+    return switch (descriptor) {
+        .stdout => executor.io.stdout,
+        .stderr => executor.io.stderr,
+        else => null,
+    };
+}
+
+fn setRuntimeWriter(
+    executor: *Executor,
+    descriptor: CommandPlan.FileDescriptor,
+    writer: ?*std.Io.Writer,
+) void {
+    switch (descriptor) {
+        .stdout => executor.io.stdout = writer,
+        .stderr => executor.io.stderr = writer,
+        else => {},
+    }
+}
+
+fn standardStreamIndex(descriptor: CommandPlan.FileDescriptor) ?usize {
+    return switch (descriptor) {
+        .stdin => 0,
+        .stdout => 1,
+        .stderr => 2,
+        else => null,
     };
 }
 
@@ -879,23 +1085,31 @@ fn spawnFailure(
                 .open => |open| open.path,
                 else => return error.Unexpected,
             };
-            const diagnostic: runtime.Diagnostic = .{
-                .subject = .{ .path = path },
-                .kind = .{ .cannot_open = switch (file_action.reason) {
-                    .not_found => .not_found,
-                    .access_denied => .access_denied,
-                    .invalid_path => .invalid_path,
-                    .path_already_exists => .path_already_exists,
-                    .resource_unavailable => .resource_unavailable,
-                    .unsupported => .unsupported,
-                } },
-            };
-            try executor.io.reportDiagnostic(diagnostic);
-            return .{
-                .status = diagnostic.status(),
-                .sandbox_coverage = .not_requested,
-            };
+            return executor.fileOpenFailure(path, file_action.reason);
         },
+    };
+}
+
+fn fileOpenFailure(
+    executor: Executor,
+    path: []const u8,
+    reason: Host.FileActionFailure.Reason,
+) std.Io.Writer.Error!Result {
+    const diagnostic: runtime.Diagnostic = .{
+        .subject = .{ .path = path },
+        .kind = .{ .cannot_open = switch (reason) {
+            .not_found => .not_found,
+            .access_denied => .access_denied,
+            .invalid_path => .invalid_path,
+            .path_already_exists => .path_already_exists,
+            .resource_unavailable => .resource_unavailable,
+            .unsupported => .unsupported,
+        } },
+    };
+    try executor.io.reportDiagnostic(diagnostic);
+    return .{
+        .status = diagnostic.status(),
+        .sandbox_coverage = .not_requested,
     };
 }
 
