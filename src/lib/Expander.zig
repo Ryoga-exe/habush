@@ -10,7 +10,7 @@ allocator: std.mem.Allocator,
 context: Context,
 
 pub const Context = struct {
-    variables: ?*const VariableStore = null,
+    variables: ?*VariableStore = null,
     overrides: ?*const VariableStore = null,
     invocation_name: ?[]const u8 = null,
     positional_parameters: []const []const u8 = &.{},
@@ -26,6 +26,7 @@ pub const Context = struct {
 };
 
 pub const Error = std.mem.Allocator.Error || error{
+    ParameterAssignmentUnavailable,
     ParameterExpansionUnsupported,
     PathnameExpansionUnsupported,
     TildeExpansionUnsupported,
@@ -230,6 +231,21 @@ fn appendBracedArgumentParameter(
                 current_field_active,
             );
         },
+        .assign => |replacement| {
+            const assigned = try expander.assignParameter(
+                expansion.parameter,
+                replacement,
+                quoted,
+            );
+            defer expander.allocator.free(assigned);
+            try expander.appendScalarArgument(
+                assigned,
+                quoted,
+                fields,
+                bytes,
+                current_field_active,
+            );
+        },
     }
 }
 
@@ -316,19 +332,59 @@ fn appendBracedAssignmentParameter(
         .value => |value| try bytes.appendSlice(expander.allocator, value),
         .empty => {},
         .word => |replacement| {
-            var iterator = Word.Iterator.initExpansionWord(replacement, 0, quoted);
-            var part_index: usize = 0;
-            while (iterator.next()) |part| : (part_index += 1) {
-                try expander.appendAssignmentPart(
-                    part.tag,
-                    replacement[part.start..part.end],
-                    part_index == 0,
-                    bytes,
-                );
-            }
-            if (iterator.status != .complete) return error.ParameterExpansionUnsupported;
+            try expander.appendExpansionWordScalar(bytes, replacement, quoted);
+        },
+        .assign => |replacement| {
+            const assigned = try expander.assignParameter(
+                expansion.parameter,
+                replacement,
+                quoted,
+            );
+            defer expander.allocator.free(assigned);
+            try bytes.appendSlice(expander.allocator, assigned);
         },
     }
+}
+
+fn appendExpansionWordScalar(
+    expander: Expander,
+    bytes: *std.ArrayList(u8),
+    source: []const u8,
+    quoted: bool,
+) Error!void {
+    var iterator = Word.Iterator.initExpansionWord(source, 0, quoted);
+    var part_index: usize = 0;
+    while (iterator.next()) |part| : (part_index += 1) {
+        try expander.appendAssignmentPart(
+            part.tag,
+            source[part.start..part.end],
+            part_index == 0,
+            bytes,
+        );
+    }
+    if (iterator.status != .complete) return error.ParameterExpansionUnsupported;
+}
+
+fn assignParameter(
+    expander: Expander,
+    parameter: []const u8,
+    replacement: []const u8,
+    quoted: bool,
+) Error![]u8 {
+    if (!VariableStore.isValidName(parameter)) return error.ParameterExpansionUnsupported;
+    const variables = expander.context.variables orelse
+        return error.ParameterAssignmentUnavailable;
+
+    var bytes: std.ArrayList(u8) = .empty;
+    errdefer bytes.deinit(expander.allocator);
+    try expander.appendExpansionWordScalar(&bytes, replacement, quoted);
+    const value = try bytes.toOwnedSlice(expander.allocator);
+    errdefer expander.allocator.free(value);
+    variables.set(parameter, value) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidName => unreachable,
+    };
+    return value;
 }
 
 fn appendParameter(
@@ -389,6 +445,7 @@ fn appendParameter(
 const ParameterSelection = union(enum) {
     value: []const u8,
     word: []const u8,
+    assign: []const u8,
     empty,
 };
 
@@ -408,7 +465,14 @@ fn selectParameterExpansion(
             if (set.len == 0) .empty else .{ .word = expansion.word }
         else
             .empty,
-        else => return error.ParameterExpansionUnsupported,
+        .assign_if_unset => if (value) |set| .{ .value = set } else .{ .assign = expansion.word },
+        .assign_if_unset_or_null => if (value) |set|
+            if (set.len == 0) .{ .assign = expansion.word } else .{ .value = set }
+        else
+            .{ .assign = expansion.word },
+        .error_if_unset,
+        .error_if_unset_or_null,
+        => return error.ParameterExpansionUnsupported,
     };
 }
 

@@ -29,7 +29,7 @@ test "expands and joins static argument parts" {
 }
 
 test "classifies unsupported argument expansions" {
-    try expectExpansionError("command \"${name:=fallback}\"", error.ParameterExpansionUnsupported);
+    try expectExpansionError("command \"${name:?fallback}\"", error.ParameterExpansionUnsupported);
     try expectExpansionError("command *.zig", error.PathnameExpansionUnsupported);
     try expectExpansionError("command ~/work", error.TildeExpansionUnsupported);
 }
@@ -125,6 +125,64 @@ test "unquoted empty alternative expansions contribute no fields" {
             (try expander.expandArgument(hir, part)).len,
         );
     }
+}
+
+test "assignment parameter operators update named variables" {
+    var hir = try generate(
+        "command \"${missing=default}\" \"${empty=other}\" " ++
+            "\"${empty:=assigned}\"",
+    );
+    defer hir.deinit(std.testing.allocator);
+    const parts = firstCommandParts(hir);
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+    try variables.set("empty", "");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const expander = Expander.initWithContext(arena.allocator(), .{
+        .variables = &variables,
+    });
+
+    const expected = [_][]const u8{ "default", "", "assigned" };
+    for (parts[1..], expected) |part, value| {
+        try std.testing.expectEqualDeep(
+            @as([]const []const u8, &.{value}),
+            try expander.expandArgument(hir, part),
+        );
+    }
+    try std.testing.expectEqualStrings("default", variables.get("missing").?);
+    try std.testing.expectEqualStrings("assigned", variables.get("empty").?);
+}
+
+test "unquoted assigned values undergo field splitting after assignment" {
+    var hir = try generate("command ${missing:=one two}");
+    defer hir.deinit(std.testing.allocator);
+    const part = firstCommandParts(hir)[1];
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try std.testing.expectEqualDeep(
+        @as([]const []const u8, &.{ "one", "two" }),
+        try Expander.initWithContext(arena.allocator(), .{
+            .variables = &variables,
+        }).expandArgument(hir, part),
+    );
+    try std.testing.expectEqualStrings("one two", variables.get("missing").?);
+}
+
+test "assignment parameter operators require mutable variable state" {
+    var hir = try generate("command ${missing:=value}");
+    defer hir.deinit(std.testing.allocator);
+    const part = firstCommandParts(hir)[1];
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try std.testing.expectError(
+        error.ParameterAssignmentUnavailable,
+        Expander.init(arena.allocator()).expandArgument(hir, part),
+    );
 }
 
 test "unquoted default words retain their own quoting during field splitting" {

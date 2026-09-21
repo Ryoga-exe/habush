@@ -761,6 +761,26 @@ test "standalone assignments expand default parameter words" {
     try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
 }
 
+test "parameter assignment persists in shell variable state" {
+    var hir = try generate("/bin/true ${assigned:=one two}");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+
+    _ = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .resolver = CommandResolver.preResolved(),
+        .variables = &variables,
+    }).execute(hir);
+
+    try std.testing.expectEqualStrings("one two", variables.get("assigned").?);
+    try std.testing.expectEqualDeep(
+        @as([]const []const u8, &.{ "/bin/true", "one", "two" }),
+        fake.spawn_calls.items[0].argv,
+    );
+}
+
 test "unsupported expansions have no host side effects" {
     const cases = [_]struct { [:0]const u8, anyerror }{
         .{ "/bin/echo *.zig", error.PathnameExpansionUnsupported },
