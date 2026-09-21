@@ -66,6 +66,33 @@ test "HIR owns source-derived and here-document strings" {
     try std.testing.expectEqualStrings("cat", hir.wordPart(hir.wordParts(command_parts[0])[0]));
 }
 
+test "HIR clone owns independent instruction and payload storage" {
+    var tree = try Ast.parse(std.testing.allocator, "build() { value=original; }");
+    defer tree.deinit(std.testing.allocator);
+    var hir = try AstGen.generate(std.testing.allocator, tree);
+    var copy = try hir.clone(std.testing.allocator);
+    defer copy.deinit(std.testing.allocator);
+    hir.deinit(std.testing.allocator);
+
+    const definition = copy.functionDefinition(firstCommand(copy));
+    try std.testing.expectEqualStrings("build", definition.name);
+    const body = copy.groupedCommand(definition.body).body;
+    const assignment = copy.assignment(copy.simpleCommandParts(firstListCommand(copy, body))[0]);
+    try std.testing.expectEqualStrings("value", assignment.name);
+    try std.testing.expectEqualStrings(
+        "original",
+        copy.wordPart(copy.wordParts(assignment.value)[0]),
+    );
+}
+
+test "HIR clone handles every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        cloneHirWithAllocator,
+        .{},
+    );
+}
+
 test "generates pipelines and pipeline negation" {
     var tree = try Ast.parse(std.testing.allocator, "! echo hi | grep h |& count");
     defer tree.deinit(std.testing.allocator);
@@ -402,6 +429,15 @@ fn generateWithAllocator(gpa: std.mem.Allocator, source: [:0]const u8) !void {
     defer tree.deinit(gpa);
     var hir = try AstGen.generate(gpa, tree);
     defer hir.deinit(gpa);
+}
+
+fn cloneHirWithAllocator(gpa: std.mem.Allocator) !void {
+    var tree = try Ast.parse(std.testing.allocator, "build() { value=original; }");
+    defer tree.deinit(std.testing.allocator);
+    var hir = try AstGen.generate(std.testing.allocator, tree);
+    defer hir.deinit(std.testing.allocator);
+    var copy = try hir.clone(gpa);
+    defer copy.deinit(gpa);
 }
 
 fn firstCommand(hir: Hir) Hir.Inst.Index {
