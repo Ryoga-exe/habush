@@ -11,6 +11,7 @@ context: Context,
 pub const Context = struct {
     variables: ?*const VariableStore = null,
     overrides: ?*const VariableStore = null,
+    invocation_name: ?[]const u8 = null,
     positional_parameters: []const []const u8 = &.{},
     last_status: u8 = 0,
 
@@ -184,7 +185,12 @@ fn appendParameter(
     }
     if (isDecimal(name)) {
         const position = std.fmt.parseUnsigned(usize, name, 10) catch return;
-        if (position == 0) return error.ParameterExpansionUnsupported;
+        if (position == 0) {
+            const invocation_name = expander.context.invocation_name orelse
+                return error.ParameterExpansionUnsupported;
+            try bytes.appendSlice(expander.allocator, invocation_name);
+            return;
+        }
         if (position <= expander.context.positional_parameters.len)
             try bytes.appendSlice(
                 expander.allocator,

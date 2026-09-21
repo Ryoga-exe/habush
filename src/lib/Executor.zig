@@ -24,6 +24,7 @@ host: Host,
 sandbox: CommandPlan.Sandbox,
 resolver: ?CommandResolver,
 search_path: []const []const u8,
+invocation_name: []const u8,
 positional_parameters: []const []const u8,
 positional_parameters_override: ?[]const []const u8,
 cwd: ?[]const u8,
@@ -51,6 +52,7 @@ pub const Options = struct {
     sandbox: CommandPlan.Sandbox = .inherit,
     resolver: ?CommandResolver = null,
     search_path: []const []const u8 = &.{},
+    invocation_name: []const u8 = "habush",
     positional_parameters: []const []const u8 = &.{},
     cwd: ?[]const u8 = null,
     /// Complete shell variable state. When present, exported bindings become
@@ -79,6 +81,7 @@ pub fn initWithOptions(gpa: std.mem.Allocator, host: Host, options: Options) Exe
         .sandbox = options.sandbox,
         .resolver = options.resolver,
         .search_path = options.search_path,
+        .invocation_name = options.invocation_name,
         .positional_parameters = options.positional_parameters,
         .positional_parameters_override = null,
         .cwd = options.cwd,
@@ -104,6 +107,7 @@ pub fn initWithState(
         .sandbox = .inherit,
         .resolver = resolver,
         .search_path = &.{},
+        .invocation_name = "",
         .positional_parameters = &.{},
         .positional_parameters_override = null,
         .cwd = null,
@@ -602,6 +606,7 @@ fn wordExpander(
         .variables = executor.variableStore(),
         .overrides = overrides,
         .positional_parameters = executor.positionalParameters(),
+        .invocation_name = executor.invocationName(),
         .last_status = executor.last_status,
     });
 }
@@ -609,6 +614,11 @@ fn wordExpander(
 fn workingDirectory(executor: Executor) ?[]const u8 {
     if (executor.runtime_state) |state| return state.workingDirectory();
     return executor.cwd;
+}
+
+fn invocationName(executor: Executor) []const u8 {
+    if (executor.runtime_state) |state| return state.invocationName();
+    return executor.invocation_name;
 }
 
 fn commandSearchPath(executor: Executor) []const []const u8 {

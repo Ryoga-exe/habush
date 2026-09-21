@@ -22,6 +22,7 @@ last_result: Executor.Result = .{
 pub const Options = struct {
     resolver: ?CommandResolver = null,
     cwd: ?[]const u8 = null,
+    invocation_name: []const u8 = "habush",
     search_path: []const []const u8 = &.{},
     positional_parameters: []const []const u8 = &.{},
     sandbox: CommandPlan.Sandbox = .inherit,
@@ -48,6 +49,7 @@ pub fn init(
         .io = options.io,
         .state = try runtime.State.init(gpa, .{
             .cwd = options.cwd,
+            .invocation_name = options.invocation_name,
             .search_path = options.search_path,
             .positional_parameters = options.positional_parameters,
             .sandbox = options.sandbox,
@@ -83,6 +85,10 @@ pub fn executeWithOptions(
 
 pub fn workingDirectory(session: Session) ?[]const u8 {
     return session.state.workingDirectory();
+}
+
+pub fn invocationName(session: Session) []const u8 {
+    return session.state.invocationName();
 }
 
 pub fn commandSearchPath(session: Session) []const []const u8 {

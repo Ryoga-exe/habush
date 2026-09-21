@@ -56,7 +56,7 @@ test "expands named parameters inside double quotes" {
 
 test "expands scalar positional and special parameters" {
     var hir = try generate(
-        "command \"$1\" \"${2}\" \"${10}\" \"$#\" \"$?\" \"$*\" $#",
+        "command \"$0\" \"$1\" \"${2}\" \"${10}\" \"$#\" \"$?\" \"$*\" $#",
     );
     defer hir.deinit(std.testing.allocator);
     const parts = firstCommandParts(hir);
@@ -71,10 +71,12 @@ test "expands scalar positional and special parameters" {
     defer arena.deinit();
     const expander = Expander.initWithContext(arena.allocator(), .{
         .variables = &variables,
+        .invocation_name = "script.hb",
         .positional_parameters = &parameters,
         .last_status = 23,
     });
     const expected = [_][]const u8{
+        "script.hb",
         "one",
         "two words",
         "ten",

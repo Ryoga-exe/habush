@@ -179,6 +179,23 @@ test "functions expand scalar parameters and restore the caller scope" {
     try std.testing.expectEqualStrings("outer", session.variable("caller").?);
 }
 
+test "zero parameter remains the session invocation name inside functions" {
+    var fake_host = FakeHost.init(std.testing.allocator);
+    defer fake_host.deinit();
+    var session = try Session.init(std.testing.allocator, fake_host.host(), .{
+        .invocation_name = "script.hb",
+    });
+    defer session.deinit();
+
+    var hir = try generate("capture() { observed=\"$0\"; }; capture other");
+    defer hir.deinit(std.testing.allocator);
+    const result = try session.execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqualStrings("script.hb", session.invocationName());
+    try std.testing.expectEqualStrings("script.hb", session.variable("observed").?);
+}
+
 test "double-quoted at forwards exact function arguments" {
     var fake_host = FakeHost.init(std.testing.allocator);
     defer fake_host.deinit();

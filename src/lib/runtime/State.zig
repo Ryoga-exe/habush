@@ -10,6 +10,7 @@ const VariableStore = @import("../VariableStore.zig");
 
 gpa: std.mem.Allocator,
 cwd: ?[]u8,
+invocation_name: []u8,
 search_path: []const []const u8,
 positional_parameters: []const []const u8,
 sandbox: CommandPlan.Sandbox,
@@ -18,6 +19,7 @@ functions: FunctionStore,
 
 pub const Options = struct {
     cwd: ?[]const u8 = null,
+    invocation_name: []const u8 = "habush",
     search_path: []const []const u8 = &.{},
     positional_parameters: []const []const u8 = &.{},
     sandbox: CommandPlan.Sandbox = .inherit,
@@ -31,6 +33,9 @@ pub const Error = VariableStore.Error;
 pub fn init(gpa: std.mem.Allocator, options: Options) Error!State {
     const cwd = if (options.cwd) |path| try gpa.dupe(u8, path) else null;
     errdefer if (cwd) |path| gpa.free(path);
+
+    const invocation_name = try gpa.dupe(u8, options.invocation_name);
+    errdefer gpa.free(invocation_name);
 
     const search_path = try cloneStrings(gpa, options.search_path);
     errdefer deinitStrings(gpa, search_path);
@@ -48,6 +53,7 @@ pub fn init(gpa: std.mem.Allocator, options: Options) Error!State {
     return .{
         .gpa = gpa,
         .cwd = cwd,
+        .invocation_name = invocation_name,
         .search_path = search_path,
         .positional_parameters = positional_parameters,
         .sandbox = try options.sandbox.clone(gpa),
@@ -58,6 +64,7 @@ pub fn init(gpa: std.mem.Allocator, options: Options) Error!State {
 
 pub fn deinit(state: *State) void {
     if (state.cwd) |cwd| state.gpa.free(cwd);
+    state.gpa.free(state.invocation_name);
     deinitStrings(state.gpa, state.search_path);
     deinitStrings(state.gpa, state.positional_parameters);
     state.sandbox.deinit(state.gpa);
@@ -69,6 +76,9 @@ pub fn deinit(state: *State) void {
 pub fn clone(state: State) std.mem.Allocator.Error!State {
     const cwd = if (state.cwd) |path| try state.gpa.dupe(u8, path) else null;
     errdefer if (cwd) |path| state.gpa.free(path);
+
+    const invocation_name = try state.gpa.dupe(u8, state.invocation_name);
+    errdefer state.gpa.free(invocation_name);
 
     const search_path = try cloneStrings(state.gpa, state.search_path);
     errdefer deinitStrings(state.gpa, search_path);
@@ -85,6 +95,7 @@ pub fn clone(state: State) std.mem.Allocator.Error!State {
     return .{
         .gpa = state.gpa,
         .cwd = cwd,
+        .invocation_name = invocation_name,
         .search_path = search_path,
         .positional_parameters = positional_parameters,
         .sandbox = sandbox,
@@ -99,6 +110,10 @@ pub fn allocator(state: State) std.mem.Allocator {
 
 pub fn workingDirectory(state: State) ?[]const u8 {
     return state.cwd;
+}
+
+pub fn invocationName(state: State) []const u8 {
+    return state.invocation_name;
 }
 
 pub fn commandSearchPath(state: State) []const []const u8 {
@@ -251,6 +266,7 @@ fn deinitStrings(allocator_value: std.mem.Allocator, strings: []const []const u8
 
 test "runtime state owns mutable session values" {
     var cwd = [_]u8{ '/', 'o', 'l', 'd' };
+    var invocation_name = [_]u8{ 's', 'c', 'r', 'i', 'p', 't' };
     var search = [_]u8{ '/', 'b', 'i', 'n' };
     var positional = [_]u8{ 'v', 'a', 'l', 'u', 'e' };
     var allowed = [_]u8{ '/', 'o', 'l', 'd' };
@@ -261,6 +277,7 @@ test "runtime state owns mutable session values" {
     };
     var state = try State.init(std.testing.allocator, .{
         .cwd = &cwd,
+        .invocation_name = &invocation_name,
         .search_path = &.{&search},
         .positional_parameters = &.{&positional},
         .sandbox = .{ .restrict = .{ .file_system = .{ .allow = &rules } } },
@@ -269,6 +286,7 @@ test "runtime state owns mutable session values" {
     defer state.deinit();
 
     cwd[1] = 'x';
+    invocation_name[0] = 'x';
     search[1] = 'x';
     positional[0] = 'x';
     allowed[1] = 'x';
@@ -276,6 +294,7 @@ test "runtime state owns mutable session values" {
     value[0] = 'x';
 
     try std.testing.expectEqualStrings("/old", state.workingDirectory().?);
+    try std.testing.expectEqualStrings("script", state.invocationName());
     try std.testing.expectEqualStrings("/bin", state.commandSearchPath()[0]);
     try std.testing.expectEqualStrings("value", state.positionalParameters()[0]);
     try std.testing.expectEqualStrings(
@@ -300,6 +319,7 @@ test "runtime state clone is independent" {
     };
     var state = try State.init(std.testing.allocator, .{
         .cwd = "/old",
+        .invocation_name = "script.hb",
         .search_path = &.{"/bin"},
         .positional_parameters = &.{"argument"},
         .sandbox = .{ .restrict = .{ .file_system = .{ .allow = &rules } } },
@@ -309,6 +329,7 @@ test "runtime state clone is independent" {
     var copy = try state.clone();
     defer copy.deinit();
 
+    copy.invocation_name[0] = 'x';
     try copy.setWorkingDirectory("/new");
     try copy.setCommandSearchPath(&.{"/usr/bin"});
     try copy.setPositionalParameters(&.{"changed"});
@@ -316,6 +337,7 @@ test "runtime state clone is independent" {
     try copy.setVariable("name", "changed");
 
     try std.testing.expectEqualStrings("/old", state.workingDirectory().?);
+    try std.testing.expectEqualStrings("script.hb", state.invocationName());
     try std.testing.expectEqualStrings("/bin", state.commandSearchPath()[0]);
     try std.testing.expectEqualStrings("argument", state.positionalParameters()[0]);
     try std.testing.expectEqualStrings("original", state.variable("name").?);
@@ -390,6 +412,7 @@ fn initWithAllocator(gpa: std.mem.Allocator) !void {
     };
     var state = try State.init(gpa, .{
         .cwd = "/workspace",
+        .invocation_name = "script.hb",
         .search_path = &search_path,
         .positional_parameters = &.{ "one", "two" },
         .sandbox = .{ .restrict = .{ .file_system = .{ .allow = &rules } } },
@@ -407,6 +430,7 @@ fn cloneWithAllocator(gpa: std.mem.Allocator) !void {
     };
     var state = try State.init(gpa, .{
         .cwd = "/workspace",
+        .invocation_name = "script.hb",
         .search_path = &.{"/bin"},
         .positional_parameters = &.{"argument"},
         .sandbox = .{ .restrict = .{ .file_system = .{ .allow = &rules } } },
