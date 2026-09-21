@@ -591,6 +591,31 @@ test "if clauses propagate exit from conditions and branches" {
     }
 }
 
+test "if clause redirections cover the condition and selected branch" {
+    var hir = try generate("if pwd; then pwd; else false; fi >out; pwd");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var state = try runtime.State.init(std.testing.allocator, .{ .cwd = "/workspace" });
+    defer state.deinit();
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    const result = try Executor.initWithState(
+        fake.host(),
+        null,
+        &state,
+        .{ .stdout = &output.writer },
+        0,
+    ).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqualStrings("/workspace\n/workspace\n", fake.redirected_output.written());
+    try std.testing.expectEqualStrings("/workspace\n", output.written());
+    try std.testing.expectEqual(@as(usize, 1), fake.open_file_calls.items.len);
+    try std.testing.expectEqual(@as(usize, 1), fake.closed_resource_count);
+}
+
 test "while and until loops skip bodies when conditions are not met" {
     const cases = [_][:0]const u8{
         "while false; do /bin/skipped; done",
@@ -661,6 +686,24 @@ test "while and until loops propagate exit from conditions and bodies" {
         try std.testing.expectEqual(.exit, result.control_flow);
         try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
     }
+}
+
+test "loop clause redirections are opened once across condition reevaluation" {
+    var hir = try generate(
+        "condition=true; while \"$condition\"; do pwd; condition=false; done >out",
+    );
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var state = try runtime.State.init(std.testing.allocator, .{ .cwd = "/workspace" });
+    defer state.deinit();
+
+    const result = try Executor.initWithState(fake.host(), null, &state, .{}, 0).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqualStrings("/workspace\n", fake.redirected_output.written());
+    try std.testing.expectEqual(@as(usize, 1), fake.open_file_calls.items.len);
+    try std.testing.expectEqual(@as(usize, 1), fake.closed_resource_count);
 }
 
 test "for loops expand explicit words once and retain the last iteration values" {
@@ -756,6 +799,28 @@ test "for loops consume continue and propagate break across nested loops" {
         if (case_index == 0)
             try std.testing.expectEqualStrings("false", variables.get("observed").?);
     }
+}
+
+test "for clause iterations share one scoped resource" {
+    var hir = try generate("for item in one two; do /bin/tool; done >out");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+
+    const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .resolver = CommandResolver.preResolved(),
+        .variables = &variables,
+    }).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqual(@as(usize, 1), fake.open_file_calls.items.len);
+    try std.testing.expectEqual(@as(usize, 2), fake.spawn_calls.items.len);
+    const first = fake.spawn_calls.items[0].file_actions[0].use_resource.resource;
+    const second = fake.spawn_calls.items[1].file_actions[0].use_resource.resource;
+    try std.testing.expectEqual(first, second);
+    try std.testing.expectEqual(@as(usize, 1), fake.closed_resource_count);
 }
 
 test "break exits a loop and continue starts its next condition" {
@@ -1128,9 +1193,6 @@ test "unquoted at contributes each split positional parameter to argv" {
 test "unsupported execution forms fail before the current command has side effects" {
     const cases = [_][:0]const u8{
         "left | right",
-        "if persisted=changed; then true; fi >out",
-        "while persisted=changed; do true; done >out",
-        "for persisted in changed; do true; done >out",
         "left &",
     };
 

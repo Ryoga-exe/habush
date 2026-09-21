@@ -220,22 +220,26 @@ fn executeBraceGroup(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!
 
 fn executeForClause(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
     const clause = hir.forClause(index);
-    if (clause.redirects.len != 0) return error.UnsupportedInstruction;
-    const variables = executor.variableStore();
-
     var arena = std.heap.ArenaAllocator.init(executor.gpa);
     defer arena.deinit();
     const allocator = arena.allocator();
+    var scope = switch (try executor.beginHirRedirections(hir, clause.redirects, allocator)) {
+        .ready => |ready| ready,
+        .failed => |result| return result,
+    };
+    defer scope.deinit();
+    const scoped_executor = scope.executor;
+    const variables = scoped_executor.variableStore();
 
     var expanded_words: std.ArrayList([]const u8) = .empty;
     var expansion_failure: Expander.Failure = undefined;
     const values = if (clause.implicit_positional_parameters)
-        executor.positionalParameters()
+        scoped_executor.positionalParameters()
     else values: {
-        const expander = executor.wordExpander(allocator, null, &expansion_failure);
+        const expander = scoped_executor.wordExpander(allocator, null, &expansion_failure);
         for (clause.words) |word| {
             const expanded = expander.expandArgument(hir, word) catch |err| switch (err) {
-                error.ParameterExpansionFailed => return executor.parameterExpansionFailure(
+                error.ParameterExpansionFailed => return scoped_executor.parameterExpansionFailure(
                     allocator,
                     expansion_failure,
                 ),
@@ -247,7 +251,7 @@ fn executeForClause(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!R
     };
 
     var result: Result = .{ .status = 0, .sandbox_coverage = .not_requested };
-    var last_status = executor.last_status;
+    var last_status = scoped_executor.last_status;
     iteration: for (values) |value| {
         const mutable_variables = variables orelse return error.VariableStateUnavailable;
         mutable_variables.set(clause.name, value) catch |err| switch (err) {
@@ -255,7 +259,7 @@ fn executeForClause(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!R
             error.OutOfMemory => return error.OutOfMemory,
         };
 
-        var body_executor = executor;
+        var body_executor = scoped_executor;
         body_executor.last_status = last_status;
         body_executor.loop_depth += 1;
         const body_result = try body_executor.executeInstruction(hir, clause.body);
@@ -314,12 +318,23 @@ fn executeList(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result
 
 fn executeLoopClause(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
     const clause = hir.loopClause(index);
-    if (clause.redirects.len != 0) return error.UnsupportedInstruction;
+    var arena = std.heap.ArenaAllocator.init(executor.gpa);
+    defer arena.deinit();
+    var scope = switch (try executor.beginHirRedirections(
+        hir,
+        clause.redirects,
+        arena.allocator(),
+    )) {
+        .ready => |ready| ready,
+        .failed => |result| return result,
+    };
+    defer scope.deinit();
+    const scoped_executor = scope.executor;
 
     var result: Result = .{ .status = 0, .sandbox_coverage = .not_requested };
-    var last_status = executor.last_status;
+    var last_status = scoped_executor.last_status;
     loop: while (true) {
-        var condition_executor = executor;
+        var condition_executor = scoped_executor;
         condition_executor.last_status = last_status;
         condition_executor.loop_depth += 1;
         const condition_result = try condition_executor.executeInstruction(hir, clause.condition);
@@ -362,7 +377,7 @@ fn executeLoopClause(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!
         };
         if (!execute_body) return result;
 
-        var body_executor = executor;
+        var body_executor = scoped_executor;
         body_executor.last_status = condition_result.status;
         body_executor.loop_depth += 1;
         const body_result = try body_executor.executeInstruction(hir, clause.body);
@@ -399,9 +414,20 @@ fn executeLoopClause(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!
 
 fn executeIfClause(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
     const clause = hir.ifClause(index);
-    if (clause.redirects.len != 0) return error.UnsupportedInstruction;
+    var arena = std.heap.ArenaAllocator.init(executor.gpa);
+    defer arena.deinit();
+    var scope = switch (try executor.beginHirRedirections(
+        hir,
+        clause.redirects,
+        arena.allocator(),
+    )) {
+        .ready => |ready| ready,
+        .failed => |result| return result,
+    };
+    defer scope.deinit();
+    const scoped_executor = scope.executor;
 
-    const condition_result = try executor.executeInstruction(hir, clause.condition);
+    const condition_result = try scoped_executor.executeInstruction(hir, clause.condition);
     if (!condition_result.control_flow.isNone()) return condition_result;
 
     const branch = if (condition_result.status == 0)
@@ -412,7 +438,7 @@ fn executeIfClause(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
             .sandbox_coverage = condition_result.sandbox_coverage,
         };
 
-    var branch_executor = executor;
+    var branch_executor = scoped_executor;
     branch_executor.last_status = condition_result.status;
     var result = try branch_executor.executeInstruction(hir, branch);
     result.sandbox_coverage = combineSandboxCoverage(
