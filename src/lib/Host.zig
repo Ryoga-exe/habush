@@ -23,6 +23,7 @@ pub const VTable = struct {
         CommandPlan.WorkingDirectory,
         CommandPlan.FileAction.Open,
     ) SpawnError!OpenFileOutcome,
+    create_input: *const fn (?*anyopaque, []const u8) Error!CommandPlan.Resource,
     close_resource: *const fn (?*anyopaque, CommandPlan.Resource) void,
     resource_writer: *const fn (?*anyopaque, CommandPlan.Resource) ?*std.Io.Writer,
     resolve_working_directory: ?*const fn (
@@ -136,6 +137,13 @@ pub fn openFile(
 
 pub fn closeResource(host: Host, resource: CommandPlan.Resource) void {
     host.vtable.close_resource(host.userdata, resource);
+}
+
+/// Creates a seekable, host-owned input resource containing `bytes`.
+/// Here-documents use this instead of exposing platform pipe or temporary-file
+/// details to the executor.
+pub fn createInput(host: Host, bytes: []const u8) Error!CommandPlan.Resource {
+    return host.vtable.create_input(host.userdata, bytes);
 }
 
 /// Returns the writer used by an in-process command for an opened resource.

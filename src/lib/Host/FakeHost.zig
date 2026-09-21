@@ -9,6 +9,7 @@ spawn_calls: std.ArrayList(CommandPlan) = .empty,
 wait_calls: std.ArrayList(Host.Process) = .empty,
 resolve_working_directory_calls: std.ArrayList(Host.WorkingDirectoryRequest) = .empty,
 open_file_calls: std.ArrayList(OpenFileCall) = .empty,
+create_input_calls: std.ArrayList([]const u8) = .empty,
 closed_resource_count: usize = 0,
 redirected_output: std.Io.Writer.Allocating,
 next_process: u32 = 1,
@@ -52,10 +53,20 @@ const vtable: Host.VTable = .{
     .spawn = spawn,
     .wait = wait,
     .open_file = openFile,
+    .create_input = createInput,
     .close_resource = closeResource,
     .resource_writer = resourceWriter,
     .resolve_working_directory = resolveWorkingDirectory,
 };
+
+fn createInput(userdata: ?*anyopaque, bytes: []const u8) Host.Error!CommandPlan.Resource {
+    const fake: *FakeHost = @ptrCast(@alignCast(userdata.?));
+    const allocator = fake.arena.allocator();
+    try fake.create_input_calls.append(allocator, try allocator.dupe(u8, bytes));
+    const resource: CommandPlan.Resource = @enumFromInt(fake.next_resource);
+    fake.next_resource +%= 1;
+    return resource;
+}
 
 fn openFile(
     userdata: ?*anyopaque,

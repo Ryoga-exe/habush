@@ -5,6 +5,7 @@
 //! duplication, and sandbox restrictions remain explicit unsupported boundaries.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const CommandPlan = @import("../CommandPlan.zig");
 const Host = @import("../Host.zig");
 const append_file = @import("System/append_file.zig");
@@ -21,8 +22,48 @@ next_process: u32 = 1,
 next_resource: u32 = 1,
 
 const FileResource = struct {
-    file: std.Io.File,
+    storage: Storage,
     writer: ?std.Io.File.Writer,
+
+    const Storage = union(enum) {
+        file: std.Io.File,
+        temporary: TemporaryFile,
+
+        const TemporaryFile = struct {
+            file: std.Io.File,
+            cleanup: ?Cleanup,
+
+            const Cleanup = struct {
+                dir: std.Io.Dir,
+                close_dir: bool,
+                basename_hex: u64,
+            };
+
+            fn deinit(temporary: TemporaryFile, io: std.Io) void {
+                temporary.file.close(io);
+                if (temporary.cleanup) |cleanup| {
+                    const basename = std.fmt.hex(cleanup.basename_hex);
+                    cleanup.dir.deleteFile(io, &basename) catch {};
+                    if (cleanup.close_dir) cleanup.dir.close(io);
+                }
+            }
+        };
+    };
+
+    fn file(resource: *const FileResource) std.Io.File {
+        return switch (resource.storage) {
+            .file => |handle| handle,
+            .temporary => |temporary| temporary.file,
+        };
+    }
+
+    fn deinit(resource: *FileResource, io: std.Io) void {
+        switch (resource.storage) {
+            .file => |handle| handle.close(io),
+            .temporary => |temporary| temporary.deinit(io),
+        }
+        resource.* = undefined;
+    }
 };
 
 pub fn deinit(system: *System) void {
@@ -31,7 +72,7 @@ pub fn deinit(system: *System) void {
     system.children.deinit(system.gpa);
     var resources = system.resources.valueIterator();
     while (resources.next()) |resource| {
-        resource.*.file.close(system.io);
+        resource.*.deinit(system.io);
         system.gpa.destroy(resource.*);
     }
     system.resources.deinit(system.gpa);
@@ -49,6 +90,7 @@ const vtable: Host.VTable = .{
     .spawn = spawn,
     .wait = wait,
     .open_file = openFile,
+    .create_input = createInput,
     .close_resource = closeResource,
     .resource_writer = resourceWriter,
     .resolve_working_directory = resolveWorkingDirectory,
@@ -117,7 +159,7 @@ fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.SpawnError!Host.SpawnOut
                     return fileActionFailure(action_index, .unsupported);
                 const resource = system.resources.get(use.resource) orelse
                     return fileActionFailure(action_index, .unsupported);
-                bindings[target] = .{ .file = resource.file };
+                bindings[target] = .{ .file = resource.file() };
             },
         }
     }
@@ -189,7 +231,7 @@ fn openFile(
     const resource_data = try system.gpa.create(FileResource);
     errdefer system.gpa.destroy(resource_data);
     resource_data.* = .{
-        .file = file,
+        .storage = .{ .file = file },
         .writer = if (open.access == .read)
             null
         else
@@ -202,10 +244,97 @@ fn openFile(
     return .{ .opened = resource };
 }
 
+fn createInput(userdata: ?*anyopaque, bytes: []const u8) Host.Error!CommandPlan.Resource {
+    const system: *System = @ptrCast(@alignCast(userdata.?));
+    const permissions: std.Io.File.Permissions = switch (builtin.os.tag) {
+        .windows => .default_file,
+        else => .fromMode(0o600),
+    };
+    var temporary_dir = system.inputResourceDirectory();
+    var owns_temporary_dir = temporary_dir.close;
+    errdefer if (owns_temporary_dir) temporary_dir.dir.close(system.io);
+    const temporary = while (true) {
+        var basename_hex: u64 = undefined;
+        system.io.random(std.mem.asBytes(&basename_hex));
+        const basename = std.fmt.hex(basename_hex);
+        const file = temporary_dir.dir.createFile(system.io, &basename, .{
+            .read = true,
+            .exclusive = true,
+            .permissions = permissions,
+        }) catch |err| switch (err) {
+            error.PathAlreadyExists, error.FileBusy, error.DeviceBusy => continue,
+            else => return error.ResourceUnavailable,
+        };
+        break FileResource.Storage.TemporaryFile{
+            .file = file,
+            .cleanup = .{
+                .dir = temporary_dir.dir,
+                .close_dir = temporary_dir.close,
+                .basename_hex = basename_hex,
+            },
+        };
+    };
+    var owned_temporary = temporary;
+    owns_temporary_dir = false;
+    errdefer owned_temporary.deinit(system.io);
+    // Unlink immediately when the platform permits it. The open handle stays
+    // usable by children; platforms that reject this keep the exclusive 0600
+    // name until resource teardown.
+    const cleanup = owned_temporary.cleanup.?;
+    const basename = std.fmt.hex(cleanup.basename_hex);
+    if (cleanup.dir.deleteFile(system.io, &basename)) {
+        if (cleanup.close_dir) cleanup.dir.close(system.io);
+        owned_temporary.cleanup = null;
+    } else |_| {}
+
+    owned_temporary.file.writeStreamingAll(system.io, bytes) catch
+        return error.ResourceUnavailable;
+    var writer = owned_temporary.file.writerStreaming(system.io, &.{});
+    writer.seekTo(0) catch return error.ResourceUnavailable;
+
+    const resource_data = system.gpa.create(FileResource) catch return error.OutOfMemory;
+    errdefer system.gpa.destroy(resource_data);
+    resource_data.* = .{ .storage = .{ .temporary = owned_temporary }, .writer = null };
+    system.resources.ensureUnusedCapacity(system.gpa, 1) catch return error.OutOfMemory;
+    const resource: CommandPlan.Resource = @enumFromInt(system.next_resource);
+    system.next_resource +%= 1;
+    system.resources.putAssumeCapacityNoClobber(resource, resource_data);
+    return resource;
+}
+
+const InputResourceDirectory = struct {
+    dir: std.Io.Dir,
+    close: bool,
+};
+
+fn inputResourceDirectory(system: *System) InputResourceDirectory {
+    if (system.environ_map) |environment| {
+        const configured_path = switch (builtin.os.tag) {
+            .windows => environment.get("TEMP") orelse environment.get("TMP"),
+            else => environment.get("TMPDIR"),
+        };
+        if (configured_path) |path| {
+            if (path.len != 0) {
+                const dir = if (std.fs.path.isAbsolute(path))
+                    std.Io.Dir.openDirAbsolute(system.io, path, .{})
+                else
+                    std.Io.Dir.cwd().openDir(system.io, path, .{});
+                if (dir) |opened| return .{ .dir = opened, .close = true } else |_| {}
+            }
+        }
+    }
+    if (builtin.os.tag != .windows) {
+        if (std.Io.Dir.openDirAbsolute(system.io, "/tmp", .{})) |dir|
+            return .{ .dir = dir, .close = true }
+        else |_| {}
+    }
+    return .{ .dir = .cwd(), .close = false };
+}
+
 fn closeResource(userdata: ?*anyopaque, resource: CommandPlan.Resource) void {
     const system: *System = @ptrCast(@alignCast(userdata.?));
     const data = system.resources.fetchRemove(resource) orelse return;
-    data.value.file.close(system.io);
+    data.value.deinit(system.io);
     system.gpa.destroy(data.value);
 }
 
@@ -746,6 +875,46 @@ test "system host shares scoped output resources with child processes" {
     );
     defer std.testing.allocator.free(output);
     try std.testing.expectEqualStrings("builtinexternal", output);
+}
+
+test "system host provides seekable input resources to child processes" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var directory_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const directory_len = try temporary.dir.realPath(std.testing.io, &directory_buffer);
+    const directory = directory_buffer[0..directory_len];
+
+    var system: System = .{ .gpa = std.testing.allocator, .io = std.testing.io };
+    defer system.deinit();
+    const system_host = system.host();
+    const input = try system_host.createInput("here-document contents\n");
+    defer system_host.closeResource(input);
+
+    try expectExitStatus(system_host, .{
+        .executable = "/bin/cat",
+        .argv = &.{"/bin/cat"},
+        .cwd = .{ .path = directory },
+        .file_actions = &.{
+            .{ .use_resource = .{ .resource = input, .target = .stdin } },
+            .{ .open = .{
+                .path = "output.txt",
+                .target = .stdout,
+                .access = .write,
+                .disposition = .create_or_truncate,
+            } },
+        },
+    }, 0);
+
+    const output = try temporary.dir.readFileAlloc(
+        std.testing.io,
+        "output.txt",
+        std.testing.allocator,
+        .limited(64),
+    );
+    defer std.testing.allocator.free(output);
+    try std.testing.expectEqualStrings("here-document contents\n", output);
 }
 
 test "system host duplicates redirected standard streams" {
