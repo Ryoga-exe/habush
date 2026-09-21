@@ -3,6 +3,10 @@ const windows = std.os.windows;
 
 pub const Error = error{Unexpected};
 
+pub fn processId() u64 {
+    return windows.GetCurrentProcessId();
+}
+
 pub fn ignoreInteractiveInterrupt() Error!void {
     if (!SetConsoleCtrlHandler(consoleCtrlHandler, windows.BOOL.TRUE).toBool())
         return error.Unexpected;

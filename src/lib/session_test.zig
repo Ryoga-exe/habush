@@ -196,6 +196,22 @@ test "zero parameter remains the session invocation name inside functions" {
     try std.testing.expectEqualStrings("script.hb", session.variable("observed").?);
 }
 
+test "shell process id remains stable inside functions" {
+    var fake_host = FakeHost.init(std.testing.allocator);
+    defer fake_host.deinit();
+    var session = try Session.init(std.testing.allocator, fake_host.host(), .{
+        .shell_process_id = 12345,
+    });
+    defer session.deinit();
+
+    var hir = try generate("capture() { observed=\"$$\"; }; capture");
+    defer hir.deinit(std.testing.allocator);
+    const result = try session.execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqualStrings("12345", session.variable("observed").?);
+}
+
 test "double-quoted at forwards exact function arguments" {
     var fake_host = FakeHost.init(std.testing.allocator);
     defer fake_host.deinit();

@@ -13,6 +13,7 @@ pub const Context = struct {
     variables: ?*VariableStore = null,
     overrides: ?*const VariableStore = null,
     invocation_name: ?[]const u8 = null,
+    shell_process_id: ?u64 = null,
     positional_parameters: []const []const u8 = &.{},
     last_status: u8 = 0,
     failure: ?*Failure = null,
@@ -457,6 +458,14 @@ fn appendParameter(
             "{d}",
             .{expander.context.positional_parameters.len},
         ) catch unreachable;
+        try bytes.appendSlice(expander.allocator, value);
+        return;
+    }
+    if (std.mem.eql(u8, name, "$")) {
+        const process_id = expander.context.shell_process_id orelse
+            return error.ParameterExpansionUnsupported;
+        var buffer: [20]u8 = undefined;
+        const value = std.fmt.bufPrint(&buffer, "{d}", .{process_id}) catch unreachable;
         try bytes.appendSlice(expander.allocator, value);
         return;
     }

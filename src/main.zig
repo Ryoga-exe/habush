@@ -76,6 +76,7 @@ pub fn main(init: std.process.Init) !u8 {
         .resolver = system_resolver.resolver(),
         .cwd = cwd,
         .invocation_name = invocation_name,
+        .shell_process_id = platform.processId(),
         .search_path = search_path,
         .positional_parameters = positional_parameters,
         .variables = variables,

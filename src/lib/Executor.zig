@@ -25,6 +25,7 @@ sandbox: CommandPlan.Sandbox,
 resolver: ?CommandResolver,
 search_path: []const []const u8,
 invocation_name: []const u8,
+shell_process_id: ?u64,
 positional_parameters: []const []const u8,
 positional_parameters_override: ?[]const []const u8,
 cwd: ?[]const u8,
@@ -53,6 +54,7 @@ pub const Options = struct {
     resolver: ?CommandResolver = null,
     search_path: []const []const u8 = &.{},
     invocation_name: []const u8 = "habush",
+    shell_process_id: ?u64 = null,
     positional_parameters: []const []const u8 = &.{},
     cwd: ?[]const u8 = null,
     /// Complete shell variable state. When present, exported bindings become
@@ -82,6 +84,7 @@ pub fn initWithOptions(gpa: std.mem.Allocator, host: Host, options: Options) Exe
         .resolver = options.resolver,
         .search_path = options.search_path,
         .invocation_name = options.invocation_name,
+        .shell_process_id = options.shell_process_id,
         .positional_parameters = options.positional_parameters,
         .positional_parameters_override = null,
         .cwd = options.cwd,
@@ -108,6 +111,7 @@ pub fn initWithState(
         .resolver = resolver,
         .search_path = &.{},
         .invocation_name = "",
+        .shell_process_id = null,
         .positional_parameters = &.{},
         .positional_parameters_override = null,
         .cwd = null,
@@ -641,6 +645,7 @@ fn wordExpander(
         .overrides = overrides,
         .positional_parameters = executor.positionalParameters(),
         .invocation_name = executor.invocationName(),
+        .shell_process_id = executor.shellProcessId(),
         .last_status = executor.last_status,
         .failure = failure,
     });
@@ -674,6 +679,11 @@ fn workingDirectory(executor: Executor) ?[]const u8 {
 fn invocationName(executor: Executor) []const u8 {
     if (executor.runtime_state) |state| return state.invocationName();
     return executor.invocation_name;
+}
+
+fn shellProcessId(executor: Executor) ?u64 {
+    if (executor.runtime_state) |state| return state.shellProcessId();
+    return executor.shell_process_id;
 }
 
 fn commandSearchPath(executor: Executor) []const []const u8 {

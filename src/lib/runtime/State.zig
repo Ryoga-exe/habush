@@ -11,6 +11,7 @@ const VariableStore = @import("../VariableStore.zig");
 gpa: std.mem.Allocator,
 cwd: ?[]u8,
 invocation_name: []u8,
+shell_process_id: ?u64,
 search_path: []const []const u8,
 positional_parameters: []const []const u8,
 sandbox: CommandPlan.Sandbox,
@@ -20,6 +21,7 @@ functions: FunctionStore,
 pub const Options = struct {
     cwd: ?[]const u8 = null,
     invocation_name: []const u8 = "habush",
+    shell_process_id: ?u64 = null,
     search_path: []const []const u8 = &.{},
     positional_parameters: []const []const u8 = &.{},
     sandbox: CommandPlan.Sandbox = .inherit,
@@ -54,6 +56,7 @@ pub fn init(gpa: std.mem.Allocator, options: Options) Error!State {
         .gpa = gpa,
         .cwd = cwd,
         .invocation_name = invocation_name,
+        .shell_process_id = options.shell_process_id,
         .search_path = search_path,
         .positional_parameters = positional_parameters,
         .sandbox = try options.sandbox.clone(gpa),
@@ -96,6 +99,7 @@ pub fn clone(state: State) std.mem.Allocator.Error!State {
         .gpa = state.gpa,
         .cwd = cwd,
         .invocation_name = invocation_name,
+        .shell_process_id = state.shell_process_id,
         .search_path = search_path,
         .positional_parameters = positional_parameters,
         .sandbox = sandbox,
@@ -114,6 +118,10 @@ pub fn workingDirectory(state: State) ?[]const u8 {
 
 pub fn invocationName(state: State) []const u8 {
     return state.invocation_name;
+}
+
+pub fn shellProcessId(state: State) ?u64 {
+    return state.shell_process_id;
 }
 
 pub fn commandSearchPath(state: State) []const []const u8 {
@@ -320,6 +328,7 @@ test "runtime state clone is independent" {
     var state = try State.init(std.testing.allocator, .{
         .cwd = "/old",
         .invocation_name = "script.hb",
+        .shell_process_id = 12345,
         .search_path = &.{"/bin"},
         .positional_parameters = &.{"argument"},
         .sandbox = .{ .restrict = .{ .file_system = .{ .allow = &rules } } },
@@ -338,6 +347,8 @@ test "runtime state clone is independent" {
 
     try std.testing.expectEqualStrings("/old", state.workingDirectory().?);
     try std.testing.expectEqualStrings("script.hb", state.invocationName());
+    try std.testing.expectEqual(@as(?u64, 12345), state.shellProcessId());
+    try std.testing.expectEqual(state.shellProcessId(), copy.shellProcessId());
     try std.testing.expectEqualStrings("/bin", state.commandSearchPath()[0]);
     try std.testing.expectEqualStrings("argument", state.positionalParameters()[0]);
     try std.testing.expectEqualStrings("original", state.variable("name").?);
