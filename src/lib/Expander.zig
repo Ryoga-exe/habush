@@ -111,11 +111,14 @@ fn appendArgumentPart(
 ) Error!void {
     switch (tag) {
         .literal => {
-            if (!force_quoted and is_first and std.mem.startsWith(u8, value, "~"))
-                return error.TildeExpansionUnsupported;
+            if (!force_quoted and std.mem.indexOfAny(u8, value, "*?[") != null)
+                return error.PathnameExpansionUnsupported;
+            if (!force_quoted and is_first and std.mem.startsWith(u8, value, "~")) {
+                try expander.appendTilde(bytes, value);
+                current_field_active.* = true;
+                return;
+            }
             if (force_quoted or !expansion_word) {
-                if (!force_quoted and std.mem.indexOfAny(u8, value, "*?[") != null)
-                    return error.PathnameExpansionUnsupported;
                 try bytes.appendSlice(expander.allocator, value);
                 current_field_active.* = true;
             } else {
@@ -300,7 +303,7 @@ fn appendAssignmentPart(
     switch (tag) {
         .literal => {
             if (is_first and std.mem.startsWith(u8, value, "~"))
-                return error.TildeExpansionUnsupported;
+                return expander.appendTilde(bytes, value);
             try bytes.appendSlice(expander.allocator, value);
         },
         .escaped,
@@ -484,6 +487,20 @@ fn conditionalParameterValue(expander: Expander, parameter: []const u8) Error!?[
     if (position == 0) return expander.context.invocation_name;
     if (position > expander.context.positional_parameters.len) return null;
     return expander.context.positional_parameters[position - 1];
+}
+
+fn appendTilde(
+    expander: Expander,
+    bytes: *std.ArrayList(u8),
+    value: []const u8,
+) Error!void {
+    std.debug.assert(value.len != 0 and value[0] == '~');
+    const prefix_end = std.mem.indexOfScalar(u8, value, '/') orelse value.len;
+    if (prefix_end != 1) return error.TildeExpansionUnsupported;
+    const home = expander.context.variable("HOME") orelse
+        return error.TildeExpansionUnsupported;
+    try bytes.appendSlice(expander.allocator, home);
+    try bytes.appendSlice(expander.allocator, value[prefix_end..]);
 }
 
 fn joinSeparator(expander: Expander) ?u8 {

@@ -31,7 +31,33 @@ test "expands and joins static argument parts" {
 test "classifies unsupported argument expansions" {
     try expectExpansionError("command \"${name:?fallback}\"", error.ParameterExpansionUnsupported);
     try expectExpansionError("command *.zig", error.PathnameExpansionUnsupported);
-    try expectExpansionError("command ~/work", error.TildeExpansionUnsupported);
+    try expectExpansionError("command ~other/work", error.TildeExpansionUnsupported);
+}
+
+test "expands current user tilde without field splitting" {
+    var hir = try generate("command ~ ~/work ${missing:-~/fallback}");
+    defer hir.deinit(std.testing.allocator);
+    const parts = firstCommandParts(hir);
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+    try variables.set("HOME", "/home/test user");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const expander = Expander.initWithContext(arena.allocator(), .{
+        .variables = &variables,
+    });
+    const expected = [_][]const u8{
+        "/home/test user",
+        "/home/test user/work",
+        "/home/test user/fallback",
+    };
+
+    for (parts[1..], expected) |part, value| {
+        try std.testing.expectEqualDeep(
+            @as([]const []const u8, &.{value}),
+            try expander.expandArgument(hir, part),
+        );
+    }
 }
 
 test "default parameter operators distinguish unset and null values" {
@@ -517,7 +543,7 @@ test "default parameter words expand in assignment values without field splittin
 }
 
 test "classifies unsupported assignment expansion" {
-    var hir = try generate("result=~/work");
+    var hir = try generate("result=~other/work");
     defer hir.deinit(std.testing.allocator);
     const assignment = hir.assignment(firstCommandParts(hir)[0]);
 
@@ -526,6 +552,24 @@ test "classifies unsupported assignment expansion" {
     try std.testing.expectError(
         error.TildeExpansionUnsupported,
         Expander.init(arena.allocator()).expandAssignment(hir, assignment.value),
+    );
+}
+
+test "expands current user tilde in assignment values" {
+    var hir = try generate("result=~/work");
+    defer hir.deinit(std.testing.allocator);
+    const assignment = hir.assignment(firstCommandParts(hir)[0]);
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+    try variables.set("HOME", "/home/test user");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try std.testing.expectEqualStrings(
+        "/home/test user/work",
+        try Expander.initWithContext(arena.allocator(), .{
+            .variables = &variables,
+        }).expandAssignment(hir, assignment.value),
     );
 }
 
