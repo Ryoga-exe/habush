@@ -1,6 +1,7 @@
 const std = @import("std");
 const Ast = @import("Ast.zig");
 const AstGen = @import("AstGen.zig");
+const CommandPlan = @import("CommandPlan.zig");
 const CommandResolver = @import("CommandResolver.zig");
 const FakeResolver = @import("CommandResolver/FakeResolver.zig");
 const Executor = @import("Executor.zig");
@@ -28,6 +29,97 @@ test "executes static simple commands through the host" {
     try std.testing.expectEqualStrings("x y", argv[2]);
     try std.testing.expectEqualStrings("", argv[3]);
     try std.testing.expectEqual(@as(usize, 1), fake.wait_calls.items.len);
+}
+
+test "lowers external command file redirects in source order" {
+    var hir = try generate("/bin/tool 3<input >output 2>>error");
+    defer hir.deinit(std.testing.allocator);
+
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+
+    _ = try preResolvedExecutor(std.testing.allocator, fake.host()).execute(hir);
+
+    const actions = fake.spawn_calls.items[0].file_actions;
+    try std.testing.expectEqual(@as(usize, 3), actions.len);
+
+    const input = actions[0].open;
+    try std.testing.expectEqual(@as(CommandPlan.FileDescriptor, @enumFromInt(3)), input.target);
+    try std.testing.expectEqual(.read, input.access);
+    try std.testing.expectEqual(.open_existing, input.disposition);
+    try std.testing.expectEqualStrings("input", input.path);
+
+    const output = actions[1].open;
+    try std.testing.expectEqual(CommandPlan.FileDescriptor.stdout, output.target);
+    try std.testing.expectEqual(.write, output.access);
+    try std.testing.expectEqual(.create_or_truncate, output.disposition);
+    try std.testing.expectEqualStrings("output", output.path);
+
+    const error_output = actions[2].open;
+    try std.testing.expectEqual(CommandPlan.FileDescriptor.stderr, error_output.target);
+    try std.testing.expectEqual(.write, error_output.access);
+    try std.testing.expectEqual(.create_or_append, error_output.disposition);
+    try std.testing.expectEqualStrings("error", error_output.path);
+}
+
+test "expands external command redirect paths" {
+    var hir = try generate("/bin/tool >\"$output\"");
+    defer hir.deinit(std.testing.allocator);
+
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+    try variables.set("output", "build result");
+
+    _ = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .resolver = CommandResolver.preResolved(),
+        .variables = &variables,
+    }).execute(hir);
+
+    try std.testing.expectEqualStrings(
+        "build result",
+        fake.spawn_calls.items[0].file_actions[0].open.path,
+    );
+}
+
+test "diagnoses invalid external command redirects before spawning" {
+    const Case = struct {
+        source: [:0]const u8,
+        message: []const u8,
+    };
+    const cases = [_]Case{
+        .{
+            .source = "/bin/tool >$outputs",
+            .message = "ambiguous redirect\n",
+        },
+        .{
+            .source = "/bin/tool 4294967296>output",
+            .message = "invalid file descriptor: 4294967296\n",
+        },
+    };
+
+    for (cases) |case| {
+        var hir = try generate(case.source);
+        defer hir.deinit(std.testing.allocator);
+        var fake = FakeHost.init(std.testing.allocator);
+        defer fake.deinit();
+        var variables = VariableStore.init(std.testing.allocator);
+        defer variables.deinit();
+        try variables.set("outputs", "one two");
+        var diagnostics: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer diagnostics.deinit();
+
+        const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+            .resolver = CommandResolver.preResolved(),
+            .variables = &variables,
+            .io = .{ .stderr = &diagnostics.writer },
+        }).execute(hir);
+
+        try std.testing.expectEqual(@as(u8, 1), result.status);
+        try std.testing.expectEqualStrings(case.message, diagnostics.written());
+        try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+    }
 }
 
 test "executes sequential lists and returns the last status" {

@@ -435,12 +435,37 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
     const expander = executor.wordExpander(allocator, null, &expansion_failure);
 
     var argv: std.ArrayList([]const u8) = .empty;
+    var file_actions: std.ArrayList(CommandPlan.FileAction) = .empty;
     const parts = hir.simpleCommandParts(index);
     var has_assignments = false;
+    var has_redirects = false;
     var has_words = false;
     for (parts) |part| {
         switch (hir.instructionTag(part)) {
             .assignment => has_assignments = true,
+            .redirect => {
+                has_redirects = true;
+                const redirect = hir.redirect(part);
+                const paths = expander.expandArgument(hir, redirect.target) catch |err| switch (err) {
+                    error.ParameterExpansionFailed => return executor.parameterExpansionFailure(
+                        allocator,
+                        expansion_failure,
+                    ),
+                    else => |other| return other,
+                };
+                if (paths.len != 1)
+                    return executor.redirectFailure(.ambiguous_redirect);
+
+                const target = if (redirect.io_number) |io_number|
+                    CommandPlan.FileDescriptor.parse(io_number) orelse
+                        return executor.redirectFailure(.{ .invalid_file_descriptor = io_number })
+                else
+                    defaultRedirectDescriptor(redirect.operator) orelse
+                        return error.UnsupportedInstruction;
+                const action = openRedirectAction(redirect.operator, target, paths[0]) orelse
+                    return error.UnsupportedInstruction;
+                try file_actions.append(allocator, action);
+            },
             .word => {
                 has_words = true;
                 const expanded = expander.expandArgument(hir, part) catch |err| switch (err) {
@@ -456,6 +481,7 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
         }
     }
     if (argv.items.len == 0) {
+        if (has_redirects) return error.UnsupportedInstruction;
         if (!has_assignments) return if (has_words)
             .{ .status = 0, .sandbox_coverage = .not_requested }
         else
@@ -498,16 +524,19 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
     }
     const builtin = Builtin.lookup(argv.items[0]);
     if (builtin) |candidate| {
-        if (candidate.special)
+        if (candidate.special) {
+            if (has_redirects) return error.UnsupportedInstruction;
             return executor.executeBuiltin(
                 candidate,
                 argv.items,
                 &command_variables,
                 has_assignments,
             );
+        }
     }
     if (executor.runtime_state) |state| {
         if (state.functionStore().contains(argv.items[0])) {
+            if (has_redirects) return error.UnsupportedInstruction;
             if (has_assignments) {
                 const mutable_variables = variables orelse unreachable;
                 try applyAssignments(mutable_variables, &command_variables);
@@ -515,13 +544,15 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
             return executor.executeFunction(argv.items);
         }
     }
-    if (builtin) |candidate|
+    if (builtin) |candidate| {
+        if (has_redirects) return error.UnsupportedInstruction;
         return executor.executeBuiltin(
             candidate,
             argv.items,
             &command_variables,
             has_assignments,
         );
+    }
 
     var process_environment = VariableStore.init(allocator);
     defer process_environment.deinit();
@@ -550,6 +581,7 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
         .argv = argv.items,
         .environment = environment,
         .cwd = if (executor.workingDirectory()) |cwd| .{ .path = cwd } else .inherit,
+        .file_actions = file_actions.items,
         .sandbox = executor.activeSandbox(),
     }) catch |err| switch (err) {
         error.CommandNotFound => return executor.commandFailure(argv.items[0], .command_not_found),
@@ -582,6 +614,43 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
         .status = try terminationStatus(try executor.host.wait(spawned.process)),
         .sandbox_coverage = spawned.sandbox_coverage,
     };
+}
+
+fn defaultRedirectDescriptor(operator: Hir.Redirect.Operator) ?CommandPlan.FileDescriptor {
+    return switch (operator) {
+        .input => .stdin,
+        .output, .append => .stdout,
+        else => null,
+    };
+}
+
+fn openRedirectAction(
+    operator: Hir.Redirect.Operator,
+    target: CommandPlan.FileDescriptor,
+    path: []const u8,
+) ?CommandPlan.FileAction {
+    const open: CommandPlan.FileAction.Open = switch (operator) {
+        .input => .{
+            .path = path,
+            .target = target,
+            .access = .read,
+            .disposition = .open_existing,
+        },
+        .output => .{
+            .path = path,
+            .target = target,
+            .access = .write,
+            .disposition = .create_or_truncate,
+        },
+        .append => .{
+            .path = path,
+            .target = target,
+            .access = .write,
+            .disposition = .create_or_append,
+        },
+        else => return null,
+    };
+    return .{ .open = open };
 }
 
 fn executeBuiltin(
@@ -709,6 +778,21 @@ fn commandFailure(
 ) std.Io.Writer.Error!Result {
     const diagnostic: runtime.Diagnostic = .{
         .subject = .{ .command = command },
+        .kind = kind,
+    };
+    try executor.io.reportDiagnostic(diagnostic);
+    return .{
+        .status = diagnostic.status(),
+        .sandbox_coverage = .not_requested,
+    };
+}
+
+fn redirectFailure(
+    executor: Executor,
+    kind: runtime.Diagnostic.Kind,
+) std.Io.Writer.Error!Result {
+    const diagnostic: runtime.Diagnostic = .{
+        .subject = .shell,
         .kind = kind,
     };
     try executor.io.reportDiagnostic(diagnostic);

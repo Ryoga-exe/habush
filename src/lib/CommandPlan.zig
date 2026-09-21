@@ -40,6 +40,11 @@ pub const FileDescriptor = enum(u32) {
     stdout = 1,
     stderr = 2,
     _,
+
+    pub fn parse(source: []const u8) ?FileDescriptor {
+        const value = std.fmt.parseUnsigned(u32, source, 10) catch return null;
+        return @enumFromInt(value);
+    }
 };
 
 /// Host-owned resource such as one endpoint of a pipe.
