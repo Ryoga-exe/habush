@@ -462,9 +462,42 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
                 else
                     defaultRedirectDescriptor(redirect.operator) orelse
                         return error.UnsupportedInstruction;
-                const action = openRedirectAction(redirect.operator, target, paths[0]) orelse
-                    return error.UnsupportedInstruction;
-                try file_actions.append(allocator, action);
+                switch (redirect.operator) {
+                    .duplicate_input, .duplicate_output => {
+                        if (std.mem.eql(u8, paths[0], "-")) {
+                            try file_actions.append(allocator, .{ .close = target });
+                        } else {
+                            const source = CommandPlan.FileDescriptor.parse(paths[0]) orelse
+                                return executor.redirectFailure(.{
+                                    .invalid_file_descriptor = paths[0],
+                                });
+                            try file_actions.append(allocator, .{ .duplicate = .{
+                                .source = source,
+                                .target = target,
+                            } });
+                        }
+                    },
+                    .output_both, .append_both => {
+                        const action = openRedirectAction(
+                            redirect.operator,
+                            target,
+                            paths[0],
+                        ) orelse return error.UnsupportedInstruction;
+                        try file_actions.append(allocator, action);
+                        try file_actions.append(allocator, .{ .duplicate = .{
+                            .source = target,
+                            .target = .stderr,
+                        } });
+                    },
+                    else => {
+                        const action = openRedirectAction(
+                            redirect.operator,
+                            target,
+                            paths[0],
+                        ) orelse return error.UnsupportedInstruction;
+                        try file_actions.append(allocator, action);
+                    },
+                }
             },
             .word => {
                 has_words = true;
@@ -602,8 +635,14 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
 
 fn defaultRedirectDescriptor(operator: Hir.Redirect.Operator) ?CommandPlan.FileDescriptor {
     return switch (operator) {
-        .input => .stdin,
-        .output, .append => .stdout,
+        .input, .duplicate_input, .input_output => .stdin,
+        .output,
+        .append,
+        .duplicate_output,
+        .clobber,
+        .output_both,
+        .append_both,
+        => .stdout,
         else => null,
     };
 }
@@ -627,6 +666,24 @@ fn openRedirectAction(
             .disposition = .create_or_truncate,
         },
         .append => .{
+            .path = path,
+            .target = target,
+            .access = .write,
+            .disposition = .create_or_append,
+        },
+        .input_output => .{
+            .path = path,
+            .target = target,
+            .access = .read_write,
+            .disposition = .create_or_open,
+        },
+        .clobber, .output_both => .{
+            .path = path,
+            .target = target,
+            .access = .write,
+            .disposition = .create_or_truncate,
+        },
+        .append_both => .{
             .path = path,
             .target = target,
             .access = .write,

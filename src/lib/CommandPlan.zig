@@ -72,6 +72,7 @@ pub const FileAction = union(enum) {
 
         pub const Disposition = enum {
             open_existing,
+            create_or_open,
             create_or_truncate,
             create_or_append,
             create_exclusive,

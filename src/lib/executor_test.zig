@@ -62,6 +62,30 @@ test "lowers external command file redirects in source order" {
     try std.testing.expectEqualStrings("error", error_output.path);
 }
 
+test "lowers read-write, clobber, descriptor, and both-stream redirects" {
+    var hir = try generate("/bin/tool <>rw >|out 2>&1 0<&- &>>both");
+    defer hir.deinit(std.testing.allocator);
+
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+
+    _ = try preResolvedExecutor(std.testing.allocator, fake.host()).execute(hir);
+
+    const actions = fake.spawn_calls.items[0].file_actions;
+    try std.testing.expectEqual(@as(usize, 6), actions.len);
+    try std.testing.expectEqual(CommandPlan.FileDescriptor.stdin, actions[0].open.target);
+    try std.testing.expectEqual(.read_write, actions[0].open.access);
+    try std.testing.expectEqual(.create_or_open, actions[0].open.disposition);
+    try std.testing.expectEqualStrings("rw", actions[0].open.path);
+    try std.testing.expectEqual(.create_or_truncate, actions[1].open.disposition);
+    try std.testing.expectEqual(CommandPlan.FileDescriptor.stdout, actions[2].duplicate.source);
+    try std.testing.expectEqual(CommandPlan.FileDescriptor.stderr, actions[2].duplicate.target);
+    try std.testing.expectEqual(CommandPlan.FileDescriptor.stdin, actions[3].close);
+    try std.testing.expectEqual(.create_or_append, actions[4].open.disposition);
+    try std.testing.expectEqual(CommandPlan.FileDescriptor.stdout, actions[5].duplicate.source);
+    try std.testing.expectEqual(CommandPlan.FileDescriptor.stderr, actions[5].duplicate.target);
+}
+
 test "expands external command redirect paths" {
     var hir = try generate("/bin/tool >\"$output\"");
     defer hir.deinit(std.testing.allocator);
