@@ -576,7 +576,7 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
         error.OutOfMemory, error.Unexpected => return err,
     }) orelse return executor.commandFailure(argv.items[0], .command_not_found);
 
-    const spawned = executor.host.spawn(.{
+    const spawn_outcome = executor.host.spawn(.{
         .executable = executable,
         .argv = argv.items,
         .environment = environment,
@@ -584,31 +584,15 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
         .file_actions = file_actions.items,
         .sandbox = executor.activeSandbox(),
     }) catch |err| switch (err) {
-        error.CommandNotFound => return executor.commandFailure(argv.items[0], .command_not_found),
-        error.AccessDenied => return executor.commandFailure(
+        error.OutOfMemory, error.InvalidArguments, error.Unexpected => return err,
+    };
+    const spawned = switch (spawn_outcome) {
+        .spawned => |spawned| spawned,
+        .failed => |failure| return executor.spawnFailure(
             argv.items[0],
-            .{ .cannot_execute = .access_denied },
+            file_actions.items,
+            failure,
         ),
-        error.InvalidExecutable => return executor.commandFailure(
-            argv.items[0],
-            .{ .cannot_execute = .invalid_executable },
-        ),
-        error.ResourceUnavailable => return executor.commandFailure(
-            argv.items[0],
-            .{ .cannot_execute = .resource_unavailable },
-        ),
-        error.SandboxUnavailable => return executor.commandFailure(
-            argv.items[0],
-            .{ .cannot_execute = .sandbox_unavailable },
-        ),
-        error.Unsupported => return executor.commandFailure(
-            argv.items[0],
-            .{ .cannot_execute = .unsupported },
-        ),
-        error.OutOfMemory,
-        error.InvalidArguments,
-        error.Unexpected,
-        => return err,
     };
     return .{
         .status = try terminationStatus(try executor.host.wait(spawned.process)),
@@ -799,6 +783,62 @@ fn redirectFailure(
     return .{
         .status = diagnostic.status(),
         .sandbox_coverage = .not_requested,
+    };
+}
+
+fn spawnFailure(
+    executor: Executor,
+    command: []const u8,
+    file_actions: []const CommandPlan.FileAction,
+    failure: Host.SpawnFailure,
+) Error!Result {
+    return switch (failure) {
+        .command_not_found => executor.commandFailure(command, .command_not_found),
+        .access_denied => executor.commandFailure(
+            command,
+            .{ .cannot_execute = .access_denied },
+        ),
+        .invalid_executable => executor.commandFailure(
+            command,
+            .{ .cannot_execute = .invalid_executable },
+        ),
+        .resource_unavailable => executor.commandFailure(
+            command,
+            .{ .cannot_execute = .resource_unavailable },
+        ),
+        .sandbox_unavailable => executor.commandFailure(
+            command,
+            .{ .cannot_execute = .sandbox_unavailable },
+        ),
+        .unsupported => executor.commandFailure(
+            command,
+            .{ .cannot_execute = .unsupported },
+        ),
+        .file_action => |file_action| {
+            const action_index = std.math.cast(usize, file_action.action_index) orelse
+                return error.Unexpected;
+            if (action_index >= file_actions.len) return error.Unexpected;
+            const path = switch (file_actions[action_index]) {
+                .open => |open| open.path,
+                else => return error.Unexpected,
+            };
+            const diagnostic: runtime.Diagnostic = .{
+                .subject = .{ .path = path },
+                .kind = .{ .cannot_open = switch (file_action.reason) {
+                    .not_found => .not_found,
+                    .access_denied => .access_denied,
+                    .invalid_path => .invalid_path,
+                    .path_already_exists => .path_already_exists,
+                    .resource_unavailable => .resource_unavailable,
+                    .unsupported => .unsupported,
+                } },
+            };
+            try executor.io.reportDiagnostic(diagnostic);
+            return .{
+                .status = diagnostic.status(),
+                .sandbox_coverage = .not_requested,
+            };
+        },
     };
 }
 

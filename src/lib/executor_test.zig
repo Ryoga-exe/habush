@@ -122,6 +122,30 @@ test "diagnoses invalid external command redirects before spawning" {
     }
 }
 
+test "reports the path and reason for host file action failures" {
+    var hir = try generate("/bin/tool <input");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    fake.spawn_failure = .{ .file_action = .{
+        .action_index = 0,
+        .reason = .not_found,
+    } };
+    var diagnostics: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer diagnostics.deinit();
+
+    const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .resolver = CommandResolver.preResolved(),
+        .io = .{ .stderr = &diagnostics.writer },
+    }).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 1), result.status);
+    try std.testing.expectEqualStrings(
+        "input: no such file or directory\n",
+        diagnostics.written(),
+    );
+}
+
 test "executes sequential lists and returns the last status" {
     var hir = try generate("/bin/first; /bin/second\n/bin/third");
     defer hir.deinit(std.testing.allocator);
@@ -1095,38 +1119,38 @@ test "reports denied command resolution as not executable" {
 
 test "reports host spawn failures as command diagnostics" {
     const Case = struct {
-        host_error: @import("Host.zig").Error,
+        spawn_failure: @import("Host.zig").SpawnFailure,
         status: u8,
         message: []const u8,
     };
     const cases = [_]Case{
         .{
-            .host_error = error.CommandNotFound,
+            .spawn_failure = .command_not_found,
             .status = 127,
             .message = "tool: command not found\n",
         },
         .{
-            .host_error = error.AccessDenied,
+            .spawn_failure = .access_denied,
             .status = 126,
             .message = "tool: permission denied\n",
         },
         .{
-            .host_error = error.InvalidExecutable,
+            .spawn_failure = .invalid_executable,
             .status = 126,
             .message = "tool: invalid executable\n",
         },
         .{
-            .host_error = error.ResourceUnavailable,
+            .spawn_failure = .resource_unavailable,
             .status = 126,
             .message = "tool: system resources unavailable\n",
         },
         .{
-            .host_error = error.SandboxUnavailable,
+            .spawn_failure = .sandbox_unavailable,
             .status = 126,
             .message = "tool: required sandbox unavailable\n",
         },
         .{
-            .host_error = error.Unsupported,
+            .spawn_failure = .unsupported,
             .status = 126,
             .message = "tool: operation not supported\n",
         },
@@ -1137,7 +1161,7 @@ test "reports host spawn failures as command diagnostics" {
     for (cases) |case| {
         var fake_host = FakeHost.init(std.testing.allocator);
         defer fake_host.deinit();
-        fake_host.spawn_error = case.host_error;
+        fake_host.spawn_failure = case.spawn_failure;
         var fake_resolver = FakeResolver.init(std.testing.allocator);
         defer fake_resolver.deinit();
         fake_resolver.result = "/bin/tool";

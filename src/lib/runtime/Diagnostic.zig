@@ -28,6 +28,7 @@ pub const Kind = union(enum) {
     parameter_expansion: ParameterExpansion,
     ambiguous_redirect,
     invalid_file_descriptor: []const u8,
+    cannot_open: CannotOpenReason,
     invalid_name: []const u8,
     cannot_change_directory: []const u8,
     working_directory_unavailable,
@@ -49,6 +50,15 @@ pub const CannotExecuteReason = enum {
     unsupported,
 };
 
+pub const CannotOpenReason = enum {
+    not_found,
+    access_denied,
+    invalid_path,
+    path_already_exists,
+    resource_unavailable,
+    unsupported,
+};
+
 pub const RenderOptions = struct {
     program_name: ?[]const u8 = null,
 };
@@ -67,6 +77,7 @@ pub fn status(diagnostic: Diagnostic) types.ExitStatus {
         .parameter_expansion,
         .ambiguous_redirect,
         .invalid_file_descriptor,
+        .cannot_open,
         .invalid_name,
         .cannot_change_directory,
         .working_directory_unavailable,
@@ -112,6 +123,14 @@ pub fn render(
             "invalid file descriptor: {s}",
             .{descriptor},
         ),
+        .cannot_open => |reason| switch (reason) {
+            .not_found => try writer.writeAll("no such file or directory"),
+            .access_denied => try writer.writeAll("permission denied"),
+            .invalid_path => try writer.writeAll("invalid path"),
+            .path_already_exists => try writer.writeAll("file exists"),
+            .resource_unavailable => try writer.writeAll("system resources unavailable"),
+            .unsupported => try writer.writeAll("operation not supported"),
+        },
         .invalid_name => |name| try writer.print("invalid name: {s}", .{name}),
         .cannot_change_directory => |path| try writer.print("cannot change directory: {s}", .{path}),
         .working_directory_unavailable => try writer.writeAll("working directory unavailable"),

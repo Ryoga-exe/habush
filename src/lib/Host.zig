@@ -16,7 +16,7 @@ userdata: ?*anyopaque,
 vtable: *const VTable,
 
 pub const VTable = struct {
-    spawn: *const fn (?*anyopaque, CommandPlan) Error!SpawnResult,
+    spawn: *const fn (?*anyopaque, CommandPlan) SpawnError!SpawnOutcome,
     wait: *const fn (?*anyopaque, Process) Error!Termination,
     resolve_working_directory: ?*const fn (
         ?*anyopaque,
@@ -37,6 +37,14 @@ pub const Error = error{
     Unexpected,
 };
 
+/// Infrastructure failures that prevent a spawn attempt from producing a
+/// shell-visible `SpawnOutcome`.
+pub const SpawnError = error{
+    OutOfMemory,
+    InvalidArguments,
+    Unexpected,
+};
+
 /// An opaque process handle owned by the host implementation.
 pub const Process = enum(u32) {
     _,
@@ -47,6 +55,38 @@ pub const SpawnResult = struct {
     /// Populated when this spawn created or joined a process group.
     process_group: ?CommandPlan.ProcessGroup = null,
     sandbox_coverage: SandboxPolicy.Coverage,
+};
+
+/// The expected outcome of attempting to spawn a command. Infrastructure
+/// failures continue to use `Error`; shell-visible failures are structured so
+/// the runtime can render an accurate diagnostic.
+pub const SpawnOutcome = union(enum) {
+    spawned: SpawnResult,
+    failed: SpawnFailure,
+};
+
+pub const SpawnFailure = union(enum) {
+    command_not_found,
+    access_denied,
+    invalid_executable,
+    resource_unavailable,
+    sandbox_unavailable,
+    unsupported,
+    file_action: FileActionFailure,
+};
+
+pub const FileActionFailure = struct {
+    action_index: u32,
+    reason: Reason,
+
+    pub const Reason = enum {
+        not_found,
+        access_denied,
+        invalid_path,
+        path_already_exists,
+        resource_unavailable,
+        unsupported,
+    };
 };
 
 pub const WorkingDirectoryRequest = struct {
@@ -63,7 +103,7 @@ pub const Termination = union(enum) {
     unknown: u32,
 };
 
-pub fn spawn(host: Host, plan: CommandPlan) Error!SpawnResult {
+pub fn spawn(host: Host, plan: CommandPlan) SpawnError!SpawnOutcome {
     plan.validate() catch return error.InvalidArguments;
     return host.vtable.spawn(host.userdata, plan);
 }

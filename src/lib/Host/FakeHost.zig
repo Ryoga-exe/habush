@@ -11,7 +11,8 @@ resolve_working_directory_calls: std.ArrayList(Host.WorkingDirectoryRequest) = .
 next_process: u32 = 1,
 next_process_group: u32 = 1,
 termination: Host.Termination = .{ .exited = 0 },
-spawn_error: ?Host.Error = null,
+spawn_error: ?Host.SpawnError = null,
+spawn_failure: ?Host.SpawnFailure = null,
 wait_error: ?Host.Error = null,
 resolve_working_directory_error: ?Host.Error = null,
 working_directory_result: ?[]const u8 = null,
@@ -39,9 +40,10 @@ const vtable: Host.VTable = .{
     .resolve_working_directory = resolveWorkingDirectory,
 };
 
-fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.Error!Host.SpawnResult {
+fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.SpawnError!Host.SpawnOutcome {
     const fake: *FakeHost = @ptrCast(@alignCast(userdata.?));
     if (fake.spawn_error) |err| return err;
+    if (fake.spawn_failure) |failure| return .{ .failed = failure };
 
     const allocator = fake.arena.allocator();
     try fake.spawn_calls.append(allocator, try clonePlan(allocator, plan));
@@ -61,11 +63,11 @@ fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.Error!Host.SpawnResult {
         .inherit => .not_requested,
         .restrict => .complete,
     };
-    return .{
+    return .{ .spawned = .{
         .process = process,
         .process_group = process_group,
         .sandbox_coverage = sandbox_coverage,
-    };
+    } };
 }
 
 fn clonePlan(allocator: std.mem.Allocator, plan: CommandPlan) !CommandPlan {
