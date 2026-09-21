@@ -25,12 +25,16 @@ sandbox: CommandPlan.Sandbox,
 resolver: ?CommandResolver,
 search_path: []const []const u8,
 positional_parameters: []const []const u8,
+positional_parameters_override: ?[]const []const u8,
 cwd: ?[]const u8,
 variables: ?*VariableStore,
 runtime_state: ?*runtime.State,
 io: runtime.Io,
 last_status: u8,
 loop_depth: u32,
+function_depth: u32,
+
+const max_function_depth = 64;
 
 /// Failures that prevent the runtime from producing a shell-visible `Result`.
 /// Expected command failures are reported through `Result.status` and, when
@@ -40,6 +44,7 @@ pub const Error = Builtin.Error || Host.Error || Expander.Error || CommandResolv
     CommandResolutionUnavailable,
     UnexpectedTermination,
     VariableStateUnavailable,
+    FunctionStateUnavailable,
 };
 
 pub const Options = struct {
@@ -75,12 +80,14 @@ pub fn initWithOptions(gpa: std.mem.Allocator, host: Host, options: Options) Exe
         .resolver = options.resolver,
         .search_path = options.search_path,
         .positional_parameters = options.positional_parameters,
+        .positional_parameters_override = null,
         .cwd = options.cwd,
         .variables = options.variables,
         .runtime_state = null,
         .io = options.io,
         .last_status = options.last_status,
         .loop_depth = 0,
+        .function_depth = 0,
     };
 }
 
@@ -98,12 +105,14 @@ pub fn initWithState(
         .resolver = resolver,
         .search_path = &.{},
         .positional_parameters = &.{},
+        .positional_parameters_override = null,
         .cwd = null,
         .variables = null,
         .runtime_state = state,
         .io = io,
         .last_status = last_status,
         .loop_depth = 0,
+        .function_depth = 0,
     };
 }
 
@@ -126,9 +135,17 @@ fn executeInstruction(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error
         .if_clause => executor.executeIfClause(hir, index),
         .while_clause, .until_clause => executor.executeLoopClause(hir, index),
         .for_clause => executor.executeForClause(hir, index),
+        .function_definition => executor.executeFunctionDefinition(hir, index),
         .simple_command => executor.executeSimpleCommand(hir, index),
         else => error.UnsupportedInstruction,
     };
+}
+
+fn executeFunctionDefinition(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
+    const state = executor.runtime_state orelse return error.FunctionStateUnavailable;
+    const definition = hir.functionDefinition(index);
+    try state.defineFunction(definition.name, hir, definition.body);
+    return .{ .status = 0, .sandbox_coverage = .not_requested };
 }
 
 fn executeSubshell(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
@@ -423,25 +440,32 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
             try command_variables.set(assignment.name, value);
         }
     }
-    if (Builtin.lookup(argv.items[0])) |builtin| {
-        if (builtin.special and has_assignments) {
-            const mutable_variables = variables orelse return error.VariableStateUnavailable;
-            try applyAssignments(mutable_variables, &command_variables);
-        }
-        const result = try builtin.run(.{
-            .host = executor.host,
-            .runtime_state = executor.runtime_state,
-            .variable_overrides = &command_variables,
-            .io = executor.io,
-            .last_status = executor.last_status,
-            .loop_depth = executor.loop_depth,
-        }, argv.items);
-        return .{
-            .status = result.status,
-            .sandbox_coverage = .not_requested,
-            .control_flow = result.control_flow,
-        };
+    const builtin = Builtin.lookup(argv.items[0]);
+    if (builtin) |candidate| {
+        if (candidate.special)
+            return executor.executeBuiltin(
+                candidate,
+                argv.items,
+                &command_variables,
+                has_assignments,
+            );
     }
+    if (executor.runtime_state) |state| {
+        if (state.functionStore().contains(argv.items[0])) {
+            if (has_assignments) {
+                const mutable_variables = variables orelse unreachable;
+                try applyAssignments(mutable_variables, &command_variables);
+            }
+            return executor.executeFunction(argv.items);
+        }
+    }
+    if (builtin) |candidate|
+        return executor.executeBuiltin(
+            candidate,
+            argv.items,
+            &command_variables,
+            has_assignments,
+        );
 
     var process_environment = VariableStore.init(allocator);
     defer process_environment.deinit();
@@ -504,6 +528,48 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
     };
 }
 
+fn executeBuiltin(
+    executor: Executor,
+    builtin: Builtin,
+    argv: []const []const u8,
+    command_variables: *const VariableStore,
+    has_assignments: bool,
+) Error!Result {
+    if (builtin.special and has_assignments) {
+        const mutable_variables = executor.variableStore() orelse
+            return error.VariableStateUnavailable;
+        try applyAssignments(mutable_variables, command_variables);
+    }
+    const result = try builtin.run(.{
+        .host = executor.host,
+        .runtime_state = executor.runtime_state,
+        .variable_overrides = command_variables,
+        .io = executor.io,
+        .last_status = executor.last_status,
+        .loop_depth = executor.loop_depth,
+    }, argv);
+    return .{
+        .status = result.status,
+        .sandbox_coverage = .not_requested,
+        .control_flow = result.control_flow,
+    };
+}
+
+fn executeFunction(executor: Executor, argv: []const []const u8) Error!Result {
+    if (executor.function_depth == max_function_depth)
+        return executor.commandFailure(argv[0], .function_call_depth_exceeded);
+
+    const state = executor.runtime_state orelse return error.FunctionStateUnavailable;
+    var definition = (try state.cloneFunction(argv[0], executor.gpa)) orelse unreachable;
+    defer definition.deinit(executor.gpa);
+
+    var function_executor = executor;
+    function_executor.positional_parameters_override = argv[1..];
+    function_executor.loop_depth = 0;
+    function_executor.function_depth += 1;
+    return function_executor.executeInstruction(definition.hir, definition.body);
+}
+
 fn variableStore(executor: Executor) ?*VariableStore {
     if (executor.runtime_state) |state| return state.variableStore();
     return executor.variables;
@@ -520,6 +586,7 @@ fn commandSearchPath(executor: Executor) []const []const u8 {
 }
 
 fn positionalParameters(executor: Executor) []const []const u8 {
+    if (executor.positional_parameters_override) |parameters| return parameters;
     if (executor.runtime_state) |state| return state.positionalParameters();
     return executor.positional_parameters;
 }

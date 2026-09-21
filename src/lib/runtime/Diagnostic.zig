@@ -26,6 +26,7 @@ pub const Kind = union(enum) {
     invalid_name: []const u8,
     cannot_change_directory: []const u8,
     working_directory_unavailable,
+    function_call_depth_exceeded,
     command_not_found,
     cannot_execute: CannotExecuteReason,
 };
@@ -55,6 +56,7 @@ pub fn status(diagnostic: Diagnostic) u8 {
         .invalid_name,
         .cannot_change_directory,
         .working_directory_unavailable,
+        .function_call_depth_exceeded,
         => 1,
         .command_not_found => 127,
         .cannot_execute => 126,
@@ -89,6 +91,7 @@ pub fn render(
         .invalid_name => |name| try writer.print("invalid name: {s}", .{name}),
         .cannot_change_directory => |path| try writer.print("cannot change directory: {s}", .{path}),
         .working_directory_unavailable => try writer.writeAll("working directory unavailable"),
+        .function_call_depth_exceeded => try writer.writeAll("maximum function call depth exceeded"),
         .command_not_found => try writer.writeAll("command not found"),
         .cannot_execute => |reason| switch (reason) {
             .access_denied => try writer.writeAll("permission denied"),
