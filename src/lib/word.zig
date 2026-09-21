@@ -25,6 +25,70 @@ pub const Part = struct {
     };
 };
 
+pub const ParameterExpansion = struct {
+    parameter: []const u8,
+    operator: ?Operator = null,
+    word: []const u8 = "",
+
+    pub const Operator = enum {
+        default_if_unset,
+        default_if_unset_or_null,
+        assign_if_unset,
+        assign_if_unset_or_null,
+        error_if_unset,
+        error_if_unset_or_null,
+        alternative_if_set,
+        alternative_if_set_and_not_null,
+    };
+
+    pub fn parse(source: []const u8) ?ParameterExpansion {
+        const parameter_end = parameterEnd(source) orelse return null;
+        if (parameter_end == source.len) {
+            return .{ .parameter = source };
+        }
+
+        const operator_source = source[parameter_end..];
+        const operator: Operator, const operator_len: usize = if (std.mem.startsWith(
+            u8,
+            operator_source,
+            ":-",
+        ))
+            .{ .default_if_unset_or_null, 2 }
+        else if (std.mem.startsWith(u8, operator_source, ":="))
+            .{ .assign_if_unset_or_null, 2 }
+        else if (std.mem.startsWith(u8, operator_source, ":?"))
+            .{ .error_if_unset_or_null, 2 }
+        else if (std.mem.startsWith(u8, operator_source, ":+"))
+            .{ .alternative_if_set_and_not_null, 2 }
+        else switch (operator_source[0]) {
+            '-' => .{ .default_if_unset, 1 },
+            '=' => .{ .assign_if_unset, 1 },
+            '?' => .{ .error_if_unset, 1 },
+            '+' => .{ .alternative_if_set, 1 },
+            else => return null,
+        };
+        return .{
+            .parameter = source[0..parameter_end],
+            .operator = operator,
+            .word = source[parameter_end + operator_len ..],
+        };
+    }
+
+    fn parameterEnd(source: []const u8) ?usize {
+        if (source.len == 0) return null;
+        if (isSpecialParameter(source[0])) return 1;
+        if (std.ascii.isDigit(source[0])) {
+            var end: usize = 1;
+            while (end < source.len and std.ascii.isDigit(source[end])) : (end += 1) {}
+            return end;
+        }
+        if (!isNameStart(source[0])) return null;
+        var end: usize = 1;
+        while (end < source.len and isNameContinue(source[end])) : (end += 1) {}
+        return end;
+    }
+};
+
 pub const Incomplete = struct {
     tag: Tag,
     opened_at: ByteOffset,
@@ -387,6 +451,33 @@ test "iterates positional and special parameters" {
     }
     try std.testing.expect(iterator.next() == null);
     try std.testing.expect(iterator.status == .complete);
+}
+
+test "parses braced parameter expansion operators" {
+    const expected = [_]struct { []const u8, ParameterExpansion.Operator }{
+        .{ "name-word", .default_if_unset },
+        .{ "name:-word", .default_if_unset_or_null },
+        .{ "name=word", .assign_if_unset },
+        .{ "name:=word", .assign_if_unset_or_null },
+        .{ "name?word", .error_if_unset },
+        .{ "name:?word", .error_if_unset_or_null },
+        .{ "name+word", .alternative_if_set },
+        .{ "name:+word", .alternative_if_set_and_not_null },
+    };
+    for (expected) |item| {
+        const expansion = ParameterExpansion.parse(item[0]).?;
+        try std.testing.expectEqualStrings("name", expansion.parameter);
+        try std.testing.expectEqual(item[1], expansion.operator.?);
+        try std.testing.expectEqualStrings("word", expansion.word);
+    }
+
+    const plain = ParameterExpansion.parse("10").?;
+    try std.testing.expectEqualStrings("10", plain.parameter);
+    try std.testing.expectEqual(null, plain.operator);
+    try std.testing.expectEqualStrings("", plain.word);
+
+    try std.testing.expect(ParameterExpansion.parse("") == null);
+    try std.testing.expect(ParameterExpansion.parse("name:word") == null);
 }
 
 test "double quote backslash follows shell rules" {
