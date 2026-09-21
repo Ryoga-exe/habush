@@ -7,6 +7,7 @@
 const std = @import("std");
 const CommandPlan = @import("../CommandPlan.zig");
 const Host = @import("../Host.zig");
+const append_file = @import("System/append_file.zig");
 const System = @This();
 
 gpa: std.mem.Allocator,
@@ -200,16 +201,13 @@ fn openRedirectFile(
             }),
         .create_or_open => createRedirectFile(io, directory, open, absolute, false, false),
         .create_or_truncate => createRedirectFile(io, directory, open, absolute, true, false),
-        .create_or_append => append: {
-            const file = try createRedirectFile(io, directory, open, absolute, false, false);
-            errdefer file.close(io);
-            // `std.Io` does not currently expose a portable append-open flag.
-            // The inherited file position still gives ordinary foreground
-            // commands append behavior, but concurrent writers are not atomic.
-            var writer = file.writerStreaming(io, &.{});
-            try writer.seekTo(try file.length(io));
-            break :append file;
-        },
+        .create_or_append => append_file.open(
+            io,
+            directory,
+            open.path,
+            absolute,
+            open.access == .read_write,
+        ),
         .create_exclusive => createRedirectFile(io, directory, open, absolute, true, true),
     };
 }
