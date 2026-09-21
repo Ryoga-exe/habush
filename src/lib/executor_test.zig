@@ -781,6 +781,32 @@ test "parameter assignment persists in shell variable state" {
     );
 }
 
+test "parameter expansion failures become shell diagnostics" {
+    var hir = try generate("/bin/not-run ${missing:?custom message}");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+    var diagnostics: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer diagnostics.deinit();
+
+    const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .variables = &variables,
+        .io = .{
+            .stderr = &diagnostics.writer,
+            .diagnostic_options = .{ .program_name = "habush" },
+        },
+    }).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 1), result.status);
+    try std.testing.expectEqualStrings(
+        "habush: missing: custom message\n",
+        diagnostics.written(),
+    );
+    try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+}
+
 test "unsupported expansions have no host side effects" {
     const cases = [_]struct { [:0]const u8, anyerror }{
         .{ "/bin/echo *.zig", error.PathnameExpansionUnsupported },

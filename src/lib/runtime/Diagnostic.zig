@@ -24,12 +24,18 @@ pub const Kind = union(enum) {
     not_in_loop,
     not_in_function,
     variable_not_set: []const u8,
+    parameter_expansion: ParameterExpansion,
     invalid_name: []const u8,
     cannot_change_directory: []const u8,
     working_directory_unavailable,
     function_call_depth_exceeded,
     command_not_found,
     cannot_execute: CannotExecuteReason,
+};
+
+pub const ParameterExpansion = struct {
+    parameter: []const u8,
+    message: []const u8,
 };
 
 pub const CannotExecuteReason = enum {
@@ -55,6 +61,7 @@ pub fn status(diagnostic: Diagnostic) u8 {
         .not_in_loop,
         .not_in_function,
         .variable_not_set,
+        .parameter_expansion,
         .invalid_name,
         .cannot_change_directory,
         .working_directory_unavailable,
@@ -91,6 +98,10 @@ pub fn render(
         .not_in_loop => try writer.writeAll("not in a loop"),
         .not_in_function => try writer.writeAll("not in a function"),
         .variable_not_set => |name| try writer.print("{s} not set", .{name}),
+        .parameter_expansion => |failure| try writer.print(
+            "{s}: {s}",
+            .{ failure.parameter, failure.message },
+        ),
         .invalid_name => |name| try writer.print("invalid name: {s}", .{name}),
         .cannot_change_directory => |path| try writer.print("cannot change directory: {s}", .{path}),
         .working_directory_unavailable => try writer.writeAll("working directory unavailable"),

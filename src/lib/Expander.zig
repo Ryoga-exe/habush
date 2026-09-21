@@ -15,6 +15,7 @@ pub const Context = struct {
     invocation_name: ?[]const u8 = null,
     positional_parameters: []const []const u8 = &.{},
     last_status: u8 = 0,
+    failure: ?*Failure = null,
 
     fn variable(context: Context, name: []const u8) ?[]const u8 {
         if (context.overrides) |overrides| {
@@ -27,9 +28,20 @@ pub const Context = struct {
 
 pub const Error = std.mem.Allocator.Error || error{
     ParameterAssignmentUnavailable,
+    ParameterExpansionFailed,
     ParameterExpansionUnsupported,
     PathnameExpansionUnsupported,
     TildeExpansionUnsupported,
+};
+
+pub const Failure = struct {
+    parameter: []const u8,
+    message: []const u8,
+    owns_message: bool = false,
+
+    pub fn deinit(failure: Failure, allocator: std.mem.Allocator) void {
+        if (failure.owns_message) allocator.free(failure.message);
+    }
 };
 
 pub fn init(allocator: std.mem.Allocator) Expander {
@@ -249,6 +261,7 @@ fn appendBracedArgumentParameter(
                 current_field_active,
             );
         },
+        .fail => try expander.failParameter(expansion, quoted),
     }
 }
 
@@ -346,6 +359,7 @@ fn appendBracedAssignmentParameter(
             defer expander.allocator.free(assigned);
             try bytes.appendSlice(expander.allocator, assigned);
         },
+        .fail => try expander.failParameter(expansion, quoted),
     }
 }
 
@@ -388,6 +402,35 @@ fn assignParameter(
         error.InvalidName => unreachable,
     };
     return value;
+}
+
+fn failParameter(
+    expander: Expander,
+    expansion: Word.ParameterExpansion,
+    quoted: bool,
+) Error!void {
+    const default_message = switch (expansion.operator.?) {
+        .error_if_unset => "parameter not set",
+        .error_if_unset_or_null => "parameter null or not set",
+        else => unreachable,
+    };
+    var failure: Failure = .{
+        .parameter = expansion.parameter,
+        .message = default_message,
+    };
+    if (expansion.word.len != 0) {
+        var bytes: std.ArrayList(u8) = .empty;
+        errdefer bytes.deinit(expander.allocator);
+        try expander.appendExpansionWordScalar(&bytes, expansion.word, quoted);
+        failure.message = try bytes.toOwnedSlice(expander.allocator);
+        failure.owns_message = true;
+    }
+    if (expander.context.failure) |destination| {
+        destination.* = failure;
+    } else {
+        failure.deinit(expander.allocator);
+    }
+    return error.ParameterExpansionFailed;
 }
 
 fn appendParameter(
@@ -449,6 +492,7 @@ const ParameterSelection = union(enum) {
     value: []const u8,
     word: []const u8,
     assign: []const u8,
+    fail,
     empty,
 };
 
@@ -473,9 +517,11 @@ fn selectParameterExpansion(
             if (set.len == 0) .{ .assign = expansion.word } else .{ .value = set }
         else
             .{ .assign = expansion.word },
-        .error_if_unset,
-        .error_if_unset_or_null,
-        => return error.ParameterExpansionUnsupported,
+        .error_if_unset => if (value) |set| .{ .value = set } else .fail,
+        .error_if_unset_or_null => if (value) |set|
+            if (set.len == 0) .fail else .{ .value = set }
+        else
+            .fail,
     };
 }
 

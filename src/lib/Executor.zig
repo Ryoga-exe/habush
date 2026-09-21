@@ -199,12 +199,21 @@ fn executeForClause(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!R
     const allocator = arena.allocator();
 
     var expanded_words: std.ArrayList([]const u8) = .empty;
+    var expansion_failure: Expander.Failure = undefined;
     const values = if (clause.implicit_positional_parameters)
         executor.positionalParameters()
     else values: {
-        const expander = executor.wordExpander(allocator, null);
-        for (clause.words) |word|
-            try expanded_words.appendSlice(allocator, try expander.expandArgument(hir, word));
+        const expander = executor.wordExpander(allocator, null, &expansion_failure);
+        for (clause.words) |word| {
+            const expanded = expander.expandArgument(hir, word) catch |err| switch (err) {
+                error.ParameterExpansionFailed => return executor.parameterExpansionFailure(
+                    allocator,
+                    expansion_failure,
+                ),
+                else => |other| return other,
+            };
+            try expanded_words.appendSlice(allocator, expanded);
+        }
         break :values expanded_words.items;
     };
 
@@ -418,7 +427,8 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
     defer arena.deinit();
     const allocator = arena.allocator();
     const variables = executor.variableStore();
-    const expander = executor.wordExpander(allocator, null);
+    var expansion_failure: Expander.Failure = undefined;
+    const expander = executor.wordExpander(allocator, null, &expansion_failure);
 
     var argv: std.ArrayList([]const u8) = .empty;
     const parts = hir.simpleCommandParts(index);
@@ -429,7 +439,14 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
             .assignment => has_assignments = true,
             .word => {
                 has_words = true;
-                try argv.appendSlice(allocator, try expander.expandArgument(hir, part));
+                const expanded = expander.expandArgument(hir, part) catch |err| switch (err) {
+                    error.ParameterExpansionFailed => return executor.parameterExpansionFailure(
+                        allocator,
+                        expansion_failure,
+                    ),
+                    else => |other| return other,
+                };
+                try argv.appendSlice(allocator, expanded);
             },
             else => return error.UnsupportedInstruction,
         }
@@ -442,7 +459,13 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
         const mutable_variables = variables orelse return error.VariableStateUnavailable;
         for (parts) |part| {
             const assignment = hir.assignment(part);
-            const value = try expander.expandAssignment(hir, assignment.value);
+            const value = expander.expandAssignment(hir, assignment.value) catch |err| switch (err) {
+                error.ParameterExpansionFailed => return executor.parameterExpansionFailure(
+                    allocator,
+                    expansion_failure,
+                ),
+                else => |other| return other,
+            };
             try mutable_variables.set(assignment.name, value);
         }
         return .{ .status = 0, .sandbox_coverage = .not_requested };
@@ -454,8 +477,18 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
         for (parts) |part| {
             if (hir.instructionTag(part) != .assignment) continue;
             const assignment = hir.assignment(part);
-            const assignment_expander = executor.wordExpander(allocator, &command_variables);
-            const value = try assignment_expander.expandAssignment(hir, assignment.value);
+            const assignment_expander = executor.wordExpander(
+                allocator,
+                &command_variables,
+                &expansion_failure,
+            );
+            const value = assignment_expander.expandAssignment(hir, assignment.value) catch |err| switch (err) {
+                error.ParameterExpansionFailed => return executor.parameterExpansionFailure(
+                    allocator,
+                    expansion_failure,
+                ),
+                else => |other| return other,
+            };
             try command_variables.set(assignment.name, value);
         }
     }
@@ -601,6 +634,7 @@ fn wordExpander(
     executor: Executor,
     allocator: std.mem.Allocator,
     overrides: ?*const VariableStore,
+    failure: *Expander.Failure,
 ) Expander {
     return Expander.initWithContext(allocator, .{
         .variables = executor.variableStore(),
@@ -608,7 +642,28 @@ fn wordExpander(
         .positional_parameters = executor.positionalParameters(),
         .invocation_name = executor.invocationName(),
         .last_status = executor.last_status,
+        .failure = failure,
     });
+}
+
+fn parameterExpansionFailure(
+    executor: Executor,
+    allocator: std.mem.Allocator,
+    failure: Expander.Failure,
+) std.Io.Writer.Error!Result {
+    defer failure.deinit(allocator);
+    const diagnostic: runtime.Diagnostic = .{
+        .subject = .shell,
+        .kind = .{ .parameter_expansion = .{
+            .parameter = failure.parameter,
+            .message = failure.message,
+        } },
+    };
+    try executor.io.reportDiagnostic(diagnostic);
+    return .{
+        .status = diagnostic.status(),
+        .sandbox_coverage = .not_requested,
+    };
 }
 
 fn workingDirectory(executor: Executor) ?[]const u8 {

@@ -29,9 +29,55 @@ test "expands and joins static argument parts" {
 }
 
 test "classifies unsupported argument expansions" {
-    try expectExpansionError("command \"${name:?fallback}\"", error.ParameterExpansionUnsupported);
+    try expectExpansionError("command $$", error.ParameterExpansionUnsupported);
     try expectExpansionError("command *.zig", error.PathnameExpansionUnsupported);
     try expectExpansionError("command ~other/work", error.TildeExpansionUnsupported);
+}
+
+test "error parameter operators expose expanded failure details" {
+    var hir = try generate("command \"${missing?custom $message}\"");
+    defer hir.deinit(std.testing.allocator);
+    const part = firstCommandParts(hir)[1];
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+    try variables.set("message", "message");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var failure: Expander.Failure = undefined;
+
+    try std.testing.expectError(
+        error.ParameterExpansionFailed,
+        Expander.initWithContext(arena.allocator(), .{
+            .variables = &variables,
+            .failure = &failure,
+        }).expandArgument(hir, part),
+    );
+    defer failure.deinit(arena.allocator());
+    try std.testing.expectEqualStrings("missing", failure.parameter);
+    try std.testing.expectEqualStrings("custom message", failure.message);
+}
+
+test "colon error parameter operator rejects null values" {
+    var hir = try generate("command \"${empty:?}\"");
+    defer hir.deinit(std.testing.allocator);
+    const part = firstCommandParts(hir)[1];
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+    try variables.set("empty", "");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var failure: Expander.Failure = undefined;
+
+    try std.testing.expectError(
+        error.ParameterExpansionFailed,
+        Expander.initWithContext(arena.allocator(), .{
+            .variables = &variables,
+            .failure = &failure,
+        }).expandArgument(hir, part),
+    );
+    defer failure.deinit(arena.allocator());
+    try std.testing.expectEqualStrings("empty", failure.parameter);
+    try std.testing.expectEqualStrings("parameter null or not set", failure.message);
 }
 
 test "expands current user tilde without field splitting" {
