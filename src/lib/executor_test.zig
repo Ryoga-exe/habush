@@ -188,6 +188,36 @@ test "pipeline negation preserves exit control flow and status" {
     try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
 }
 
+test "brace groups execute in the current shell state" {
+    var hir = try generate("name=before; { name=inside; false; }");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+
+    const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .variables = &variables,
+    }).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 1), result.status);
+    try std.testing.expect(result.control_flow.isNone());
+    try std.testing.expectEqualStrings("inside", variables.get("name").?);
+}
+
+test "brace groups propagate control flow" {
+    var hir = try generate("{ exit 7; /bin/skipped; }; /bin/skipped");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+
+    const result = try Executor.init(std.testing.allocator, fake.host()).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 7), result.status);
+    try std.testing.expectEqual(.exit, result.control_flow);
+    try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+}
+
 test "if clauses execute the selected branch" {
     const cases = [_]struct { [:0]const u8, u8 }{
         .{ "if true; then false; else true; fi", 1 },
@@ -675,6 +705,7 @@ test "unsupported execution forms fail before the current command has side effec
         "if persisted=changed; then true; fi >out",
         "while persisted=changed; do true; done >out",
         "for persisted in changed; do true; done >out",
+        "{ persisted=changed; } >out",
         "left &",
     };
 

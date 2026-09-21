@@ -1,11 +1,11 @@
 //! Executes Habush HIR through a `Host`.
 //!
 //! The current runtime foundation executes empty units, foreground sequential
-//! lists, and-or commands, pipeline negation, if clauses, while/until/for loops
-//! with break/continue control, standalone assignments, builtins, and external
-//! simple commands.
-//! Redirections, background execution, pipelines, compound commands, and
-//! compound control flow remain explicit `UnsupportedInstruction` boundaries.
+//! lists, and-or commands, pipeline negation, brace groups, if clauses,
+//! while/until/for loops with break/continue control, standalone assignments,
+//! builtins, and external simple commands.
+//! Redirections, background execution, pipelines, subshells, and function
+//! definitions remain explicit `UnsupportedInstruction` boundaries.
 
 const std = @import("std");
 const Builtin = @import("Builtin.zig");
@@ -121,12 +121,19 @@ fn executeInstruction(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error
         .list => executor.executeList(hir, index),
         .and_if, .or_if => executor.executeAndOr(hir, index),
         .negated_pipeline => executor.executeNegatedPipeline(hir, index),
+        .brace_group => executor.executeBraceGroup(hir, index),
         .if_clause => executor.executeIfClause(hir, index),
         .while_clause, .until_clause => executor.executeLoopClause(hir, index),
         .for_clause => executor.executeForClause(hir, index),
         .simple_command => executor.executeSimpleCommand(hir, index),
         else => error.UnsupportedInstruction,
     };
+}
+
+fn executeBraceGroup(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
+    const group = hir.groupedCommand(index);
+    if (group.redirects.len != 0) return error.UnsupportedInstruction;
+    return executor.executeInstruction(hir, group.body);
 }
 
 fn executeForClause(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
