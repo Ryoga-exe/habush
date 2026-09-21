@@ -61,6 +61,29 @@ pub fn deinit(state: *State) void {
     state.* = undefined;
 }
 
+pub fn clone(state: State) std.mem.Allocator.Error!State {
+    const cwd = if (state.cwd) |path| try state.gpa.dupe(u8, path) else null;
+    errdefer if (cwd) |path| state.gpa.free(path);
+
+    const search_path = try cloneStrings(state.gpa, state.search_path);
+    errdefer deinitStrings(state.gpa, search_path);
+
+    const positional_parameters = try cloneStrings(state.gpa, state.positional_parameters);
+    errdefer deinitStrings(state.gpa, positional_parameters);
+
+    var sandbox = try state.sandbox.clone(state.gpa);
+    errdefer sandbox.deinit(state.gpa);
+
+    return .{
+        .gpa = state.gpa,
+        .cwd = cwd,
+        .search_path = search_path,
+        .positional_parameters = positional_parameters,
+        .sandbox = sandbox,
+        .variables = try state.variables.clone(state.gpa),
+    };
+}
+
 pub fn allocator(state: State) std.mem.Allocator {
     return state.gpa;
 }
@@ -241,6 +264,45 @@ test "runtime state initialization handles every allocation failure" {
     );
 }
 
+test "runtime state clone is independent" {
+    const rules = [_]SandboxPolicy.PathRule{
+        .{ .path = "/allowed", .access = .{ .read = true } },
+    };
+    var state = try State.init(std.testing.allocator, .{
+        .cwd = "/old",
+        .search_path = &.{"/bin"},
+        .positional_parameters = &.{"argument"},
+        .sandbox = .{ .restrict = .{ .file_system = .{ .allow = &rules } } },
+        .variables = &.{.{ .name = "name", .value = "original", .exported = true }},
+    });
+    defer state.deinit();
+    var copy = try state.clone();
+    defer copy.deinit();
+
+    try copy.setWorkingDirectory("/new");
+    try copy.setCommandSearchPath(&.{"/usr/bin"});
+    try copy.setPositionalParameters(&.{"changed"});
+    try copy.setVariable("name", "changed");
+
+    try std.testing.expectEqualStrings("/old", state.workingDirectory().?);
+    try std.testing.expectEqualStrings("/bin", state.commandSearchPath()[0]);
+    try std.testing.expectEqualStrings("argument", state.positionalParameters()[0]);
+    try std.testing.expectEqualStrings("original", state.variable("name").?);
+    try std.testing.expect(state.isVariableExported("name"));
+    try std.testing.expectEqualStrings(
+        "/allowed",
+        state.activeSandbox().restrict.file_system.allow[0].path,
+    );
+}
+
+test "runtime state clone handles every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        cloneWithAllocator,
+        .{},
+    );
+}
+
 test "directory change updates PWD and OLDPWD atomically" {
     var state = try State.init(std.testing.allocator, .{
         .cwd = "/old",
@@ -306,6 +368,22 @@ fn initWithAllocator(gpa: std.mem.Allocator) !void {
         },
     });
     defer state.deinit();
+}
+
+fn cloneWithAllocator(gpa: std.mem.Allocator) !void {
+    const rules = [_]SandboxPolicy.PathRule{
+        .{ .path = "/workspace", .access = .{ .read = true } },
+    };
+    var state = try State.init(gpa, .{
+        .cwd = "/workspace",
+        .search_path = &.{"/bin"},
+        .positional_parameters = &.{"argument"},
+        .sandbox = .{ .restrict = .{ .file_system = .{ .allow = &rules } } },
+        .variables = &.{.{ .name = "name", .value = "value", .exported = true }},
+    });
+    defer state.deinit();
+    var copy = try state.clone();
+    defer copy.deinit();
 }
 
 test {
