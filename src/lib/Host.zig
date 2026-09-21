@@ -18,11 +18,23 @@ vtable: *const VTable,
 pub const VTable = struct {
     spawn: *const fn (?*anyopaque, CommandPlan) SpawnError!SpawnOutcome,
     wait: *const fn (?*anyopaque, Process) Error!Termination,
+    open_file: *const fn (
+        ?*anyopaque,
+        CommandPlan.WorkingDirectory,
+        CommandPlan.FileAction.Open,
+    ) SpawnError!OpenFileOutcome,
+    close_resource: *const fn (?*anyopaque, CommandPlan.Resource) void,
+    resource_writer: *const fn (?*anyopaque, CommandPlan.Resource) ?*std.Io.Writer,
     resolve_working_directory: ?*const fn (
         ?*anyopaque,
         std.mem.Allocator,
         WorkingDirectoryRequest,
     ) Error![]u8 = null,
+};
+
+pub const OpenFileOutcome = union(enum) {
+    opened: CommandPlan.Resource,
+    failed: FileActionFailure.Reason,
 };
 
 pub const Error = error{
@@ -110,6 +122,26 @@ pub fn spawn(host: Host, plan: CommandPlan) SpawnError!SpawnOutcome {
 
 pub fn wait(host: Host, process: Process) Error!Termination {
     return host.vtable.wait(host.userdata, process);
+}
+
+/// Opens a file once for a shell redirection scope. The returned resource may
+/// be inherited by child processes through `FileAction.use_resource`.
+pub fn openFile(
+    host: Host,
+    cwd: CommandPlan.WorkingDirectory,
+    open: CommandPlan.FileAction.Open,
+) SpawnError!OpenFileOutcome {
+    return host.vtable.open_file(host.userdata, cwd, open);
+}
+
+pub fn closeResource(host: Host, resource: CommandPlan.Resource) void {
+    host.vtable.close_resource(host.userdata, resource);
+}
+
+/// Returns the writer used by an in-process command for an opened resource.
+/// Read-only and unknown resources do not provide a writer.
+pub fn resourceWriter(host: Host, resource: CommandPlan.Resource) ?*std.Io.Writer {
+    return host.vtable.resource_writer(host.userdata, resource);
 }
 
 /// Resolves and validates a directory using the host platform's path rules.

@@ -16,12 +16,25 @@ io: std.Io,
 /// The caller retains ownership and must keep it alive while this host is used.
 environ_map: ?*const std.process.Environ.Map = null,
 children: std.AutoHashMapUnmanaged(Host.Process, std.process.Child) = .empty,
+resources: std.AutoHashMapUnmanaged(CommandPlan.Resource, *FileResource) = .empty,
 next_process: u32 = 1,
+next_resource: u32 = 1,
+
+const FileResource = struct {
+    file: std.Io.File,
+    writer: ?std.Io.File.Writer,
+};
 
 pub fn deinit(system: *System) void {
     var children = system.children.valueIterator();
     while (children.next()) |child| child.kill(system.io);
     system.children.deinit(system.gpa);
+    var resources = system.resources.valueIterator();
+    while (resources.next()) |resource| {
+        resource.*.file.close(system.io);
+        system.gpa.destroy(resource.*);
+    }
+    system.resources.deinit(system.gpa);
     system.* = undefined;
 }
 
@@ -35,6 +48,9 @@ pub fn host(system: *System) Host {
 const vtable: Host.VTable = .{
     .spawn = spawn,
     .wait = wait,
+    .open_file = openFile,
+    .close_resource = closeResource,
+    .resource_writer = resourceWriter,
     .resolve_working_directory = resolveWorkingDirectory,
 };
 
@@ -96,7 +112,13 @@ fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.SpawnError!Host.SpawnOut
                     return fileActionFailure(action_index, .unsupported);
                 bindings[target] = .close;
             },
-            .use_resource => return fileActionFailure(action_index, .unsupported),
+            .use_resource => |use| {
+                const target = stdioIndex(use.target) orelse
+                    return fileActionFailure(action_index, .unsupported);
+                const resource = system.resources.get(use.resource) orelse
+                    return fileActionFailure(action_index, .unsupported);
+                bindings[target] = .{ .file = resource.file };
+            },
         }
     }
 
@@ -142,6 +164,56 @@ fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.SpawnError!Host.SpawnOut
         .process = process,
         .sandbox_coverage = .not_requested,
     } };
+}
+
+fn openFile(
+    userdata: ?*anyopaque,
+    cwd: CommandPlan.WorkingDirectory,
+    open: CommandPlan.FileAction.Open,
+) Host.SpawnError!Host.OpenFileOutcome {
+    const system: *System = @ptrCast(@alignCast(userdata.?));
+    var working_directory: ?std.Io.Dir = null;
+    defer if (working_directory) |directory| directory.close(system.io);
+    working_directory = switch (cwd) {
+        .inherit => null,
+        .path => |path| std.Io.Dir.cwd().openDir(system.io, path, .{}) catch |err| {
+            return .{ .failed = fileActionReason(err) orelse return error.Unexpected };
+        },
+    };
+    const directory = working_directory orelse std.Io.Dir.cwd();
+    const file = openRedirectFile(system.io, directory, open) catch |err| {
+        return .{ .failed = fileActionReason(err) orelse return error.Unexpected };
+    };
+    errdefer file.close(system.io);
+
+    const resource_data = try system.gpa.create(FileResource);
+    errdefer system.gpa.destroy(resource_data);
+    resource_data.* = .{
+        .file = file,
+        .writer = if (open.access == .read)
+            null
+        else
+            file.writerStreaming(system.io, &.{}),
+    };
+    try system.resources.ensureUnusedCapacity(system.gpa, 1);
+    const resource: CommandPlan.Resource = @enumFromInt(system.next_resource);
+    system.next_resource +%= 1;
+    system.resources.putAssumeCapacityNoClobber(resource, resource_data);
+    return .{ .opened = resource };
+}
+
+fn closeResource(userdata: ?*anyopaque, resource: CommandPlan.Resource) void {
+    const system: *System = @ptrCast(@alignCast(userdata.?));
+    const data = system.resources.fetchRemove(resource) orelse return;
+    data.value.file.close(system.io);
+    system.gpa.destroy(data.value);
+}
+
+fn resourceWriter(userdata: ?*anyopaque, resource: CommandPlan.Resource) ?*std.Io.Writer {
+    const system: *System = @ptrCast(@alignCast(userdata.?));
+    const data = system.resources.get(resource) orelse return null;
+    const writer = &(data.writer orelse return null);
+    return &writer.interface;
 }
 
 const StdioBinding = union(enum) {
@@ -637,6 +709,43 @@ test "system host applies output file actions relative to the command directory"
     );
     defer std.testing.allocator.free(output);
     try std.testing.expectEqualStrings("firstsecond", output);
+}
+
+test "system host shares scoped output resources with child processes" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var directory_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const directory_len = try temporary.dir.realPath(std.testing.io, &directory_buffer);
+    const directory = directory_buffer[0..directory_len];
+
+    var system: System = .{ .gpa = std.testing.allocator, .io = std.testing.io };
+    defer system.deinit();
+    const system_host = system.host();
+    const opened = try system_host.openFile(.{ .path = directory }, .{
+        .path = "scoped.txt",
+        .target = .stdout,
+        .access = .write,
+        .disposition = .create_or_truncate,
+    });
+    const resource = opened.opened;
+    defer system_host.closeResource(resource);
+
+    try system_host.resourceWriter(resource).?.writeAll("builtin");
+    var child = outputCommand("external");
+    child.file_actions = &.{.{ .use_resource = .{
+        .resource = resource,
+        .target = .stdout,
+    } }};
+    try expectExitStatus(system_host, child, 0);
+
+    const output = try temporary.dir.readFileAlloc(
+        std.testing.io,
+        "scoped.txt",
+        std.testing.allocator,
+        .limited(64),
+    );
+    defer std.testing.allocator.free(output);
+    try std.testing.expectEqualStrings("builtinexternal", output);
 }
 
 test "system host duplicates redirected standard streams" {
