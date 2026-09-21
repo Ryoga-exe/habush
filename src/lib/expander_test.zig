@@ -80,6 +80,53 @@ test "default parameter operators support positional parameters" {
     }
 }
 
+test "alternative parameter operators distinguish set and non-null values" {
+    var hir = try generate(
+        "command \"${missing+alternative}\" \"${empty+alternative}\" " ++
+            "\"${empty:+alternative}\" \"${present:+alternative}\"",
+    );
+    defer hir.deinit(std.testing.allocator);
+    const parts = firstCommandParts(hir);
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+    try variables.set("empty", "");
+    try variables.set("present", "value");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const expander = Expander.initWithContext(arena.allocator(), .{
+        .variables = &variables,
+    });
+
+    const expected = [_][]const u8{ "", "alternative", "", "alternative" };
+    for (parts[1..], expected) |part, value| {
+        try std.testing.expectEqualDeep(
+            @as([]const []const u8, &.{value}),
+            try expander.expandArgument(hir, part),
+        );
+    }
+}
+
+test "unquoted empty alternative expansions contribute no fields" {
+    var hir = try generate("command ${missing+word} ${empty:+word}");
+    defer hir.deinit(std.testing.allocator);
+    const parts = firstCommandParts(hir);
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+    try variables.set("empty", "");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const expander = Expander.initWithContext(arena.allocator(), .{
+        .variables = &variables,
+    });
+
+    for (parts[1..]) |part| {
+        try std.testing.expectEqual(
+            @as(usize, 0),
+            (try expander.expandArgument(hir, part)).len,
+        );
+    }
+}
+
 test "unquoted default words retain their own quoting during field splitting" {
     var hir = try generate(
         "command ${missing:-one two} ${missing:-\"three four\"} " ++

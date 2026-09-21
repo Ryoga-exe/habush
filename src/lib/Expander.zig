@@ -198,7 +198,7 @@ fn appendBracedArgumentParameter(
 ) Error!void {
     const expansion = Word.ParameterExpansion.parse(source) orelse
         return error.ParameterExpansionUnsupported;
-    const operator = expansion.operator orelse
+    if (expansion.operator == null)
         return expander.appendArgumentParameter(
             expansion.parameter,
             quoted,
@@ -206,32 +206,31 @@ fn appendBracedArgumentParameter(
             bytes,
             current_field_active,
         );
-    const parameter_value = try expander.defaultParameterValue(expansion.parameter);
-    const use_word = switch (operator) {
-        .default_if_unset => parameter_value == null,
-        .default_if_unset_or_null => parameter_value == null or parameter_value.?.len == 0,
-        else => return error.ParameterExpansionUnsupported,
-    };
-    if (!use_word) {
-        return expander.appendScalarArgument(
-            parameter_value.?,
+    switch (try expander.selectParameterExpansion(expansion)) {
+        .value => |value| return expander.appendScalarArgument(
+            value,
             quoted,
             fields,
             bytes,
             current_field_active,
-        );
+        ),
+        .empty => {
+            if (quoted) current_field_active.* = true;
+        },
+        .word => |replacement| {
+            if (replacement.len == 0 and quoted) {
+                current_field_active.* = true;
+                return;
+            }
+            try expander.appendExpansionWord(
+                replacement,
+                quoted,
+                fields,
+                bytes,
+                current_field_active,
+            );
+        },
     }
-    if (expansion.word.len == 0 and quoted) {
-        current_field_active.* = true;
-        return;
-    }
-    try expander.appendExpansionWord(
-        expansion.word,
-        quoted,
-        fields,
-        bytes,
-        current_field_active,
-    );
 }
 
 fn appendScalarArgument(
@@ -311,30 +310,25 @@ fn appendBracedAssignmentParameter(
 ) Error!void {
     const expansion = Word.ParameterExpansion.parse(source) orelse
         return error.ParameterExpansionUnsupported;
-    const operator = expansion.operator orelse
+    if (expansion.operator == null)
         return expander.appendParameter(bytes, expansion.parameter);
-    const parameter_value = try expander.defaultParameterValue(expansion.parameter);
-    const use_word = switch (operator) {
-        .default_if_unset => parameter_value == null,
-        .default_if_unset_or_null => parameter_value == null or parameter_value.?.len == 0,
-        else => return error.ParameterExpansionUnsupported,
-    };
-    if (!use_word) {
-        try bytes.appendSlice(expander.allocator, parameter_value.?);
-        return;
+    switch (try expander.selectParameterExpansion(expansion)) {
+        .value => |value| try bytes.appendSlice(expander.allocator, value),
+        .empty => {},
+        .word => |replacement| {
+            var iterator = Word.Iterator.initExpansionWord(replacement, 0, quoted);
+            var part_index: usize = 0;
+            while (iterator.next()) |part| : (part_index += 1) {
+                try expander.appendAssignmentPart(
+                    part.tag,
+                    replacement[part.start..part.end],
+                    part_index == 0,
+                    bytes,
+                );
+            }
+            if (iterator.status != .complete) return error.ParameterExpansionUnsupported;
+        },
     }
-
-    var iterator = Word.Iterator.initExpansionWord(expansion.word, 0, quoted);
-    var part_index: usize = 0;
-    while (iterator.next()) |part| : (part_index += 1) {
-        try expander.appendAssignmentPart(
-            part.tag,
-            expansion.word[part.start..part.end],
-            part_index == 0,
-            bytes,
-        );
-    }
-    if (iterator.status != .complete) return error.ParameterExpansionUnsupported;
 }
 
 fn appendParameter(
@@ -392,7 +386,33 @@ fn appendParameter(
     return error.ParameterExpansionUnsupported;
 }
 
-fn defaultParameterValue(expander: Expander, parameter: []const u8) Error!?[]const u8 {
+const ParameterSelection = union(enum) {
+    value: []const u8,
+    word: []const u8,
+    empty,
+};
+
+fn selectParameterExpansion(
+    expander: Expander,
+    expansion: Word.ParameterExpansion,
+) Error!ParameterSelection {
+    const value = try expander.conditionalParameterValue(expansion.parameter);
+    return switch (expansion.operator.?) {
+        .default_if_unset => if (value) |set| .{ .value = set } else .{ .word = expansion.word },
+        .default_if_unset_or_null => if (value) |set|
+            if (set.len == 0) .{ .word = expansion.word } else .{ .value = set }
+        else
+            .{ .word = expansion.word },
+        .alternative_if_set => if (value != null) .{ .word = expansion.word } else .empty,
+        .alternative_if_set_and_not_null => if (value) |set|
+            if (set.len == 0) .empty else .{ .word = expansion.word }
+        else
+            .empty,
+        else => return error.ParameterExpansionUnsupported,
+    };
+}
+
+fn conditionalParameterValue(expander: Expander, parameter: []const u8) Error!?[]const u8 {
     if (VariableStore.isValidName(parameter)) return expander.context.variable(parameter);
     if (!isDecimal(parameter)) return error.ParameterExpansionUnsupported;
 
