@@ -54,6 +54,93 @@ test "expands named parameters inside double quotes" {
     try std.testing.expectEqualStrings("pre:value with spaces::post", fields[0]);
 }
 
+test "expands scalar positional and special parameters" {
+    var hir = try generate(
+        "command \"$1\" \"${2}\" \"${10}\" \"$#\" \"$?\" \"$*\" $#",
+    );
+    defer hir.deinit(std.testing.allocator);
+    const parts = firstCommandParts(hir);
+    const parameters = [_][]const u8{
+        "one", "two words", "three", "four", "five",
+        "six", "seven",     "eight", "nine", "ten",
+    };
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+    try variables.set("IFS", ":");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const expander = Expander.initWithContext(arena.allocator(), .{
+        .variables = &variables,
+        .positional_parameters = &parameters,
+        .last_status = 23,
+    });
+    const expected = [_][]const u8{
+        "one",
+        "two words",
+        "ten",
+        "10",
+        "23",
+        "one:two words:three:four:five:six:seven:eight:nine:ten",
+        "10",
+    };
+    for (parts[1..], expected) |word, value| {
+        const fields = try expander.expandArgument(hir, word);
+        try std.testing.expectEqual(@as(usize, 1), fields.len);
+        try std.testing.expectEqualStrings(value, fields[0]);
+    }
+}
+
+test "double-quoted at preserves positional parameter fields" {
+    var hir = try generate("command pre\"$@\"post \"$@\" \"$@\"suffix");
+    defer hir.deinit(std.testing.allocator);
+    const parts = firstCommandParts(hir);
+    const parameters = [_][]const u8{ "one", "two words", "" };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const expander = Expander.initWithContext(arena.allocator(), .{
+        .positional_parameters = &parameters,
+    });
+    const prefixed = try expander.expandArgument(hir, parts[1]);
+    try std.testing.expectEqualDeep(
+        @as([]const []const u8, &.{ "preone", "two words", "post" }),
+        prefixed,
+    );
+    const standalone = try expander.expandArgument(hir, parts[2]);
+    try std.testing.expectEqualDeep(
+        @as([]const []const u8, &.{ "one", "two words", "" }),
+        standalone,
+    );
+    const suffixed = try expander.expandArgument(hir, parts[3]);
+    try std.testing.expectEqualDeep(
+        @as([]const []const u8, &.{ "one", "two words", "suffix" }),
+        suffixed,
+    );
+
+    const empty = try Expander.init(arena.allocator()).expandArgument(hir, parts[2]);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+}
+
+test "expands special parameters in assignment values" {
+    var hir = try generate("result=$1 count=$# status=$? joined=$*");
+    defer hir.deinit(std.testing.allocator);
+    const parts = firstCommandParts(hir);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const expander = Expander.initWithContext(arena.allocator(), .{
+        .positional_parameters = &.{ "one", "two words" },
+        .last_status = 7,
+    });
+    const expected = [_][]const u8{ "one", "2", "7", "one two words" };
+    for (parts, expected) |part, value| {
+        const assignment = hir.assignment(part);
+        try std.testing.expectEqualStrings(
+            value,
+            try expander.expandAssignment(hir, assignment.value),
+        );
+    }
+}
+
 test "expands assignment values without field or pathname expansion" {
     var hir = try generate("result=pre$name:${missing}:*.zig");
     defer hir.deinit(std.testing.allocator);

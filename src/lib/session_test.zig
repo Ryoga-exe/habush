@@ -130,6 +130,176 @@ test "session supplies positional parameters to implicit for loops" {
     try std.testing.expectEqualStrings("two words", session.variable("observed").?);
 }
 
+test "session persists function definitions and scopes their positional parameters" {
+    var fake_host = FakeHost.init(std.testing.allocator);
+    defer fake_host.deinit();
+    var session = try Session.init(std.testing.allocator, fake_host.host(), .{});
+    defer session.deinit();
+
+    {
+        var definition = try generate(
+            "remember() { for item; do observed=\"$item\"; done; name=inside; false; }",
+        );
+        defer definition.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u8, 0), (try session.execute(definition)).status);
+    }
+
+    var invocation = try generate("remember one \"two words\"");
+    defer invocation.deinit(std.testing.allocator);
+    const result = try session.execute(invocation);
+
+    try std.testing.expectEqual(@as(u8, 1), result.status);
+    try std.testing.expect(result.control_flow.isNone());
+    try std.testing.expectEqualStrings("two words", session.variable("item").?);
+    try std.testing.expectEqualStrings("two words", session.variable("observed").?);
+    try std.testing.expectEqualStrings("inside", session.variable("name").?);
+    try std.testing.expectEqual(@as(usize, 0), fake_host.spawn_calls.items.len);
+}
+
+test "functions expand scalar parameters and restore the caller scope" {
+    var fake_host = FakeHost.init(std.testing.allocator);
+    defer fake_host.deinit();
+    var session = try Session.init(std.testing.allocator, fake_host.host(), .{
+        .positional_parameters = &.{"outer"},
+    });
+    defer session.deinit();
+
+    var hir = try generate(
+        "capture() { status=$? first=$1 count=$#; }; " ++
+            "false; capture one \"two words\"; " ++
+            "for item; do caller=\"$item\"; done",
+    );
+    defer hir.deinit(std.testing.allocator);
+    const result = try session.execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqualStrings("1", session.variable("status").?);
+    try std.testing.expectEqualStrings("one", session.variable("first").?);
+    try std.testing.expectEqualStrings("2", session.variable("count").?);
+    try std.testing.expectEqualStrings("outer", session.variable("caller").?);
+}
+
+test "double-quoted at forwards exact function arguments" {
+    var fake_host = FakeHost.init(std.testing.allocator);
+    defer fake_host.deinit();
+    var session = try Session.init(std.testing.allocator, fake_host.host(), .{
+        .resolver = CommandResolver.preResolved(),
+    });
+    defer session.deinit();
+
+    var hir = try generate("forward() { /bin/tool \"$@\"; }; forward one \"two words\" \"\"");
+    defer hir.deinit(std.testing.allocator);
+    const result = try session.execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqual(@as(usize, 1), fake_host.spawn_calls.items.len);
+    try std.testing.expectEqualDeep(
+        @as([]const []const u8, &.{ "/bin/tool", "one", "two words", "" }),
+        fake_host.spawn_calls.items[0].argv,
+    );
+}
+
+test "empty double-quoted at removes its command word" {
+    var fake_host = FakeHost.init(std.testing.allocator);
+    defer fake_host.deinit();
+    var session = try Session.init(std.testing.allocator, fake_host.host(), .{});
+    defer session.deinit();
+
+    var hir = try generate("empty() { \"$@\"; observed=after; }; empty");
+    defer hir.deinit(std.testing.allocator);
+    const result = try session.execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqualStrings("after", session.variable("observed").?);
+    try std.testing.expectEqual(@as(usize, 0), fake_host.spawn_calls.items.len);
+}
+
+test "shell functions override regular builtins but not special builtins" {
+    var fake_host = FakeHost.init(std.testing.allocator);
+    defer fake_host.deinit();
+    var session = try Session.init(std.testing.allocator, fake_host.host(), .{});
+    defer session.deinit();
+
+    var hir = try generate("true() { false; }; exit() { false; }; true; exit 7");
+    defer hir.deinit(std.testing.allocator);
+    const result = try session.execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 7), result.status);
+    try std.testing.expectEqual(.exit, result.control_flow);
+}
+
+test "subshells inherit functions without leaking their state changes" {
+    var fake_host = FakeHost.init(std.testing.allocator);
+    defer fake_host.deinit();
+    var session = try Session.init(std.testing.allocator, fake_host.host(), .{
+        .variables = &.{.{ .name = "name", .value = "outside" }},
+    });
+    defer session.deinit();
+
+    var hir = try generate("change() { name=inside; }; (change); observed=\"$name\"");
+    defer hir.deinit(std.testing.allocator);
+    const result = try session.execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqualStrings("outside", session.variable("name").?);
+    try std.testing.expectEqualStrings("outside", session.variable("observed").?);
+}
+
+test "recursive functions stop at the runtime call-depth limit" {
+    var fake_host = FakeHost.init(std.testing.allocator);
+    defer fake_host.deinit();
+    var diagnostics: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer diagnostics.deinit();
+    var session = try Session.init(std.testing.allocator, fake_host.host(), .{
+        .io = .{ .stderr = &diagnostics.writer },
+    });
+    defer session.deinit();
+
+    var hir = try generate("recurse() { recurse; }; recurse");
+    defer hir.deinit(std.testing.allocator);
+    const result = try session.execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 1), result.status);
+    try std.testing.expect(result.control_flow.isNone());
+    try std.testing.expectEqualStrings(
+        "recurse: maximum function call depth exceeded\n",
+        diagnostics.written(),
+    );
+}
+
+test "return completes only the current function" {
+    var fake_host = FakeHost.init(std.testing.allocator);
+    defer fake_host.deinit();
+    var session = try Session.init(std.testing.allocator, fake_host.host(), .{});
+    defer session.deinit();
+
+    var hir = try generate(
+        "inner() { false; return; skipped=inner; }; " ++
+            "outer() { inner; after=outer; return 9; skipped=outer; }; outer",
+    );
+    defer hir.deinit(std.testing.allocator);
+    const result = try session.execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 9), result.status);
+    try std.testing.expect(result.control_flow.isNone());
+    try std.testing.expectEqualStrings("outer", session.variable("after").?);
+    try std.testing.expect(session.variable("skipped") == null);
+}
+
+test "subshells contain return control from their function" {
+    var fake_host = FakeHost.init(std.testing.allocator);
+    defer fake_host.deinit();
+    var session = try Session.init(std.testing.allocator, fake_host.host(), .{});
+    defer session.deinit();
+
+    var hir = try generate("work() { (return 7); observed=after; }; work");
+    defer hir.deinit(std.testing.allocator);
+    const result = try session.execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqualStrings("after", session.variable("observed").?);
+}
+
 test "session routes builtin output" {
     var fake_host = FakeHost.init(std.testing.allocator);
     defer fake_host.deinit();

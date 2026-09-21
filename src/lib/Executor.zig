@@ -1,11 +1,11 @@
 //! Executes Habush HIR through a `Host`.
 //!
 //! The current runtime foundation executes empty units, foreground sequential
-//! lists, and-or commands, pipeline negation, if clauses, while/until/for loops
-//! with break/continue control, standalone assignments, builtins, and external
-//! simple commands.
-//! Redirections, background execution, pipelines, compound commands, and
-//! compound control flow remain explicit `UnsupportedInstruction` boundaries.
+//! lists, and-or commands, pipeline negation, brace groups, if clauses,
+//! while/until/for loops with break/continue control, standalone assignments,
+//! builtins, and external simple commands.
+//! Redirections, background execution, pipelines, and function definitions
+//! remain explicit `UnsupportedInstruction` boundaries.
 
 const std = @import("std");
 const Builtin = @import("Builtin.zig");
@@ -25,12 +25,16 @@ sandbox: CommandPlan.Sandbox,
 resolver: ?CommandResolver,
 search_path: []const []const u8,
 positional_parameters: []const []const u8,
+positional_parameters_override: ?[]const []const u8,
 cwd: ?[]const u8,
 variables: ?*VariableStore,
 runtime_state: ?*runtime.State,
 io: runtime.Io,
 last_status: u8,
 loop_depth: u32,
+function_depth: u32,
+
+const max_function_depth = 64;
 
 /// Failures that prevent the runtime from producing a shell-visible `Result`.
 /// Expected command failures are reported through `Result.status` and, when
@@ -40,6 +44,7 @@ pub const Error = Builtin.Error || Host.Error || Expander.Error || CommandResolv
     CommandResolutionUnavailable,
     UnexpectedTermination,
     VariableStateUnavailable,
+    FunctionStateUnavailable,
 };
 
 pub const Options = struct {
@@ -75,12 +80,14 @@ pub fn initWithOptions(gpa: std.mem.Allocator, host: Host, options: Options) Exe
         .resolver = options.resolver,
         .search_path = options.search_path,
         .positional_parameters = options.positional_parameters,
+        .positional_parameters_override = null,
         .cwd = options.cwd,
         .variables = options.variables,
         .runtime_state = null,
         .io = options.io,
         .last_status = options.last_status,
         .loop_depth = 0,
+        .function_depth = 0,
     };
 }
 
@@ -98,12 +105,14 @@ pub fn initWithState(
         .resolver = resolver,
         .search_path = &.{},
         .positional_parameters = &.{},
+        .positional_parameters_override = null,
         .cwd = null,
         .variables = null,
         .runtime_state = state,
         .io = io,
         .last_status = last_status,
         .loop_depth = 0,
+        .function_depth = 0,
     };
 }
 
@@ -121,12 +130,59 @@ fn executeInstruction(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error
         .list => executor.executeList(hir, index),
         .and_if, .or_if => executor.executeAndOr(hir, index),
         .negated_pipeline => executor.executeNegatedPipeline(hir, index),
+        .subshell => executor.executeSubshell(hir, index),
+        .brace_group => executor.executeBraceGroup(hir, index),
         .if_clause => executor.executeIfClause(hir, index),
         .while_clause, .until_clause => executor.executeLoopClause(hir, index),
         .for_clause => executor.executeForClause(hir, index),
+        .function_definition => executor.executeFunctionDefinition(hir, index),
         .simple_command => executor.executeSimpleCommand(hir, index),
         else => error.UnsupportedInstruction,
     };
+}
+
+fn executeFunctionDefinition(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
+    const state = executor.runtime_state orelse return error.FunctionStateUnavailable;
+    const definition = hir.functionDefinition(index);
+    try state.defineFunction(definition.name, hir, definition.body);
+    return .{ .status = 0, .sandbox_coverage = .not_requested };
+}
+
+fn executeSubshell(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
+    const group = hir.groupedCommand(index);
+    if (group.redirects.len != 0) return error.UnsupportedInstruction;
+
+    var subshell_executor = executor;
+    subshell_executor.loop_depth = 0;
+    if (executor.runtime_state) |state| {
+        var state_copy = try state.clone();
+        defer state_copy.deinit();
+        subshell_executor.runtime_state = &state_copy;
+        return subshell_executor.executeSubshellBody(hir, group.body);
+    }
+    if (executor.variables) |variables| {
+        var variables_copy = try variables.clone(executor.gpa);
+        defer variables_copy.deinit();
+        subshell_executor.variables = &variables_copy;
+        return subshell_executor.executeSubshellBody(hir, group.body);
+    }
+    return subshell_executor.executeSubshellBody(hir, group.body);
+}
+
+fn executeSubshellBody(executor: Executor, hir: Hir, body: Hir.Inst.Index) Error!Result {
+    var result = try executor.executeInstruction(hir, body);
+    switch (result.control_flow) {
+        .none => {},
+        .exit, .@"return" => result.control_flow = .none,
+        .@"break", .@"continue" => unreachable,
+    }
+    return result;
+}
+
+fn executeBraceGroup(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
+    const group = hir.groupedCommand(index);
+    if (group.redirects.len != 0) return error.UnsupportedInstruction;
+    return executor.executeInstruction(hir, group.body);
 }
 
 fn executeForClause(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
@@ -142,7 +198,7 @@ fn executeForClause(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!R
     const values = if (clause.implicit_positional_parameters)
         executor.positionalParameters()
     else values: {
-        const expander = Expander.initWithContext(allocator, .{ .variables = variables });
+        const expander = executor.wordExpander(allocator, null);
         for (clause.words) |word|
             try expanded_words.appendSlice(allocator, try expander.expandArgument(hir, word));
         break :values expanded_words.items;
@@ -170,6 +226,10 @@ fn executeForClause(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!R
             .none => last_status = body_result.status,
             .exit => {
                 result.control_flow = .exit;
+                return result;
+            },
+            .@"return" => {
+                result.control_flow = .@"return";
                 return result;
             },
             .@"break" => |levels| {
@@ -232,6 +292,11 @@ fn executeLoopClause(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!
                 result.control_flow = .exit;
                 return result;
             },
+            .@"return" => {
+                result.status = condition_result.status;
+                result.control_flow = .@"return";
+                return result;
+            },
             .@"break" => |levels| {
                 result.status = condition_result.status;
                 if (levels > 1) result.control_flow = .{ .@"break" = levels - 1 };
@@ -268,6 +333,10 @@ fn executeLoopClause(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!
             .none => last_status = body_result.status,
             .exit => {
                 result.control_flow = .exit;
+                return result;
+            },
+            .@"return" => {
+                result.control_flow = .@"return";
                 return result;
             },
             .@"break" => |levels| {
@@ -345,22 +414,27 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
     defer arena.deinit();
     const allocator = arena.allocator();
     const variables = executor.variableStore();
-    const expander = Expander.initWithContext(allocator, .{
-        .variables = variables,
-    });
+    const expander = executor.wordExpander(allocator, null);
 
     var argv: std.ArrayList([]const u8) = .empty;
     const parts = hir.simpleCommandParts(index);
     var has_assignments = false;
+    var has_words = false;
     for (parts) |part| {
         switch (hir.instructionTag(part)) {
             .assignment => has_assignments = true,
-            .word => try argv.appendSlice(allocator, try expander.expandArgument(hir, part)),
+            .word => {
+                has_words = true;
+                try argv.appendSlice(allocator, try expander.expandArgument(hir, part));
+            },
             else => return error.UnsupportedInstruction,
         }
     }
     if (argv.items.len == 0) {
-        if (!has_assignments) return error.UnsupportedInstruction;
+        if (!has_assignments) return if (has_words)
+            .{ .status = 0, .sandbox_coverage = .not_requested }
+        else
+            error.UnsupportedInstruction;
         const mutable_variables = variables orelse return error.VariableStateUnavailable;
         for (parts) |part| {
             const assignment = hir.assignment(part);
@@ -376,33 +450,37 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
         for (parts) |part| {
             if (hir.instructionTag(part) != .assignment) continue;
             const assignment = hir.assignment(part);
-            const assignment_expander = Expander.initWithContext(allocator, .{
-                .variables = variables,
-                .overrides = &command_variables,
-            });
+            const assignment_expander = executor.wordExpander(allocator, &command_variables);
             const value = try assignment_expander.expandAssignment(hir, assignment.value);
             try command_variables.set(assignment.name, value);
         }
     }
-    if (Builtin.lookup(argv.items[0])) |builtin| {
-        if (builtin.special and has_assignments) {
-            const mutable_variables = variables orelse return error.VariableStateUnavailable;
-            try applyAssignments(mutable_variables, &command_variables);
-        }
-        const result = try builtin.run(.{
-            .host = executor.host,
-            .runtime_state = executor.runtime_state,
-            .variable_overrides = &command_variables,
-            .io = executor.io,
-            .last_status = executor.last_status,
-            .loop_depth = executor.loop_depth,
-        }, argv.items);
-        return .{
-            .status = result.status,
-            .sandbox_coverage = .not_requested,
-            .control_flow = result.control_flow,
-        };
+    const builtin = Builtin.lookup(argv.items[0]);
+    if (builtin) |candidate| {
+        if (candidate.special)
+            return executor.executeBuiltin(
+                candidate,
+                argv.items,
+                &command_variables,
+                has_assignments,
+            );
     }
+    if (executor.runtime_state) |state| {
+        if (state.functionStore().contains(argv.items[0])) {
+            if (has_assignments) {
+                const mutable_variables = variables orelse unreachable;
+                try applyAssignments(mutable_variables, &command_variables);
+            }
+            return executor.executeFunction(argv.items);
+        }
+    }
+    if (builtin) |candidate|
+        return executor.executeBuiltin(
+            candidate,
+            argv.items,
+            &command_variables,
+            has_assignments,
+        );
 
     var process_environment = VariableStore.init(allocator);
     defer process_environment.deinit();
@@ -465,9 +543,67 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
     };
 }
 
+fn executeBuiltin(
+    executor: Executor,
+    builtin: Builtin,
+    argv: []const []const u8,
+    command_variables: *const VariableStore,
+    has_assignments: bool,
+) Error!Result {
+    if (builtin.special and has_assignments) {
+        const mutable_variables = executor.variableStore() orelse
+            return error.VariableStateUnavailable;
+        try applyAssignments(mutable_variables, command_variables);
+    }
+    const result = try builtin.run(.{
+        .host = executor.host,
+        .runtime_state = executor.runtime_state,
+        .variable_overrides = command_variables,
+        .io = executor.io,
+        .last_status = executor.last_status,
+        .loop_depth = executor.loop_depth,
+        .function_depth = executor.function_depth,
+    }, argv);
+    return .{
+        .status = result.status,
+        .sandbox_coverage = .not_requested,
+        .control_flow = result.control_flow,
+    };
+}
+
+fn executeFunction(executor: Executor, argv: []const []const u8) Error!Result {
+    if (executor.function_depth == max_function_depth)
+        return executor.commandFailure(argv[0], .function_call_depth_exceeded);
+
+    const state = executor.runtime_state orelse return error.FunctionStateUnavailable;
+    var definition = (try state.cloneFunction(argv[0], executor.gpa)) orelse unreachable;
+    defer definition.deinit(executor.gpa);
+
+    var function_executor = executor;
+    function_executor.positional_parameters_override = argv[1..];
+    function_executor.loop_depth = 0;
+    function_executor.function_depth += 1;
+    var result = try function_executor.executeInstruction(definition.hir, definition.body);
+    if (result.control_flow == .@"return") result.control_flow = .none;
+    return result;
+}
+
 fn variableStore(executor: Executor) ?*VariableStore {
     if (executor.runtime_state) |state| return state.variableStore();
     return executor.variables;
+}
+
+fn wordExpander(
+    executor: Executor,
+    allocator: std.mem.Allocator,
+    overrides: ?*const VariableStore,
+) Expander {
+    return Expander.initWithContext(allocator, .{
+        .variables = executor.variableStore(),
+        .overrides = overrides,
+        .positional_parameters = executor.positionalParameters(),
+        .last_status = executor.last_status,
+    });
 }
 
 fn workingDirectory(executor: Executor) ?[]const u8 {
@@ -481,6 +617,7 @@ fn commandSearchPath(executor: Executor) []const []const u8 {
 }
 
 fn positionalParameters(executor: Executor) []const []const u8 {
+    if (executor.positional_parameters_override) |parameters| return parameters;
     if (executor.runtime_state) |state| return state.positionalParameters();
     return executor.positional_parameters;
 }

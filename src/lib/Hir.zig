@@ -63,6 +63,22 @@ pub fn deinit(hir: *Hir, gpa: Allocator) void {
     hir.* = undefined;
 }
 
+pub fn clone(hir: Hir, gpa: Allocator) Allocator.Error!Hir {
+    const instruction_list = hir.instructions.toMultiArrayList();
+    var instruction_copy = try instruction_list.clone(gpa);
+    var instructions = instruction_copy.toOwnedSlice();
+    errdefer instructions.deinit(gpa);
+
+    const string_bytes = try gpa.dupe(u8, hir.string_bytes);
+    errdefer gpa.free(string_bytes);
+
+    return .{
+        .instructions = instructions,
+        .string_bytes = string_bytes,
+        .extra = try gpa.dupe(u32, hir.extra),
+    };
+}
+
 pub fn instructionTag(hir: Hir, index: Inst.Index) Inst.Tag {
     return hir.instructions.items(.tag)[@intFromEnum(index)];
 }

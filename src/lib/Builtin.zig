@@ -18,6 +18,7 @@ pub const Tag = enum {
     cd,
     exit,
     pwd,
+    @"return",
     @"export",
     unset,
 };
@@ -34,6 +35,7 @@ pub const Context = struct {
     io: runtime.Io = .{},
     last_status: u8 = 0,
     loop_depth: u32 = 0,
+    function_depth: u32 = 0,
 };
 
 pub const Error = std.mem.Allocator.Error || std.Io.Writer.Error || error{
@@ -50,6 +52,7 @@ const definitions = std.StaticStringMap(Builtin).initComptime(.{
     .{ "cd", Builtin{ .tag = .cd } },
     .{ "exit", Builtin{ .tag = .exit, .special = true } },
     .{ "pwd", Builtin{ .tag = .pwd } },
+    .{ "return", Builtin{ .tag = .@"return", .special = true } },
     .{ "export", Builtin{ .tag = .@"export", .special = true } },
     .{ "unset", Builtin{ .tag = .unset, .special = true } },
 });
@@ -68,6 +71,7 @@ pub fn run(builtin: Builtin, context: Context, argv: []const []const u8) Error!R
         .cd => runCd(context, argv),
         .exit => runExit(context, argv),
         .pwd => runPwd(context, argv),
+        .@"return" => runReturn(context, argv),
         .@"export" => runExport(context, argv),
         .unset => runUnset(context, argv),
     };
@@ -118,6 +122,26 @@ fn runExit(context: Context, argv: []const []const u8) Error!Result {
     // Shell statuses expose the low eight bits of a valid integer operand.
     const status: u8 = @truncate(@as(u64, @bitCast(value)));
     return .{ .status = status, .control_flow = .exit };
+}
+
+fn runReturn(context: Context, argv: []const []const u8) Error!Result {
+    if (argv.len > 2) return commandFailure(context, argv[0], .too_many_arguments);
+    if (context.function_depth == 0)
+        return commandFailure(context, argv[0], .not_in_function);
+    if (argv.len == 1) {
+        return .{ .status = context.last_status, .control_flow = .@"return" };
+    }
+
+    const value = std.fmt.parseInt(i64, argv[1], 10) catch {
+        const failure = try commandFailure(
+            context,
+            argv[0],
+            .{ .numeric_argument_required = argv[1] },
+        );
+        return .{ .status = failure.status, .control_flow = .@"return" };
+    };
+    const status: u8 = @truncate(@as(u64, @bitCast(value)));
+    return .{ .status = status, .control_flow = .@"return" };
 }
 
 fn runCd(context: Context, argv: []const []const u8) Error!Result {
@@ -318,6 +342,7 @@ test "looks up core builtins by command name" {
     try std.testing.expect(lookup("exit").?.special);
     try std.testing.expect(lookup("break").?.special);
     try std.testing.expect(lookup("continue").?.special);
+    try std.testing.expect(lookup("return").?.special);
     try std.testing.expect(!lookup("true").?.special);
     try std.testing.expect(lookup("missing") == null);
     try std.testing.expect(lookup("./true") == null);
@@ -408,6 +433,49 @@ test "exit diagnoses invalid operands" {
     try std.testing.expectEqualStrings(
         "exit: numeric argument required: 999999999999999999999999999999\n" ++
             "exit: too many arguments\n",
+        diagnostics.written(),
+    );
+}
+
+test "return requests function completion with selected status" {
+    const context: Context = .{ .function_depth = 1, .last_status = 23 };
+
+    const inherited = try lookup("return").?.run(context, &.{"return"});
+    try std.testing.expectEqual(@as(u8, 23), inherited.status);
+    try std.testing.expectEqual(runtime.ControlFlow.@"return", inherited.control_flow);
+
+    const explicit = try lookup("return").?.run(context, &.{ "return", "257" });
+    try std.testing.expectEqual(@as(u8, 1), explicit.status);
+    try std.testing.expectEqual(runtime.ControlFlow.@"return", explicit.control_flow);
+
+    const negative = try lookup("return").?.run(context, &.{ "return", "-1" });
+    try std.testing.expectEqual(@as(u8, 255), negative.status);
+    try std.testing.expectEqual(runtime.ControlFlow.@"return", negative.control_flow);
+}
+
+test "return diagnoses invalid contexts and operands" {
+    var diagnostics: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer diagnostics.deinit();
+    const outside_context: Context = .{ .io = .{ .stderr = &diagnostics.writer } };
+
+    const outside = try lookup("return").?.run(outside_context, &.{"return"});
+    try std.testing.expectEqual(@as(u8, 1), outside.status);
+    try std.testing.expect(outside.control_flow.isNone());
+
+    const function_context: Context = .{
+        .function_depth = 1,
+        .io = .{ .stderr = &diagnostics.writer },
+    };
+    const invalid = try lookup("return").?.run(
+        function_context,
+        &.{ "return", "not-a-number" },
+    );
+    try std.testing.expectEqual(@as(u8, 2), invalid.status);
+    try std.testing.expectEqual(runtime.ControlFlow.@"return", invalid.control_flow);
+
+    try std.testing.expectEqualStrings(
+        "return: not in a function\n" ++
+            "return: numeric argument required: not-a-number\n",
         diagnostics.written(),
     );
 }

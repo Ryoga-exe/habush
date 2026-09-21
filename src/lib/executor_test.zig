@@ -6,6 +6,7 @@ const FakeResolver = @import("CommandResolver/FakeResolver.zig");
 const Executor = @import("Executor.zig");
 const FakeHost = @import("Host/FakeHost.zig");
 const SandboxPolicy = @import("SandboxPolicy.zig");
+const runtime = @import("runtime.zig");
 const VariableStore = @import("VariableStore.zig");
 
 test "executes static simple commands through the host" {
@@ -186,6 +187,100 @@ test "pipeline negation preserves exit control flow and status" {
     try std.testing.expectEqual(@as(u8, 7), result.status);
     try std.testing.expectEqual(.exit, result.control_flow);
     try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+}
+
+test "brace groups execute in the current shell state" {
+    var hir = try generate("name=before; { name=inside; false; }");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+
+    const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .variables = &variables,
+    }).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 1), result.status);
+    try std.testing.expect(result.control_flow.isNone());
+    try std.testing.expectEqualStrings("inside", variables.get("name").?);
+}
+
+test "brace groups propagate control flow" {
+    var hir = try generate("{ exit 7; /bin/skipped; }; /bin/skipped");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+
+    const result = try Executor.init(std.testing.allocator, fake.host()).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 7), result.status);
+    try std.testing.expectEqual(.exit, result.control_flow);
+    try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+}
+
+test "subshells isolate runtime state and contain exit control flow" {
+    var hir = try generate("(name=inside; cd child; exit 7); observed=\"$name\"");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    fake.working_directory_result = "/workspace/child";
+    var state = try runtime.State.init(std.testing.allocator, .{
+        .cwd = "/workspace",
+        .variables = &.{.{ .name = "name", .value = "outside" }},
+    });
+    defer state.deinit();
+
+    const result = try Executor.initWithState(
+        fake.host(),
+        null,
+        &state,
+        .{},
+        0,
+    ).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expect(result.control_flow.isNone());
+    try std.testing.expectEqualStrings("outside", state.variable("name").?);
+    try std.testing.expectEqualStrings("outside", state.variable("observed").?);
+    try std.testing.expectEqualStrings("/workspace", state.workingDirectory().?);
+    try std.testing.expect(state.variable("PWD") == null);
+}
+
+test "subshells return their body status without exiting the shell" {
+    var hir = try generate("(exit 7)");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+
+    const result = try Executor.init(std.testing.allocator, fake.host()).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 7), result.status);
+    try std.testing.expect(result.control_flow.isNone());
+}
+
+test "subshells do not inherit the surrounding loop context" {
+    var hir = try generate(
+        "condition=true; while \"$condition\"; do " ++
+            "condition=false; (break); observed=after; done",
+    );
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var diagnostics: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer diagnostics.deinit();
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+
+    const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .variables = &variables,
+        .io = .{ .stderr = &diagnostics.writer },
+    }).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expect(result.control_flow.isNone());
+    try std.testing.expectEqualStrings("after", variables.get("observed").?);
+    try std.testing.expectEqualStrings("break: not in a loop\n", diagnostics.written());
 }
 
 test "if clauses execute the selected branch" {
@@ -675,6 +770,8 @@ test "unsupported execution forms fail before the current command has side effec
         "if persisted=changed; then true; fi >out",
         "while persisted=changed; do true; done >out",
         "for persisted in changed; do true; done >out",
+        "{ persisted=changed; } >out",
+        "(persisted=changed) >out",
         "left &",
     };
 

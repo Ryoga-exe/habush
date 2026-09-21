@@ -9,6 +9,7 @@ pub const CommandPlan = @import("CommandPlan.zig");
 pub const CommandResolver = @import("CommandResolver.zig");
 pub const Executor = @import("Executor.zig");
 pub const Expander = @import("Expander.zig");
+pub const FunctionStore = @import("FunctionStore.zig");
 pub const Host = @import("Host.zig");
 pub const Hir = @import("Hir.zig");
 pub const runtime = @import("runtime.zig");

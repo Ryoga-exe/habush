@@ -62,6 +62,11 @@ pub fn build(b: *std.Build) void {
     script_arguments_test.addArgs(&.{ "true", "false" });
     expectCliResult(script_arguments_test, test_step, 1, "", "");
 
+    const function_test = b.addRunArtifact(exe);
+    function_test.setName("test cli shell function");
+    function_test.addFileArg(b.path("test/cli/function.hb"));
+    expectCliResult(function_test, test_step, 23, "", "");
+
     const script_diagnostic_test = b.addRunArtifact(exe);
     script_diagnostic_test.setName("test cli script diagnostic");
     script_diagnostic_test.addFileArg(b.path("test/cli/invalid.hb"));
