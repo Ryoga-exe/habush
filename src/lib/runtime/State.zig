@@ -2,6 +2,8 @@
 
 const std = @import("std");
 const CommandPlan = @import("../CommandPlan.zig");
+const FunctionStore = @import("../FunctionStore.zig");
+const Hir = @import("../Hir.zig");
 const State = @This();
 const SandboxPolicy = @import("../SandboxPolicy.zig");
 const VariableStore = @import("../VariableStore.zig");
@@ -12,6 +14,7 @@ search_path: []const []const u8,
 positional_parameters: []const []const u8,
 sandbox: CommandPlan.Sandbox,
 variables: VariableStore,
+functions: FunctionStore,
 
 pub const Options = struct {
     cwd: ?[]const u8 = null,
@@ -49,6 +52,7 @@ pub fn init(gpa: std.mem.Allocator, options: Options) Error!State {
         .positional_parameters = positional_parameters,
         .sandbox = try options.sandbox.clone(gpa),
         .variables = variables,
+        .functions = FunctionStore.init(gpa),
     };
 }
 
@@ -58,6 +62,7 @@ pub fn deinit(state: *State) void {
     deinitStrings(state.gpa, state.positional_parameters);
     state.sandbox.deinit(state.gpa);
     state.variables.deinit();
+    state.functions.deinit();
     state.* = undefined;
 }
 
@@ -74,13 +79,17 @@ pub fn clone(state: State) std.mem.Allocator.Error!State {
     var sandbox = try state.sandbox.clone(state.gpa);
     errdefer sandbox.deinit(state.gpa);
 
+    var variables = try state.variables.clone(state.gpa);
+    errdefer variables.deinit();
+
     return .{
         .gpa = state.gpa,
         .cwd = cwd,
         .search_path = search_path,
         .positional_parameters = positional_parameters,
         .sandbox = sandbox,
-        .variables = try state.variables.clone(state.gpa),
+        .variables = variables,
+        .functions = try state.functions.clone(state.gpa),
     };
 }
 
@@ -106,6 +115,27 @@ pub fn activeSandbox(state: State) CommandPlan.Sandbox {
 
 pub fn variableStore(state: *State) *VariableStore {
     return &state.variables;
+}
+
+pub fn functionStore(state: *State) *FunctionStore {
+    return &state.functions;
+}
+
+pub fn defineFunction(
+    state: *State,
+    name: []const u8,
+    hir: Hir,
+    body: Hir.Inst.Index,
+) FunctionStore.Error!void {
+    return state.functions.set(name, hir, body);
+}
+
+pub fn cloneFunction(
+    state: State,
+    name: []const u8,
+    gpa: std.mem.Allocator,
+) std.mem.Allocator.Error!?FunctionStore.Definition {
+    return state.functions.cloneDefinition(name, gpa);
 }
 
 pub fn variable(state: State, name: []const u8) ?[]const u8 {
