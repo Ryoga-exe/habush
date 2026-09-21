@@ -1,8 +1,9 @@
 //! Executes Habush HIR through a `Host`.
 //!
 //! The current runtime foundation executes empty units, foreground sequential
-//! lists, and-or commands, pipeline negation, if clauses, standalone
-//! assignments, builtins, and external simple commands.
+//! lists, and-or commands, pipeline negation, if clauses, while/until/for loops
+//! with break/continue control, standalone assignments, builtins, and external
+//! simple commands.
 //! Redirections, background execution, pipelines, compound commands, and
 //! compound control flow remain explicit `UnsupportedInstruction` boundaries.
 
@@ -23,11 +24,13 @@ host: Host,
 sandbox: CommandPlan.Sandbox,
 resolver: ?CommandResolver,
 search_path: []const []const u8,
+positional_parameters: []const []const u8,
 cwd: ?[]const u8,
 variables: ?*VariableStore,
 runtime_state: ?*runtime.State,
 io: runtime.Io,
 last_status: u8,
+loop_depth: u32,
 
 /// Failures that prevent the runtime from producing a shell-visible `Result`.
 /// Expected command failures are reported through `Result.status` and, when
@@ -43,6 +46,7 @@ pub const Options = struct {
     sandbox: CommandPlan.Sandbox = .inherit,
     resolver: ?CommandResolver = null,
     search_path: []const []const u8 = &.{},
+    positional_parameters: []const []const u8 = &.{},
     cwd: ?[]const u8 = null,
     /// Complete shell variable state. When present, exported bindings become
     /// an exact replacement environment; `null` preserves host inheritance.
@@ -70,11 +74,13 @@ pub fn initWithOptions(gpa: std.mem.Allocator, host: Host, options: Options) Exe
         .sandbox = options.sandbox,
         .resolver = options.resolver,
         .search_path = options.search_path,
+        .positional_parameters = options.positional_parameters,
         .cwd = options.cwd,
         .variables = options.variables,
         .runtime_state = null,
         .io = options.io,
         .last_status = options.last_status,
+        .loop_depth = 0,
     };
 }
 
@@ -91,11 +97,13 @@ pub fn initWithState(
         .sandbox = .inherit,
         .resolver = resolver,
         .search_path = &.{},
+        .positional_parameters = &.{},
         .cwd = null,
         .variables = null,
         .runtime_state = state,
         .io = io,
         .last_status = last_status,
+        .loop_depth = 0,
     };
 }
 
@@ -114,9 +122,71 @@ fn executeInstruction(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error
         .and_if, .or_if => executor.executeAndOr(hir, index),
         .negated_pipeline => executor.executeNegatedPipeline(hir, index),
         .if_clause => executor.executeIfClause(hir, index),
+        .while_clause, .until_clause => executor.executeLoopClause(hir, index),
+        .for_clause => executor.executeForClause(hir, index),
         .simple_command => executor.executeSimpleCommand(hir, index),
         else => error.UnsupportedInstruction,
     };
+}
+
+fn executeForClause(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
+    const clause = hir.forClause(index);
+    if (clause.redirects.len != 0) return error.UnsupportedInstruction;
+    const variables = executor.variableStore();
+
+    var arena = std.heap.ArenaAllocator.init(executor.gpa);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var expanded_words: std.ArrayList([]const u8) = .empty;
+    const values = if (clause.implicit_positional_parameters)
+        executor.positionalParameters()
+    else values: {
+        const expander = Expander.initWithContext(allocator, .{ .variables = variables });
+        for (clause.words) |word|
+            try expanded_words.appendSlice(allocator, try expander.expandArgument(hir, word));
+        break :values expanded_words.items;
+    };
+
+    var result: Result = .{ .status = 0, .sandbox_coverage = .not_requested };
+    var last_status = executor.last_status;
+    iteration: for (values) |value| {
+        const mutable_variables = variables orelse return error.VariableStateUnavailable;
+        mutable_variables.set(clause.name, value) catch |err| switch (err) {
+            error.InvalidName => unreachable,
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+
+        var body_executor = executor;
+        body_executor.last_status = last_status;
+        body_executor.loop_depth += 1;
+        const body_result = try body_executor.executeInstruction(hir, clause.body);
+        result.status = body_result.status;
+        result.sandbox_coverage = combineSandboxCoverage(
+            result.sandbox_coverage,
+            body_result.sandbox_coverage,
+        );
+        switch (body_result.control_flow) {
+            .none => last_status = body_result.status,
+            .exit => {
+                result.control_flow = .exit;
+                return result;
+            },
+            .@"break" => |levels| {
+                if (levels > 1) result.control_flow = .{ .@"break" = levels - 1 };
+                return result;
+            },
+            .@"continue" => |levels| {
+                if (levels > 1) {
+                    result.control_flow = .{ .@"continue" = levels - 1 };
+                    return result;
+                }
+                last_status = body_result.status;
+                continue :iteration;
+            },
+        }
+    }
+    return result;
 }
 
 fn executeList(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
@@ -135,9 +205,85 @@ fn executeList(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result
         );
         result.control_flow = command_result.control_flow;
         last_status = command_result.status;
-        if (command_result.control_flow != .none) break;
+        if (!command_result.control_flow.isNone()) break;
     }
     return result;
+}
+
+fn executeLoopClause(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
+    const clause = hir.loopClause(index);
+    if (clause.redirects.len != 0) return error.UnsupportedInstruction;
+
+    var result: Result = .{ .status = 0, .sandbox_coverage = .not_requested };
+    var last_status = executor.last_status;
+    loop: while (true) {
+        var condition_executor = executor;
+        condition_executor.last_status = last_status;
+        condition_executor.loop_depth += 1;
+        const condition_result = try condition_executor.executeInstruction(hir, clause.condition);
+        result.sandbox_coverage = combineSandboxCoverage(
+            result.sandbox_coverage,
+            condition_result.sandbox_coverage,
+        );
+        switch (condition_result.control_flow) {
+            .none => {},
+            .exit => {
+                result.status = condition_result.status;
+                result.control_flow = .exit;
+                return result;
+            },
+            .@"break" => |levels| {
+                result.status = condition_result.status;
+                if (levels > 1) result.control_flow = .{ .@"break" = levels - 1 };
+                return result;
+            },
+            .@"continue" => |levels| {
+                result.status = condition_result.status;
+                if (levels > 1) {
+                    result.control_flow = .{ .@"continue" = levels - 1 };
+                    return result;
+                }
+                last_status = condition_result.status;
+                continue :loop;
+            },
+        }
+
+        const execute_body = switch (hir.instructionTag(index)) {
+            .while_clause => condition_result.status == 0,
+            .until_clause => condition_result.status != 0,
+            else => unreachable,
+        };
+        if (!execute_body) return result;
+
+        var body_executor = executor;
+        body_executor.last_status = condition_result.status;
+        body_executor.loop_depth += 1;
+        const body_result = try body_executor.executeInstruction(hir, clause.body);
+        result.status = body_result.status;
+        result.sandbox_coverage = combineSandboxCoverage(
+            result.sandbox_coverage,
+            body_result.sandbox_coverage,
+        );
+        switch (body_result.control_flow) {
+            .none => last_status = body_result.status,
+            .exit => {
+                result.control_flow = .exit;
+                return result;
+            },
+            .@"break" => |levels| {
+                if (levels > 1) result.control_flow = .{ .@"break" = levels - 1 };
+                return result;
+            },
+            .@"continue" => |levels| {
+                if (levels > 1) {
+                    result.control_flow = .{ .@"continue" = levels - 1 };
+                    return result;
+                }
+                last_status = body_result.status;
+                continue :loop;
+            },
+        }
+    }
 }
 
 fn executeIfClause(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
@@ -145,7 +291,7 @@ fn executeIfClause(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
     if (clause.redirects.len != 0) return error.UnsupportedInstruction;
 
     const condition_result = try executor.executeInstruction(hir, clause.condition);
-    if (condition_result.control_flow != .none) return condition_result;
+    if (!condition_result.control_flow.isNone()) return condition_result;
 
     const branch = if (condition_result.status == 0)
         clause.then_body
@@ -168,7 +314,7 @@ fn executeIfClause(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
 fn executeAndOr(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
     const operands = hir.andOr(index);
     const lhs_result = try executor.executeInstruction(hir, operands.lhs);
-    if (lhs_result.control_flow != .none) return lhs_result;
+    if (!lhs_result.control_flow.isNone()) return lhs_result;
 
     const execute_rhs = switch (hir.instructionTag(index)) {
         .and_if => lhs_result.status == 0,
@@ -189,7 +335,7 @@ fn executeAndOr(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Resul
 
 fn executeNegatedPipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
     var result = try executor.executeInstruction(hir, hir.negatedPipeline(index));
-    if (result.control_flow != .none) return result;
+    if (!result.control_flow.isNone()) return result;
     result.status = if (result.status == 0) 1 else 0;
     return result;
 }
@@ -249,6 +395,7 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
             .variable_overrides = &command_variables,
             .io = executor.io,
             .last_status = executor.last_status,
+            .loop_depth = executor.loop_depth,
         }, argv.items);
         return .{
             .status = result.status,
@@ -331,6 +478,11 @@ fn workingDirectory(executor: Executor) ?[]const u8 {
 fn commandSearchPath(executor: Executor) []const []const u8 {
     if (executor.runtime_state) |state| return state.commandSearchPath();
     return executor.search_path;
+}
+
+fn positionalParameters(executor: Executor) []const []const u8 {
+    if (executor.runtime_state) |state| return state.positionalParameters();
+    return executor.positional_parameters;
 }
 
 fn activeSandbox(executor: Executor) CommandPlan.Sandbox {

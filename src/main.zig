@@ -41,6 +41,10 @@ pub fn main(init: std.process.Init) !u8 {
     };
     const cwd = cwd_buffer[0..cwd_len];
     const variables = try environmentBindings(arena, init.environ_map);
+    const positional_parameters: []const []const u8 = switch (invocation) {
+        .script => |script| try argumentSlices(arena, script.arguments),
+        else => &.{},
+    };
     const search_path = if (init.environ_map.get("PATH")) |path|
         try splitEnvironmentList(arena, path, std.fs.path.delimiter)
     else
@@ -68,6 +72,7 @@ pub fn main(init: std.process.Init) !u8 {
         .resolver = system_resolver.resolver(),
         .cwd = cwd,
         .search_path = search_path,
+        .positional_parameters = positional_parameters,
         .variables = variables,
         .io = .{
             .stdout = stdout,
@@ -88,20 +93,20 @@ pub fn main(init: std.process.Init) !u8 {
     return switch (invocation) {
         .stream => shell.run(),
         .command => |command| shell.runCommand(command),
-        .script => |path| {
+        .script => |script| {
             const source = Io.Dir.cwd().readFileAllocOptions(
                 io,
-                path,
+                script.path,
                 gpa,
                 .unlimited,
                 .of(u8),
                 0,
             ) catch |err| {
-                try reportScriptReadError(stderr, path, err);
+                try reportScriptReadError(stderr, script.path, err);
                 return 1;
             };
             defer gpa.free(source);
-            return shell.runSource(source, path);
+            return shell.runSource(source, script.path);
         },
     };
 }
@@ -109,26 +114,35 @@ pub fn main(init: std.process.Init) !u8 {
 const Invocation = union(enum) {
     stream,
     command: []const u8,
-    script: []const u8,
+    script: struct {
+        path: []const u8,
+        arguments: []const [:0]const u8,
+    },
 
-    const usage = "habush [-c command | script]";
+    const usage = "habush [-c command | script [argument ...]]";
 
     fn parse(args: []const [:0]const u8) ?Invocation {
         if (args.len <= 1) return .stream;
-        if (args.len == 2) {
-            if (std.mem.eql(u8, args[1], "--")) return .stream;
-            if (std.mem.startsWith(u8, args[1], "-")) return null;
-            return .{ .script = args[1] };
-        }
         if (args.len == 3 and std.mem.eql(u8, args[1], "-c")) {
             return .{ .command = args[2] };
         }
-        if (args.len == 3 and std.mem.eql(u8, args[1], "--")) {
-            return .{ .script = args[2] };
+        if (std.mem.eql(u8, args[1], "--")) {
+            if (args.len == 2) return .stream;
+            return .{ .script = .{ .path = args[2], .arguments = args[3..] } };
         }
-        return null;
+        if (std.mem.startsWith(u8, args[1], "-")) return null;
+        return .{ .script = .{ .path = args[1], .arguments = args[2..] } };
     }
 };
+
+fn argumentSlices(
+    allocator: std.mem.Allocator,
+    arguments: []const [:0]const u8,
+) std.mem.Allocator.Error![]const []const u8 {
+    const result = try allocator.alloc([]const u8, arguments.len);
+    for (arguments, result) |argument, *destination| destination.* = argument;
+    return result;
+}
 
 fn reportScriptReadError(
     writer: *Io.Writer,

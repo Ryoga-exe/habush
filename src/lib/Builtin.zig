@@ -11,6 +11,8 @@ special: bool = false,
 
 pub const Tag = enum {
     @":",
+    @"break",
+    @"continue",
     true,
     false,
     cd,
@@ -31,6 +33,7 @@ pub const Context = struct {
     variable_overrides: ?*const VariableStore = null,
     io: runtime.Io = .{},
     last_status: u8 = 0,
+    loop_depth: u32 = 0,
 };
 
 pub const Error = std.mem.Allocator.Error || std.Io.Writer.Error || error{
@@ -40,6 +43,8 @@ pub const Error = std.mem.Allocator.Error || std.Io.Writer.Error || error{
 
 const definitions = std.StaticStringMap(Builtin).initComptime(.{
     .{ ":", Builtin{ .tag = .@":", .special = true } },
+    .{ "break", Builtin{ .tag = .@"break", .special = true } },
+    .{ "continue", Builtin{ .tag = .@"continue", .special = true } },
     .{ "true", Builtin{ .tag = .true } },
     .{ "false", Builtin{ .tag = .false } },
     .{ "cd", Builtin{ .tag = .cd } },
@@ -57,12 +62,42 @@ pub fn run(builtin: Builtin, context: Context, argv: []const []const u8) Error!R
     if (argv.len == 0) return .{ .status = 2 };
     return switch (builtin.tag) {
         .@":", .true => .{ .status = 0 },
+        .@"break" => runLoopControl(context, argv, .@"break"),
+        .@"continue" => runLoopControl(context, argv, .@"continue"),
         .false => .{ .status = 1 },
         .cd => runCd(context, argv),
         .exit => runExit(context, argv),
         .pwd => runPwd(context, argv),
         .@"export" => runExport(context, argv),
         .unset => runUnset(context, argv),
+    };
+}
+
+const LoopControl = enum {
+    @"break",
+    @"continue",
+};
+
+fn runLoopControl(
+    context: Context,
+    argv: []const []const u8,
+    control: LoopControl,
+) Error!Result {
+    if (argv.len > 2) return commandFailure(context, argv[0], .too_many_arguments);
+    const requested_levels = if (argv.len == 1)
+        1
+    else
+        std.fmt.parseUnsigned(u32, argv[1], 10) catch
+            return commandFailure(context, argv[0], .{ .invalid_loop_count = argv[1] });
+    if (requested_levels == 0) {
+        return commandFailure(context, argv[0], .{ .invalid_loop_count = argv[1] });
+    }
+    if (context.loop_depth == 0) return commandFailure(context, argv[0], .not_in_loop);
+
+    const levels = @min(requested_levels, context.loop_depth);
+    return switch (control) {
+        .@"break" => .{ .status = 0, .control_flow = .{ .@"break" = levels } },
+        .@"continue" => .{ .status = 0, .control_flow = .{ .@"continue" = levels } },
     };
 }
 
@@ -281,6 +316,8 @@ fn reportCommandDiagnostic(
 
 test "looks up core builtins by command name" {
     try std.testing.expect(lookup("exit").?.special);
+    try std.testing.expect(lookup("break").?.special);
+    try std.testing.expect(lookup("continue").?.special);
     try std.testing.expect(!lookup("true").?.special);
     try std.testing.expect(lookup("missing") == null);
     try std.testing.expect(lookup("./true") == null);
@@ -290,6 +327,49 @@ test "runs status-only core builtins" {
     try std.testing.expectEqual(@as(u8, 0), (try lookup(":").?.run(.{}, &.{":"})).status);
     try std.testing.expectEqual(@as(u8, 0), (try lookup("true").?.run(.{}, &.{"true"})).status);
     try std.testing.expectEqual(@as(u8, 1), (try lookup("false").?.run(.{}, &.{"false"})).status);
+}
+
+test "break and continue request loop control" {
+    const context: Context = .{ .loop_depth = 3 };
+
+    const break_result = try lookup("break").?.run(context, &.{ "break", "2" });
+    try std.testing.expectEqual(@as(u8, 0), break_result.status);
+    switch (break_result.control_flow) {
+        .@"break" => |levels| try std.testing.expectEqual(@as(u32, 2), levels),
+        else => return error.TestUnexpectedResult,
+    }
+
+    const continue_result = try lookup("continue").?.run(context, &.{ "continue", "9" });
+    try std.testing.expectEqual(@as(u8, 0), continue_result.status);
+    switch (continue_result.control_flow) {
+        .@"continue" => |levels| try std.testing.expectEqual(@as(u32, 3), levels),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "break and continue diagnose invalid contexts and operands" {
+    var diagnostics: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer diagnostics.deinit();
+    const context: Context = .{ .io = .{ .stderr = &diagnostics.writer } };
+
+    const outside = try lookup("break").?.run(context, &.{"break"});
+    try std.testing.expectEqual(@as(u8, 1), outside.status);
+    try std.testing.expect(outside.control_flow.isNone());
+
+    const zero = try lookup("continue").?.run(context, &.{ "continue", "0" });
+    try std.testing.expectEqual(@as(u8, 2), zero.status);
+    try std.testing.expect(zero.control_flow.isNone());
+
+    const non_numeric = try lookup("break").?.run(context, &.{ "break", "many" });
+    try std.testing.expectEqual(@as(u8, 2), non_numeric.status);
+    try std.testing.expect(non_numeric.control_flow.isNone());
+
+    try std.testing.expectEqualStrings(
+        "break: not in a loop\n" ++
+            "continue: invalid loop count: 0\n" ++
+            "break: invalid loop count: many\n",
+        diagnostics.written(),
+    );
 }
 
 test "exit requests shell termination with selected status" {

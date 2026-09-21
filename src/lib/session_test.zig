@@ -56,9 +56,11 @@ test "session replaces owned runtime configuration" {
 
     var cwd = [_]u8{ '/', 'n', 'e', 'w' };
     var first_path = [_]u8{ '/', 'o', 'n', 'e' };
+    var positional = [_]u8{ 'v', 'a', 'l', 'u', 'e' };
     var allowed_path = [_]u8{ '/', 'n', 'e', 'w' };
     try session.setWorkingDirectory(&cwd);
     try session.setCommandSearchPath(&.{ &first_path, "/two" });
+    try session.setPositionalParameters(&.{&positional});
     const rules = [_]SandboxPolicy.PathRule{
         .{ .path = &allowed_path, .access = .{ .write = true } },
     };
@@ -70,11 +72,13 @@ test "session replaces owned runtime configuration" {
 
     cwd[1] = 'x';
     first_path[1] = 'x';
+    positional[0] = 'x';
     allowed_path[1] = 'x';
 
     try std.testing.expectEqualStrings("/new", session.workingDirectory().?);
     try std.testing.expectEqual(@as(usize, 2), session.commandSearchPath().len);
     try std.testing.expectEqualStrings("/one", session.commandSearchPath()[0]);
+    try std.testing.expectEqualStrings("value", session.positionalParameters()[0]);
     try std.testing.expectEqualStrings(
         "/new",
         session.activeSandbox().restrict.file_system.allow[0].path,
@@ -107,6 +111,23 @@ test "session carries the previous status into exit" {
     const overridden = try session.executeWithOptions(exit_hir, .{ .last_status = 2 });
     try std.testing.expectEqual(@as(u8, 2), overridden.status);
     try std.testing.expectEqual(.exit, overridden.control_flow);
+}
+
+test "session supplies positional parameters to implicit for loops" {
+    var fake_host = FakeHost.init(std.testing.allocator);
+    defer fake_host.deinit();
+    var session = try Session.init(std.testing.allocator, fake_host.host(), .{
+        .positional_parameters = &.{ "one", "two words" },
+    });
+    defer session.deinit();
+
+    var hir = try generate("for item; do observed=\"$item\"; done");
+    defer hir.deinit(std.testing.allocator);
+    const result = try session.execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqualStrings("two words", session.variable("item").?);
+    try std.testing.expectEqualStrings("two words", session.variable("observed").?);
 }
 
 test "session routes builtin output" {

@@ -236,6 +236,266 @@ test "if clauses propagate exit from conditions and branches" {
     }
 }
 
+test "while and until loops skip bodies when conditions are not met" {
+    const cases = [_][:0]const u8{
+        "while false; do /bin/skipped; done",
+        "until true; do /bin/skipped; done",
+    };
+
+    for (cases) |source| {
+        var hir = try generate(source);
+        defer hir.deinit(std.testing.allocator);
+        var fake = FakeHost.init(std.testing.allocator);
+        defer fake.deinit();
+
+        const result = try Executor.init(std.testing.allocator, fake.host()).execute(hir);
+
+        try std.testing.expectEqual(@as(u8, 0), result.status);
+        try std.testing.expectEqual(.none, result.control_flow);
+        try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+    }
+}
+
+test "while and until loops reevaluate conditions and return the last body status" {
+    const cases = [_]struct { [:0]const u8, []const u8 }{
+        .{
+            "command=true; while \"$command\"; do command=false; false; done",
+            "false",
+        },
+        .{
+            "command=false; until \"$command\"; do command=true; false; done",
+            "true",
+        },
+    };
+
+    for (cases) |case| {
+        var hir = try generate(case[0]);
+        defer hir.deinit(std.testing.allocator);
+        var fake = FakeHost.init(std.testing.allocator);
+        defer fake.deinit();
+        var variables = VariableStore.init(std.testing.allocator);
+        defer variables.deinit();
+
+        const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+            .variables = &variables,
+        }).execute(hir);
+
+        try std.testing.expectEqual(@as(u8, 1), result.status);
+        try std.testing.expectEqual(.none, result.control_flow);
+        try std.testing.expectEqualStrings(case[1], variables.get("command").?);
+        try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+    }
+}
+
+test "while and until loops propagate exit from conditions and bodies" {
+    const cases = [_]struct { [:0]const u8, u8 }{
+        .{ "false; while exit; do true; done; /bin/skipped", 1 },
+        .{ "while true; do exit 7; done; /bin/skipped", 7 },
+        .{ "until false; do exit; done; /bin/skipped", 1 },
+    };
+
+    for (cases) |case| {
+        var hir = try generate(case[0]);
+        defer hir.deinit(std.testing.allocator);
+        var fake = FakeHost.init(std.testing.allocator);
+        defer fake.deinit();
+
+        const result = try Executor.init(std.testing.allocator, fake.host()).execute(hir);
+
+        try std.testing.expectEqual(case[1], result.status);
+        try std.testing.expectEqual(.exit, result.control_flow);
+        try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+    }
+}
+
+test "for loops expand explicit words once and retain the last iteration values" {
+    var hir = try generate(
+        \\source=one
+        \\for item in "$source" "two words" "$source"; do
+        \\  source=changed
+        \\  observed="$item"
+        \\done
+    );
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+
+    const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .variables = &variables,
+    }).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expect(result.control_flow.isNone());
+    try std.testing.expectEqualStrings("one", variables.get("item").?);
+    try std.testing.expectEqualStrings("one", variables.get("observed").?);
+    try std.testing.expectEqualStrings("changed", variables.get("source").?);
+    try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+}
+
+test "for loops without an in list iterate over positional parameters" {
+    var hir = try generate("for item; do observed=\"$item\"; done");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+
+    const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .positional_parameters = &.{ "one", "two words", "three" },
+        .variables = &variables,
+    }).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expect(result.control_flow.isNone());
+    try std.testing.expectEqualStrings("three", variables.get("item").?);
+    try std.testing.expectEqualStrings("three", variables.get("observed").?);
+}
+
+test "for loops with no values succeed without variable state" {
+    var hir = try generate("for item in; do /bin/skipped; done");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+
+    const result = try Executor.init(std.testing.allocator, fake.host()).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expect(result.control_flow.isNone());
+    try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+}
+
+test "for loops consume continue and propagate break across nested loops" {
+    const cases = [_][:0]const u8{
+        \\for command in continue false; do
+        \\  "$command"
+        \\  observed="$command"
+        \\done
+        ,
+        \\for outer in one; do
+        \\  for inner in two; do
+        \\    break 2
+        \\    /bin/skipped
+        \\  done
+        \\  /bin/skipped
+        \\done
+        ,
+    };
+
+    for (cases, 0..) |source, case_index| {
+        var hir = try generate(source);
+        defer hir.deinit(std.testing.allocator);
+        var fake = FakeHost.init(std.testing.allocator);
+        defer fake.deinit();
+        var variables = VariableStore.init(std.testing.allocator);
+        defer variables.deinit();
+
+        const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+            .variables = &variables,
+        }).execute(hir);
+
+        try std.testing.expectEqual(@as(u8, 0), result.status);
+        try std.testing.expect(result.control_flow.isNone());
+        try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+        if (case_index == 0)
+            try std.testing.expectEqualStrings("false", variables.get("observed").?);
+    }
+}
+
+test "break exits a loop and continue starts its next condition" {
+    const cases = [_]struct { [:0]const u8, []const u8 }{
+        .{
+            "command=true; while \"$command\"; do command=false; break; /bin/skipped; done",
+            "false",
+        },
+        .{
+            "command=true; while \"$command\"; do command=false; continue; /bin/skipped; done",
+            "false",
+        },
+    };
+
+    for (cases) |case| {
+        var hir = try generate(case[0]);
+        defer hir.deinit(std.testing.allocator);
+        var fake = FakeHost.init(std.testing.allocator);
+        defer fake.deinit();
+        var variables = VariableStore.init(std.testing.allocator);
+        defer variables.deinit();
+
+        const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+            .variables = &variables,
+        }).execute(hir);
+
+        try std.testing.expectEqual(@as(u8, 0), result.status);
+        try std.testing.expect(result.control_flow.isNone());
+        try std.testing.expectEqualStrings(case[1], variables.get("command").?);
+        try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+    }
+}
+
+test "break and continue propagate across nested loops" {
+    const cases = [_][:0]const u8{
+        \\outer=true
+        \\while "$outer"; do
+        \\  outer=false
+        \\  while true; do
+        \\    break 2
+        \\    /bin/skipped
+        \\  done
+        \\  /bin/skipped
+        \\done
+        ,
+        \\outer=true
+        \\inner=true
+        \\while "$outer"; do
+        \\  outer=false
+        \\  while "$inner"; do
+        \\    inner=false
+        \\    continue 2
+        \\    /bin/skipped
+        \\  done
+        \\  /bin/skipped
+        \\done
+        ,
+    };
+
+    for (cases) |source| {
+        var hir = try generate(source);
+        defer hir.deinit(std.testing.allocator);
+        var fake = FakeHost.init(std.testing.allocator);
+        defer fake.deinit();
+        var variables = VariableStore.init(std.testing.allocator);
+        defer variables.deinit();
+
+        const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+            .variables = &variables,
+        }).execute(hir);
+
+        try std.testing.expectEqual(@as(u8, 0), result.status);
+        try std.testing.expect(result.control_flow.isNone());
+        try std.testing.expectEqualStrings("false", variables.get("outer").?);
+        try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+    }
+}
+
+test "break outside a loop reports a command failure" {
+    var hir = try generate("break");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var diagnostics: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer diagnostics.deinit();
+
+    const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .io = .{ .stderr = &diagnostics.writer },
+    }).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 1), result.status);
+    try std.testing.expect(result.control_flow.isNone());
+    try std.testing.expectEqualStrings("break: not in a loop\n", diagnostics.written());
+}
+
 test "special builtin assignments persist in session state" {
     var hir = try generate("name=temporary next=\"$name value\" :");
     defer hir.deinit(std.testing.allocator);
@@ -413,6 +673,8 @@ test "unsupported execution forms fail before the current command has side effec
         "left | right",
         "persisted=changed >out",
         "if persisted=changed; then true; fi >out",
+        "while persisted=changed; do true; done >out",
+        "for persisted in changed; do true; done >out",
         "left &",
     };
 

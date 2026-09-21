@@ -9,12 +9,14 @@ const VariableStore = @import("../VariableStore.zig");
 gpa: std.mem.Allocator,
 cwd: ?[]u8,
 search_path: []const []const u8,
+positional_parameters: []const []const u8,
 sandbox: CommandPlan.Sandbox,
 variables: VariableStore,
 
 pub const Options = struct {
     cwd: ?[]const u8 = null,
     search_path: []const []const u8 = &.{},
+    positional_parameters: []const []const u8 = &.{},
     sandbox: CommandPlan.Sandbox = .inherit,
     /// Complete initial shell variable state. The caller should import the
     /// host environment here and mark those bindings exported when desired.
@@ -30,6 +32,9 @@ pub fn init(gpa: std.mem.Allocator, options: Options) Error!State {
     const search_path = try cloneStrings(gpa, options.search_path);
     errdefer deinitStrings(gpa, search_path);
 
+    const positional_parameters = try cloneStrings(gpa, options.positional_parameters);
+    errdefer deinitStrings(gpa, positional_parameters);
+
     var variables = VariableStore.init(gpa);
     errdefer variables.deinit();
     for (options.variables) |binding| {
@@ -41,6 +46,7 @@ pub fn init(gpa: std.mem.Allocator, options: Options) Error!State {
         .gpa = gpa,
         .cwd = cwd,
         .search_path = search_path,
+        .positional_parameters = positional_parameters,
         .sandbox = try options.sandbox.clone(gpa),
         .variables = variables,
     };
@@ -49,6 +55,7 @@ pub fn init(gpa: std.mem.Allocator, options: Options) Error!State {
 pub fn deinit(state: *State) void {
     if (state.cwd) |cwd| state.gpa.free(cwd);
     deinitStrings(state.gpa, state.search_path);
+    deinitStrings(state.gpa, state.positional_parameters);
     state.sandbox.deinit(state.gpa);
     state.variables.deinit();
     state.* = undefined;
@@ -64,6 +71,10 @@ pub fn workingDirectory(state: State) ?[]const u8 {
 
 pub fn commandSearchPath(state: State) []const []const u8 {
     return state.search_path;
+}
+
+pub fn positionalParameters(state: State) []const []const u8 {
+    return state.positional_parameters;
 }
 
 pub fn activeSandbox(state: State) CommandPlan.Sandbox {
@@ -145,6 +156,15 @@ pub fn setCommandSearchPath(
     state.search_path = copy;
 }
 
+pub fn setPositionalParameters(
+    state: *State,
+    positional_parameters: []const []const u8,
+) std.mem.Allocator.Error!void {
+    const copy = try cloneStrings(state.gpa, positional_parameters);
+    deinitStrings(state.gpa, state.positional_parameters);
+    state.positional_parameters = copy;
+}
+
 pub fn setSandbox(
     state: *State,
     sandbox: CommandPlan.Sandbox,
@@ -179,6 +199,7 @@ fn deinitStrings(allocator_value: std.mem.Allocator, strings: []const []const u8
 test "runtime state owns mutable session values" {
     var cwd = [_]u8{ '/', 'o', 'l', 'd' };
     var search = [_]u8{ '/', 'b', 'i', 'n' };
+    var positional = [_]u8{ 'v', 'a', 'l', 'u', 'e' };
     var allowed = [_]u8{ '/', 'o', 'l', 'd' };
     var name = [_]u8{ 'n', 'a', 'm', 'e' };
     var value = [_]u8{ 'v', 'a', 'l', 'u', 'e' };
@@ -188,6 +209,7 @@ test "runtime state owns mutable session values" {
     var state = try State.init(std.testing.allocator, .{
         .cwd = &cwd,
         .search_path = &.{&search},
+        .positional_parameters = &.{&positional},
         .sandbox = .{ .restrict = .{ .file_system = .{ .allow = &rules } } },
         .variables = &.{.{ .name = &name, .value = &value, .exported = true }},
     });
@@ -195,12 +217,14 @@ test "runtime state owns mutable session values" {
 
     cwd[1] = 'x';
     search[1] = 'x';
+    positional[0] = 'x';
     allowed[1] = 'x';
     name[0] = 'x';
     value[0] = 'x';
 
     try std.testing.expectEqualStrings("/old", state.workingDirectory().?);
     try std.testing.expectEqualStrings("/bin", state.commandSearchPath()[0]);
+    try std.testing.expectEqualStrings("value", state.positionalParameters()[0]);
     try std.testing.expectEqualStrings(
         "/old",
         state.activeSandbox().restrict.file_system.allow[0].path,
@@ -274,6 +298,7 @@ fn initWithAllocator(gpa: std.mem.Allocator) !void {
     var state = try State.init(gpa, .{
         .cwd = "/workspace",
         .search_path = &search_path,
+        .positional_parameters = &.{ "one", "two" },
         .sandbox = .{ .restrict = .{ .file_system = .{ .allow = &rules } } },
         .variables = &.{
             .{ .name = "first", .value = "one", .exported = true },
