@@ -1,4 +1,9 @@
 //! Context-sensitive expansion of HIR words.
+//!
+//! This stage performs current-user tilde expansion, parameter expansion,
+//! field splitting, and quote removal. Pathname expansion, named-user tilde
+//! expansion, and parameter transformations such as `${#name}` remain
+//! explicit unsupported boundaries.
 
 const std = @import("std");
 const Expander = @This();

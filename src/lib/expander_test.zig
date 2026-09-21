@@ -666,6 +666,30 @@ test "argument expansion handles every allocation failure" {
     );
 }
 
+test "parameter assignment handles every allocation failure" {
+    var hir = try generate("command ${missing:=one two}");
+    defer hir.deinit(std.testing.allocator);
+    const word_inst = firstCommandParts(hir)[1];
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        expandAssignmentParameterWithAllocator,
+        .{ hir, word_inst },
+    );
+}
+
+test "parameter failure handles every allocation failure" {
+    var hir = try generate("command ${missing:?custom message}");
+    defer hir.deinit(std.testing.allocator);
+    const word_inst = firstCommandParts(hir)[1];
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        expandFailureWithAllocator,
+        .{ hir, word_inst },
+    );
+}
+
 fn expectExpansionError(source: [:0]const u8, expected: anyerror) !void {
     var hir = try generate(source);
     defer hir.deinit(std.testing.allocator);
@@ -689,6 +713,40 @@ fn expandWithAllocator(
         for (fields) |field| gpa.free(field);
         gpa.free(fields);
     }
+}
+
+fn expandAssignmentParameterWithAllocator(
+    gpa: std.mem.Allocator,
+    hir: Hir,
+    word_inst: Hir.Inst.Index,
+) !void {
+    var variables = VariableStore.init(gpa);
+    defer variables.deinit();
+    const fields = try Expander.initWithContext(gpa, .{
+        .variables = &variables,
+    }).expandArgument(hir, word_inst);
+    defer {
+        for (fields) |field| gpa.free(field);
+        gpa.free(fields);
+    }
+}
+
+fn expandFailureWithAllocator(
+    gpa: std.mem.Allocator,
+    hir: Hir,
+    word_inst: Hir.Inst.Index,
+) !void {
+    var failure: Expander.Failure = undefined;
+    _ = Expander.initWithContext(gpa, .{
+        .failure = &failure,
+    }).expandArgument(hir, word_inst) catch |err| switch (err) {
+        error.ParameterExpansionFailed => {
+            failure.deinit(gpa);
+            return;
+        },
+        else => |other| return other,
+    };
+    return error.ExpectedParameterExpansionFailure;
 }
 
 fn firstCommandParts(hir: Hir) []const Hir.Inst.Index {
