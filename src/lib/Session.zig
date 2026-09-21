@@ -23,7 +23,7 @@ pub const Options = struct {
     resolver: ?CommandResolver = null,
     cwd: ?[]const u8 = null,
     invocation_name: []const u8 = "habush",
-    shell_process_id: ?u64 = null,
+    shell_process_id: ?runtime.ProcessId = null,
     search_path: []const []const u8 = &.{},
     positional_parameters: []const []const u8 = &.{},
     sandbox: CommandPlan.Sandbox = .inherit,
@@ -36,7 +36,7 @@ pub const Options = struct {
 pub const ExecutionOptions = struct {
     /// Overrides the previous successful execution status. Frontends use this
     /// after failures, such as parse errors, that occur outside the runtime.
-    last_status: ?u8 = null,
+    last_status: ?runtime.ExitStatus = null,
 };
 
 pub fn init(

@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const Diagnostic = @This();
+const types = @import("types.zig");
 
 subject: Subject,
 kind: Kind,
@@ -50,7 +51,7 @@ pub const RenderOptions = struct {
     program_name: ?[]const u8 = null,
 };
 
-pub fn status(diagnostic: Diagnostic) u8 {
+pub fn status(diagnostic: Diagnostic) types.ExitStatus {
     return switch (diagnostic.kind) {
         .unsupported_option,
         .unexpected_argument,
@@ -121,7 +122,7 @@ test "renders the shell status classes" {
     const Case = struct {
         diagnostic: Diagnostic,
         options: RenderOptions = .{},
-        status: u8,
+        status: types.ExitStatus,
         rendered: []const u8,
     };
     const cases = [_]Case{

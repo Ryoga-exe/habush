@@ -5,7 +5,7 @@ const Io = std.Io;
 const platform = @import("platform.zig");
 const Shell = @import("Shell.zig");
 
-pub fn main(init: std.process.Init) !u8 {
+pub fn main(init: std.process.Init) !habush.runtime.ExitStatus {
     const arena = init.arena.allocator();
     const gpa = init.gpa;
     const io = init.io;

@@ -24,7 +24,7 @@ pub const Tag = enum {
 };
 
 pub const Result = struct {
-    status: u8,
+    status: runtime.ExitStatus,
     control_flow: runtime.ControlFlow = .none,
 };
 
@@ -33,7 +33,7 @@ pub const Context = struct {
     runtime_state: ?*runtime.State = null,
     variable_overrides: ?*const VariableStore = null,
     io: runtime.Io = .{},
-    last_status: u8 = 0,
+    last_status: runtime.ExitStatus = 0,
     loop_depth: u32 = 0,
     function_depth: u32 = 0,
 };
@@ -120,7 +120,7 @@ fn runExit(context: Context, argv: []const []const u8) Error!Result {
         return .{ .status = failure.status, .control_flow = .exit };
     };
     // Shell statuses expose the low eight bits of a valid integer operand.
-    const status: u8 = @truncate(@as(u64, @bitCast(value)));
+    const status: runtime.ExitStatus = @truncate(@as(u64, @bitCast(value)));
     return .{ .status = status, .control_flow = .exit };
 }
 
@@ -140,7 +140,7 @@ fn runReturn(context: Context, argv: []const []const u8) Error!Result {
         );
         return .{ .status = failure.status, .control_flow = .@"return" };
     };
-    const status: u8 = @truncate(@as(u64, @bitCast(value)));
+    const status: runtime.ExitStatus = @truncate(@as(u64, @bitCast(value)));
     return .{ .status = status, .control_flow = .@"return" };
 }
 
@@ -218,7 +218,7 @@ fn runPwd(context: Context, argv: []const []const u8) Error!Result {
 
 fn runExport(context: Context, argv: []const []const u8) Error!Result {
     const state = context.runtime_state orelse return error.RuntimeStateUnavailable;
-    var status: u8 = 0;
+    var status: runtime.ExitStatus = 0;
     var operands = argv[1..];
     if (operands.len != 0 and std.mem.eql(u8, operands[0], "--")) operands = operands[1..];
     if (operands.len == 0) try writeExportedVariables(context.io.stdout, state.variableStore());
@@ -278,7 +278,7 @@ fn writeShellQuoted(writer: *std.Io.Writer, value: []const u8) std.Io.Writer.Err
 
 fn runUnset(context: Context, argv: []const []const u8) Error!Result {
     const state = context.runtime_state orelse return error.RuntimeStateUnavailable;
-    var status: u8 = 0;
+    var status: runtime.ExitStatus = 0;
     var operands = argv[1..];
     if (operands.len != 0 and std.mem.eql(u8, operands[0], "--")) operands = operands[1..];
     for (operands) |name| {
@@ -329,7 +329,7 @@ fn reportCommandDiagnostic(
     context: Context,
     command: []const u8,
     kind: runtime.Diagnostic.Kind,
-) std.Io.Writer.Error!u8 {
+) std.Io.Writer.Error!runtime.ExitStatus {
     const diagnostic: runtime.Diagnostic = .{
         .subject = .{ .command = command },
         .kind = kind,

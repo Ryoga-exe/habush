@@ -25,14 +25,14 @@ sandbox: CommandPlan.Sandbox,
 resolver: ?CommandResolver,
 search_path: []const []const u8,
 invocation_name: []const u8,
-shell_process_id: ?u64,
+shell_process_id: ?runtime.ProcessId,
 positional_parameters: []const []const u8,
 positional_parameters_override: ?[]const []const u8,
 cwd: ?[]const u8,
 variables: ?*VariableStore,
 runtime_state: ?*runtime.State,
 io: runtime.Io,
-last_status: u8,
+last_status: runtime.ExitStatus,
 loop_depth: u32,
 function_depth: u32,
 
@@ -54,7 +54,7 @@ pub const Options = struct {
     resolver: ?CommandResolver = null,
     search_path: []const []const u8 = &.{},
     invocation_name: []const u8 = "habush",
-    shell_process_id: ?u64 = null,
+    shell_process_id: ?runtime.ProcessId = null,
     positional_parameters: []const []const u8 = &.{},
     cwd: ?[]const u8 = null,
     /// Complete shell variable state. When present, exported bindings become
@@ -62,12 +62,12 @@ pub const Options = struct {
     variables: ?*VariableStore = null,
     io: runtime.Io = .{},
     /// Status visible to a command such as `exit` when no operand is given.
-    last_status: u8 = 0,
+    last_status: runtime.ExitStatus = 0,
 };
 
 /// The shell-visible outcome of a completed HIR unit.
 pub const Result = struct {
-    status: u8,
+    status: runtime.ExitStatus,
     sandbox_coverage: SandboxPolicy.Coverage,
     control_flow: runtime.ControlFlow = .none,
 };
@@ -102,7 +102,7 @@ pub fn initWithState(
     resolver: ?CommandResolver,
     state: *runtime.State,
     io: runtime.Io,
-    last_status: u8,
+    last_status: runtime.ExitStatus,
 ) Executor {
     return .{
         .gpa = state.allocator(),
@@ -681,7 +681,7 @@ fn invocationName(executor: Executor) []const u8 {
     return executor.invocation_name;
 }
 
-fn shellProcessId(executor: Executor) ?u64 {
+fn shellProcessId(executor: Executor) ?runtime.ProcessId {
     if (executor.runtime_state) |state| return state.shellProcessId();
     return executor.shell_process_id;
 }

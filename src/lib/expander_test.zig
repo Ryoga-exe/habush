@@ -44,7 +44,7 @@ test "expands the shell process id" {
     try std.testing.expectEqualDeep(
         @as([]const []const u8, &.{"12345"}),
         try Expander.initWithContext(arena.allocator(), .{
-            .shell_process_id = 12345,
+            .shell_process_id = @enumFromInt(12345),
         }).expandArgument(hir, part),
     );
 }

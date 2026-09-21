@@ -10,9 +10,9 @@ stdin: *Io.Reader,
 stderr: *Io.Writer,
 session: *habush.Session,
 interactive: bool,
-last_status: u8 = 0,
+last_status: habush.runtime.ExitStatus = 0,
 
-pub fn run(self: *Shell) !u8 {
+pub fn run(self: *Shell) !habush.runtime.ExitStatus {
     while (true) {
         const source = try self.readCommand() orelse return self.last_status;
         defer self.allocator.free(source);
@@ -29,13 +29,17 @@ pub fn run(self: *Shell) !u8 {
     }
 }
 
-pub fn runCommand(self: *Shell, command: []const u8) !u8 {
+pub fn runCommand(self: *Shell, command: []const u8) !habush.runtime.ExitStatus {
     const source = try self.allocator.dupeZ(u8, command);
     defer self.allocator.free(source);
     return self.runSource(source, null);
 }
 
-pub fn runSource(self: *Shell, source: [:0]const u8, source_name: ?[]const u8) !u8 {
+pub fn runSource(
+    self: *Shell,
+    source: [:0]const u8,
+    source_name: ?[]const u8,
+) !habush.runtime.ExitStatus {
     if (std.mem.trim(u8, source, &std.ascii.whitespace).len == 0) return 0;
 
     _ = try self.handleInput(source, source_name);

@@ -3,7 +3,7 @@ const windows = std.os.windows;
 
 pub const Error = error{Unexpected};
 
-pub fn processId() u64 {
+pub fn processId() u32 {
     return windows.GetCurrentProcessId();
 }
 

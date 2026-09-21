@@ -8,6 +8,7 @@
 const std = @import("std");
 const Expander = @This();
 const Hir = @import("Hir.zig");
+const runtime_types = @import("runtime/types.zig");
 const VariableStore = @import("VariableStore.zig");
 const Word = @import("word.zig");
 
@@ -18,9 +19,9 @@ pub const Context = struct {
     variables: ?*VariableStore = null,
     overrides: ?*const VariableStore = null,
     invocation_name: ?[]const u8 = null,
-    shell_process_id: ?u64 = null,
+    shell_process_id: ?runtime_types.ProcessId = null,
     positional_parameters: []const []const u8 = &.{},
-    last_status: u8 = 0,
+    last_status: runtime_types.ExitStatus = 0,
     failure: ?*Failure = null,
 
     fn variable(context: Context, name: []const u8) ?[]const u8 {
@@ -470,7 +471,8 @@ fn appendParameter(
         const process_id = expander.context.shell_process_id orelse
             return error.ParameterExpansionUnsupported;
         var buffer: [20]u8 = undefined;
-        const value = std.fmt.bufPrint(&buffer, "{d}", .{process_id}) catch unreachable;
+        const value = std.fmt.bufPrint(&buffer, "{d}", .{@intFromEnum(process_id)}) catch
+            unreachable;
         try bytes.appendSlice(expander.allocator, value);
         return;
     }

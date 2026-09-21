@@ -1,6 +1,7 @@
 //! Platform operations used by the `habush` executable.
 
 const builtin = @import("builtin");
+const ProcessId = @import("habush").runtime.ProcessId;
 
 const implementation = switch (builtin.os.tag) {
     .windows => @import("platform/windows.zig"),
@@ -15,4 +16,6 @@ const implementation = switch (builtin.os.tag) {
 };
 
 pub const ignoreInteractiveInterrupt = implementation.ignoreInteractiveInterrupt;
-pub const processId = implementation.processId;
+pub fn processId() ProcessId {
+    return @enumFromInt(implementation.processId());
+}

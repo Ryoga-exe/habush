@@ -1,7 +1,7 @@
 const std = @import("std");
 const posix = std.posix;
 
-pub fn processId() u64 {
+pub fn processId() u32 {
     return @intCast(posix.system.getpid());
 }
 

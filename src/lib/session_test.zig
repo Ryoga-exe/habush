@@ -200,7 +200,7 @@ test "shell process id remains stable inside functions" {
     var fake_host = FakeHost.init(std.testing.allocator);
     defer fake_host.deinit();
     var session = try Session.init(std.testing.allocator, fake_host.host(), .{
-        .shell_process_id = 12345,
+        .shell_process_id = @enumFromInt(12345),
     });
     defer session.deinit();
 

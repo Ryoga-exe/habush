@@ -7,6 +7,7 @@
 const std = @import("std");
 const Host = @This();
 const CommandPlan = @import("CommandPlan.zig");
+const runtime_types = @import("runtime/types.zig");
 const SandboxPolicy = @import("SandboxPolicy.zig");
 
 pub const System = @import("Host/System.zig");
@@ -56,7 +57,7 @@ pub const WorkingDirectoryRequest = struct {
 pub const Termination = union(enum) {
     /// Portable shell exit status. System hosts normalize native process
     /// results to the range 0...255.
-    exited: u8,
+    exited: runtime_types.ExitStatus,
     signal: u32,
     stopped: u32,
     unknown: u32,
