@@ -264,7 +264,12 @@ pub const Iterator = struct {
             return iterator.part(braced_parameter_tag, content_start, content_end);
         }
 
-        if (!isNameStart(iterator.source[iterator.index + 1])) return null;
+        const first = iterator.source[iterator.index + 1];
+        if (isSpecialParameter(first) or std.ascii.isDigit(first)) {
+            iterator.index += 2;
+            return iterator.part(parameter_tag, iterator.index - 1, iterator.index);
+        }
+        if (!isNameStart(first)) return null;
         const name_start = iterator.index + 1;
         iterator.index = name_start + 1;
         while (iterator.index < iterator.source.len and
@@ -301,6 +306,13 @@ fn isNameStart(byte: u8) bool {
 
 fn isNameContinue(byte: u8) bool {
     return isNameStart(byte) or std.ascii.isDigit(byte);
+}
+
+fn isSpecialParameter(byte: u8) bool {
+    return switch (byte) {
+        '@', '*', '#', '?', '-', '$', '!' => true,
+        else => false,
+    };
 }
 
 test "iterates mixed word parts" {
@@ -341,6 +353,40 @@ test "preserves empty quoted parts" {
     try std.testing.expectEqual(@as(ByteOffset, 7), double.start);
     try std.testing.expectEqual(double.start, double.end);
     try std.testing.expect(iterator.next() == null);
+}
+
+test "iterates positional and special parameters" {
+    const source = "$1x \"$@:$?:$#:$10:${10}:$*:$-:$$:$!\"";
+    var iterator = Iterator.init(source, 0);
+
+    const expected = [_]struct { Part.Tag, []const u8 }{
+        .{ .parameter, "1" },
+        .{ .literal, "x " },
+        .{ .double_quoted_parameter, "@" },
+        .{ .double_quoted, ":" },
+        .{ .double_quoted_parameter, "?" },
+        .{ .double_quoted, ":" },
+        .{ .double_quoted_parameter, "#" },
+        .{ .double_quoted, ":" },
+        .{ .double_quoted_parameter, "1" },
+        .{ .double_quoted, "0:" },
+        .{ .double_quoted_braced_parameter, "10" },
+        .{ .double_quoted, ":" },
+        .{ .double_quoted_parameter, "*" },
+        .{ .double_quoted, ":" },
+        .{ .double_quoted_parameter, "-" },
+        .{ .double_quoted, ":" },
+        .{ .double_quoted_parameter, "$" },
+        .{ .double_quoted, ":" },
+        .{ .double_quoted_parameter, "!" },
+    };
+    for (expected) |item| {
+        const part = iterator.next().?;
+        try std.testing.expectEqual(item[0], part.tag);
+        try std.testing.expectEqualStrings(item[1], source[part.start..part.end]);
+    }
+    try std.testing.expect(iterator.next() == null);
+    try std.testing.expect(iterator.status == .complete);
 }
 
 test "double quote backslash follows shell rules" {
