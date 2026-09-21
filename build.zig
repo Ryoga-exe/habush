@@ -51,6 +51,17 @@ pub fn build(b: *std.Build) void {
     stream_test.setStdIn(.{ .bytes = "true\nexit 9\n" });
     expectCliResult(stream_test, test_step, 9, "", "");
 
+    const incomplete_heredoc_test = b.addRunArtifact(exe);
+    incomplete_heredoc_test.setName("test cli incomplete here-document");
+    incomplete_heredoc_test.addArgs(&.{ "-c", ": <<EOF\nbody\n" });
+    expectCliResult(
+        incomplete_heredoc_test,
+        test_step,
+        2,
+        "",
+        "habush: incomplete here-document\n",
+    );
+
     const script_test = b.addRunArtifact(exe);
     script_test.setName("test cli script file");
     script_test.addFileArg(b.path("test/cli/exit.hb"));

@@ -176,6 +176,43 @@ test "here-strings append a newline to scalar expansion" {
         .file_actions[0].use_resource.target);
 }
 
+test "closes earlier here-document resources when later expansion fails" {
+    const collected = [_]@import("heredoc.zig").Collected{
+        .{
+            .delimiter = "FIRST",
+            .strip_tabs = false,
+            .expand_body = true,
+            .body = "first\n",
+        },
+        .{
+            .delimiter = "SECOND",
+            .strip_tabs = false,
+            .expand_body = true,
+            .body = "${missing:?required}\n",
+        },
+    };
+    var hir = try generateWithHereDocuments(
+        "/bin/cat <<FIRST <<SECOND\n",
+        &collected,
+    );
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var diagnostics: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer diagnostics.deinit();
+
+    const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .resolver = CommandResolver.preResolved(),
+        .io = .{ .stderr = &diagnostics.writer },
+    }).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 1), result.status);
+    try std.testing.expectEqualStrings("missing: required\n", diagnostics.written());
+    try std.testing.expectEqual(@as(usize, 1), fake.create_input_calls.items.len);
+    try std.testing.expectEqual(@as(usize, 1), fake.closed_resource_count);
+    try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+}
+
 test "diagnoses invalid external command redirects before spawning" {
     const Case = struct {
         source: [:0]const u8,
