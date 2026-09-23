@@ -170,6 +170,14 @@ pub fn build(b: *std.Build) void {
         pipeline_final_exit_status_test.setName("test cli final pipeline exit status");
         pipeline_final_exit_status_test.addArgs(&.{ "-c", "true | exit 7" });
         expectCliResult(pipeline_final_exit_status_test, test_step, 7, "", "");
+
+        const function_pipeline_test = b.addRunArtifact(exe);
+        function_pipeline_test.setName("test cli shell function pipeline");
+        function_pipeline_test.addArgs(&.{
+            "-c",
+            "copy() { /bin/cat; }; /bin/echo function-data | copy | /usr/bin/grep -q function-data",
+        });
+        expectCliResult(function_pipeline_test, test_step, 0, "", "");
     }
 
     const parameter_diagnostic_test = b.addRunArtifact(exe);

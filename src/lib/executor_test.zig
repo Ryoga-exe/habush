@@ -842,6 +842,83 @@ test "loop control in a pipeline does not leave the parent loop" {
     }
 }
 
+test "shell function pipeline stage runs after adjacent external stages launch" {
+    var hir = try generate(
+        "filter() { /bin/filter; }; /bin/source | filter | /bin/sink",
+    );
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var state = try runtime.State.init(std.testing.allocator, .{});
+    defer state.deinit();
+
+    const result = try Executor.initWithState(
+        fake.host(),
+        CommandResolver.preResolved(),
+        &state,
+        .{},
+        0,
+    ).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqual(@as(usize, 3), fake.spawn_calls.items.len);
+    try std.testing.expectEqualStrings("/bin/sink", fake.spawn_calls.items[0].argv[0]);
+    try std.testing.expectEqualStrings("/bin/source", fake.spawn_calls.items[1].argv[0]);
+    try std.testing.expectEqualStrings("/bin/filter", fake.spawn_calls.items[2].argv[0]);
+    const function_actions = fake.spawn_calls.items[2].file_actions;
+    try std.testing.expectEqual(@as(usize, 2), function_actions.len);
+    try std.testing.expectEqual(CommandPlan.FileDescriptor.stdin, function_actions[0]
+        .use_resource.target);
+    try std.testing.expectEqual(CommandPlan.FileDescriptor.stdout, function_actions[1]
+        .use_resource.target);
+    try std.testing.expectEqual(@as(usize, 3), fake.wait_calls.items.len);
+    try std.testing.expectEqual(@as(usize, 4), fake.closed_resource_count);
+}
+
+test "shell function pipeline stage state does not escape" {
+    var hir = try generate(
+        "mutate() { cd child; export NAME=inside; }; mutate | /bin/sink",
+    );
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    fake.working_directory_result = "/workspace/child";
+    var state = try runtime.State.init(std.testing.allocator, .{
+        .cwd = "/workspace",
+        .variables = &.{.{ .name = "NAME", .value = "outside" }},
+    });
+    defer state.deinit();
+
+    const result = try Executor.initWithState(
+        fake.host(),
+        CommandResolver.preResolved(),
+        &state,
+        .{},
+        0,
+    ).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqualStrings("/workspace", state.workingDirectory().?);
+    try std.testing.expectEqualStrings("outside", state.variable("NAME").?);
+    try std.testing.expect(!state.isVariableExported("NAME"));
+}
+
+test "multiple shell function pipeline stages remain unsupported" {
+    var hir = try generate("f() { :; }; g() { :; }; f | g");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var state = try runtime.State.init(std.testing.allocator, .{});
+    defer state.deinit();
+
+    try std.testing.expectError(
+        error.UnsupportedInstruction,
+        Executor.initWithState(fake.host(), null, &state, .{}, 0).execute(hir),
+    );
+    try std.testing.expectEqual(@as(usize, 0), fake.create_pipe_calls);
+    try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+}
+
 test "upstream pipeline spawn failures reap downstream processes" {
     var hir = try generate("/bin/first | /bin/second");
     defer hir.deinit(std.testing.allocator);

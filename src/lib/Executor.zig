@@ -4,7 +4,8 @@
 //! lists, and-or commands, pipeline negation, brace groups, if clauses,
 //! while/until/for loops with break/continue control, standalone assignments,
 //! builtins, external simple commands, and foreground pipelines of external
-//! simple commands and selected builtins that do not consume stdin.
+//! simple commands, builtins that do not consume stdin, and at most one shell
+//! function stage.
 //! Standard-stream redirections are supported for simple and compound
 //! commands, including here-documents and here-strings. Background execution
 //! and non-external pipeline stages remain explicit `UnsupportedInstruction`
@@ -88,6 +89,17 @@ const PipelinePipe = struct {
     endpoints: Host.Pipe,
     read_open: bool = true,
     write_open: bool = true,
+};
+
+const PipelineStageKind = enum {
+    external,
+    builtin,
+    function,
+};
+
+const PipelineStageClassification = union(enum) {
+    kind: PipelineStageKind,
+    failed: Result,
 };
 
 pub fn init(gpa: std.mem.Allocator, host: Host) Executor {
@@ -504,10 +516,17 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
     var pipe_stderr: std.ArrayList(bool) = .empty;
     try collectPipeline(hir, index, allocator, &stages, &pipe_stderr);
     std.debug.assert(stages.items.len == pipe_stderr.items.len + 1);
-    for (stages.items) |stage| {
-        if (hir.instructionTag(stage) != .simple_command)
-            return error.UnsupportedInstruction;
+
+    const stage_kinds = try allocator.alloc(PipelineStageKind, stages.items.len);
+    var function_count: usize = 0;
+    for (stages.items, stage_kinds) |stage, *kind| {
+        kind.* = switch (try executor.classifyPipelineStage(hir, stage, allocator)) {
+            .kind => |value| value,
+            .failed => |result| return result,
+        };
+        if (kind.* == .function) function_count += 1;
     }
+    if (function_count > 1) return error.UnsupportedInstruction;
 
     const pipes = try allocator.alloc(PipelinePipe, pipe_stderr.items.len);
     var pipe_count: usize = 0;
@@ -533,35 +552,44 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
     }
 
     var result: Result = .{ .status = 0, .sandbox_coverage = .not_requested };
-    var remaining_stages = stages.items.len;
-    while (remaining_stages != 0) {
-        remaining_stages -= 1;
-        const stage_index = remaining_stages;
-        const stage = stages.items[stage_index];
-        var stage_executor = executor;
-        stage_executor.pipeline_stage = .{
-            .input = if (stage_index == 0) null else pipes[stage_index - 1].endpoints.read_end,
-            .output = if (stage_index == pipes.len) null else pipes[stage_index].endpoints.write_end,
-            .pipe_stderr = stage_index < pipe_stderr.items.len and
-                pipe_stderr.items[stage_index],
-            .spawned = &spawned[stage_index],
-        };
-        const stage_result = stage_executor.executePipelineStage(hir, stage) catch |err| switch (err) {
-            // A non-final in-process stage observes a closed pipeline as a
-            // command failure, not as an executor infrastructure failure.
-            error.WriteFailed => if (stage_index + 1 == stages.items.len)
-                return err
-            else
-                Result{ .status = 1, .sandbox_coverage = .not_requested },
-            else => |other| return other,
-        };
-        if (stage_index + 1 == stages.items.len) result.status = stage_result.status;
-        result.sandbox_coverage = combineSandboxCoverage(
-            result.sandbox_coverage,
-            stage_result.sandbox_coverage,
-        );
-        if (stage_index != 0) closePipeRead(executor.host, &pipes[stage_index - 1]);
-        if (stage_index != pipes.len) closePipeWrite(executor.host, &pipes[stage_index]);
+    const phase_count: usize = if (function_count == 0) 1 else 2;
+    for (0..phase_count) |phase| {
+        var remaining_stages = stages.items.len;
+        while (remaining_stages != 0) {
+            remaining_stages -= 1;
+            const stage_index = remaining_stages;
+            const kind = stage_kinds[stage_index];
+            if (phase_count != 1) {
+                if (phase == 0 and kind != .external) continue;
+                if (phase == 1 and kind == .external) continue;
+            }
+
+            const stage = stages.items[stage_index];
+            var stage_executor = executor;
+            stage_executor.pipeline_stage = .{
+                .input = if (stage_index == 0) null else pipes[stage_index - 1].endpoints.read_end,
+                .output = if (stage_index == pipes.len) null else pipes[stage_index].endpoints.write_end,
+                .pipe_stderr = stage_index < pipe_stderr.items.len and
+                    pipe_stderr.items[stage_index],
+                .spawned = &spawned[stage_index],
+            };
+            const stage_result = stage_executor.executePipelineStage(hir, stage) catch |err| switch (err) {
+                // A non-final in-process stage observes a closed pipeline as a
+                // command failure, not as an executor infrastructure failure.
+                error.WriteFailed => if (stage_index + 1 == stages.items.len)
+                    return err
+                else
+                    Result{ .status = 1, .sandbox_coverage = .not_requested },
+                else => |other| return other,
+            };
+            if (stage_index + 1 == stages.items.len) result.status = stage_result.status;
+            result.sandbox_coverage = combineSandboxCoverage(
+                result.sandbox_coverage,
+                stage_result.sandbox_coverage,
+            );
+            if (stage_index != 0) closePipeRead(executor.host, &pipes[stage_index - 1]);
+            if (stage_index != pipes.len) closePipeWrite(executor.host, &pipes[stage_index]);
+        }
     }
 
     for (spawned, 0..) |process, stage_index| {
@@ -573,6 +601,42 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
         }
     }
     return result;
+}
+
+fn classifyPipelineStage(
+    executor: Executor,
+    hir: Hir,
+    index: Hir.Inst.Index,
+    allocator: std.mem.Allocator,
+) Error!PipelineStageClassification {
+    if (hir.instructionTag(index) != .simple_command)
+        return error.UnsupportedInstruction;
+
+    var expansion_failure: Expander.Failure = undefined;
+    const expander = executor.wordExpander(allocator, null, &expansion_failure);
+    var argv: std.ArrayList([]const u8) = .empty;
+    for (hir.simpleCommandParts(index)) |part| switch (hir.instructionTag(part)) {
+        .assignment, .redirect => {},
+        .word => {
+            const expanded = expander.expandArgument(hir, part) catch |err| switch (err) {
+                error.ParameterExpansionFailed => return .{ .failed = try executor.parameterExpansionFailure(
+                    allocator,
+                    expansion_failure,
+                ) },
+                else => |other| return other,
+            };
+            try argv.appendSlice(allocator, expanded);
+        },
+        else => return error.UnsupportedInstruction,
+    };
+    if (argv.items.len == 0) return error.UnsupportedInstruction;
+    const builtin = Builtin.lookup(argv.items[0]);
+    if (builtin) |candidate|
+        if (candidate.special) return .{ .kind = .builtin };
+    if (executor.runtime_state) |state|
+        if (state.functionStore().contains(argv.items[0])) return .{ .kind = .function };
+    if (builtin != null) return .{ .kind = .builtin };
+    return .{ .kind = .external };
 }
 
 fn executePipelineStage(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
@@ -754,12 +818,11 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
     }
     if (executor.runtime_state) |state| {
         if (state.functionStore().contains(argv.items[0])) {
-            if (executor.pipeline_stage != null) return error.UnsupportedInstruction;
             if (has_assignments) {
                 const mutable_variables = variables orelse unreachable;
                 try applyAssignments(mutable_variables, &command_variables);
             }
-            var scope = switch (try executor.beginRedirections(
+            var scope = switch (try executor.beginSimpleCommandRedirections(
                 file_actions.items,
                 &redirect_resources,
                 allocator,
@@ -768,6 +831,10 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
                 .failed => |result| return result,
             };
             defer scope.deinit();
+            // The pipeline endpoints become scoped redirections for the
+            // function body. Inner commands are ordinary foreground commands,
+            // not additional top-level pipeline stages.
+            scope.executor.pipeline_stage = null;
             return scope.executor.executeFunction(argv.items);
         }
     }
