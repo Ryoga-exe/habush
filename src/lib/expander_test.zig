@@ -347,6 +347,29 @@ test "expands named parameters inside double quotes" {
     try std.testing.expectEqualStrings("pre:value with spaces::post", fields[0]);
 }
 
+test "expands here-document parameters without treating quotes as syntax" {
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+    try variables.set("name", "value with spaces");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const expanded = try Expander.initWithContext(arena.allocator(), .{
+        .variables = &variables,
+        .positional_parameters = &.{ "one", "two" },
+        .last_status = 23,
+    }).expandHereDocument(
+        "'$name' \"${missing:-$name}\" $? $*\n" ++
+            "\\$name \\\\ \\q joined\\\nline\n",
+    );
+
+    try std.testing.expectEqualStrings(
+        "'value with spaces' \"value with spaces\" 23 one two\n" ++
+            "$name \\ \\q joinedline\n",
+        expanded,
+    );
+}
+
 test "expands scalar positional and special parameters" {
     var hir = try generate(
         "command \"$0\" \"$1\" \"${2}\" \"${10}\" \"$#\" \"$?\" \"$*\" $# \"$-\" \"$!\"",
@@ -690,6 +713,14 @@ test "parameter failure handles every allocation failure" {
     );
 }
 
+test "here-document expansion handles every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        expandHereDocumentWithAllocator,
+        .{},
+    );
+}
+
 fn expectExpansionError(source: [:0]const u8, expected: anyerror) !void {
     var hir = try generate(source);
     defer hir.deinit(std.testing.allocator);
@@ -747,6 +778,16 @@ fn expandFailureWithAllocator(
         else => |other| return other,
     };
     return error.ExpectedParameterExpansionFailure;
+}
+
+fn expandHereDocumentWithAllocator(gpa: std.mem.Allocator) !void {
+    var variables = VariableStore.init(gpa);
+    defer variables.deinit();
+    try variables.set("name", "two words");
+    const expanded = try Expander.initWithContext(gpa, .{
+        .variables = &variables,
+    }).expandHereDocument("$name ${missing:-fallback} escaped \\$name\n");
+    defer gpa.free(expanded);
 }
 
 fn firstCommandParts(hir: Hir) []const Hir.Inst.Index {

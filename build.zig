@@ -51,6 +51,17 @@ pub fn build(b: *std.Build) void {
     stream_test.setStdIn(.{ .bytes = "true\nexit 9\n" });
     expectCliResult(stream_test, test_step, 9, "", "");
 
+    const incomplete_heredoc_test = b.addRunArtifact(exe);
+    incomplete_heredoc_test.setName("test cli incomplete here-document");
+    incomplete_heredoc_test.addArgs(&.{ "-c", ": <<EOF\nbody\n" });
+    expectCliResult(
+        incomplete_heredoc_test,
+        test_step,
+        2,
+        "",
+        "habush: incomplete here-document\n",
+    );
+
     const script_test = b.addRunArtifact(exe);
     script_test.setName("test cli script file");
     script_test.addFileArg(b.path("test/cli/exit.hb"));
@@ -71,6 +82,43 @@ pub fn build(b: *std.Build) void {
     word_expansion_test.setName("test cli word expansion");
     word_expansion_test.addFileArg(b.path("test/cli/word-expansion.hb"));
     expectCliResult(word_expansion_test, test_step, 23, "", "");
+
+    if (target.result.os.tag != .windows) {
+        const heredoc_test = b.addRunArtifact(exe);
+        heredoc_test.setName("test cli here-document input");
+        heredoc_test.addFileArg(b.path("test/cli/heredoc.hb"));
+        expectCliResult(
+            heredoc_test,
+            test_step,
+            0,
+            "expanded two words\nliteral $value\ntwo words\n" ++
+                "compound input\nsecond input wins\ntabs stripped\n" ++
+                "continued delimiter\n",
+            "",
+        );
+
+        const heredoc_diagnostic_test = b.addRunArtifact(exe);
+        heredoc_diagnostic_test.setName("test cli diagnostic after here-document");
+        heredoc_diagnostic_test.addFileArg(b.path("test/cli/invalid-after-heredoc.hb"));
+        heredoc_diagnostic_test.expectExitCode(2);
+        heredoc_diagnostic_test.expectStdOutEqual("");
+        heredoc_diagnostic_test.expectStdErrMatch(":4:1: expected command, found ')'\n");
+        test_step.dependOn(&heredoc_diagnostic_test.step);
+
+        const continued_heredoc_diagnostic_test = b.addRunArtifact(exe);
+        continued_heredoc_diagnostic_test.setName(
+            "test cli diagnostic after continued here-document",
+        );
+        continued_heredoc_diagnostic_test.addFileArg(
+            b.path("test/cli/invalid-after-continued-heredoc.hb"),
+        );
+        continued_heredoc_diagnostic_test.expectExitCode(2);
+        continued_heredoc_diagnostic_test.expectStdOutEqual("");
+        continued_heredoc_diagnostic_test.expectStdErrMatch(
+            ":4:1: expected command, found ')'\n",
+        );
+        test_step.dependOn(&continued_heredoc_diagnostic_test.step);
+    }
 
     const parameter_diagnostic_test = b.addRunArtifact(exe);
     parameter_diagnostic_test.setName("test cli parameter expansion diagnostic");

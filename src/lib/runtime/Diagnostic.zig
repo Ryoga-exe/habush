@@ -26,6 +26,11 @@ pub const Kind = union(enum) {
     not_in_function,
     variable_not_set: []const u8,
     parameter_expansion: ParameterExpansion,
+    ambiguous_redirect,
+    invalid_file_descriptor: []const u8,
+    unsupported_file_descriptor: []const u8,
+    input_resource_unavailable,
+    cannot_open: CannotOpenReason,
     invalid_name: []const u8,
     cannot_change_directory: []const u8,
     working_directory_unavailable,
@@ -47,6 +52,15 @@ pub const CannotExecuteReason = enum {
     unsupported,
 };
 
+pub const CannotOpenReason = enum {
+    not_found,
+    access_denied,
+    invalid_path,
+    path_already_exists,
+    resource_unavailable,
+    unsupported,
+};
+
 pub const RenderOptions = struct {
     program_name: ?[]const u8 = null,
 };
@@ -63,6 +77,11 @@ pub fn status(diagnostic: Diagnostic) types.ExitStatus {
         .not_in_function,
         .variable_not_set,
         .parameter_expansion,
+        .ambiguous_redirect,
+        .invalid_file_descriptor,
+        .unsupported_file_descriptor,
+        .input_resource_unavailable,
+        .cannot_open,
         .invalid_name,
         .cannot_change_directory,
         .working_directory_unavailable,
@@ -103,6 +122,26 @@ pub fn render(
             "{s}: {s}",
             .{ failure.parameter, failure.message },
         ),
+        .ambiguous_redirect => try writer.writeAll("ambiguous redirect"),
+        .invalid_file_descriptor => |descriptor| try writer.print(
+            "invalid file descriptor: {s}",
+            .{descriptor},
+        ),
+        .unsupported_file_descriptor => |descriptor| try writer.print(
+            "unsupported file descriptor: {s}",
+            .{descriptor},
+        ),
+        .input_resource_unavailable => try writer.writeAll(
+            "cannot create redirection input: system resources unavailable",
+        ),
+        .cannot_open => |reason| switch (reason) {
+            .not_found => try writer.writeAll("no such file or directory"),
+            .access_denied => try writer.writeAll("permission denied"),
+            .invalid_path => try writer.writeAll("invalid path"),
+            .path_already_exists => try writer.writeAll("file exists"),
+            .resource_unavailable => try writer.writeAll("system resources unavailable"),
+            .unsupported => try writer.writeAll("operation not supported"),
+        },
         .invalid_name => |name| try writer.print("invalid name: {s}", .{name}),
         .cannot_change_directory => |path| try writer.print("cannot change directory: {s}", .{path}),
         .working_directory_unavailable => try writer.writeAll("working directory unavailable"),

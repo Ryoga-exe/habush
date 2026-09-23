@@ -8,20 +8,38 @@ arena: std.heap.ArenaAllocator,
 spawn_calls: std.ArrayList(CommandPlan) = .empty,
 wait_calls: std.ArrayList(Host.Process) = .empty,
 resolve_working_directory_calls: std.ArrayList(Host.WorkingDirectoryRequest) = .empty,
+open_file_calls: std.ArrayList(OpenFileCall) = .empty,
+create_input_calls: std.ArrayList([]const u8) = .empty,
+closed_resource_count: usize = 0,
+redirected_output: std.Io.Writer.Allocating,
 next_process: u32 = 1,
 next_process_group: u32 = 1,
+next_resource: u32 = 1,
 termination: Host.Termination = .{ .exited = 0 },
-spawn_error: ?Host.Error = null,
+spawn_error: ?Host.SpawnError = null,
+spawn_failure: ?Host.SpawnFailure = null,
 wait_error: ?Host.Error = null,
 resolve_working_directory_error: ?Host.Error = null,
 working_directory_result: ?[]const u8 = null,
+open_file_failure: ?Host.FileActionFailure.Reason = null,
+open_file_failure_after: usize = 0,
+create_input_error: ?Host.Error = null,
 sandbox_coverage: ?SandboxPolicy.Coverage = null,
 
+pub const OpenFileCall = struct {
+    cwd: CommandPlan.WorkingDirectory,
+    open: CommandPlan.FileAction.Open,
+};
+
 pub fn init(gpa: std.mem.Allocator) FakeHost {
-    return .{ .arena = std.heap.ArenaAllocator.init(gpa) };
+    return .{
+        .arena = std.heap.ArenaAllocator.init(gpa),
+        .redirected_output = .init(gpa),
+    };
 }
 
 pub fn deinit(fake: *FakeHost) void {
+    fake.redirected_output.deinit();
     fake.arena.deinit();
     fake.* = undefined;
 }
@@ -36,12 +54,68 @@ pub fn host(fake: *FakeHost) Host {
 const vtable: Host.VTable = .{
     .spawn = spawn,
     .wait = wait,
+    .open_file = openFile,
+    .create_input = createInput,
+    .close_resource = closeResource,
+    .resource_writer = resourceWriter,
     .resolve_working_directory = resolveWorkingDirectory,
 };
 
-fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.Error!Host.SpawnResult {
+fn createInput(userdata: ?*anyopaque, bytes: []const u8) Host.Error!CommandPlan.Resource {
+    const fake: *FakeHost = @ptrCast(@alignCast(userdata.?));
+    if (fake.create_input_error) |err| return err;
+    const allocator = fake.arena.allocator();
+    try fake.create_input_calls.append(allocator, try allocator.dupe(u8, bytes));
+    const resource: CommandPlan.Resource = @enumFromInt(fake.next_resource);
+    fake.next_resource +%= 1;
+    return resource;
+}
+
+fn openFile(
+    userdata: ?*anyopaque,
+    cwd: CommandPlan.WorkingDirectory,
+    open: CommandPlan.FileAction.Open,
+) Host.SpawnError!Host.OpenFileOutcome {
+    const fake: *FakeHost = @ptrCast(@alignCast(userdata.?));
+    if (fake.open_file_failure) |reason| {
+        if (fake.open_file_calls.items.len >= fake.open_file_failure_after)
+            return .{ .failed = reason };
+    }
+
+    const allocator = fake.arena.allocator();
+    try fake.open_file_calls.append(allocator, .{
+        .cwd = switch (cwd) {
+            .inherit => .inherit,
+            .path => |path| .{ .path = try allocator.dupe(u8, path) },
+        },
+        .open = .{
+            .path = try allocator.dupe(u8, open.path),
+            .target = open.target,
+            .access = open.access,
+            .disposition = open.disposition,
+        },
+    });
+    const resource: CommandPlan.Resource = @enumFromInt(fake.next_resource);
+    fake.next_resource +%= 1;
+    return .{ .opened = resource };
+}
+
+fn closeResource(userdata: ?*anyopaque, resource: CommandPlan.Resource) void {
+    const fake: *FakeHost = @ptrCast(@alignCast(userdata.?));
+    _ = resource;
+    fake.closed_resource_count += 1;
+}
+
+fn resourceWriter(userdata: ?*anyopaque, resource: CommandPlan.Resource) ?*std.Io.Writer {
+    const fake: *FakeHost = @ptrCast(@alignCast(userdata.?));
+    if (@intFromEnum(resource) == 0 or @intFromEnum(resource) >= fake.next_resource) return null;
+    return &fake.redirected_output.writer;
+}
+
+fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.SpawnError!Host.SpawnOutcome {
     const fake: *FakeHost = @ptrCast(@alignCast(userdata.?));
     if (fake.spawn_error) |err| return err;
+    if (fake.spawn_failure) |failure| return .{ .failed = failure };
 
     const allocator = fake.arena.allocator();
     try fake.spawn_calls.append(allocator, try clonePlan(allocator, plan));
@@ -61,11 +135,11 @@ fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.Error!Host.SpawnResult {
         .inherit => .not_requested,
         .restrict => .complete,
     };
-    return .{
+    return .{ .spawned = .{
         .process = process,
         .process_group = process_group,
         .sandbox_coverage = sandbox_coverage,
-    };
+    } };
 }
 
 fn clonePlan(allocator: std.mem.Allocator, plan: CommandPlan) !CommandPlan {

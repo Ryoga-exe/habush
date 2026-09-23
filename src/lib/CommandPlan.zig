@@ -35,11 +35,18 @@ pub const WorkingDirectory = union(enum) {
 };
 
 /// A logical shell descriptor which the host maps to its native mechanism.
+/// The representation preserves arbitrary shell descriptor numbers for future
+/// platform backends; the current executor supports only stdin/stdout/stderr.
 pub const FileDescriptor = enum(u32) {
     stdin = 0,
     stdout = 1,
     stderr = 2,
     _,
+
+    pub fn parse(source: []const u8) ?FileDescriptor {
+        const value = std.fmt.parseUnsigned(u32, source, 10) catch return null;
+        return @enumFromInt(value);
+    }
 };
 
 /// Host-owned resource such as one endpoint of a pipe.
@@ -67,6 +74,7 @@ pub const FileAction = union(enum) {
 
         pub const Disposition = enum {
             open_existing,
+            create_or_open,
             create_or_truncate,
             create_or_append,
             create_exclusive,
