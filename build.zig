@@ -155,6 +155,11 @@ pub fn build(b: *std.Build) void {
             "",
             "habush: /definitely/missing: command not found\n",
         );
+
+        const export_pipeline_output_test = b.addRunArtifact(exe);
+        export_pipeline_output_test.setName("test cli export pipeline output");
+        export_pipeline_output_test.addArgs(&.{ "-c", "export | /usr/bin/grep -q ." });
+        expectCliResult(export_pipeline_output_test, test_step, 0, "", "");
     }
 
     const parameter_diagnostic_test = b.addRunArtifact(exe);

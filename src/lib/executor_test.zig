@@ -714,6 +714,62 @@ test "closed downstream pipeline turns builtin write failure into stage status" 
     try std.testing.expectEqual(@as(usize, 2), fake.closed_resource_count);
 }
 
+test "stateful pipeline builtins do not mutate the parent shell" {
+    var hir = try generate("cd child | export NAME=inside | unset KEEP | /bin/last");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    fake.working_directory_result = "/workspace/child";
+    var state = try runtime.State.init(std.testing.allocator, .{
+        .cwd = "/workspace",
+        .variables = &.{
+            .{ .name = "NAME", .value = "outside" },
+            .{ .name = "KEEP", .value = "present", .exported = true },
+        },
+    });
+    defer state.deinit();
+
+    const result = try Executor.initWithState(
+        fake.host(),
+        CommandResolver.preResolved(),
+        &state,
+        .{},
+        0,
+    ).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqualStrings("/workspace", state.workingDirectory().?);
+    try std.testing.expectEqualStrings("outside", state.variable("NAME").?);
+    try std.testing.expect(!state.isVariableExported("NAME"));
+    try std.testing.expectEqualStrings("present", state.variable("KEEP").?);
+    try std.testing.expect(state.isVariableExported("KEEP"));
+    try std.testing.expectEqual(@as(usize, 1), fake.resolve_working_directory_calls.items.len);
+    try std.testing.expectEqual(@as(usize, 3), fake.create_pipe_calls);
+    try std.testing.expectEqual(@as(usize, 6), fake.closed_resource_count);
+}
+
+test "export output flows to a downstream pipeline stage" {
+    var hir = try generate("export | /bin/last");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var state = try runtime.State.init(std.testing.allocator, .{
+        .variables = &.{.{ .name = "SENTINEL", .value = "value", .exported = true }},
+    });
+    defer state.deinit();
+
+    const result = try Executor.initWithState(
+        fake.host(),
+        CommandResolver.preResolved(),
+        &state,
+        .{},
+        0,
+    ).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqualStrings("export SENTINEL='value'\n", fake.redirected_output.written());
+}
+
 test "upstream pipeline spawn failures reap downstream processes" {
     var hir = try generate("/bin/first | /bin/second");
     defer hir.deinit(std.testing.allocator);

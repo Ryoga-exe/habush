@@ -57,12 +57,12 @@ const definitions = std.StaticStringMap(Builtin).initComptime(.{
     .{ "continue", Builtin{ .tag = .@"continue", .special = true } },
     .{ "true", Builtin{ .tag = .true, .pipeline_support = .no_stdin } },
     .{ "false", Builtin{ .tag = .false, .pipeline_support = .no_stdin } },
-    .{ "cd", Builtin{ .tag = .cd } },
+    .{ "cd", Builtin{ .tag = .cd, .pipeline_support = .no_stdin } },
     .{ "exit", Builtin{ .tag = .exit, .special = true } },
     .{ "pwd", Builtin{ .tag = .pwd, .pipeline_support = .no_stdin } },
     .{ "return", Builtin{ .tag = .@"return", .special = true } },
-    .{ "export", Builtin{ .tag = .@"export", .special = true } },
-    .{ "unset", Builtin{ .tag = .unset, .special = true } },
+    .{ "export", Builtin{ .tag = .@"export", .special = true, .pipeline_support = .no_stdin } },
+    .{ "unset", Builtin{ .tag = .unset, .special = true, .pipeline_support = .no_stdin } },
 });
 
 pub fn lookup(name: []const u8) ?Builtin {
@@ -362,7 +362,10 @@ test "looks up core builtins by command name" {
     try std.testing.expect(lookup("true").?.supportsPipeline());
     try std.testing.expect(lookup("false").?.supportsPipeline());
     try std.testing.expect(lookup("pwd").?.supportsPipeline());
-    try std.testing.expect(!lookup("export").?.supportsPipeline());
+    try std.testing.expect(lookup("cd").?.supportsPipeline());
+    try std.testing.expect(lookup("export").?.supportsPipeline());
+    try std.testing.expect(lookup("unset").?.supportsPipeline());
+    try std.testing.expect(!lookup("exit").?.supportsPipeline());
 }
 
 test "runs status-only core builtins" {
