@@ -4,7 +4,7 @@
 //! lists, and-or commands, pipeline negation, brace groups, if clauses,
 //! while/until/for loops with break/continue control, standalone assignments,
 //! builtins, external simple commands, and foreground pipelines of external
-//! simple commands.
+//! simple commands and status-only builtins.
 //! Standard-stream redirections are supported for simple and compound
 //! commands, including here-documents and here-strings. Background execution
 //! and non-external pipeline stages remain explicit `UnsupportedInstruction`
@@ -535,7 +535,7 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
                 pipe_stderr.items[stage_index],
             .spawned = &spawned[stage_index],
         };
-        const stage_result = try stage_executor.executeInstruction(hir, stage);
+        const stage_result = try stage_executor.executePipelineStage(hir, stage);
         result.status = stage_result.status;
         result.sandbox_coverage = combineSandboxCoverage(
             result.sandbox_coverage,
@@ -553,6 +553,26 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
             if (stage_index + 1 == stages.items.len) result.status = status;
         }
     }
+    return result;
+}
+
+fn executePipelineStage(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
+    var stage_executor = executor;
+    stage_executor.loop_depth = 0;
+    var result = if (executor.runtime_state) |state| result: {
+        var state_copy = try state.clone();
+        defer state_copy.deinit();
+        stage_executor.runtime_state = &state_copy;
+        break :result try stage_executor.executeInstruction(hir, index);
+    } else if (executor.variables) |variables| result: {
+        var variables_copy = try variables.clone(executor.gpa);
+        defer variables_copy.deinit();
+        stage_executor.variables = &variables_copy;
+        break :result try stage_executor.executeInstruction(hir, index);
+    } else try stage_executor.executeInstruction(hir, index);
+    // Pipeline elements execute in a subshell environment. Control flow can
+    // determine that element's status but cannot leave the pipeline.
+    result.control_flow = .none;
     return result;
 }
 
@@ -683,8 +703,9 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
     const builtin = Builtin.lookup(argv.items[0]);
     if (builtin) |candidate| {
         if (candidate.special) {
-            if (executor.pipeline_stage != null) return error.UnsupportedInstruction;
-            var scope = switch (try executor.beginRedirections(
+            if (executor.pipeline_stage != null and !candidate.isPipelineStatusOnly())
+                return error.UnsupportedInstruction;
+            var scope = switch (try executor.beginSimpleCommandRedirections(
                 file_actions.items,
                 &redirect_resources,
                 allocator,
@@ -721,8 +742,9 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
         }
     }
     if (builtin) |candidate| {
-        if (executor.pipeline_stage != null) return error.UnsupportedInstruction;
-        var scope = switch (try executor.beginRedirections(
+        if (executor.pipeline_stage != null and !candidate.isPipelineStatusOnly())
+            return error.UnsupportedInstruction;
+        var scope = switch (try executor.beginSimpleCommandRedirections(
             file_actions.items,
             &redirect_resources,
             allocator,
@@ -1059,6 +1081,30 @@ fn beginRedirections(
         .executor = scoped_executor,
         .resources = resources.items,
     } };
+}
+
+fn beginSimpleCommandRedirections(
+    executor: Executor,
+    actions: []const CommandPlan.FileAction,
+    owned_resources: *std.ArrayList(CommandPlan.Resource),
+    allocator: std.mem.Allocator,
+) Error!RedirectionStart {
+    var effective_actions: std.ArrayList(CommandPlan.FileAction) = .empty;
+    if (executor.pipeline_stage) |stage| {
+        if (stage.input) |resource| try effective_actions.append(allocator, .{
+            .use_resource = .{ .resource = resource, .target = .stdin },
+        });
+        if (stage.output) |resource| try effective_actions.append(allocator, .{
+            .use_resource = .{ .resource = resource, .target = .stdout },
+        });
+    }
+    try effective_actions.appendSlice(allocator, actions);
+    if (executor.pipeline_stage) |stage| {
+        if (stage.pipe_stderr) try effective_actions.append(allocator, .{
+            .duplicate = .{ .source = .stdout, .target = .stderr },
+        });
+    }
+    return executor.beginRedirections(effective_actions.items, owned_resources, allocator);
 }
 
 fn closeRedirectResources(

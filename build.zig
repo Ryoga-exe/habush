@@ -134,6 +134,11 @@ pub fn build(b: *std.Build) void {
         pipeline_status_test.setName("test cli pipeline status");
         pipeline_status_test.addArgs(&.{ "-c", "/usr/bin/true | /usr/bin/false" });
         expectCliResult(pipeline_status_test, test_step, 1, "", "");
+
+        const builtin_pipeline_status_test = b.addRunArtifact(exe);
+        builtin_pipeline_status_test.setName("test cli builtin pipeline status");
+        builtin_pipeline_status_test.addArgs(&.{ "-c", "true | false" });
+        expectCliResult(builtin_pipeline_status_test, test_step, 1, "", "");
     }
 
     const parameter_diagnostic_test = b.addRunArtifact(exe);

@@ -61,6 +61,16 @@ pub fn lookup(name: []const u8) ?Builtin {
     return definitions.get(name);
 }
 
+/// Whether this builtin can run inline while a foreground pipeline is being
+/// assembled. These builtins neither consume stdin nor produce output, so
+/// they cannot block before adjacent external stages have been spawned.
+pub fn isPipelineStatusOnly(builtin: Builtin) bool {
+    return switch (builtin.tag) {
+        .@":", .true, .false => true,
+        else => false,
+    };
+}
+
 pub fn run(builtin: Builtin, context: Context, argv: []const []const u8) Error!Result {
     if (argv.len == 0) return .{ .status = 2 };
     return switch (builtin.tag) {
@@ -346,6 +356,10 @@ test "looks up core builtins by command name" {
     try std.testing.expect(!lookup("true").?.special);
     try std.testing.expect(lookup("missing") == null);
     try std.testing.expect(lookup("./true") == null);
+    try std.testing.expect(lookup(":").?.isPipelineStatusOnly());
+    try std.testing.expect(lookup("true").?.isPipelineStatusOnly());
+    try std.testing.expect(lookup("false").?.isPipelineStatusOnly());
+    try std.testing.expect(!lookup("pwd").?.isPipelineStatusOnly());
 }
 
 test "runs status-only core builtins" {

@@ -614,8 +614,51 @@ test "pipeline connections override an outer scoped stream" {
     try std.testing.expectEqual(@as(usize, 3), fake.closed_resource_count);
 }
 
-test "unsupported builtin pipeline stages close pipe resources" {
-    var hir = try generate("true | /bin/second");
+test "status-only builtins execute as isolated pipeline stages" {
+    const cases = [_]struct {
+        source: [:0]const u8,
+        status: u8,
+        spawn_count: usize,
+    }{
+        .{ .source = "true | false", .status = 1, .spawn_count = 0 },
+        .{ .source = "false | /bin/second", .status = 0, .spawn_count = 1 },
+        .{ .source = "/bin/first | false", .status = 1, .spawn_count = 1 },
+    };
+    for (cases) |case| {
+        var hir = try generate(case.source);
+        defer hir.deinit(std.testing.allocator);
+        var fake = FakeHost.init(std.testing.allocator);
+        defer fake.deinit();
+
+        const result = try preResolvedExecutor(std.testing.allocator, fake.host()).execute(hir);
+
+        try std.testing.expectEqual(case.status, result.status);
+        try std.testing.expectEqual(case.spawn_count, fake.spawn_calls.items.len);
+        try std.testing.expectEqual(case.spawn_count, fake.wait_calls.items.len);
+        try std.testing.expectEqual(@as(usize, 2), fake.closed_resource_count);
+    }
+}
+
+test "special builtin pipeline assignments do not escape the stage" {
+    var hir = try generate("persisted=changed : | /bin/second");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+    try variables.set("persisted", "original");
+
+    const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .resolver = CommandResolver.preResolved(),
+        .variables = &variables,
+    }).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqualStrings("original", variables.get("persisted").?);
+}
+
+test "unsupported output builtin pipeline stages close pipe resources" {
+    var hir = try generate("pwd | /bin/second");
     defer hir.deinit(std.testing.allocator);
     var fake = FakeHost.init(std.testing.allocator);
     defer fake.deinit();
