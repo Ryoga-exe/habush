@@ -139,6 +139,22 @@ pub fn build(b: *std.Build) void {
         builtin_pipeline_status_test.setName("test cli builtin pipeline status");
         builtin_pipeline_status_test.addArgs(&.{ "-c", "true | false" });
         expectCliResult(builtin_pipeline_status_test, test_step, 1, "", "");
+
+        const builtin_pipeline_output_test = b.addRunArtifact(exe);
+        builtin_pipeline_output_test.setName("test cli builtin pipeline output");
+        builtin_pipeline_output_test.addArgs(&.{ "-c", "pwd | /usr/bin/grep -q /" });
+        expectCliResult(builtin_pipeline_output_test, test_step, 0, "", "");
+
+        const failed_builtin_pipeline_output_test = b.addRunArtifact(exe);
+        failed_builtin_pipeline_output_test.setName("test cli failed builtin pipeline output");
+        failed_builtin_pipeline_output_test.addArgs(&.{ "-c", "pwd | /definitely/missing" });
+        expectCliResult(
+            failed_builtin_pipeline_output_test,
+            test_step,
+            127,
+            "",
+            "habush: /definitely/missing: command not found\n",
+        );
     }
 
     const parameter_diagnostic_test = b.addRunArtifact(exe);

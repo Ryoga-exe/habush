@@ -4,7 +4,7 @@
 //! lists, and-or commands, pipeline negation, brace groups, if clauses,
 //! while/until/for loops with break/continue control, standalone assignments,
 //! builtins, external simple commands, and foreground pipelines of external
-//! simple commands and status-only builtins.
+//! simple commands and selected builtins that do not consume stdin.
 //! Standard-stream redirections are supported for simple and compound
 //! commands, including here-documents and here-strings. Background execution
 //! and non-external pipeline stages remain explicit `UnsupportedInstruction`
@@ -546,7 +546,15 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
                 pipe_stderr.items[stage_index],
             .spawned = &spawned[stage_index],
         };
-        const stage_result = try stage_executor.executePipelineStage(hir, stage);
+        const stage_result = stage_executor.executePipelineStage(hir, stage) catch |err| switch (err) {
+            // A non-final in-process stage observes a closed pipeline as a
+            // command failure, not as an executor infrastructure failure.
+            error.WriteFailed => if (stage_index + 1 == stages.items.len)
+                return err
+            else
+                Result{ .status = 1, .sandbox_coverage = .not_requested },
+            else => |other| return other,
+        };
         if (stage_index + 1 == stages.items.len) result.status = stage_result.status;
         result.sandbox_coverage = combineSandboxCoverage(
             result.sandbox_coverage,
@@ -726,7 +734,7 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
     const builtin = Builtin.lookup(argv.items[0]);
     if (builtin) |candidate| {
         if (candidate.special) {
-            if (executor.pipeline_stage != null and !candidate.isPipelineStatusOnly())
+            if (executor.pipeline_stage != null and !candidate.supportsPipeline())
                 return error.UnsupportedInstruction;
             var scope = switch (try executor.beginSimpleCommandRedirections(
                 file_actions.items,
@@ -765,7 +773,7 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
         }
     }
     if (builtin) |candidate| {
-        if (executor.pipeline_stage != null and !candidate.isPipelineStatusOnly())
+        if (executor.pipeline_stage != null and !candidate.supportsPipeline())
             return error.UnsupportedInstruction;
         var scope = switch (try executor.beginSimpleCommandRedirections(
             file_actions.items,

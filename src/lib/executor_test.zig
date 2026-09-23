@@ -662,20 +662,56 @@ test "special builtin pipeline assignments do not escape the stage" {
     try std.testing.expectEqualStrings("original", variables.get("persisted").?);
 }
 
-test "unsupported output builtin pipeline stages close pipe resources" {
+test "output builtin runs after its downstream pipeline stage is launched" {
     var hir = try generate("pwd | /bin/second");
     defer hir.deinit(std.testing.allocator);
     var fake = FakeHost.init(std.testing.allocator);
     defer fake.deinit();
+    var state = try runtime.State.init(std.testing.allocator, .{ .cwd = "/workspace" });
+    defer state.deinit();
 
-    try std.testing.expectError(
-        error.UnsupportedInstruction,
-        preResolvedExecutor(std.testing.allocator, fake.host()).execute(hir),
-    );
+    const result = try Executor.initWithState(
+        fake.host(),
+        CommandResolver.preResolved(),
+        &state,
+        .{},
+        0,
+    ).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqualStrings("/bin/second", fake.spawn_calls.items[0].argv[0]);
+    try std.testing.expectEqualStrings("/workspace\n", fake.redirected_output.written());
     try std.testing.expectEqual(@as(usize, 1), fake.create_pipe_calls);
     try std.testing.expectEqual(@as(usize, 2), fake.closed_resource_count);
     try std.testing.expectEqual(@as(usize, 1), fake.spawn_calls.items.len);
     try std.testing.expectEqual(@as(usize, 1), fake.wait_calls.items.len);
+}
+
+test "closed downstream pipeline turns builtin write failure into stage status" {
+    var hir = try generate("pwd | /bin/missing");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    fake.spawn_failure = .command_not_found;
+    var full_buffer: [0]u8 = .{};
+    var failing_writer: std.Io.Writer = .fixed(&full_buffer);
+    fake.resource_writer_override = &failing_writer;
+    var state = try runtime.State.init(std.testing.allocator, .{ .cwd = "/workspace" });
+    defer state.deinit();
+    var diagnostics: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer diagnostics.deinit();
+
+    const result = try Executor.initWithState(
+        fake.host(),
+        CommandResolver.preResolved(),
+        &state,
+        .{ .stderr = &diagnostics.writer },
+        0,
+    ).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 127), result.status);
+    try std.testing.expectEqualStrings("/bin/missing: command not found\n", diagnostics.written());
+    try std.testing.expectEqual(@as(usize, 2), fake.closed_resource_count);
 }
 
 test "upstream pipeline spawn failures reap downstream processes" {

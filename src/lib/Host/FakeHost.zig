@@ -13,6 +13,7 @@ create_input_calls: std.ArrayList([]const u8) = .empty,
 create_pipe_calls: usize = 0,
 closed_resource_count: usize = 0,
 redirected_output: std.Io.Writer.Allocating,
+resource_writer_override: ?*std.Io.Writer = null,
 next_process: u32 = 1,
 next_process_group: u32 = 1,
 next_resource: u32 = 1,
@@ -122,6 +123,7 @@ fn closeResource(userdata: ?*anyopaque, resource: CommandPlan.Resource) void {
 fn resourceWriter(userdata: ?*anyopaque, resource: CommandPlan.Resource) ?*std.Io.Writer {
     const fake: *FakeHost = @ptrCast(@alignCast(userdata.?));
     if (@intFromEnum(resource) == 0 or @intFromEnum(resource) >= fake.next_resource) return null;
+    if (fake.resource_writer_override) |writer| return writer;
     return &fake.redirected_output.writer;
 }
 
