@@ -527,6 +527,141 @@ test "pipeline negation preserves exit control flow and status" {
     try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
 }
 
+test "executes external pipeline stages before waiting" {
+    var hir = try generate("/bin/first | /bin/second |& /bin/third");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    fake.termination = .{ .exited = 23 };
+
+    const result = try preResolvedExecutor(std.testing.allocator, fake.host()).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 23), result.status);
+    try std.testing.expectEqual(@as(usize, 2), fake.create_pipe_calls);
+    try std.testing.expectEqual(@as(usize, 4), fake.closed_resource_count);
+    try std.testing.expectEqual(@as(usize, 3), fake.spawn_calls.items.len);
+    try std.testing.expectEqual(@as(usize, 3), fake.wait_calls.items.len);
+
+    const first_actions = fake.spawn_calls.items[0].file_actions;
+    try std.testing.expectEqual(@as(usize, 1), first_actions.len);
+    try std.testing.expectEqual(CommandPlan.FileDescriptor.stdout, first_actions[0]
+        .use_resource.target);
+
+    const second_actions = fake.spawn_calls.items[1].file_actions;
+    try std.testing.expectEqual(@as(usize, 3), second_actions.len);
+    try std.testing.expectEqual(CommandPlan.FileDescriptor.stdin, second_actions[0]
+        .use_resource.target);
+    try std.testing.expectEqual(CommandPlan.FileDescriptor.stdout, second_actions[1]
+        .use_resource.target);
+    try std.testing.expectEqual(CommandPlan.FileDescriptor.stdout, second_actions[2]
+        .duplicate.source);
+    try std.testing.expectEqual(CommandPlan.FileDescriptor.stderr, second_actions[2]
+        .duplicate.target);
+
+    const third_actions = fake.spawn_calls.items[2].file_actions;
+    try std.testing.expectEqual(@as(usize, 1), third_actions.len);
+    try std.testing.expectEqual(CommandPlan.FileDescriptor.stdin, third_actions[0]
+        .use_resource.target);
+}
+
+test "pipeline connections surround command redirections in shell order" {
+    var hir = try generate("/bin/first >out |& /bin/second <input");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+
+    _ = try preResolvedExecutor(std.testing.allocator, fake.host()).execute(hir);
+
+    const first_actions = fake.spawn_calls.items[0].file_actions;
+    try std.testing.expectEqual(@as(usize, 3), first_actions.len);
+    try std.testing.expectEqual(CommandPlan.FileDescriptor.stdout, first_actions[0]
+        .use_resource.target);
+    try std.testing.expectEqualStrings("out", first_actions[1].open.path);
+    try std.testing.expectEqual(CommandPlan.FileDescriptor.stdout, first_actions[2]
+        .duplicate.source);
+    try std.testing.expectEqual(CommandPlan.FileDescriptor.stderr, first_actions[2]
+        .duplicate.target);
+
+    const second_actions = fake.spawn_calls.items[1].file_actions;
+    try std.testing.expectEqual(@as(usize, 2), second_actions.len);
+    try std.testing.expectEqual(CommandPlan.FileDescriptor.stdin, second_actions[0]
+        .use_resource.target);
+    try std.testing.expectEqualStrings("input", second_actions[1].open.path);
+}
+
+test "pipeline connections override an outer scoped stream" {
+    var hir = try generate("{ /bin/first | /bin/second; } >out");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+
+    _ = try preResolvedExecutor(std.testing.allocator, fake.host()).execute(hir);
+
+    const scoped_resource = fake.spawn_calls.items[0].file_actions[0].use_resource.resource;
+    const pipe_resource = fake.spawn_calls.items[0].file_actions[1].use_resource.resource;
+    try std.testing.expect(scoped_resource != pipe_resource);
+    try std.testing.expectEqual(CommandPlan.FileDescriptor.stdout, fake.spawn_calls.items[0]
+        .file_actions[0].use_resource.target);
+    try std.testing.expectEqual(CommandPlan.FileDescriptor.stdout, fake.spawn_calls.items[0]
+        .file_actions[1].use_resource.target);
+
+    const last_actions = fake.spawn_calls.items[1].file_actions;
+    try std.testing.expectEqual(scoped_resource, last_actions[0].use_resource.resource);
+    try std.testing.expectEqual(CommandPlan.FileDescriptor.stdout, last_actions[0]
+        .use_resource.target);
+    try std.testing.expectEqual(CommandPlan.FileDescriptor.stdin, last_actions[1]
+        .use_resource.target);
+    try std.testing.expectEqual(@as(usize, 3), fake.closed_resource_count);
+}
+
+test "unsupported builtin pipeline stages close pipe resources" {
+    var hir = try generate("true | /bin/second");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+
+    try std.testing.expectError(
+        error.UnsupportedInstruction,
+        preResolvedExecutor(std.testing.allocator, fake.host()).execute(hir),
+    );
+    try std.testing.expectEqual(@as(usize, 1), fake.create_pipe_calls);
+    try std.testing.expectEqual(@as(usize, 2), fake.closed_resource_count);
+    try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+}
+
+test "later pipeline spawn failures reap earlier processes" {
+    var hir = try generate("/bin/first | /bin/second");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    fake.spawn_failure = .command_not_found;
+    fake.spawn_failure_after = 1;
+    var diagnostics: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer diagnostics.deinit();
+
+    const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .resolver = CommandResolver.preResolved(),
+        .io = .{ .stderr = &diagnostics.writer },
+    }).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 127), result.status);
+    try std.testing.expectEqualStrings("/bin/second: command not found\n", diagnostics.written());
+    try std.testing.expectEqual(@as(usize, 1), fake.spawn_calls.items.len);
+    try std.testing.expectEqual(@as(usize, 1), fake.wait_calls.items.len);
+    try std.testing.expectEqual(@as(usize, 2), fake.closed_resource_count);
+}
+
+test "pipeline execution cleans up every allocation failure" {
+    var hir = try generate("/bin/first | /bin/second | /bin/third");
+    defer hir.deinit(std.testing.allocator);
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        executePipelineWithAllocator,
+        .{hir},
+    );
+}
+
 test "brace groups execute in the current shell state" {
     var hir = try generate("name=before; { name=inside; false; }");
     defer hir.deinit(std.testing.allocator);
@@ -1432,7 +1567,6 @@ test "unquoted at contributes each split positional parameter to argv" {
 
 test "unsupported execution forms fail before the current command has side effects" {
     const cases = [_][:0]const u8{
-        "left | right",
         "left &",
     };
 
@@ -1721,4 +1855,26 @@ fn executeScopedRedirectionsWithAllocator(
         fake.open_file_calls.items.len + fake.create_input_calls.items.len,
         fake.closed_resource_count,
     );
+}
+
+fn executePipelineWithAllocator(
+    gpa: std.mem.Allocator,
+    hir: @import("Hir.zig"),
+) !void {
+    // Keep the host allocator independent so cleanup operations remain
+    // available while the executor allocator injects a failure.
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+
+    const result = preResolvedExecutor(gpa, fake.host()).execute(hir) catch |err| {
+        try expectPipelineResourcesReleased(&fake);
+        return err;
+    };
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try expectPipelineResourcesReleased(&fake);
+}
+
+fn expectPipelineResourcesReleased(fake: *const FakeHost) !void {
+    try std.testing.expectEqual(fake.create_pipe_calls * 2, fake.closed_resource_count);
+    try std.testing.expectEqual(fake.spawn_calls.items.len, fake.wait_calls.items.len);
 }

@@ -9,6 +9,7 @@ const builtin = @import("builtin");
 const CommandPlan = @import("../CommandPlan.zig");
 const Host = @import("../Host.zig");
 const append_file = @import("System/append_file.zig");
+const pipe = @import("System/pipe.zig");
 const System = @This();
 
 gpa: std.mem.Allocator,
@@ -90,11 +91,41 @@ const vtable: Host.VTable = .{
     .spawn = spawn,
     .wait = wait,
     .open_file = openFile,
+    .create_pipe = createPipe,
     .create_input = createInput,
     .close_resource = closeResource,
     .resource_writer = resourceWriter,
     .resolve_working_directory = resolveWorkingDirectory,
 };
+
+fn createPipe(userdata: ?*anyopaque) Host.Error!Host.Pipe {
+    const system: *System = @ptrCast(@alignCast(userdata.?));
+    const files = pipe.create() catch |err| return switch (err) {
+        error.OperationUnsupported => error.Unsupported,
+        else => error.ResourceUnavailable,
+    };
+    errdefer files[0].close(system.io);
+    errdefer files[1].close(system.io);
+
+    const read_data = try system.gpa.create(FileResource);
+    errdefer system.gpa.destroy(read_data);
+    const write_data = try system.gpa.create(FileResource);
+    errdefer system.gpa.destroy(write_data);
+    try system.resources.ensureUnusedCapacity(system.gpa, 2);
+
+    read_data.* = .{ .storage = .{ .file = files[0] }, .writer = null };
+    write_data.* = .{
+        .storage = .{ .file = files[1] },
+        .writer = files[1].writerStreaming(system.io, &.{}),
+    };
+    const read_end: CommandPlan.Resource = @enumFromInt(system.next_resource);
+    system.next_resource +%= 1;
+    const write_end: CommandPlan.Resource = @enumFromInt(system.next_resource);
+    system.next_resource +%= 1;
+    system.resources.putAssumeCapacityNoClobber(read_end, read_data);
+    system.resources.putAssumeCapacityNoClobber(write_end, write_data);
+    return .{ .read_end = read_end, .write_end = write_end };
+}
 
 fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.SpawnError!Host.SpawnOutcome {
     const system: *System = @ptrCast(@alignCast(userdata.?));
@@ -915,6 +946,21 @@ test "system host provides seekable input resources to child processes" {
     );
     defer std.testing.allocator.free(output);
     try std.testing.expectEqualStrings("here-document contents\n", output);
+}
+
+test "system host creates and closes pipeline resources" {
+    var system: System = .{ .gpa = std.testing.allocator, .io = std.testing.io };
+    defer system.deinit();
+    const system_host = system.host();
+
+    const pipeline_pipe = try system_host.createPipe();
+    try std.testing.expectEqual(@as(usize, 2), system.resources.count());
+    try std.testing.expect(system_host.resourceWriter(pipeline_pipe.read_end) == null);
+    try std.testing.expect(system_host.resourceWriter(pipeline_pipe.write_end) != null);
+
+    system_host.closeResource(pipeline_pipe.write_end);
+    system_host.closeResource(pipeline_pipe.read_end);
+    try std.testing.expectEqual(@as(usize, 0), system.resources.count());
 }
 
 test "system host duplicates redirected standard streams" {

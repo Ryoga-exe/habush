@@ -118,6 +118,22 @@ pub fn build(b: *std.Build) void {
             ":4:1: expected command, found ')'\n",
         );
         test_step.dependOn(&continued_heredoc_diagnostic_test.step);
+
+        const pipeline_test = b.addRunArtifact(exe);
+        pipeline_test.setName("test cli foreground pipeline");
+        pipeline_test.addFileArg(b.path("test/cli/pipeline.hb"));
+        expectCliResult(
+            pipeline_test,
+            test_step,
+            0,
+            "pipeline-data\noutputerror",
+            "",
+        );
+
+        const pipeline_status_test = b.addRunArtifact(exe);
+        pipeline_status_test.setName("test cli pipeline status");
+        pipeline_status_test.addArgs(&.{ "-c", "/usr/bin/true | /usr/bin/false" });
+        expectCliResult(pipeline_status_test, test_step, 1, "", "");
     }
 
     const parameter_diagnostic_test = b.addRunArtifact(exe);

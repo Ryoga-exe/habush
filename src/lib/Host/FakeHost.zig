@@ -10,6 +10,7 @@ wait_calls: std.ArrayList(Host.Process) = .empty,
 resolve_working_directory_calls: std.ArrayList(Host.WorkingDirectoryRequest) = .empty,
 open_file_calls: std.ArrayList(OpenFileCall) = .empty,
 create_input_calls: std.ArrayList([]const u8) = .empty,
+create_pipe_calls: usize = 0,
 closed_resource_count: usize = 0,
 redirected_output: std.Io.Writer.Allocating,
 next_process: u32 = 1,
@@ -18,6 +19,7 @@ next_resource: u32 = 1,
 termination: Host.Termination = .{ .exited = 0 },
 spawn_error: ?Host.SpawnError = null,
 spawn_failure: ?Host.SpawnFailure = null,
+spawn_failure_after: usize = 0,
 wait_error: ?Host.Error = null,
 resolve_working_directory_error: ?Host.Error = null,
 working_directory_result: ?[]const u8 = null,
@@ -55,11 +57,22 @@ const vtable: Host.VTable = .{
     .spawn = spawn,
     .wait = wait,
     .open_file = openFile,
+    .create_pipe = createPipe,
     .create_input = createInput,
     .close_resource = closeResource,
     .resource_writer = resourceWriter,
     .resolve_working_directory = resolveWorkingDirectory,
 };
+
+fn createPipe(userdata: ?*anyopaque) Host.Error!Host.Pipe {
+    const fake: *FakeHost = @ptrCast(@alignCast(userdata.?));
+    fake.create_pipe_calls += 1;
+    const read_end: CommandPlan.Resource = @enumFromInt(fake.next_resource);
+    fake.next_resource +%= 1;
+    const write_end: CommandPlan.Resource = @enumFromInt(fake.next_resource);
+    fake.next_resource +%= 1;
+    return .{ .read_end = read_end, .write_end = write_end };
+}
 
 fn createInput(userdata: ?*anyopaque, bytes: []const u8) Host.Error!CommandPlan.Resource {
     const fake: *FakeHost = @ptrCast(@alignCast(userdata.?));
@@ -115,7 +128,10 @@ fn resourceWriter(userdata: ?*anyopaque, resource: CommandPlan.Resource) ?*std.I
 fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.SpawnError!Host.SpawnOutcome {
     const fake: *FakeHost = @ptrCast(@alignCast(userdata.?));
     if (fake.spawn_error) |err| return err;
-    if (fake.spawn_failure) |failure| return .{ .failed = failure };
+    if (fake.spawn_failure) |failure| {
+        if (fake.spawn_calls.items.len >= fake.spawn_failure_after)
+            return .{ .failed = failure };
+    }
 
     const allocator = fake.arena.allocator();
     try fake.spawn_calls.append(allocator, try clonePlan(allocator, plan));
