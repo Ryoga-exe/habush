@@ -17,3 +17,7 @@ SECOND
 /bin/cat <<-EOF
 	tabs stripped
 	EOF
+/bin/cat <<EOF
+EO\
+F
+/bin/echo continued delimiter

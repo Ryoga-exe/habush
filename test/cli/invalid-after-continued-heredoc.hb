@@ -1,0 +1,4 @@
+: <<EOF &&
+body
+EOF
+)

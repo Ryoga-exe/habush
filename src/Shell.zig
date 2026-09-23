@@ -132,10 +132,18 @@ fn readCommand(self: *Shell) !?CommandInput {
         if (inspection.ready_here_document_count > documents.items.len) {
             for (documents.items.len..inspection.ready_here_document_count) |document_index| {
                 const metadata = inspection.here_documents[document_index];
+                const document_start_line = self.input_line;
                 const body = try self.readHereDocument(metadata) orelse {
                     incomplete_here_document = true;
                     break;
                 };
+                // Here-document bodies are not part of the parser source. Keep
+                // equivalent blank lines so token locations still refer to
+                // physical input lines when the command continues afterwards.
+                try command.writer.splatByteAll(
+                    '\n',
+                    self.input_line - document_start_line,
+                );
                 errdefer self.allocator.free(body);
                 const delimiter = try self.allocator.dupe(u8, metadata.delimiter);
                 errdefer self.allocator.free(delimiter);
@@ -227,6 +235,10 @@ fn readHereDocument(
 ) !?[]u8 {
     var body: Io.Writer.Allocating = .init(self.allocator);
     errdefer body.deinit();
+    var pending: Io.Writer.Allocating = .init(self.allocator);
+    defer pending.deinit();
+    var delimiter_candidate: Io.Writer.Allocating = .init(self.allocator);
+    defer delimiter_candidate.deinit();
     while (true) {
         if (self.interactive) try self.printPrompt(true);
         const line = try self.readInputLine() orelse {
@@ -235,11 +247,29 @@ fn readHereDocument(
         };
         defer self.allocator.free(line);
         const stripped = habush.heredoc.lineAfterTabStripping(line, metadata.strip_tabs);
-        if (std.mem.eql(u8, stripped, metadata.delimiter))
+        try pending.writer.writeAll(stripped);
+        try pending.writer.writeByte('\n');
+
+        const continued = metadata.expand_body and hasLineContinuation(stripped);
+        try delimiter_candidate.writer.writeAll(
+            if (continued) stripped[0 .. stripped.len - 1] else stripped,
+        );
+        if (continued) continue;
+
+        if (std.mem.eql(u8, delimiter_candidate.written(), metadata.delimiter))
             return try body.toOwnedSlice();
-        try body.writer.writeAll(stripped);
-        try body.writer.writeByte('\n');
+        try body.writer.writeAll(pending.written());
+        pending.clearRetainingCapacity();
+        delimiter_candidate.clearRetainingCapacity();
     }
+}
+
+fn hasLineContinuation(line: []const u8) bool {
+    var backslash_count: usize = 0;
+    var index = line.len;
+    while (index != 0 and line[index - 1] == '\\') : (index -= 1)
+        backslash_count += 1;
+    return backslash_count % 2 == 1;
 }
 
 fn readInputLine(self: *Shell) !?[:0]u8 {

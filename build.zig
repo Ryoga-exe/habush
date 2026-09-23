@@ -92,7 +92,8 @@ pub fn build(b: *std.Build) void {
             test_step,
             0,
             "expanded two words\nliteral $value\ntwo words\n" ++
-                "compound input\nsecond input wins\ntabs stripped\n",
+                "compound input\nsecond input wins\ntabs stripped\n" ++
+                "continued delimiter\n",
             "",
         );
 
@@ -103,6 +104,20 @@ pub fn build(b: *std.Build) void {
         heredoc_diagnostic_test.expectStdOutEqual("");
         heredoc_diagnostic_test.expectStdErrMatch(":4:1: expected command, found ')'\n");
         test_step.dependOn(&heredoc_diagnostic_test.step);
+
+        const continued_heredoc_diagnostic_test = b.addRunArtifact(exe);
+        continued_heredoc_diagnostic_test.setName(
+            "test cli diagnostic after continued here-document",
+        );
+        continued_heredoc_diagnostic_test.addFileArg(
+            b.path("test/cli/invalid-after-continued-heredoc.hb"),
+        );
+        continued_heredoc_diagnostic_test.expectExitCode(2);
+        continued_heredoc_diagnostic_test.expectStdOutEqual("");
+        continued_heredoc_diagnostic_test.expectStdErrMatch(
+            ":4:1: expected command, found ')'\n",
+        );
+        test_step.dependOn(&continued_heredoc_diagnostic_test.step);
     }
 
     const parameter_diagnostic_test = b.addRunArtifact(exe);

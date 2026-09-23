@@ -681,6 +681,23 @@ test "later scoped redirection failure closes earlier resources" {
     try std.testing.expectEqual(@as(usize, 1), fake.closed_resource_count);
 }
 
+test "scoped redirections close resources on every allocation failure" {
+    const collected = [_]@import("heredoc.zig").Collected{.{
+        .delimiter = "EOF",
+        .strip_tabs = false,
+        .expand_body = true,
+        .body = "body\n",
+    }};
+    var hir = try generateWithHereDocuments("{ : <<EOF; } >out", &collected);
+    defer hir.deinit(std.testing.allocator);
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        executeScopedRedirectionsWithAllocator,
+        .{hir},
+    );
+}
+
 test "subshells isolate runtime state and contain exit control flow" {
     var hir = try generate("(name=inside; cd child; exit 7); observed=\"$name\"");
     defer hir.deinit(std.testing.allocator);
@@ -1683,4 +1700,25 @@ fn executeAssignmentsWithAllocator(
         .resolver = CommandResolver.preResolved(),
         .variables = &variables,
     }).execute(command_hir);
+}
+
+fn executeScopedRedirectionsWithAllocator(
+    gpa: std.mem.Allocator,
+    hir: @import("Hir.zig"),
+) !void {
+    var fake = FakeHost.init(gpa);
+    defer fake.deinit();
+
+    const result = Executor.initWithOptions(gpa, fake.host(), .{}).execute(hir) catch |err| {
+        try std.testing.expectEqual(
+            fake.open_file_calls.items.len + fake.create_input_calls.items.len,
+            fake.closed_resource_count,
+        );
+        return err;
+    };
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqual(
+        fake.open_file_calls.items.len + fake.create_input_calls.items.len,
+        fake.closed_resource_count,
+    );
 }

@@ -857,8 +857,6 @@ fn beginRedirections(
     var scoped_executor = executor;
     var resources = owned_resources.*;
     owned_resources.* = .empty;
-    var scoped_actions: std.ArrayList(CommandPlan.FileAction) = .empty;
-    try scoped_actions.appendSlice(allocator, executor.scoped_file_actions);
     var retain_resources = false;
     defer if (!retain_resources) {
         var index = resources.items.len;
@@ -867,6 +865,8 @@ fn beginRedirections(
             executor.host.closeResource(resources.items[index]);
         }
     };
+    var scoped_actions: std.ArrayList(CommandPlan.FileAction) = .empty;
+    try scoped_actions.appendSlice(allocator, executor.scoped_file_actions);
 
     for (actions) |action| switch (action) {
         .open => |open| {
