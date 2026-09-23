@@ -84,6 +84,12 @@ const PipelineStage = struct {
     spawned: *?Host.SpawnResult,
 };
 
+const PipelinePipe = struct {
+    endpoints: Host.Pipe,
+    read_open: bool = true,
+    write_open: bool = true,
+};
+
 pub fn init(gpa: std.mem.Allocator, host: Host) Executor {
     return initWithOptions(gpa, host, .{});
 }
@@ -503,48 +509,53 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
             return error.UnsupportedInstruction;
     }
 
-    const pipes = try allocator.alloc(Host.Pipe, pipe_stderr.items.len);
+    const pipes = try allocator.alloc(PipelinePipe, pipe_stderr.items.len);
     var pipe_count: usize = 0;
-    var pipes_open = true;
     const spawned = try allocator.alloc(?Host.SpawnResult, stages.items.len);
     @memset(spawned, null);
     defer {
-        if (pipes_open) closePipes(executor.host, pipes[0..pipe_count]);
+        closePipes(executor.host, pipes[0..pipe_count]);
         for (spawned) |process| {
             if (process) |value| _ = executor.host.wait(value.process) catch {};
         }
     }
 
     for (pipes) |*pipeline_pipe| {
-        pipeline_pipe.* = executor.host.createPipe() catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.ResourceUnavailable => return executor.pipelineFailure(.resource_unavailable),
-            error.Unsupported => return executor.pipelineFailure(.unsupported),
-            else => |other| return other,
+        pipeline_pipe.* = .{
+            .endpoints = executor.host.createPipe() catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.ResourceUnavailable => return executor.pipelineFailure(.resource_unavailable),
+                error.Unsupported => return executor.pipelineFailure(.unsupported),
+                else => |other| return other,
+            },
         };
         pipe_count += 1;
     }
 
     var result: Result = .{ .status = 0, .sandbox_coverage = .not_requested };
-    for (stages.items, 0..) |stage, stage_index| {
+    var remaining_stages = stages.items.len;
+    while (remaining_stages != 0) {
+        remaining_stages -= 1;
+        const stage_index = remaining_stages;
+        const stage = stages.items[stage_index];
         var stage_executor = executor;
         stage_executor.pipeline_stage = .{
-            .input = if (stage_index == 0) null else pipes[stage_index - 1].read_end,
-            .output = if (stage_index == pipes.len) null else pipes[stage_index].write_end,
+            .input = if (stage_index == 0) null else pipes[stage_index - 1].endpoints.read_end,
+            .output = if (stage_index == pipes.len) null else pipes[stage_index].endpoints.write_end,
             .pipe_stderr = stage_index < pipe_stderr.items.len and
                 pipe_stderr.items[stage_index],
             .spawned = &spawned[stage_index],
         };
         const stage_result = try stage_executor.executePipelineStage(hir, stage);
-        result.status = stage_result.status;
+        if (stage_index + 1 == stages.items.len) result.status = stage_result.status;
         result.sandbox_coverage = combineSandboxCoverage(
             result.sandbox_coverage,
             stage_result.sandbox_coverage,
         );
+        if (stage_index != 0) closePipeRead(executor.host, &pipes[stage_index - 1]);
+        if (stage_index != pipes.len) closePipeWrite(executor.host, &pipes[stage_index]);
     }
 
-    closePipes(executor.host, pipes);
-    pipes_open = false;
     for (spawned, 0..) |process, stage_index| {
         if (process) |value| {
             const termination = try executor.host.wait(value.process);
@@ -594,13 +605,25 @@ fn collectPipeline(
     };
 }
 
-fn closePipes(host: Host, pipes: []const Host.Pipe) void {
+fn closePipes(host: Host, pipes: []PipelinePipe) void {
     var index = pipes.len;
     while (index != 0) {
         index -= 1;
-        host.closeResource(pipes[index].write_end);
-        host.closeResource(pipes[index].read_end);
+        closePipeWrite(host, &pipes[index]);
+        closePipeRead(host, &pipes[index]);
     }
+}
+
+fn closePipeRead(host: Host, pipeline_pipe: *PipelinePipe) void {
+    if (!pipeline_pipe.read_open) return;
+    host.closeResource(pipeline_pipe.endpoints.read_end);
+    pipeline_pipe.read_open = false;
+}
+
+fn closePipeWrite(host: Host, pipeline_pipe: *PipelinePipe) void {
+    if (!pipeline_pipe.write_open) return;
+    host.closeResource(pipeline_pipe.endpoints.write_end);
+    pipeline_pipe.write_open = false;
 }
 
 fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {

@@ -527,7 +527,7 @@ test "pipeline negation preserves exit control flow and status" {
     try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
 }
 
-test "executes external pipeline stages before waiting" {
+test "launches external pipeline stages downstream-first before waiting" {
     var hir = try generate("/bin/first | /bin/second |& /bin/third");
     defer hir.deinit(std.testing.allocator);
     var fake = FakeHost.init(std.testing.allocator);
@@ -542,12 +542,14 @@ test "executes external pipeline stages before waiting" {
     try std.testing.expectEqual(@as(usize, 3), fake.spawn_calls.items.len);
     try std.testing.expectEqual(@as(usize, 3), fake.wait_calls.items.len);
 
-    const first_actions = fake.spawn_calls.items[0].file_actions;
-    try std.testing.expectEqual(@as(usize, 1), first_actions.len);
-    try std.testing.expectEqual(CommandPlan.FileDescriptor.stdout, first_actions[0]
+    const third_actions = fake.spawn_calls.items[0].file_actions;
+    try std.testing.expectEqualStrings("/bin/third", fake.spawn_calls.items[0].argv[0]);
+    try std.testing.expectEqual(@as(usize, 1), third_actions.len);
+    try std.testing.expectEqual(CommandPlan.FileDescriptor.stdin, third_actions[0]
         .use_resource.target);
 
     const second_actions = fake.spawn_calls.items[1].file_actions;
+    try std.testing.expectEqualStrings("/bin/second", fake.spawn_calls.items[1].argv[0]);
     try std.testing.expectEqual(@as(usize, 3), second_actions.len);
     try std.testing.expectEqual(CommandPlan.FileDescriptor.stdin, second_actions[0]
         .use_resource.target);
@@ -558,9 +560,10 @@ test "executes external pipeline stages before waiting" {
     try std.testing.expectEqual(CommandPlan.FileDescriptor.stderr, second_actions[2]
         .duplicate.target);
 
-    const third_actions = fake.spawn_calls.items[2].file_actions;
-    try std.testing.expectEqual(@as(usize, 1), third_actions.len);
-    try std.testing.expectEqual(CommandPlan.FileDescriptor.stdin, third_actions[0]
+    const first_actions = fake.spawn_calls.items[2].file_actions;
+    try std.testing.expectEqualStrings("/bin/first", fake.spawn_calls.items[2].argv[0]);
+    try std.testing.expectEqual(@as(usize, 1), first_actions.len);
+    try std.testing.expectEqual(CommandPlan.FileDescriptor.stdout, first_actions[0]
         .use_resource.target);
 }
 
@@ -572,7 +575,15 @@ test "pipeline connections surround command redirections in shell order" {
 
     _ = try preResolvedExecutor(std.testing.allocator, fake.host()).execute(hir);
 
-    const first_actions = fake.spawn_calls.items[0].file_actions;
+    const second_actions = fake.spawn_calls.items[0].file_actions;
+    try std.testing.expectEqualStrings("/bin/second", fake.spawn_calls.items[0].argv[0]);
+    try std.testing.expectEqual(@as(usize, 2), second_actions.len);
+    try std.testing.expectEqual(CommandPlan.FileDescriptor.stdin, second_actions[0]
+        .use_resource.target);
+    try std.testing.expectEqualStrings("input", second_actions[1].open.path);
+
+    const first_actions = fake.spawn_calls.items[1].file_actions;
+    try std.testing.expectEqualStrings("/bin/first", fake.spawn_calls.items[1].argv[0]);
     try std.testing.expectEqual(@as(usize, 3), first_actions.len);
     try std.testing.expectEqual(CommandPlan.FileDescriptor.stdout, first_actions[0]
         .use_resource.target);
@@ -581,12 +592,6 @@ test "pipeline connections surround command redirections in shell order" {
         .duplicate.source);
     try std.testing.expectEqual(CommandPlan.FileDescriptor.stderr, first_actions[2]
         .duplicate.target);
-
-    const second_actions = fake.spawn_calls.items[1].file_actions;
-    try std.testing.expectEqual(@as(usize, 2), second_actions.len);
-    try std.testing.expectEqual(CommandPlan.FileDescriptor.stdin, second_actions[0]
-        .use_resource.target);
-    try std.testing.expectEqualStrings("input", second_actions[1].open.path);
 }
 
 test "pipeline connections override an outer scoped stream" {
@@ -597,19 +602,19 @@ test "pipeline connections override an outer scoped stream" {
 
     _ = try preResolvedExecutor(std.testing.allocator, fake.host()).execute(hir);
 
-    const scoped_resource = fake.spawn_calls.items[0].file_actions[0].use_resource.resource;
-    const pipe_resource = fake.spawn_calls.items[0].file_actions[1].use_resource.resource;
-    try std.testing.expect(scoped_resource != pipe_resource);
-    try std.testing.expectEqual(CommandPlan.FileDescriptor.stdout, fake.spawn_calls.items[0]
-        .file_actions[0].use_resource.target);
-    try std.testing.expectEqual(CommandPlan.FileDescriptor.stdout, fake.spawn_calls.items[0]
-        .file_actions[1].use_resource.target);
-
-    const last_actions = fake.spawn_calls.items[1].file_actions;
-    try std.testing.expectEqual(scoped_resource, last_actions[0].use_resource.resource);
+    const last_actions = fake.spawn_calls.items[0].file_actions;
+    const scoped_resource = last_actions[0].use_resource.resource;
     try std.testing.expectEqual(CommandPlan.FileDescriptor.stdout, last_actions[0]
         .use_resource.target);
     try std.testing.expectEqual(CommandPlan.FileDescriptor.stdin, last_actions[1]
+        .use_resource.target);
+
+    const first_actions = fake.spawn_calls.items[1].file_actions;
+    const pipe_resource = first_actions[1].use_resource.resource;
+    try std.testing.expect(scoped_resource != pipe_resource);
+    try std.testing.expectEqual(CommandPlan.FileDescriptor.stdout, first_actions[0]
+        .use_resource.target);
+    try std.testing.expectEqual(CommandPlan.FileDescriptor.stdout, first_actions[1]
         .use_resource.target);
     try std.testing.expectEqual(@as(usize, 3), fake.closed_resource_count);
 }
@@ -669,10 +674,11 @@ test "unsupported output builtin pipeline stages close pipe resources" {
     );
     try std.testing.expectEqual(@as(usize, 1), fake.create_pipe_calls);
     try std.testing.expectEqual(@as(usize, 2), fake.closed_resource_count);
-    try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+    try std.testing.expectEqual(@as(usize, 1), fake.spawn_calls.items.len);
+    try std.testing.expectEqual(@as(usize, 1), fake.wait_calls.items.len);
 }
 
-test "later pipeline spawn failures reap earlier processes" {
+test "upstream pipeline spawn failures reap downstream processes" {
     var hir = try generate("/bin/first | /bin/second");
     defer hir.deinit(std.testing.allocator);
     var fake = FakeHost.init(std.testing.allocator);
@@ -687,8 +693,8 @@ test "later pipeline spawn failures reap earlier processes" {
         .io = .{ .stderr = &diagnostics.writer },
     }).execute(hir);
 
-    try std.testing.expectEqual(@as(u8, 127), result.status);
-    try std.testing.expectEqualStrings("/bin/second: command not found\n", diagnostics.written());
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqualStrings("/bin/first: command not found\n", diagnostics.written());
     try std.testing.expectEqual(@as(usize, 1), fake.spawn_calls.items.len);
     try std.testing.expectEqual(@as(usize, 1), fake.wait_calls.items.len);
     try std.testing.expectEqual(@as(usize, 2), fake.closed_resource_count);
