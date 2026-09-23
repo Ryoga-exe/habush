@@ -903,7 +903,7 @@ test "shell function pipeline stage state does not escape" {
     try std.testing.expect(!state.isVariableExported("NAME"));
 }
 
-test "multiple shell function pipeline stages remain unsupported" {
+test "multiple general in-process pipeline stages remain unsupported" {
     var hir = try generate("f() { :; }; g() { :; }; f | g");
     defer hir.deinit(std.testing.allocator);
     var fake = FakeHost.init(std.testing.allocator);
@@ -917,6 +917,90 @@ test "multiple shell function pipeline stages remain unsupported" {
     );
     try std.testing.expectEqual(@as(usize, 0), fake.create_pipe_calls);
     try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+}
+
+test "compound pipeline stage runs after adjacent external stages launch" {
+    var hir = try generate("/bin/source | { /bin/filter; } | /bin/sink");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+
+    const result = try preResolvedExecutor(std.testing.allocator, fake.host()).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqual(@as(usize, 3), fake.spawn_calls.items.len);
+    try std.testing.expectEqualStrings("/bin/sink", fake.spawn_calls.items[0].argv[0]);
+    try std.testing.expectEqualStrings("/bin/source", fake.spawn_calls.items[1].argv[0]);
+    try std.testing.expectEqualStrings("/bin/filter", fake.spawn_calls.items[2].argv[0]);
+    const compound_actions = fake.spawn_calls.items[2].file_actions;
+    try std.testing.expectEqual(@as(usize, 2), compound_actions.len);
+    try std.testing.expectEqual(CommandPlan.FileDescriptor.stdin, compound_actions[0]
+        .use_resource.target);
+    try std.testing.expectEqual(CommandPlan.FileDescriptor.stdout, compound_actions[1]
+        .use_resource.target);
+    try std.testing.expectEqual(@as(usize, 3), fake.wait_calls.items.len);
+    try std.testing.expectEqual(@as(usize, 4), fake.closed_resource_count);
+}
+
+test "compound redirects retain pipeline and pipe-stderr ordering" {
+    var hir = try generate("{ /bin/body; } >out |& /bin/sink");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+
+    _ = try preResolvedExecutor(std.testing.allocator, fake.host()).execute(hir);
+
+    try std.testing.expectEqualStrings("/bin/body", fake.spawn_calls.items[1].argv[0]);
+    const actions = fake.spawn_calls.items[1].file_actions;
+    try std.testing.expectEqual(@as(usize, 3), actions.len);
+    try std.testing.expectEqual(CommandPlan.FileDescriptor.stdout, actions[0]
+        .use_resource.target);
+    try std.testing.expectEqual(CommandPlan.FileDescriptor.stdout, actions[1]
+        .use_resource.target);
+    try std.testing.expectEqual(CommandPlan.FileDescriptor.stdout, actions[2]
+        .duplicate.source);
+    try std.testing.expectEqual(CommandPlan.FileDescriptor.stderr, actions[2]
+        .duplicate.target);
+}
+
+test "subshell if and for commands run as compound pipeline stages" {
+    const cases = [_]struct {
+        source: [:0]const u8,
+        body_command: []const u8,
+    }{
+        .{
+            .source = "/bin/source | ( /bin/subshell-body; ) | /bin/sink",
+            .body_command = "/bin/subshell-body",
+        },
+        .{
+            .source = "/bin/source | if true; then /bin/if-body; fi | /bin/sink",
+            .body_command = "/bin/if-body",
+        },
+        .{
+            .source = "/bin/source | for item in one; do /bin/for-body; done | /bin/sink",
+            .body_command = "/bin/for-body",
+        },
+    };
+    for (cases) |case| {
+        var hir = try generate(case.source);
+        defer hir.deinit(std.testing.allocator);
+        var fake = FakeHost.init(std.testing.allocator);
+        defer fake.deinit();
+        var variables = VariableStore.init(std.testing.allocator);
+        defer variables.deinit();
+
+        const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+            .resolver = CommandResolver.preResolved(),
+            .variables = &variables,
+        }).execute(hir);
+
+        try std.testing.expectEqual(@as(u8, 0), result.status);
+        try std.testing.expectEqual(@as(usize, 3), fake.spawn_calls.items.len);
+        try std.testing.expectEqualStrings("/bin/sink", fake.spawn_calls.items[0].argv[0]);
+        try std.testing.expectEqualStrings("/bin/source", fake.spawn_calls.items[1].argv[0]);
+        try std.testing.expectEqualStrings(case.body_command, fake.spawn_calls.items[2].argv[0]);
+        try std.testing.expectEqual(@as(usize, 4), fake.closed_resource_count);
+    }
 }
 
 test "upstream pipeline spawn failures reap downstream processes" {

@@ -178,6 +178,14 @@ pub fn build(b: *std.Build) void {
             "copy() { /bin/cat; }; /bin/echo function-data | copy | /usr/bin/grep -q function-data",
         });
         expectCliResult(function_pipeline_test, test_step, 0, "", "");
+
+        const compound_pipeline_test = b.addRunArtifact(exe);
+        compound_pipeline_test.setName("test cli compound command pipeline");
+        compound_pipeline_test.addArgs(&.{
+            "-c",
+            "/bin/echo compound-data | { /bin/cat; } | /usr/bin/grep -q compound-data",
+        });
+        expectCliResult(compound_pipeline_test, test_step, 0, "", "");
     }
 
     const parameter_diagnostic_test = b.addRunArtifact(exe);

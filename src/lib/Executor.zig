@@ -4,8 +4,8 @@
 //! lists, and-or commands, pipeline negation, brace groups, if clauses,
 //! while/until/for loops with break/continue control, standalone assignments,
 //! builtins, external simple commands, and foreground pipelines of external
-//! simple commands, builtins that do not consume stdin, and at most one shell
-//! function stage.
+//! simple commands, builtins that do not consume stdin, and at most one
+//! general in-process stage such as a shell function or compound command.
 //! Standard-stream redirections are supported for simple and compound
 //! commands, including here-documents and here-strings. Background execution
 //! and non-external pipeline stages remain explicit `UnsupportedInstruction`
@@ -94,7 +94,7 @@ const PipelinePipe = struct {
 const PipelineStageKind = enum {
     external,
     builtin,
-    function,
+    in_process,
 };
 
 const PipelineStageClassification = union(enum) {
@@ -518,15 +518,15 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
     std.debug.assert(stages.items.len == pipe_stderr.items.len + 1);
 
     const stage_kinds = try allocator.alloc(PipelineStageKind, stages.items.len);
-    var function_count: usize = 0;
+    var in_process_count: usize = 0;
     for (stages.items, stage_kinds) |stage, *kind| {
         kind.* = switch (try executor.classifyPipelineStage(hir, stage, allocator)) {
             .kind => |value| value,
             .failed => |result| return result,
         };
-        if (kind.* == .function) function_count += 1;
+        if (kind.* == .in_process) in_process_count += 1;
     }
-    if (function_count > 1) return error.UnsupportedInstruction;
+    if (in_process_count > 1) return error.UnsupportedInstruction;
 
     const pipes = try allocator.alloc(PipelinePipe, pipe_stderr.items.len);
     var pipe_count: usize = 0;
@@ -552,7 +552,7 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
     }
 
     var result: Result = .{ .status = 0, .sandbox_coverage = .not_requested };
-    const phase_count: usize = if (function_count == 0) 1 else 2;
+    const phase_count: usize = if (in_process_count == 0) 1 else 2;
     for (0..phase_count) |phase| {
         var remaining_stages = stages.items.len;
         while (remaining_stages != 0) {
@@ -609,8 +609,17 @@ fn classifyPipelineStage(
     index: Hir.Inst.Index,
     allocator: std.mem.Allocator,
 ) Error!PipelineStageClassification {
-    if (hir.instructionTag(index) != .simple_command)
-        return error.UnsupportedInstruction;
+    if (hir.instructionTag(index) != .simple_command) return switch (hir.instructionTag(index)) {
+        .subshell,
+        .brace_group,
+        .if_clause,
+        .while_clause,
+        .until_clause,
+        .for_clause,
+        => .{ .kind = .in_process },
+        .function_definition => .{ .kind = .builtin },
+        else => error.UnsupportedInstruction,
+    };
 
     var expansion_failure: Expander.Failure = undefined;
     const expander = executor.wordExpander(allocator, null, &expansion_failure);
@@ -634,7 +643,7 @@ fn classifyPipelineStage(
     if (builtin) |candidate|
         if (candidate.special) return .{ .kind = .builtin };
     if (executor.runtime_state) |state|
-        if (state.functionStore().contains(argv.items[0])) return .{ .kind = .function };
+        if (state.functionStore().contains(argv.items[0])) return .{ .kind = .in_process };
     if (builtin != null) return .{ .kind = .builtin };
     return .{ .kind = .external };
 }
@@ -969,7 +978,16 @@ fn beginHirRedirections(
             &resources,
         )) |failure| return .{ .failed = failure };
     }
-    return executor.beginRedirections(actions.items, &resources, allocator);
+    var start = try executor.beginSimpleCommandRedirections(
+        actions.items,
+        &resources,
+        allocator,
+    );
+    if (executor.pipeline_stage != null) switch (start) {
+        .ready => |*scope| scope.executor.pipeline_stage = null,
+        .failed => {},
+    };
+    return start;
 }
 
 fn appendRedirectActions(
