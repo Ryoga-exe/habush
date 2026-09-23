@@ -770,6 +770,78 @@ test "export output flows to a downstream pipeline stage" {
     try std.testing.expectEqualStrings("export SENTINEL='value'\n", fake.redirected_output.written());
 }
 
+test "exit control flow stays inside its pipeline stage" {
+    const cases = [_]struct {
+        source: [:0]const u8,
+        status: u8,
+    }{
+        .{ .source = "exit 7 | true", .status = 0 },
+        .{ .source = "true | exit 7", .status = 7 },
+    };
+    for (cases) |case| {
+        var hir = try generate(case.source);
+        defer hir.deinit(std.testing.allocator);
+        var fake = FakeHost.init(std.testing.allocator);
+        defer fake.deinit();
+
+        const result = try Executor.init(std.testing.allocator, fake.host()).execute(hir);
+
+        try std.testing.expectEqual(case.status, result.status);
+        try std.testing.expect(result.control_flow.isNone());
+    }
+}
+
+test "return in a pipeline does not leave the calling function" {
+    var hir = try generate("f() { true | return 7; /bin/after; }; f");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var state = try runtime.State.init(std.testing.allocator, .{});
+    defer state.deinit();
+
+    const result = try Executor.initWithState(
+        fake.host(),
+        CommandResolver.preResolved(),
+        &state,
+        .{},
+        0,
+    ).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expect(result.control_flow.isNone());
+    try std.testing.expectEqual(@as(usize, 1), fake.spawn_calls.items.len);
+    try std.testing.expectEqualStrings("/bin/after", fake.spawn_calls.items[0].argv[0]);
+}
+
+test "loop control in a pipeline does not leave the parent loop" {
+    const cases = [_][:0]const u8{
+        "for item in one; do true | break; /bin/after; done",
+        "for item in one; do true | continue; /bin/after; done",
+    };
+    for (cases) |source| {
+        var hir = try generate(source);
+        defer hir.deinit(std.testing.allocator);
+        var fake = FakeHost.init(std.testing.allocator);
+        defer fake.deinit();
+        var variables = VariableStore.init(std.testing.allocator);
+        defer variables.deinit();
+        var diagnostics: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer diagnostics.deinit();
+
+        const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+            .resolver = CommandResolver.preResolved(),
+            .variables = &variables,
+            .io = .{ .stderr = &diagnostics.writer },
+        }).execute(hir);
+
+        try std.testing.expectEqual(@as(u8, 0), result.status);
+        try std.testing.expect(result.control_flow.isNone());
+        try std.testing.expectEqualStrings("", diagnostics.written());
+        try std.testing.expectEqual(@as(usize, 1), fake.spawn_calls.items.len);
+        try std.testing.expectEqualStrings("/bin/after", fake.spawn_calls.items[0].argv[0]);
+    }
+}
+
 test "upstream pipeline spawn failures reap downstream processes" {
     var hir = try generate("/bin/first | /bin/second");
     defer hir.deinit(std.testing.allocator);

@@ -577,7 +577,6 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
 
 fn executePipelineStage(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
     var stage_executor = executor;
-    stage_executor.loop_depth = 0;
     var result = if (executor.runtime_state) |state| result: {
         var state_copy = try state.clone();
         defer state_copy.deinit();

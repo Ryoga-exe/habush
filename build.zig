@@ -160,6 +160,16 @@ pub fn build(b: *std.Build) void {
         export_pipeline_output_test.setName("test cli export pipeline output");
         export_pipeline_output_test.addArgs(&.{ "-c", "export | /usr/bin/grep -q ." });
         expectCliResult(export_pipeline_output_test, test_step, 0, "", "");
+
+        const pipeline_exit_isolation_test = b.addRunArtifact(exe);
+        pipeline_exit_isolation_test.setName("test cli pipeline exit isolation");
+        pipeline_exit_isolation_test.addArgs(&.{ "-c", "exit 7 | true; /bin/echo survived" });
+        expectCliResult(pipeline_exit_isolation_test, test_step, 0, "survived\n", "");
+
+        const pipeline_final_exit_status_test = b.addRunArtifact(exe);
+        pipeline_final_exit_status_test.setName("test cli final pipeline exit status");
+        pipeline_final_exit_status_test.addArgs(&.{ "-c", "true | exit 7" });
+        expectCliResult(pipeline_final_exit_status_test, test_step, 7, "", "");
     }
 
     const parameter_diagnostic_test = b.addRunArtifact(exe);
