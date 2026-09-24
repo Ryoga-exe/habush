@@ -38,8 +38,7 @@ runtime_state: ?*runtime.State,
 io: runtime.Io,
 scoped_file_actions: []const CommandPlan.FileAction,
 pipeline_stage: ?PipelineStage,
-prepared_argv: ?[]const []const u8,
-prepared_command: ?PreparedCommand,
+prepared_simple: ?PreparedSimpleCommand,
 last_status: runtime.ExitStatus,
 loop_depth: u32,
 function_depth: u32,
@@ -105,11 +104,15 @@ const PreparedCommand = union(enum) {
     function,
 };
 
+const PreparedSimpleCommand = struct {
+    argv: []const []const u8,
+    command: PreparedCommand,
+};
+
 const PipelineStagePreparation = union(enum) {
     ready: struct {
         kind: PipelineStageKind,
-        argv: ?[]const []const u8 = null,
-        command: ?PreparedCommand = null,
+        simple: ?PreparedSimpleCommand = null,
     },
     failed: Result,
 };
@@ -117,8 +120,7 @@ const PipelineStagePreparation = union(enum) {
 const PreparedPipelineStage = struct {
     index: Hir.Inst.Index,
     kind: PipelineStageKind = .external,
-    argv: ?[]const []const u8 = null,
-    command: ?PreparedCommand = null,
+    simple: ?PreparedSimpleCommand = null,
     state: ?runtime.State = null,
     variables: ?VariableStore = null,
 
@@ -131,8 +133,7 @@ const PreparedPipelineStage = struct {
         var result = base;
         if (stage.state) |*state| result.runtime_state = state;
         if (stage.variables) |*variables| result.variables = variables;
-        result.prepared_argv = stage.argv;
-        result.prepared_command = stage.command;
+        result.prepared_simple = stage.simple;
         return result;
     }
 };
@@ -158,8 +159,7 @@ pub fn initWithOptions(gpa: std.mem.Allocator, host: Host, options: Options) Exe
         .io = options.io,
         .scoped_file_actions = &.{},
         .pipeline_stage = null,
-        .prepared_argv = null,
-        .prepared_command = null,
+        .prepared_simple = null,
         .last_status = options.last_status,
         .loop_depth = 0,
         .function_depth = 0,
@@ -189,8 +189,7 @@ pub fn initWithState(
         .io = io,
         .scoped_file_actions = &.{},
         .pipeline_stage = null,
-        .prepared_argv = null,
-        .prepared_command = null,
+        .prepared_simple = null,
         .last_status = last_status,
         .loop_depth = 0,
         .function_depth = 0,
@@ -569,8 +568,7 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
             .failed => |result| return result,
         };
         stage.kind = preparation.kind;
-        stage.argv = preparation.argv;
-        stage.command = preparation.command;
+        stage.simple = preparation.simple;
         if (stage.kind == .in_process) in_process_count += 1;
     }
     // A general in-process stage may read from its pipeline input. External
@@ -696,24 +694,20 @@ fn preparePipelineStage(
     if (builtin) |candidate|
         if (candidate.special) return .{ .ready = .{
             .kind = .builtin,
-            .argv = expanded_argv,
-            .command = .{ .builtin = candidate },
+            .simple = .{ .argv = expanded_argv, .command = .{ .builtin = candidate } },
         } };
     if (executor.runtime_state) |state|
         if (state.functionStore().contains(expanded_argv[0])) return .{ .ready = .{
             .kind = .in_process,
-            .argv = expanded_argv,
-            .command = .function,
+            .simple = .{ .argv = expanded_argv, .command = .function },
         } };
     if (builtin) |candidate| return .{ .ready = .{
         .kind = .builtin,
-        .argv = expanded_argv,
-        .command = .{ .builtin = candidate },
+        .simple = .{ .argv = expanded_argv, .command = .{ .builtin = candidate } },
     } };
     return .{ .ready = .{
         .kind = .external,
-        .argv = expanded_argv,
-        .command = .external,
+        .simple = .{ .argv = expanded_argv, .command = .external },
     } };
 }
 
@@ -765,7 +759,7 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
     const expander = executor.wordExpander(allocator, null, &expansion_failure);
 
     var argv: std.ArrayList([]const u8) = .empty;
-    if (executor.prepared_argv) |expanded| try argv.appendSlice(allocator, expanded);
+    if (executor.prepared_simple) |prepared| try argv.appendSlice(allocator, prepared.argv);
     var file_actions: std.ArrayList(CommandPlan.FileAction) = .empty;
     var redirect_resources: std.ArrayList(CommandPlan.Resource) = .empty;
     defer closeRedirectResources(executor.host, &redirect_resources);
@@ -776,21 +770,10 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
     for (parts) |part| {
         switch (hir.instructionTag(part)) {
             .assignment => has_assignments = true,
-            .redirect => {
-                has_redirects = true;
-                if (try executor.appendRedirectActions(
-                    hir,
-                    part,
-                    allocator,
-                    expander,
-                    &expansion_failure,
-                    &file_actions,
-                    &redirect_resources,
-                )) |failure| return failure;
-            },
+            .redirect => has_redirects = true,
             .word => {
                 has_words = true;
-                if (executor.prepared_argv != null) continue;
+                if (executor.prepared_simple != null) continue;
                 const expanded = expander.expandArgument(hir, part) catch |err| switch (err) {
                     error.ParameterExpansionFailed => return executor.parameterExpansionFailure(
                         allocator,
@@ -802,6 +785,20 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
             },
             else => return error.UnsupportedInstruction,
         }
+    }
+    // Command words are expanded before redirect operands. Redirect actions
+    // themselves still retain their source order when applied to the command.
+    for (parts) |part| {
+        if (hir.instructionTag(part) != .redirect) continue;
+        if (try executor.appendRedirectActions(
+            hir,
+            part,
+            allocator,
+            expander,
+            &expansion_failure,
+            &file_actions,
+            &redirect_resources,
+        )) |failure| return failure;
     }
     if (argv.items.len == 0) {
         if (executor.pipeline_stage != null) return error.UnsupportedInstruction;
@@ -855,7 +852,7 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
             try command_variables.set(assignment.name, value);
         }
     }
-    const builtin: ?Builtin = if (executor.prepared_command) |command| switch (command) {
+    const builtin: ?Builtin = if (executor.prepared_simple) |prepared| switch (prepared.command) {
         .builtin => |candidate| candidate,
         .function, .external => null,
     } else Builtin.lookup(argv.items[0]);
@@ -880,7 +877,7 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
             );
         }
     }
-    const is_function = if (executor.prepared_command) |command| switch (command) {
+    const is_function = if (executor.prepared_simple) |prepared| switch (prepared.command) {
         .function => true,
         .builtin, .external => false,
     } else if (executor.runtime_state) |state|
@@ -905,8 +902,7 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
         // function body. Inner commands are ordinary foreground commands,
         // not additional top-level pipeline stages.
         scope.executor.pipeline_stage = null;
-        scope.executor.prepared_argv = null;
-        scope.executor.prepared_command = null;
+        scope.executor.prepared_simple = null;
         return scope.executor.executeFunction(argv.items);
     }
     if (builtin) |candidate| {

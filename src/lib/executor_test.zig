@@ -671,6 +671,32 @@ test "pipeline command words expand once in their isolated stage state" {
     try std.testing.expect(state.variable("NAME") == null);
 }
 
+test "command words precede redirect expansion with and without a pipeline" {
+    const cases = [_]struct { source: [:0]const u8, pipeline: bool }{
+        .{ .source = "/bin/first >\"${NAME:-missing}\" \"${NAME:=chosen}\"", .pipeline = false },
+        .{ .source = "/bin/first >\"${NAME:-missing}\" \"${NAME:=chosen}\" | /bin/last", .pipeline = true },
+    };
+    for (cases) |case| {
+        var hir = try generate(case.source);
+        defer hir.deinit(std.testing.allocator);
+        var fake = FakeHost.init(std.testing.allocator);
+        defer fake.deinit();
+        var variables = VariableStore.init(std.testing.allocator);
+        defer variables.deinit();
+
+        const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+            .resolver = CommandResolver.preResolved(),
+            .variables = &variables,
+        }).execute(hir);
+
+        try std.testing.expectEqual(@as(u8, 0), result.status);
+        const spawned = fake.spawn_calls.items[@intFromBool(case.pipeline)];
+        try std.testing.expectEqualStrings("chosen", spawned.argv[1]);
+        try std.testing.expectEqualStrings("chosen", spawned.file_actions[spawned.file_actions.len - 1].open.path);
+        try std.testing.expectEqual(case.pipeline, variables.get("NAME") == null);
+    }
+}
+
 test "special builtin pipeline assignments do not escape the stage" {
     var hir = try generate("persisted=changed : | /bin/second");
     defer hir.deinit(std.testing.allocator);
