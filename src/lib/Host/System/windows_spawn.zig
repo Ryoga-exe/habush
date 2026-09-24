@@ -1,7 +1,8 @@
-//! Spawn an executable with Windows anonymous pipe handles as standard streams.
+//! Spawn an executable with Windows file or pipe handles as standard streams.
 //!
 //! Zig 0.16's `std.process.spawn` reopens `.file` standard streams with
-//! `OpenFile` on Windows. Anonymous pipe handles cannot be reopened that way.
+//! `OpenFile` on Windows. Anonymous pipes cannot be reopened, and reopening
+//! regular files loses the original handle's shared position/append behavior.
 
 const std = @import("std");
 const windows = std.os.windows;
@@ -30,8 +31,14 @@ pub fn spawn(
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const executable_w = std.unicode.wtf8ToWtf16LeAllocZ(arena, executable) catch |err|
-        return conversionError(err);
+    // A bare executable name still needs Windows' normal executable search.
+    // With a path, keep lpApplicationName explicit so spaces cannot select a
+    // different program than the one requested.
+    const executable_w = if (std.fs.path.dirname(executable) == null)
+        null
+    else
+        std.unicode.wtf8ToWtf16LeAllocZ(arena, executable) catch |err|
+            return conversionError(err);
     const command_line_w = try commandLine(arena, argv);
     const cwd_w = if (cwd) |path|
         std.unicode.wtf8ToWtf16LeAllocZ(arena, path) catch |err|
@@ -67,7 +74,7 @@ pub fn spawn(
     startup.hStdError = inherited[2];
     var process_info: windows.PROCESS.INFORMATION = undefined;
     if (windows.kernel32.CreateProcessW(
-        executable_w.ptr,
+        if (executable_w) |path| path.ptr else null,
         command_line_w.ptr,
         null,
         null,
