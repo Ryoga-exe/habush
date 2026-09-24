@@ -9,6 +9,8 @@ const builtin = @import("builtin");
 const CommandPlan = @import("../CommandPlan.zig");
 const Host = @import("../Host.zig");
 const append_file = @import("System/append_file.zig");
+const pipe = @import("System/pipe.zig");
+const windows_spawn = if (builtin.os.tag == .windows) @import("System/windows_spawn.zig") else struct {};
 const System = @This();
 
 gpa: std.mem.Allocator,
@@ -90,11 +92,41 @@ const vtable: Host.VTable = .{
     .spawn = spawn,
     .wait = wait,
     .open_file = openFile,
+    .create_pipe = createPipe,
     .create_input = createInput,
     .close_resource = closeResource,
     .resource_writer = resourceWriter,
     .resolve_working_directory = resolveWorkingDirectory,
 };
+
+fn createPipe(userdata: ?*anyopaque) Host.Error!Host.Pipe {
+    const system: *System = @ptrCast(@alignCast(userdata.?));
+    const files = pipe.create() catch |err| return switch (err) {
+        error.OperationUnsupported => error.Unsupported,
+        else => error.ResourceUnavailable,
+    };
+    errdefer files[0].close(system.io);
+    errdefer files[1].close(system.io);
+
+    const read_data = try system.gpa.create(FileResource);
+    errdefer system.gpa.destroy(read_data);
+    const write_data = try system.gpa.create(FileResource);
+    errdefer system.gpa.destroy(write_data);
+    try system.resources.ensureUnusedCapacity(system.gpa, 2);
+
+    read_data.* = .{ .storage = .{ .file = files[0] }, .writer = null };
+    write_data.* = .{
+        .storage = .{ .file = files[1] },
+        .writer = files[1].writerStreaming(system.io, &.{}),
+    };
+    const read_end: CommandPlan.Resource = @enumFromInt(system.next_resource);
+    system.next_resource +%= 1;
+    const write_end: CommandPlan.Resource = @enumFromInt(system.next_resource);
+    system.next_resource +%= 1;
+    system.resources.putAssumeCapacityNoClobber(read_end, read_data);
+    system.resources.putAssumeCapacityNoClobber(write_end, write_data);
+    return .{ .read_end = read_end, .write_end = write_end };
+}
 
 fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.SpawnError!Host.SpawnOutcome {
     const system: *System = @ptrCast(@alignCast(userdata.?));
@@ -188,7 +220,26 @@ fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.SpawnError!Host.SpawnOut
     defer if (environment) |*map| map.deinit();
 
     try system.children.ensureUnusedCapacity(system.gpa, 1);
-    const child = std.process.spawn(system.io, .{
+    const child = if (builtin.os.tag == .windows and needsWindowsHandleSpawn(bindings)) child: {
+        const outcome = try windows_spawn.spawn(
+            system.gpa,
+            argv,
+            switch (plan.cwd) {
+                .inherit => null,
+                .path => |path| path,
+            },
+            if (environment) |*map| map else system.environ_map,
+            .{
+                bindingFile(bindings[0]),
+                bindingFile(bindings[1]),
+                bindingFile(bindings[2]),
+            },
+        );
+        break :child switch (outcome) {
+            .spawned => |spawned| spawned,
+            .failed => |failure| return .{ .failed = failure },
+        };
+    } else std.process.spawn(system.io, .{
         .argv = argv,
         .cwd = switch (plan.cwd) {
             .inherit => .inherit,
@@ -350,6 +401,23 @@ const StdioBinding = union(enum) {
     file: std.Io.File,
     close,
 };
+
+fn needsWindowsHandleSpawn(bindings: [3]StdioBinding) bool {
+    for (bindings, 0..) |binding, index| switch (binding) {
+        .file => return true,
+        .inherit => |source| if (stdioIndex(source).? != index) return true,
+        .close => {},
+    };
+    return false;
+}
+
+fn bindingFile(binding: StdioBinding) ?std.Io.File {
+    return switch (binding) {
+        .inherit => |source| stdioFile(source),
+        .file => |file| file,
+        .close => null,
+    };
+}
 
 fn spawnStdio(
     binding: StdioBinding,
@@ -837,7 +905,10 @@ test "system host applies output file actions relative to the command directory"
         .limited(64),
     );
     defer std.testing.allocator.free(output);
-    try std.testing.expectEqualStrings("firstsecond", output);
+    try std.testing.expectEqualStrings(
+        if (builtin.os.tag == .windows) "first\r\nsecond\r\n" else "firstsecond",
+        output,
+    );
 }
 
 test "system host shares scoped output resources with child processes" {
@@ -874,7 +945,10 @@ test "system host shares scoped output resources with child processes" {
         .limited(64),
     );
     defer std.testing.allocator.free(output);
-    try std.testing.expectEqualStrings("builtinexternal", output);
+    try std.testing.expectEqualStrings(
+        if (builtin.os.tag == .windows) "builtinexternal\r\n" else "builtinexternal",
+        output,
+    );
 }
 
 test "system host provides seekable input resources to child processes" {
@@ -917,6 +991,21 @@ test "system host provides seekable input resources to child processes" {
     try std.testing.expectEqualStrings("here-document contents\n", output);
 }
 
+test "system host creates and closes pipeline resources" {
+    var system: System = .{ .gpa = std.testing.allocator, .io = std.testing.io };
+    defer system.deinit();
+    const system_host = system.host();
+
+    const pipeline_pipe = try system_host.createPipe();
+    try std.testing.expectEqual(@as(usize, 2), system.resources.count());
+    try std.testing.expect(system_host.resourceWriter(pipeline_pipe.read_end) == null);
+    try std.testing.expect(system_host.resourceWriter(pipeline_pipe.write_end) != null);
+
+    system_host.closeResource(pipeline_pipe.write_end);
+    system_host.closeResource(pipeline_pipe.read_end);
+    try std.testing.expectEqual(@as(usize, 0), system.resources.count());
+}
+
 test "system host duplicates redirected standard streams" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
@@ -945,7 +1034,10 @@ test "system host duplicates redirected standard streams" {
         .limited(64),
     );
     defer std.testing.allocator.free(output);
-    try std.testing.expectEqualStrings("outerr", output);
+    try std.testing.expectEqualStrings(
+        if (builtin.os.tag == .windows) "out\r\nerr\r\n" else "outerr",
+        output,
+    );
 }
 
 test "system host preserves file action source order" {
@@ -989,8 +1081,8 @@ test "system host preserves file action source order" {
         .limited(64),
     );
     defer std.testing.allocator.free(after);
-    try std.testing.expectEqualStrings("err", before);
-    try std.testing.expectEqualStrings("out", after);
+    try std.testing.expectEqualStrings(if (builtin.os.tag == .windows) "err\r\n" else "err", before);
+    try std.testing.expectEqualStrings(if (builtin.os.tag == .windows) "out\r\n" else "out", after);
 }
 
 test "system host identifies a failing input file action" {
@@ -1078,7 +1170,7 @@ fn outputCommand(comptime output: []const u8) CommandPlan {
     return switch (@import("builtin").os.tag) {
         .windows => .{
             .executable = "cmd.exe",
-            .argv = &.{ "shell-spelling", "/D", "/C", "<nul set /p =" ++ output },
+            .argv = &.{ "shell-spelling", "/D", "/C", "echo " ++ output },
         },
         else => .{
             .executable = "/bin/sh",
@@ -1095,7 +1187,7 @@ fn outputBothCommand() CommandPlan {
                 "shell-spelling",
                 "/D",
                 "/C",
-                "<nul set /p \"=out\" & <nul set /p \"=err\" 1>&2",
+                "echo out&echo err>&2",
             },
         },
         else => .{

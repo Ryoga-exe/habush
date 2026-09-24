@@ -8,6 +8,7 @@ const VariableStore = @import("VariableStore.zig");
 
 tag: Tag,
 special: bool = false,
+pipeline_support: PipelineSupport = .unsupported,
 
 pub const Tag = enum {
     @":",
@@ -21,6 +22,13 @@ pub const Tag = enum {
     @"return",
     @"export",
     unset,
+};
+
+pub const PipelineSupport = enum {
+    unsupported,
+    /// The builtin does not consume pipeline input. It may write output after
+    /// the downstream stage has been launched.
+    no_stdin,
 };
 
 pub const Result = struct {
@@ -44,21 +52,25 @@ pub const Error = std.mem.Allocator.Error || std.Io.Writer.Error || error{
 };
 
 const definitions = std.StaticStringMap(Builtin).initComptime(.{
-    .{ ":", Builtin{ .tag = .@":", .special = true } },
-    .{ "break", Builtin{ .tag = .@"break", .special = true } },
-    .{ "continue", Builtin{ .tag = .@"continue", .special = true } },
-    .{ "true", Builtin{ .tag = .true } },
-    .{ "false", Builtin{ .tag = .false } },
-    .{ "cd", Builtin{ .tag = .cd } },
-    .{ "exit", Builtin{ .tag = .exit, .special = true } },
-    .{ "pwd", Builtin{ .tag = .pwd } },
-    .{ "return", Builtin{ .tag = .@"return", .special = true } },
-    .{ "export", Builtin{ .tag = .@"export", .special = true } },
-    .{ "unset", Builtin{ .tag = .unset, .special = true } },
+    .{ ":", Builtin{ .tag = .@":", .special = true, .pipeline_support = .no_stdin } },
+    .{ "break", Builtin{ .tag = .@"break", .special = true, .pipeline_support = .no_stdin } },
+    .{ "continue", Builtin{ .tag = .@"continue", .special = true, .pipeline_support = .no_stdin } },
+    .{ "true", Builtin{ .tag = .true, .pipeline_support = .no_stdin } },
+    .{ "false", Builtin{ .tag = .false, .pipeline_support = .no_stdin } },
+    .{ "cd", Builtin{ .tag = .cd, .pipeline_support = .no_stdin } },
+    .{ "exit", Builtin{ .tag = .exit, .special = true, .pipeline_support = .no_stdin } },
+    .{ "pwd", Builtin{ .tag = .pwd, .pipeline_support = .no_stdin } },
+    .{ "return", Builtin{ .tag = .@"return", .special = true, .pipeline_support = .no_stdin } },
+    .{ "export", Builtin{ .tag = .@"export", .special = true, .pipeline_support = .no_stdin } },
+    .{ "unset", Builtin{ .tag = .unset, .special = true, .pipeline_support = .no_stdin } },
 });
 
 pub fn lookup(name: []const u8) ?Builtin {
     return definitions.get(name);
+}
+
+pub fn supportsPipeline(builtin: Builtin) bool {
+    return builtin.pipeline_support != .unsupported;
 }
 
 pub fn run(builtin: Builtin, context: Context, argv: []const []const u8) Error!Result {
@@ -346,6 +358,17 @@ test "looks up core builtins by command name" {
     try std.testing.expect(!lookup("true").?.special);
     try std.testing.expect(lookup("missing") == null);
     try std.testing.expect(lookup("./true") == null);
+    try std.testing.expect(lookup(":").?.supportsPipeline());
+    try std.testing.expect(lookup("true").?.supportsPipeline());
+    try std.testing.expect(lookup("false").?.supportsPipeline());
+    try std.testing.expect(lookup("pwd").?.supportsPipeline());
+    try std.testing.expect(lookup("cd").?.supportsPipeline());
+    try std.testing.expect(lookup("export").?.supportsPipeline());
+    try std.testing.expect(lookup("unset").?.supportsPipeline());
+    try std.testing.expect(lookup("exit").?.supportsPipeline());
+    try std.testing.expect(lookup("return").?.supportsPipeline());
+    try std.testing.expect(lookup("break").?.supportsPipeline());
+    try std.testing.expect(lookup("continue").?.supportsPipeline());
 }
 
 test "runs status-only core builtins" {

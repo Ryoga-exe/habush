@@ -23,6 +23,7 @@ pub const VTable = struct {
         CommandPlan.WorkingDirectory,
         CommandPlan.FileAction.Open,
     ) SpawnError!OpenFileOutcome,
+    create_pipe: *const fn (?*anyopaque) Error!Pipe,
     create_input: *const fn (?*anyopaque, []const u8) Error!CommandPlan.Resource,
     close_resource: *const fn (?*anyopaque, CommandPlan.Resource) void,
     resource_writer: *const fn (?*anyopaque, CommandPlan.Resource) ?*std.Io.Writer,
@@ -36,6 +37,11 @@ pub const VTable = struct {
 pub const OpenFileOutcome = union(enum) {
     opened: CommandPlan.Resource,
     failed: FileActionFailure.Reason,
+};
+
+pub const Pipe = struct {
+    read_end: CommandPlan.Resource,
+    write_end: CommandPlan.Resource,
 };
 
 pub const Error = error{
@@ -137,6 +143,12 @@ pub fn openFile(
 
 pub fn closeResource(host: Host, resource: CommandPlan.Resource) void {
     host.vtable.close_resource(host.userdata, resource);
+}
+
+/// Creates a connected pair of host-owned resources. The caller owns both
+/// endpoints and must close them after every child has inherited its endpoint.
+pub fn createPipe(host: Host) Error!Pipe {
+    return host.vtable.create_pipe(host.userdata);
 }
 
 /// Creates a seekable, host-owned input resource containing `bytes`.

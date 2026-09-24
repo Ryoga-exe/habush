@@ -83,7 +83,15 @@ pub fn build(b: *std.Build) void {
     word_expansion_test.addFileArg(b.path("test/cli/word-expansion.hb"));
     expectCliResult(word_expansion_test, test_step, 23, "", "");
 
-    if (target.result.os.tag != .windows) {
+    if (target.result.os.tag == .windows) {
+        const windows_pipeline_test = b.addRunArtifact(exe);
+        windows_pipeline_test.setName("test cli Windows anonymous pipeline");
+        windows_pipeline_test.addArgs(&.{ "-c", "cmd.exe /C echo pipeline-data | findstr.exe pipeline-data" });
+        windows_pipeline_test.expectExitCode(0);
+        windows_pipeline_test.expectStdOutMatch("pipeline-data");
+        windows_pipeline_test.expectStdErrEqual("");
+        test_step.dependOn(&windows_pipeline_test.step);
+    } else {
         const heredoc_test = b.addRunArtifact(exe);
         heredoc_test.setName("test cli here-document input");
         heredoc_test.addFileArg(b.path("test/cli/heredoc.hb"));
@@ -118,6 +126,74 @@ pub fn build(b: *std.Build) void {
             ":4:1: expected command, found ')'\n",
         );
         test_step.dependOn(&continued_heredoc_diagnostic_test.step);
+
+        const pipeline_test = b.addRunArtifact(exe);
+        pipeline_test.setName("test cli foreground pipeline");
+        pipeline_test.addFileArg(b.path("test/cli/pipeline.hb"));
+        expectCliResult(
+            pipeline_test,
+            test_step,
+            0,
+            "pipeline-data\noutputerror",
+            "",
+        );
+
+        const pipeline_status_test = b.addRunArtifact(exe);
+        pipeline_status_test.setName("test cli pipeline status");
+        pipeline_status_test.addArgs(&.{ "-c", "/usr/bin/true | /usr/bin/false" });
+        expectCliResult(pipeline_status_test, test_step, 1, "", "");
+
+        const builtin_pipeline_status_test = b.addRunArtifact(exe);
+        builtin_pipeline_status_test.setName("test cli builtin pipeline status");
+        builtin_pipeline_status_test.addArgs(&.{ "-c", "true | false" });
+        expectCliResult(builtin_pipeline_status_test, test_step, 1, "", "");
+
+        const builtin_pipeline_output_test = b.addRunArtifact(exe);
+        builtin_pipeline_output_test.setName("test cli builtin pipeline output");
+        builtin_pipeline_output_test.addArgs(&.{ "-c", "pwd | /usr/bin/grep -q /" });
+        expectCliResult(builtin_pipeline_output_test, test_step, 0, "", "");
+
+        const failed_builtin_pipeline_output_test = b.addRunArtifact(exe);
+        failed_builtin_pipeline_output_test.setName("test cli failed builtin pipeline output");
+        failed_builtin_pipeline_output_test.addArgs(&.{ "-c", "pwd | /definitely/missing" });
+        expectCliResult(
+            failed_builtin_pipeline_output_test,
+            test_step,
+            127,
+            "",
+            "habush: /definitely/missing: command not found\n",
+        );
+
+        const export_pipeline_output_test = b.addRunArtifact(exe);
+        export_pipeline_output_test.setName("test cli export pipeline output");
+        export_pipeline_output_test.addArgs(&.{ "-c", "export | /usr/bin/grep -q ." });
+        expectCliResult(export_pipeline_output_test, test_step, 0, "", "");
+
+        const pipeline_exit_isolation_test = b.addRunArtifact(exe);
+        pipeline_exit_isolation_test.setName("test cli pipeline exit isolation");
+        pipeline_exit_isolation_test.addArgs(&.{ "-c", "exit 7 | true; /bin/echo survived" });
+        expectCliResult(pipeline_exit_isolation_test, test_step, 0, "survived\n", "");
+
+        const pipeline_final_exit_status_test = b.addRunArtifact(exe);
+        pipeline_final_exit_status_test.setName("test cli final pipeline exit status");
+        pipeline_final_exit_status_test.addArgs(&.{ "-c", "true | exit 7" });
+        expectCliResult(pipeline_final_exit_status_test, test_step, 7, "", "");
+
+        const function_pipeline_test = b.addRunArtifact(exe);
+        function_pipeline_test.setName("test cli shell function pipeline");
+        function_pipeline_test.addArgs(&.{
+            "-c",
+            "copy() { /bin/cat; }; /bin/echo function-data | copy | /usr/bin/grep -q function-data",
+        });
+        expectCliResult(function_pipeline_test, test_step, 0, "", "");
+
+        const compound_pipeline_test = b.addRunArtifact(exe);
+        compound_pipeline_test.setName("test cli compound command pipeline");
+        compound_pipeline_test.addArgs(&.{
+            "-c",
+            "/bin/echo compound-data | { /bin/cat; } | /usr/bin/grep -q compound-data",
+        });
+        expectCliResult(compound_pipeline_test, test_step, 0, "", "");
     }
 
     const parameter_diagnostic_test = b.addRunArtifact(exe);

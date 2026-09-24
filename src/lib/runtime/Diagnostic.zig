@@ -30,6 +30,7 @@ pub const Kind = union(enum) {
     invalid_file_descriptor: []const u8,
     unsupported_file_descriptor: []const u8,
     input_resource_unavailable,
+    cannot_create_pipeline: CannotCreatePipelineReason,
     cannot_open: CannotOpenReason,
     invalid_name: []const u8,
     cannot_change_directory: []const u8,
@@ -61,6 +62,11 @@ pub const CannotOpenReason = enum {
     unsupported,
 };
 
+pub const CannotCreatePipelineReason = enum {
+    resource_unavailable,
+    unsupported,
+};
+
 pub const RenderOptions = struct {
     program_name: ?[]const u8 = null,
 };
@@ -81,6 +87,7 @@ pub fn status(diagnostic: Diagnostic) types.ExitStatus {
         .invalid_file_descriptor,
         .unsupported_file_descriptor,
         .input_resource_unavailable,
+        .cannot_create_pipeline,
         .cannot_open,
         .invalid_name,
         .cannot_change_directory,
@@ -134,6 +141,12 @@ pub fn render(
         .input_resource_unavailable => try writer.writeAll(
             "cannot create redirection input: system resources unavailable",
         ),
+        .cannot_create_pipeline => |reason| switch (reason) {
+            .resource_unavailable => try writer.writeAll(
+                "cannot create pipeline: system resources unavailable",
+            ),
+            .unsupported => try writer.writeAll("cannot create pipeline: operation not supported"),
+        },
         .cannot_open => |reason| switch (reason) {
             .not_found => try writer.writeAll("no such file or directory"),
             .access_denied => try writer.writeAll("permission denied"),
