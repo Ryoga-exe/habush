@@ -39,6 +39,7 @@ io: runtime.Io,
 scoped_file_actions: []const CommandPlan.FileAction,
 pipeline_stage: ?PipelineStage,
 prepared_argv: ?[]const []const u8,
+prepared_command: ?PreparedCommand,
 last_status: runtime.ExitStatus,
 loop_depth: u32,
 function_depth: u32,
@@ -98,10 +99,17 @@ const PipelineStageKind = enum {
     in_process,
 };
 
+const PreparedCommand = union(enum) {
+    external,
+    builtin: Builtin,
+    function,
+};
+
 const PipelineStagePreparation = union(enum) {
     ready: struct {
         kind: PipelineStageKind,
         argv: ?[]const []const u8 = null,
+        command: ?PreparedCommand = null,
     },
     failed: Result,
 };
@@ -110,6 +118,7 @@ const PreparedPipelineStage = struct {
     index: Hir.Inst.Index,
     kind: PipelineStageKind = .external,
     argv: ?[]const []const u8 = null,
+    command: ?PreparedCommand = null,
     state: ?runtime.State = null,
     variables: ?VariableStore = null,
 
@@ -123,6 +132,7 @@ const PreparedPipelineStage = struct {
         if (stage.state) |*state| result.runtime_state = state;
         if (stage.variables) |*variables| result.variables = variables;
         result.prepared_argv = stage.argv;
+        result.prepared_command = stage.command;
         return result;
     }
 };
@@ -149,6 +159,7 @@ pub fn initWithOptions(gpa: std.mem.Allocator, host: Host, options: Options) Exe
         .scoped_file_actions = &.{},
         .pipeline_stage = null,
         .prepared_argv = null,
+        .prepared_command = null,
         .last_status = options.last_status,
         .loop_depth = 0,
         .function_depth = 0,
@@ -179,6 +190,7 @@ pub fn initWithState(
         .scoped_file_actions = &.{},
         .pipeline_stage = null,
         .prepared_argv = null,
+        .prepared_command = null,
         .last_status = last_status,
         .loop_depth = 0,
         .function_depth = 0,
@@ -558,6 +570,7 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
         };
         stage.kind = preparation.kind;
         stage.argv = preparation.argv;
+        stage.command = preparation.command;
         if (stage.kind == .in_process) in_process_count += 1;
     }
     // A general in-process stage may read from its pipeline input. External
@@ -681,11 +694,27 @@ fn preparePipelineStage(
     const builtin = Builtin.lookup(argv.items[0]);
     const expanded_argv = try argv.toOwnedSlice(allocator);
     if (builtin) |candidate|
-        if (candidate.special) return .{ .ready = .{ .kind = .builtin, .argv = expanded_argv } };
+        if (candidate.special) return .{ .ready = .{
+            .kind = .builtin,
+            .argv = expanded_argv,
+            .command = .{ .builtin = candidate },
+        } };
     if (executor.runtime_state) |state|
-        if (state.functionStore().contains(expanded_argv[0])) return .{ .ready = .{ .kind = .in_process, .argv = expanded_argv } };
-    if (builtin != null) return .{ .ready = .{ .kind = .builtin, .argv = expanded_argv } };
-    return .{ .ready = .{ .kind = .external, .argv = expanded_argv } };
+        if (state.functionStore().contains(expanded_argv[0])) return .{ .ready = .{
+            .kind = .in_process,
+            .argv = expanded_argv,
+            .command = .function,
+        } };
+    if (builtin) |candidate| return .{ .ready = .{
+        .kind = .builtin,
+        .argv = expanded_argv,
+        .command = .{ .builtin = candidate },
+    } };
+    return .{ .ready = .{
+        .kind = .external,
+        .argv = expanded_argv,
+        .command = .external,
+    } };
 }
 
 fn collectPipeline(
@@ -826,7 +855,10 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
             try command_variables.set(assignment.name, value);
         }
     }
-    const builtin = Builtin.lookup(argv.items[0]);
+    const builtin: ?Builtin = if (executor.prepared_command) |command| switch (command) {
+        .builtin => |candidate| candidate,
+        .function, .external => null,
+    } else Builtin.lookup(argv.items[0]);
     if (builtin) |candidate| {
         if (candidate.special) {
             if (executor.pipeline_stage != null and !candidate.supportsPipeline())
@@ -848,28 +880,34 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
             );
         }
     }
-    if (executor.runtime_state) |state| {
-        if (state.functionStore().contains(argv.items[0])) {
-            if (has_assignments) {
-                const mutable_variables = variables orelse unreachable;
-                try applyAssignments(mutable_variables, &command_variables);
-            }
-            var scope = switch (try executor.beginSimpleCommandRedirections(
-                file_actions.items,
-                &redirect_resources,
-                allocator,
-            )) {
-                .ready => |ready| ready,
-                .failed => |result| return result,
-            };
-            defer scope.deinit();
-            // The pipeline endpoints become scoped redirections for the
-            // function body. Inner commands are ordinary foreground commands,
-            // not additional top-level pipeline stages.
-            scope.executor.pipeline_stage = null;
-            scope.executor.prepared_argv = null;
-            return scope.executor.executeFunction(argv.items);
+    const is_function = if (executor.prepared_command) |command| switch (command) {
+        .function => true,
+        .builtin, .external => false,
+    } else if (executor.runtime_state) |state|
+        state.functionStore().contains(argv.items[0])
+    else
+        false;
+    if (is_function) {
+        if (has_assignments) {
+            const mutable_variables = variables orelse unreachable;
+            try applyAssignments(mutable_variables, &command_variables);
         }
+        var scope = switch (try executor.beginSimpleCommandRedirections(
+            file_actions.items,
+            &redirect_resources,
+            allocator,
+        )) {
+            .ready => |ready| ready,
+            .failed => |result| return result,
+        };
+        defer scope.deinit();
+        // The pipeline endpoints become scoped redirections for the
+        // function body. Inner commands are ordinary foreground commands,
+        // not additional top-level pipeline stages.
+        scope.executor.pipeline_stage = null;
+        scope.executor.prepared_argv = null;
+        scope.executor.prepared_command = null;
+        return scope.executor.executeFunction(argv.items);
     }
     if (builtin) |candidate| {
         if (executor.pipeline_stage != null and !candidate.supportsPipeline())

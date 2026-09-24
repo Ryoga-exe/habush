@@ -902,6 +902,28 @@ test "shell function pipeline stage runs after adjacent external stages launch" 
     try std.testing.expectEqual(@as(usize, 4), fake.closed_resource_count);
 }
 
+test "prepared pipeline command preserves function precedence over regular builtin" {
+    var hir = try generate("pwd() { /bin/function-body; }; pwd | /bin/sink");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var state = try runtime.State.init(std.testing.allocator, .{});
+    defer state.deinit();
+
+    const result = try Executor.initWithState(
+        fake.host(),
+        CommandResolver.preResolved(),
+        &state,
+        .{},
+        0,
+    ).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqual(@as(usize, 2), fake.spawn_calls.items.len);
+    try std.testing.expectEqualStrings("/bin/sink", fake.spawn_calls.items[0].argv[0]);
+    try std.testing.expectEqualStrings("/bin/function-body", fake.spawn_calls.items[1].argv[0]);
+}
+
 test "shell function pipeline stage state does not escape" {
     var hir = try generate(
         "mutate() { cd child; export NAME=inside; }; mutate | /bin/sink",
