@@ -10,6 +10,7 @@ const CommandPlan = @import("../CommandPlan.zig");
 const Host = @import("../Host.zig");
 const append_file = @import("System/append_file.zig");
 const pipe = @import("System/pipe.zig");
+const windows_spawn = if (builtin.os.tag == .windows) @import("System/windows_spawn.zig") else struct {};
 const System = @This();
 
 gpa: std.mem.Allocator,
@@ -25,6 +26,7 @@ next_resource: u32 = 1,
 const FileResource = struct {
     storage: Storage,
     writer: ?std.Io.File.Writer,
+    anonymous_pipe: bool = false,
 
     const Storage = union(enum) {
         file: std.Io.File,
@@ -113,10 +115,11 @@ fn createPipe(userdata: ?*anyopaque) Host.Error!Host.Pipe {
     errdefer system.gpa.destroy(write_data);
     try system.resources.ensureUnusedCapacity(system.gpa, 2);
 
-    read_data.* = .{ .storage = .{ .file = files[0] }, .writer = null };
+    read_data.* = .{ .storage = .{ .file = files[0] }, .writer = null, .anonymous_pipe = true };
     write_data.* = .{
         .storage = .{ .file = files[1] },
         .writer = files[1].writerStreaming(system.io, &.{}),
+        .anonymous_pipe = true,
     };
     const read_end: CommandPlan.Resource = @enumFromInt(system.next_resource);
     system.next_resource +%= 1;
@@ -190,7 +193,10 @@ fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.SpawnError!Host.SpawnOut
                     return fileActionFailure(action_index, .unsupported);
                 const resource = system.resources.get(use.resource) orelse
                     return fileActionFailure(action_index, .unsupported);
-                bindings[target] = .{ .file = resource.file() };
+                bindings[target] = if (resource.anonymous_pipe)
+                    .{ .anonymous_pipe = resource.file() }
+                else
+                    .{ .file = resource.file() };
             },
         }
     }
@@ -219,7 +225,26 @@ fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.SpawnError!Host.SpawnOut
     defer if (environment) |*map| map.deinit();
 
     try system.children.ensureUnusedCapacity(system.gpa, 1);
-    const child = std.process.spawn(system.io, .{
+    const child = if (builtin.os.tag == .windows and hasAnonymousPipe(bindings)) child: {
+        const outcome = try windows_spawn.spawn(
+            system.gpa,
+            argv,
+            switch (plan.cwd) {
+                .inherit => null,
+                .path => |path| path,
+            },
+            if (environment) |*map| map else system.environ_map,
+            .{
+                bindingFile(bindings[0]),
+                bindingFile(bindings[1]),
+                bindingFile(bindings[2]),
+            },
+        );
+        break :child switch (outcome) {
+            .spawned => |spawned| spawned,
+            .failed => |failure| return .{ .failed = failure },
+        };
+    } else std.process.spawn(system.io, .{
         .argv = argv,
         .cwd = switch (plan.cwd) {
             .inherit => .inherit,
@@ -379,8 +404,22 @@ fn resourceWriter(userdata: ?*anyopaque, resource: CommandPlan.Resource) ?*std.I
 const StdioBinding = union(enum) {
     inherit: CommandPlan.FileDescriptor,
     file: std.Io.File,
+    anonymous_pipe: std.Io.File,
     close,
 };
+
+fn hasAnonymousPipe(bindings: [3]StdioBinding) bool {
+    for (bindings) |binding| if (binding == .anonymous_pipe) return true;
+    return false;
+}
+
+fn bindingFile(binding: StdioBinding) ?std.Io.File {
+    return switch (binding) {
+        .inherit => |source| stdioFile(source),
+        .file, .anonymous_pipe => |file| file,
+        .close => null,
+    };
+}
 
 fn spawnStdio(
     binding: StdioBinding,
@@ -391,7 +430,7 @@ fn spawnStdio(
             .inherit
         else
             .{ .file = stdioFile(source) },
-        .file => |file| .{ .file = file },
+        .file, .anonymous_pipe => |file| .{ .file = file },
         .close => .close,
     };
 }

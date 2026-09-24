@@ -83,7 +83,15 @@ pub fn build(b: *std.Build) void {
     word_expansion_test.addFileArg(b.path("test/cli/word-expansion.hb"));
     expectCliResult(word_expansion_test, test_step, 23, "", "");
 
-    if (target.result.os.tag != .windows) {
+    if (target.result.os.tag == .windows) {
+        const windows_pipeline_test = b.addRunArtifact(exe);
+        windows_pipeline_test.setName("test cli Windows anonymous pipeline");
+        windows_pipeline_test.addArgs(&.{ "-c", "cmd.exe /C echo pipeline-data | findstr.exe pipeline-data" });
+        windows_pipeline_test.expectExitCode(0);
+        windows_pipeline_test.expectStdOutMatch("pipeline-data");
+        windows_pipeline_test.expectStdErrEqual("");
+        test_step.dependOn(&windows_pipeline_test.step);
+    } else {
         const heredoc_test = b.addRunArtifact(exe);
         heredoc_test.setName("test cli here-document input");
         heredoc_test.addFileArg(b.path("test/cli/heredoc.hb"));
