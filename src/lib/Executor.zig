@@ -8,8 +8,8 @@
 //! general in-process stage such as a shell function or compound command.
 //! Standard-stream redirections are supported for simple and compound
 //! commands, including here-documents and here-strings. Background execution
-//! and non-external pipeline stages remain explicit `UnsupportedInstruction`
-//! boundaries.
+//! and pipelines containing multiple general in-process stages remain explicit
+//! `UnsupportedInstruction` boundaries.
 
 const std = @import("std");
 const Builtin = @import("Builtin.zig");
@@ -526,6 +526,9 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
         };
         if (kind.* == .in_process) in_process_count += 1;
     }
+    // A general in-process stage may read from its pipeline input. External
+    // neighbours are launched first so one such stage can run synchronously;
+    // two such stages require a concurrent runtime scheduler.
     if (in_process_count > 1) return error.UnsupportedInstruction;
 
     const pipes = try allocator.alloc(PipelinePipe, pipe_stderr.items.len);
