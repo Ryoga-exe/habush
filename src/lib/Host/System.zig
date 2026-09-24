@@ -1187,7 +1187,7 @@ fn outputBothCommand() CommandPlan {
                 "shell-spelling",
                 "/D",
                 "/C",
-                "echo out & echo err 1>&2",
+                "echo out&echo err>&2",
             },
         },
         else => .{
