@@ -98,15 +98,23 @@ const PipelineStageKind = enum {
     in_process,
 };
 
-const PreparedCommand = union(enum) {
+const CommandSelection = union(enum) {
     external,
     builtin: Builtin,
     function,
+
+    fn pipelineStageKind(command: CommandSelection) PipelineStageKind {
+        return switch (command) {
+            .external => .external,
+            .builtin => .builtin,
+            .function => .in_process,
+        };
+    }
 };
 
 const PreparedSimpleCommand = struct {
     argv: []const []const u8,
-    command: PreparedCommand,
+    command: CommandSelection,
 };
 
 const PipelineStagePreparation = union(enum) {
@@ -689,26 +697,21 @@ fn preparePipelineStage(
         else => return error.UnsupportedInstruction,
     };
     if (argv.items.len == 0) return error.UnsupportedInstruction;
-    const builtin = Builtin.lookup(argv.items[0]);
     const expanded_argv = try argv.toOwnedSlice(allocator);
-    if (builtin) |candidate|
-        if (candidate.special) return .{ .ready = .{
-            .kind = .builtin,
-            .simple = .{ .argv = expanded_argv, .command = .{ .builtin = candidate } },
-        } };
-    if (executor.runtime_state) |state|
-        if (state.functionStore().contains(expanded_argv[0])) return .{ .ready = .{
-            .kind = .in_process,
-            .simple = .{ .argv = expanded_argv, .command = .function },
-        } };
-    if (builtin) |candidate| return .{ .ready = .{
-        .kind = .builtin,
-        .simple = .{ .argv = expanded_argv, .command = .{ .builtin = candidate } },
-    } };
+    const command = executor.resolveCommand(expanded_argv[0]);
     return .{ .ready = .{
-        .kind = .external,
-        .simple = .{ .argv = expanded_argv, .command = .external },
+        .kind = command.pipelineStageKind(),
+        .simple = .{ .argv = expanded_argv, .command = command },
     } };
+}
+
+fn resolveCommand(executor: Executor, name: []const u8) CommandSelection {
+    const builtin = Builtin.lookup(name);
+    if (builtin) |candidate| if (candidate.special) return .{ .builtin = candidate };
+    if (executor.runtime_state) |state|
+        if (state.functionStore().contains(name)) return .function;
+    if (builtin) |candidate| return .{ .builtin = candidate };
+    return .external;
 }
 
 fn collectPipeline(
@@ -852,12 +855,12 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
             try command_variables.set(assignment.name, value);
         }
     }
-    const builtin: ?Builtin = if (executor.prepared_simple) |prepared| switch (prepared.command) {
-        .builtin => |candidate| candidate,
-        .function, .external => null,
-    } else Builtin.lookup(argv.items[0]);
-    if (builtin) |candidate| {
-        if (candidate.special) {
+    const command = if (executor.prepared_simple) |prepared|
+        prepared.command
+    else
+        executor.resolveCommand(argv.items[0]);
+    switch (command) {
+        .builtin => |candidate| {
             if (executor.pipeline_stage != null and !candidate.supportsPipeline())
                 return error.UnsupportedInstruction;
             var scope = switch (try executor.beginSimpleCommandRedirections(
@@ -875,54 +878,29 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
                 &command_variables,
                 has_assignments,
             );
-        }
-    }
-    const is_function = if (executor.prepared_simple) |prepared| switch (prepared.command) {
-        .function => true,
-        .builtin, .external => false,
-    } else if (executor.runtime_state) |state|
-        state.functionStore().contains(argv.items[0])
-    else
-        false;
-    if (is_function) {
-        if (has_assignments) {
-            const mutable_variables = variables orelse unreachable;
-            try applyAssignments(mutable_variables, &command_variables);
-        }
-        var scope = switch (try executor.beginSimpleCommandRedirections(
-            file_actions.items,
-            &redirect_resources,
-            allocator,
-        )) {
-            .ready => |ready| ready,
-            .failed => |result| return result,
-        };
-        defer scope.deinit();
-        // The pipeline endpoints become scoped redirections for the
-        // function body. Inner commands are ordinary foreground commands,
-        // not additional top-level pipeline stages.
-        scope.executor.pipeline_stage = null;
-        scope.executor.prepared_simple = null;
-        return scope.executor.executeFunction(argv.items);
-    }
-    if (builtin) |candidate| {
-        if (executor.pipeline_stage != null and !candidate.supportsPipeline())
-            return error.UnsupportedInstruction;
-        var scope = switch (try executor.beginSimpleCommandRedirections(
-            file_actions.items,
-            &redirect_resources,
-            allocator,
-        )) {
-            .ready => |ready| ready,
-            .failed => |result| return result,
-        };
-        defer scope.deinit();
-        return scope.executor.executeBuiltin(
-            candidate,
-            argv.items,
-            &command_variables,
-            has_assignments,
-        );
+        },
+        .function => {
+            if (has_assignments) {
+                const mutable_variables = variables orelse unreachable;
+                try applyAssignments(mutable_variables, &command_variables);
+            }
+            var scope = switch (try executor.beginSimpleCommandRedirections(
+                file_actions.items,
+                &redirect_resources,
+                allocator,
+            )) {
+                .ready => |ready| ready,
+                .failed => |result| return result,
+            };
+            defer scope.deinit();
+            // The pipeline endpoints become scoped redirections for the
+            // function body. Inner commands are ordinary foreground commands,
+            // not additional top-level pipeline stages.
+            scope.executor.pipeline_stage = null;
+            scope.executor.prepared_simple = null;
+            return scope.executor.executeFunction(argv.items);
+        },
+        .external => {},
     }
 
     var process_environment = VariableStore.init(allocator);
