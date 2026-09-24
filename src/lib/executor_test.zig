@@ -644,6 +644,33 @@ test "status-only builtins execute as isolated pipeline stages" {
     }
 }
 
+test "pipeline command words expand once in their isolated stage state" {
+    var hir = try generate(
+        "/bin/first \"${NAME:=first}\" \"${NAME:=second}\" | /bin/last",
+    );
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var state = try runtime.State.init(std.testing.allocator, .{});
+    defer state.deinit();
+
+    const result = try Executor.initWithState(
+        fake.host(),
+        CommandResolver.preResolved(),
+        &state,
+        .{},
+        0,
+    ).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqual(@as(usize, 2), fake.spawn_calls.items.len);
+    try std.testing.expectEqualDeep(
+        @as([]const []const u8, &.{ "/bin/first", "first", "first" }),
+        fake.spawn_calls.items[1].argv,
+    );
+    try std.testing.expect(state.variable("NAME") == null);
+}
+
 test "special builtin pipeline assignments do not escape the stage" {
     var hir = try generate("persisted=changed : | /bin/second");
     defer hir.deinit(std.testing.allocator);
@@ -1032,6 +1059,17 @@ test "pipeline execution cleans up every allocation failure" {
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         executePipelineWithAllocator,
+        .{hir},
+    );
+}
+
+test "prepared pipeline state cleans up every allocation failure" {
+    var hir = try generate("/bin/first \"${NAME:=value}\" | /bin/last");
+    defer hir.deinit(std.testing.allocator);
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        executeStatefulPipelineWithAllocator,
         .{hir},
     );
 }
@@ -2245,6 +2283,30 @@ fn executePipelineWithAllocator(
         return err;
     };
     try std.testing.expectEqual(@as(u8, 0), result.status);
+    try expectPipelineResourcesReleased(&fake);
+}
+
+fn executeStatefulPipelineWithAllocator(
+    gpa: std.mem.Allocator,
+    hir: @import("Hir.zig"),
+) !void {
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var state = try runtime.State.init(gpa, .{});
+    defer state.deinit();
+
+    const result = Executor.initWithState(
+        fake.host(),
+        CommandResolver.preResolved(),
+        &state,
+        .{},
+        0,
+    ).execute(hir) catch |err| {
+        try expectPipelineResourcesReleased(&fake);
+        return err;
+    };
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expect(state.variable("NAME") == null);
     try expectPipelineResourcesReleased(&fake);
 }
 
