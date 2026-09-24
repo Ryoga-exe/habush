@@ -1163,7 +1163,9 @@ fn outputCommand(comptime output: []const u8) CommandPlan {
     return switch (@import("builtin").os.tag) {
         .windows => .{
             .executable = "cmd.exe",
-            .argv = &.{ "shell-spelling", "/D", "/C", "<nul set /p =" ++ output },
+            // `set /p` reaches EOF on NUL and leaves ERRORLEVEL=1 even after
+            // writing its prompt. Normalize the test command's exit status.
+            .argv = &.{ "shell-spelling", "/D", "/C", "<nul set /p =" ++ output ++ " & exit /B 0" },
         },
         else => .{
             .executable = "/bin/sh",
@@ -1180,7 +1182,7 @@ fn outputBothCommand() CommandPlan {
                 "shell-spelling",
                 "/D",
                 "/C",
-                "<nul set /p \"=out\" & <nul set /p \"=err\" 1>&2",
+                "<nul set /p \"=out\" & <nul set /p \"=err\" 1>&2 & exit /B 0",
             },
         },
         else => .{

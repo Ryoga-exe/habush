@@ -130,6 +130,7 @@ fn commandLine(gpa: std.mem.Allocator, argv: []const []const u8) Host.SpawnError
     // Match Zig's Windows argv serialization, while keeping the resolved
     // executable as argv[0]. CreateProcessW does not parse argv for us.
     var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(gpa);
     const first = argv[0];
     if (std.mem.indexOfScalar(u8, first, '"') != null or
         std.mem.indexOfScalar(u8, first, 0) != null)
