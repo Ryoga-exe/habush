@@ -100,6 +100,7 @@ pub const ProcessGroup = enum(u32) {
 pub const ProcessGroupAction = union(enum) {
     inherit,
     create,
+    /// Join a group that still has a live member. Zero is reserved for `.create`.
     join: ProcessGroup,
 };
 
@@ -126,6 +127,10 @@ pub const Sandbox = union(enum) {
 pub fn validate(plan: CommandPlan) error{InvalidArguments}!void {
     if (plan.executable.len == 0 or plan.argv.len == 0 or plan.argv[0].len == 0)
         return error.InvalidArguments;
+    switch (plan.process_group) {
+        .join => |group| if (@intFromEnum(group) == 0) return error.InvalidArguments,
+        .inherit, .create => {},
+    }
     switch (plan.environment) {
         .inherit => {},
         .overlay, .replace => |variables| for (variables) |variable| {
