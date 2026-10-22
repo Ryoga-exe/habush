@@ -100,7 +100,8 @@ pub const ProcessGroup = enum(u32) {
 pub const ProcessGroupAction = union(enum) {
     inherit,
     create,
-    /// Join a group that still has a live member. Zero is reserved for `.create`.
+    /// Join a group returned by the same host and not yet fully waited.
+    /// Zero is reserved for `.create`.
     join: ProcessGroup,
 };
 

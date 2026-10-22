@@ -19,7 +19,7 @@ io: std.Io,
 /// Parent process environment used as the base for `.overlay` plans.
 /// The caller retains ownership and must keep it alive while this host is used.
 environ_map: ?*const std.process.Environ.Map = null,
-children: std.AutoHashMapUnmanaged(Host.Process, std.process.Child) = .empty,
+children: std.AutoHashMapUnmanaged(Host.Process, ChildRecord) = .empty,
 resources: std.AutoHashMapUnmanaged(CommandPlan.Resource, *FileResource) = .empty,
 next_process: u32 = 1,
 next_resource: u32 = 1,
@@ -69,9 +69,14 @@ const FileResource = struct {
     }
 };
 
+const ChildRecord = struct {
+    child: std.process.Child,
+    process_group: ?CommandPlan.ProcessGroup,
+};
+
 pub fn deinit(system: *System) void {
     var children = system.children.valueIterator();
-    while (children.next()) |child| child.kill(system.io);
+    while (children.next()) |record| record.child.kill(system.io);
     system.children.deinit(system.gpa);
     var resources = system.resources.valueIterator();
     while (resources.next()) |resource| {
@@ -134,6 +139,9 @@ fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.SpawnError!Host.SpawnOut
     if (plan.sandbox != .inherit or
         ((builtin.os.tag == .windows or builtin.os.tag == .wasi) and plan.process_group != .inherit))
         return .{ .failed = .unsupported };
+    if (plan.process_group == .join and
+        !system.ownsProcessGroup(plan.process_group.join))
+        return error.InvalidArguments;
     const pgid: ?std.posix.pid_t = if (builtin.os.tag == .windows or builtin.os.tag == .wasi)
         null
     else switch (plan.process_group) {
@@ -271,7 +279,10 @@ fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.SpawnError!Host.SpawnOut
         .join => |group| group,
     };
     const process = system.nextProcess();
-    system.children.putAssumeCapacityNoClobber(process, child);
+    system.children.putAssumeCapacityNoClobber(process, .{
+        .child = child,
+        .process_group = process_group,
+    });
     return .{ .spawned = .{
         .process = process,
         .process_group = process_group,
@@ -596,8 +607,8 @@ fn applyEnvironmentVariables(
 
 fn wait(userdata: ?*anyopaque, process: Host.Process) Host.Error!Host.Termination {
     const system: *System = @ptrCast(@alignCast(userdata.?));
-    const child = system.children.getPtr(process) orelse return error.InvalidArguments;
-    const termination = child.wait(system.io) catch |err| return switch (err) {
+    const record = system.children.getPtr(process) orelse return error.InvalidArguments;
+    const termination = record.child.wait(system.io) catch |err| return switch (err) {
         error.AccessDenied => error.AccessDenied,
         else => error.Unexpected,
     };
@@ -608,6 +619,16 @@ fn wait(userdata: ?*anyopaque, process: Host.Process) Host.Error!Host.Terminatio
         .stopped => |signal| .{ .stopped = @intFromEnum(signal) },
         .unknown => |status| .{ .unknown = status },
     };
+}
+
+fn ownsProcessGroup(system: *System, group: CommandPlan.ProcessGroup) bool {
+    var records = system.children.valueIterator();
+    while (records.next()) |record| {
+        if (record.process_group) |owned| {
+            if (owned == group) return true;
+        }
+    }
+    return false;
 }
 
 fn nextProcess(system: *System) Host.Process {
@@ -858,7 +879,7 @@ test "system host creates a POSIX process group" {
         .process_group = .create,
     })).spawned;
     try std.testing.expectEqual(
-        @as(u32, @intCast(system.children.get(spawned.process).?.id.?)),
+        @as(u32, @intCast(system.children.get(spawned.process).?.child.id.?)),
         @intFromEnum(spawned.process_group.?),
     );
 
@@ -872,6 +893,7 @@ test "system host creates a POSIX process group" {
     );
     system_host.closeResource(input.write_end);
     _ = try system_host.wait(spawned.process);
+    try std.testing.expectError(error.InvalidArguments, system_host.spawn(join_plan));
 }
 
 test "system host reports missing executables" {
