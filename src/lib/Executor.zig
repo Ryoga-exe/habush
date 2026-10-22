@@ -117,18 +117,28 @@ const PreparedSimpleCommand = struct {
     command: CommandSelection,
 };
 
+const PipelineStagePlan = union(enum) {
+    simple: PreparedSimpleCommand,
+    definition,
+    compound,
+
+    fn kind(plan: PipelineStagePlan) PipelineStageKind {
+        return switch (plan) {
+            .simple => |simple| simple.command.pipelineStageKind(),
+            .definition => .builtin,
+            .compound => .in_process,
+        };
+    }
+};
+
 const PipelineStagePreparation = union(enum) {
-    ready: struct {
-        kind: PipelineStageKind,
-        simple: ?PreparedSimpleCommand = null,
-    },
+    ready: PipelineStagePlan,
     failed: Result,
 };
 
 const PreparedPipelineStage = struct {
     index: Hir.Inst.Index,
-    kind: PipelineStageKind = .external,
-    simple: ?PreparedSimpleCommand = null,
+    plan: ?PipelineStagePlan = null,
     state: ?runtime.State = null,
     variables: ?VariableStore = null,
 
@@ -141,7 +151,10 @@ const PreparedPipelineStage = struct {
         var result = base;
         if (stage.state) |*state| result.runtime_state = state;
         if (stage.variables) |*variables| result.variables = variables;
-        result.prepared_simple = stage.simple;
+        result.prepared_simple = if (stage.plan) |plan| switch (plan) {
+            .simple => |simple| simple,
+            .definition, .compound => null,
+        } else null;
         return result;
     }
 };
@@ -571,13 +584,12 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
         if (executor.runtime_state) |state| stage.state = try state.clone();
         if (executor.variables) |variables| stage.variables = try variables.clone(executor.gpa);
         const stage_executor = stage.executor(executor);
-        const preparation = switch (try stage_executor.preparePipelineStage(hir, stage.index, allocator)) {
+        const plan = switch (try stage_executor.preparePipelineStage(hir, stage.index, allocator)) {
             .ready => |value| value,
             .failed => |result| return result,
         };
-        stage.kind = preparation.kind;
-        stage.simple = preparation.simple;
-        if (stage.kind == .in_process) in_process_count += 1;
+        stage.plan = plan;
+        if (plan.kind() == .in_process) in_process_count += 1;
     }
     // A general in-process stage may read from its pipeline input. External
     // neighbours are launched first so one such stage can run synchronously;
@@ -614,7 +626,7 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
         while (remaining_stages != 0) {
             remaining_stages -= 1;
             const stage_index = remaining_stages;
-            const kind = prepared[stage_index].kind;
+            const kind = prepared[stage_index].plan.?.kind();
             if (phase_count != 1) {
                 if (phase == 0 and kind != .external) continue;
                 if (phase == 1 and kind == .external) continue;
@@ -674,8 +686,8 @@ fn preparePipelineStage(
         .while_clause,
         .until_clause,
         .for_clause,
-        => .{ .ready = .{ .kind = .in_process } },
-        .function_definition => .{ .ready = .{ .kind = .builtin } },
+        => .{ .ready = .compound },
+        .function_definition => .{ .ready = .definition },
         else => error.UnsupportedInstruction,
     };
 
@@ -699,10 +711,7 @@ fn preparePipelineStage(
     if (argv.items.len == 0) return error.UnsupportedInstruction;
     const expanded_argv = try argv.toOwnedSlice(allocator);
     const command = executor.resolveCommand(expanded_argv[0]);
-    return .{ .ready = .{
-        .kind = command.pipelineStageKind(),
-        .simple = .{ .argv = expanded_argv, .command = command },
-    } };
+    return .{ .ready = .{ .simple = .{ .argv = expanded_argv, .command = command } } };
 }
 
 fn resolveCommand(executor: Executor, name: []const u8) CommandSelection {
