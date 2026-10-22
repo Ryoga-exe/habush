@@ -32,7 +32,7 @@ pub fn main(init: std.process.Init) !habush.runtime.ExitStatus {
     };
     const interactive = invocation == .stream and try stdin_file.isTty(io) and try stderr_file.isTty(io);
 
-    if (interactive) try platform.ignoreInteractiveInterrupt();
+    if (interactive) try platform.installInteractiveInterruptHandler();
 
     var cwd_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const cwd_len = std.process.currentPath(io, &cwd_buffer) catch |err| switch (err) {

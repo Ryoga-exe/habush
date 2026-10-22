@@ -7,7 +7,7 @@ pub fn processId() u32 {
     return windows.GetCurrentProcessId();
 }
 
-pub fn ignoreInteractiveInterrupt() Error!void {
+pub fn installInteractiveInterruptHandler() Error!void {
     if (!SetConsoleCtrlHandler(consoleCtrlHandler, windows.BOOL.TRUE).toBool())
         return error.Unexpected;
 }
