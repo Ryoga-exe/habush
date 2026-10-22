@@ -1,8 +1,9 @@
 //! Native `Host` implementation backed by Zig's cross-platform standard APIs.
 //!
 //! The process backend supports foreground commands and file actions for the
-//! three standard descriptors. Process groups, non-standard descriptors, and
-//! sandbox restrictions remain explicit unsupported boundaries.
+//! three standard descriptors. POSIX process groups are available for future
+//! job control; non-standard descriptors and sandbox restrictions remain
+//! explicit unsupported boundaries.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -130,8 +131,17 @@ fn createPipe(userdata: ?*anyopaque) Host.Error!Host.Pipe {
 
 fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.SpawnError!Host.SpawnOutcome {
     const system: *System = @ptrCast(@alignCast(userdata.?));
-    if (plan.process_group != .inherit or plan.sandbox != .inherit)
+    if (plan.sandbox != .inherit or
+        ((builtin.os.tag == .windows or builtin.os.tag == .wasi) and plan.process_group != .inherit))
         return .{ .failed = .unsupported };
+    const pgid: ?std.posix.pid_t = if (builtin.os.tag == .windows or builtin.os.tag == .wasi)
+        null
+    else switch (plan.process_group) {
+        .inherit => null,
+        .create => 0,
+        .join => |group| std.math.cast(std.posix.pid_t, @intFromEnum(group)) orelse
+            return error.InvalidArguments,
+    };
 
     var bindings = [_]StdioBinding{
         .{ .inherit = .stdin },
@@ -249,12 +259,22 @@ fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.SpawnError!Host.SpawnOut
         .stdin = child_io[0],
         .stdout = child_io[1],
         .stderr = child_io[2],
+        .pgid = pgid,
     }) catch |err| return .{ .failed = try mapSpawnFailure(err) };
 
+    const process_group: ?CommandPlan.ProcessGroup = switch (plan.process_group) {
+        .inherit => null,
+        .create => if (builtin.os.tag == .windows or builtin.os.tag == .wasi)
+            unreachable
+        else
+            @enumFromInt(@as(u32, @intCast(child.id.?))),
+        .join => |group| group,
+    };
     const process = system.nextProcess();
     system.children.putAssumeCapacityNoClobber(process, child);
     return .{ .spawned = .{
         .process = process,
+        .process_group = process_group,
         .sandbox_coverage = .not_requested,
     } };
 }
@@ -615,6 +635,8 @@ fn mapSpawnFailure(err: std.process.SpawnError) Host.SpawnError!Host.SpawnFailur
         error.InvalidWtf8,
         error.InvalidBatchScriptArg,
         error.InvalidName,
+        error.InvalidProcessGroupId,
+        error.ProcessAlreadyExec,
         error.BadPathName,
         error.NameTooLong,
         => return error.InvalidArguments,
@@ -816,6 +838,42 @@ test "system host owns foreground processes until wait" {
     );
 }
 
+test "system host creates a POSIX process group" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    var system: System = .{ .gpa = std.testing.allocator, .io = std.testing.io };
+    defer system.deinit();
+    const system_host = system.host();
+    const input = try system_host.createPipe();
+    defer system_host.closeResource(input.read_end);
+    defer system_host.closeResource(input.write_end);
+
+    const spawned = (try system_host.spawn(.{
+        .executable = "/bin/sh",
+        .argv = &.{ "shell-spelling", "-c", "read value" },
+        .file_actions = &.{.{ .use_resource = .{
+            .resource = input.read_end,
+            .target = .stdin,
+        } }},
+        .process_group = .create,
+    })).spawned;
+    try std.testing.expectEqual(
+        @as(u32, @intCast(system.children.get(spawned.process).?.id.?)),
+        @intFromEnum(spawned.process_group.?),
+    );
+
+    var join_plan = exitCommand(0);
+    join_plan.process_group = .{ .join = spawned.process_group.? };
+    const joined = (try system_host.spawn(join_plan)).spawned;
+    try std.testing.expectEqual(spawned.process_group, joined.process_group);
+    try std.testing.expectEqualDeep(
+        Host.Termination{ .exited = 0 },
+        try system_host.wait(joined.process),
+    );
+    system_host.closeResource(input.write_end);
+    _ = try system_host.wait(spawned.process);
+}
+
 test "system host reports missing executables" {
     var system: System = .{ .gpa = std.testing.allocator, .io = std.testing.io };
     defer system.deinit();
@@ -848,14 +906,16 @@ test "system host rejects process features before spawning" {
             } }},
         }),
     );
-    try std.testing.expectEqualDeep(
-        Host.SpawnOutcome{ .failed = .unsupported },
-        try system_host.spawn(.{
-            .executable = executable,
-            .argv = argv,
-            .process_group = .create,
-        }),
-    );
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        try std.testing.expectEqualDeep(
+            Host.SpawnOutcome{ .failed = .unsupported },
+            try system_host.spawn(.{
+                .executable = executable,
+                .argv = argv,
+                .process_group = .create,
+            }),
+        );
+    }
     try std.testing.expectEqualDeep(
         Host.SpawnOutcome{ .failed = .unsupported },
         try system_host.spawn(.{
