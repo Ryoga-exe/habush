@@ -14,6 +14,18 @@ test "host rejects an empty executable before dispatch" {
     try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
 }
 
+test "host rejects joining process group zero before dispatch" {
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+
+    try std.testing.expectError(error.InvalidArguments, fake.host().spawn(.{
+        .executable = "/bin/command",
+        .argv = &.{"command"},
+        .process_group = .{ .join = @enumFromInt(0) },
+    }));
+    try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+}
+
 test "host rejects an invalid portable sandbox policy before dispatch" {
     var fake = FakeHost.init(std.testing.allocator);
     defer fake.deinit();
