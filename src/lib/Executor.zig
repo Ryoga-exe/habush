@@ -38,6 +38,7 @@ runtime_state: ?*runtime.State,
 io: runtime.Io,
 scoped_file_actions: []const CommandPlan.FileAction,
 pipeline_stage: ?PipelineStage,
+prepared_simple: ?PreparedSimpleCommand,
 last_status: runtime.ExitStatus,
 loop_depth: u32,
 function_depth: u32,
@@ -97,9 +98,65 @@ const PipelineStageKind = enum {
     in_process,
 };
 
-const PipelineStageClassification = union(enum) {
-    kind: PipelineStageKind,
+const CommandSelection = union(enum) {
+    external,
+    builtin: Builtin,
+    function,
+
+    fn pipelineStageKind(command: CommandSelection) PipelineStageKind {
+        return switch (command) {
+            .external => .external,
+            .builtin => .builtin,
+            .function => .in_process,
+        };
+    }
+};
+
+const PreparedSimpleCommand = struct {
+    argv: []const []const u8,
+    command: CommandSelection,
+};
+
+const PipelineStagePlan = union(enum) {
+    simple: PreparedSimpleCommand,
+    definition,
+    compound,
+
+    fn kind(plan: PipelineStagePlan) PipelineStageKind {
+        return switch (plan) {
+            .simple => |simple| simple.command.pipelineStageKind(),
+            .definition => .builtin,
+            .compound => .in_process,
+        };
+    }
+};
+
+const PipelineStagePreparation = union(enum) {
+    ready: PipelineStagePlan,
     failed: Result,
+};
+
+const PreparedPipelineStage = struct {
+    index: Hir.Inst.Index,
+    plan: ?PipelineStagePlan = null,
+    state: ?runtime.State = null,
+    variables: ?VariableStore = null,
+
+    fn deinit(stage: *PreparedPipelineStage) void {
+        if (stage.state) |*state| state.deinit();
+        if (stage.variables) |*variables| variables.deinit();
+    }
+
+    fn executor(stage: *PreparedPipelineStage, base: Executor) Executor {
+        var result = base;
+        if (stage.state) |*state| result.runtime_state = state;
+        if (stage.variables) |*variables| result.variables = variables;
+        result.prepared_simple = if (stage.plan) |plan| switch (plan) {
+            .simple => |simple| simple,
+            .definition, .compound => null,
+        } else null;
+        return result;
+    }
 };
 
 pub fn init(gpa: std.mem.Allocator, host: Host) Executor {
@@ -123,6 +180,7 @@ pub fn initWithOptions(gpa: std.mem.Allocator, host: Host, options: Options) Exe
         .io = options.io,
         .scoped_file_actions = &.{},
         .pipeline_stage = null,
+        .prepared_simple = null,
         .last_status = options.last_status,
         .loop_depth = 0,
         .function_depth = 0,
@@ -152,6 +210,7 @@ pub fn initWithState(
         .io = io,
         .scoped_file_actions = &.{},
         .pipeline_stage = null,
+        .prepared_simple = null,
         .last_status = last_status,
         .loop_depth = 0,
         .function_depth = 0,
@@ -517,14 +576,20 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
     try collectPipeline(hir, index, allocator, &stages, &pipe_stderr);
     std.debug.assert(stages.items.len == pipe_stderr.items.len + 1);
 
-    const stage_kinds = try allocator.alloc(PipelineStageKind, stages.items.len);
+    const prepared = try allocator.alloc(PreparedPipelineStage, stages.items.len);
+    for (prepared, stages.items) |*stage, stage_index| stage.* = .{ .index = stage_index };
+    defer for (prepared) |*stage| stage.deinit();
     var in_process_count: usize = 0;
-    for (stages.items, stage_kinds) |stage, *kind| {
-        kind.* = switch (try executor.classifyPipelineStage(hir, stage, allocator)) {
-            .kind => |value| value,
+    for (prepared) |*stage| {
+        if (executor.runtime_state) |state| stage.state = try state.clone();
+        if (executor.variables) |variables| stage.variables = try variables.clone(executor.gpa);
+        const stage_executor = stage.executor(executor);
+        const plan = switch (try stage_executor.preparePipelineStage(hir, stage.index, allocator)) {
+            .ready => |value| value,
             .failed => |result| return result,
         };
-        if (kind.* == .in_process) in_process_count += 1;
+        stage.plan = plan;
+        if (plan.kind() == .in_process) in_process_count += 1;
     }
     // A general in-process stage may read from its pipeline input. External
     // neighbours are launched first so one such stage can run synchronously;
@@ -561,14 +626,13 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
         while (remaining_stages != 0) {
             remaining_stages -= 1;
             const stage_index = remaining_stages;
-            const kind = stage_kinds[stage_index];
+            const kind = prepared[stage_index].plan.?.kind();
             if (phase_count != 1) {
                 if (phase == 0 and kind != .external) continue;
                 if (phase == 1 and kind == .external) continue;
             }
 
-            const stage = stages.items[stage_index];
-            var stage_executor = executor;
+            var stage_executor = prepared[stage_index].executor(executor);
             stage_executor.pipeline_stage = .{
                 .input = if (stage_index == 0) null else pipes[stage_index - 1].endpoints.read_end,
                 .output = if (stage_index == pipes.len) null else pipes[stage_index].endpoints.write_end,
@@ -576,7 +640,7 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
                     pipe_stderr.items[stage_index],
                 .spawned = &spawned[stage_index],
             };
-            const stage_result = stage_executor.executePipelineStage(hir, stage) catch |err| switch (err) {
+            var stage_result = stage_executor.executeInstruction(hir, prepared[stage_index].index) catch |err| switch (err) {
                 // A non-final in-process stage observes a closed pipeline as a
                 // command failure, not as an executor infrastructure failure.
                 error.WriteFailed => if (stage_index + 1 == stages.items.len)
@@ -585,6 +649,9 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
                     Result{ .status = 1, .sandbox_coverage = .not_requested },
                 else => |other| return other,
             };
+            // A pipeline stage is an isolated shell environment. Its control
+            // flow contributes a status but cannot leave the pipeline.
+            stage_result.control_flow = .none;
             if (stage_index + 1 == stages.items.len) result.status = stage_result.status;
             result.sandbox_coverage = combineSandboxCoverage(
                 result.sandbox_coverage,
@@ -606,12 +673,12 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
     return result;
 }
 
-fn classifyPipelineStage(
+fn preparePipelineStage(
     executor: Executor,
     hir: Hir,
     index: Hir.Inst.Index,
     allocator: std.mem.Allocator,
-) Error!PipelineStageClassification {
+) Error!PipelineStagePreparation {
     if (hir.instructionTag(index) != .simple_command) return switch (hir.instructionTag(index)) {
         .subshell,
         .brace_group,
@@ -619,8 +686,8 @@ fn classifyPipelineStage(
         .while_clause,
         .until_clause,
         .for_clause,
-        => .{ .kind = .in_process },
-        .function_definition => .{ .kind = .builtin },
+        => .{ .ready = .compound },
+        .function_definition => .{ .ready = .definition },
         else => error.UnsupportedInstruction,
     };
 
@@ -642,32 +709,18 @@ fn classifyPipelineStage(
         else => return error.UnsupportedInstruction,
     };
     if (argv.items.len == 0) return error.UnsupportedInstruction;
-    const builtin = Builtin.lookup(argv.items[0]);
-    if (builtin) |candidate|
-        if (candidate.special) return .{ .kind = .builtin };
-    if (executor.runtime_state) |state|
-        if (state.functionStore().contains(argv.items[0])) return .{ .kind = .in_process };
-    if (builtin != null) return .{ .kind = .builtin };
-    return .{ .kind = .external };
+    const expanded_argv = try argv.toOwnedSlice(allocator);
+    const command = executor.resolveCommand(expanded_argv[0]);
+    return .{ .ready = .{ .simple = .{ .argv = expanded_argv, .command = command } } };
 }
 
-fn executePipelineStage(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
-    var stage_executor = executor;
-    var result = if (executor.runtime_state) |state| result: {
-        var state_copy = try state.clone();
-        defer state_copy.deinit();
-        stage_executor.runtime_state = &state_copy;
-        break :result try stage_executor.executeInstruction(hir, index);
-    } else if (executor.variables) |variables| result: {
-        var variables_copy = try variables.clone(executor.gpa);
-        defer variables_copy.deinit();
-        stage_executor.variables = &variables_copy;
-        break :result try stage_executor.executeInstruction(hir, index);
-    } else try stage_executor.executeInstruction(hir, index);
-    // Pipeline elements execute in a subshell environment. Control flow can
-    // determine that element's status but cannot leave the pipeline.
-    result.control_flow = .none;
-    return result;
+fn resolveCommand(executor: Executor, name: []const u8) CommandSelection {
+    const builtin = Builtin.lookup(name);
+    if (builtin) |candidate| if (candidate.special) return .{ .builtin = candidate };
+    if (executor.runtime_state) |state|
+        if (state.functionStore().contains(name)) return .function;
+    if (builtin) |candidate| return .{ .builtin = candidate };
+    return .external;
 }
 
 fn collectPipeline(
@@ -718,6 +771,7 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
     const expander = executor.wordExpander(allocator, null, &expansion_failure);
 
     var argv: std.ArrayList([]const u8) = .empty;
+    if (executor.prepared_simple) |prepared| try argv.appendSlice(allocator, prepared.argv);
     var file_actions: std.ArrayList(CommandPlan.FileAction) = .empty;
     var redirect_resources: std.ArrayList(CommandPlan.Resource) = .empty;
     defer closeRedirectResources(executor.host, &redirect_resources);
@@ -728,20 +782,10 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
     for (parts) |part| {
         switch (hir.instructionTag(part)) {
             .assignment => has_assignments = true,
-            .redirect => {
-                has_redirects = true;
-                if (try executor.appendRedirectActions(
-                    hir,
-                    part,
-                    allocator,
-                    expander,
-                    &expansion_failure,
-                    &file_actions,
-                    &redirect_resources,
-                )) |failure| return failure;
-            },
+            .redirect => has_redirects = true,
             .word => {
                 has_words = true;
+                if (executor.prepared_simple != null) continue;
                 const expanded = expander.expandArgument(hir, part) catch |err| switch (err) {
                     error.ParameterExpansionFailed => return executor.parameterExpansionFailure(
                         allocator,
@@ -753,6 +797,20 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
             },
             else => return error.UnsupportedInstruction,
         }
+    }
+    // Command words are expanded before redirect operands. Redirect actions
+    // themselves still retain their source order when applied to the command.
+    for (parts) |part| {
+        if (hir.instructionTag(part) != .redirect) continue;
+        if (try executor.appendRedirectActions(
+            hir,
+            part,
+            allocator,
+            expander,
+            &expansion_failure,
+            &file_actions,
+            &redirect_resources,
+        )) |failure| return failure;
     }
     if (argv.items.len == 0) {
         if (executor.pipeline_stage != null) return error.UnsupportedInstruction;
@@ -806,9 +864,12 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
             try command_variables.set(assignment.name, value);
         }
     }
-    const builtin = Builtin.lookup(argv.items[0]);
-    if (builtin) |candidate| {
-        if (candidate.special) {
+    const command = if (executor.prepared_simple) |prepared|
+        prepared.command
+    else
+        executor.resolveCommand(argv.items[0]);
+    switch (command) {
+        .builtin => |candidate| {
             if (executor.pipeline_stage != null and !candidate.supportsPipeline())
                 return error.UnsupportedInstruction;
             var scope = switch (try executor.beginSimpleCommandRedirections(
@@ -826,10 +887,8 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
                 &command_variables,
                 has_assignments,
             );
-        }
-    }
-    if (executor.runtime_state) |state| {
-        if (state.functionStore().contains(argv.items[0])) {
+        },
+        .function => {
             if (has_assignments) {
                 const mutable_variables = variables orelse unreachable;
                 try applyAssignments(mutable_variables, &command_variables);
@@ -847,27 +906,10 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
             // function body. Inner commands are ordinary foreground commands,
             // not additional top-level pipeline stages.
             scope.executor.pipeline_stage = null;
+            scope.executor.prepared_simple = null;
             return scope.executor.executeFunction(argv.items);
-        }
-    }
-    if (builtin) |candidate| {
-        if (executor.pipeline_stage != null and !candidate.supportsPipeline())
-            return error.UnsupportedInstruction;
-        var scope = switch (try executor.beginSimpleCommandRedirections(
-            file_actions.items,
-            &redirect_resources,
-            allocator,
-        )) {
-            .ready => |ready| ready,
-            .failed => |result| return result,
-        };
-        defer scope.deinit();
-        return scope.executor.executeBuiltin(
-            candidate,
-            argv.items,
-            &command_variables,
-            has_assignments,
-        );
+        },
+        .external => {},
     }
 
     var process_environment = VariableStore.init(allocator);

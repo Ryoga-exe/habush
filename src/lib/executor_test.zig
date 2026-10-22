@@ -644,6 +644,59 @@ test "status-only builtins execute as isolated pipeline stages" {
     }
 }
 
+test "pipeline command words expand once in their isolated stage state" {
+    var hir = try generate(
+        "/bin/first \"${NAME:=first}\" \"${NAME:=second}\" | /bin/last",
+    );
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var state = try runtime.State.init(std.testing.allocator, .{});
+    defer state.deinit();
+
+    const result = try Executor.initWithState(
+        fake.host(),
+        CommandResolver.preResolved(),
+        &state,
+        .{},
+        0,
+    ).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqual(@as(usize, 2), fake.spawn_calls.items.len);
+    try std.testing.expectEqualDeep(
+        @as([]const []const u8, &.{ "/bin/first", "first", "first" }),
+        fake.spawn_calls.items[1].argv,
+    );
+    try std.testing.expect(state.variable("NAME") == null);
+}
+
+test "command words precede redirect expansion with and without a pipeline" {
+    const cases = [_]struct { source: [:0]const u8, pipeline: bool }{
+        .{ .source = "/bin/first >\"${NAME:-missing}\" \"${NAME:=chosen}\"", .pipeline = false },
+        .{ .source = "/bin/first >\"${NAME:-missing}\" \"${NAME:=chosen}\" | /bin/last", .pipeline = true },
+    };
+    for (cases) |case| {
+        var hir = try generate(case.source);
+        defer hir.deinit(std.testing.allocator);
+        var fake = FakeHost.init(std.testing.allocator);
+        defer fake.deinit();
+        var variables = VariableStore.init(std.testing.allocator);
+        defer variables.deinit();
+
+        const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+            .resolver = CommandResolver.preResolved(),
+            .variables = &variables,
+        }).execute(hir);
+
+        try std.testing.expectEqual(@as(u8, 0), result.status);
+        const spawned = fake.spawn_calls.items[@intFromBool(case.pipeline)];
+        try std.testing.expectEqualStrings("chosen", spawned.argv[1]);
+        try std.testing.expectEqualStrings("chosen", spawned.file_actions[spawned.file_actions.len - 1].open.path);
+        try std.testing.expectEqual(case.pipeline, variables.get("NAME") == null);
+    }
+}
+
 test "special builtin pipeline assignments do not escape the stage" {
     var hir = try generate("persisted=changed : | /bin/second");
     defer hir.deinit(std.testing.allocator);
@@ -875,6 +928,28 @@ test "shell function pipeline stage runs after adjacent external stages launch" 
     try std.testing.expectEqual(@as(usize, 4), fake.closed_resource_count);
 }
 
+test "prepared pipeline command preserves function precedence over regular builtin" {
+    var hir = try generate("pwd() { /bin/function-body; }; pwd | /bin/sink");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var state = try runtime.State.init(std.testing.allocator, .{});
+    defer state.deinit();
+
+    const result = try Executor.initWithState(
+        fake.host(),
+        CommandResolver.preResolved(),
+        &state,
+        .{},
+        0,
+    ).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqual(@as(usize, 2), fake.spawn_calls.items.len);
+    try std.testing.expectEqualStrings("/bin/sink", fake.spawn_calls.items[0].argv[0]);
+    try std.testing.expectEqualStrings("/bin/function-body", fake.spawn_calls.items[1].argv[0]);
+}
+
 test "shell function pipeline stage state does not escape" {
     var hir = try generate(
         "mutate() { cd child; export NAME=inside; }; mutate | /bin/sink",
@@ -1032,6 +1107,17 @@ test "pipeline execution cleans up every allocation failure" {
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         executePipelineWithAllocator,
+        .{hir},
+    );
+}
+
+test "prepared pipeline state cleans up every allocation failure" {
+    var hir = try generate("/bin/first \"${NAME:=value}\" | /bin/last");
+    defer hir.deinit(std.testing.allocator);
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        executeStatefulPipelineWithAllocator,
         .{hir},
     );
 }
@@ -2245,6 +2331,30 @@ fn executePipelineWithAllocator(
         return err;
     };
     try std.testing.expectEqual(@as(u8, 0), result.status);
+    try expectPipelineResourcesReleased(&fake);
+}
+
+fn executeStatefulPipelineWithAllocator(
+    gpa: std.mem.Allocator,
+    hir: @import("Hir.zig"),
+) !void {
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var state = try runtime.State.init(gpa, .{});
+    defer state.deinit();
+
+    const result = Executor.initWithState(
+        fake.host(),
+        CommandResolver.preResolved(),
+        &state,
+        .{},
+        0,
+    ).execute(hir) catch |err| {
+        try expectPipelineResourcesReleased(&fake);
+        return err;
+    };
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expect(state.variable("NAME") == null);
     try expectPipelineResourcesReleased(&fake);
 }
 
