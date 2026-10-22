@@ -15,7 +15,7 @@ const implementation = switch (builtin.os.tag) {
     else => @compileError("habush does not support this platform"),
 };
 
-pub const ignoreInteractiveInterrupt = implementation.ignoreInteractiveInterrupt;
+pub const installInteractiveInterruptHandler = implementation.installInteractiveInterruptHandler;
 pub fn processId() ProcessId {
     return @enumFromInt(implementation.processId());
 }
