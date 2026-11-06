@@ -1,14 +1,15 @@
 //! Native `Host` implementation backed by Zig's cross-platform standard APIs.
 //!
-//! The process backend supports foreground commands and file actions for the
-//! three standard descriptors. POSIX process groups and explicit controlling
-//! terminal leases support job control; non-standard descriptors and sandbox
-//! restrictions remain explicit unsupported boundaries.
+//! The backend owns child processes and standard-stream resources, exposes
+//! process events, and leases foreground terminals on POSIX systems. FIFO
+//! actions can run in a trusted command worker. Arbitrary file descriptors
+//! and sandbox restrictions remain unsupported boundaries.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const CommandPlan = @import("../CommandPlan.zig");
 const Host = @import("../Host.zig");
+const command_worker = @import("../worker.zig");
 const runtime_types = @import("../runtime/types.zig");
 const append_file = @import("System/append_file.zig");
 const pipe = @import("System/pipe.zig");
@@ -23,13 +24,19 @@ const TerminalModes = if (builtin.os.tag == .windows or builtin.os.tag == .wasi)
 else
     terminal.Modes;
 
+/// Must be safe for concurrent use when `parallel_open_file` is exercised.
 gpa: std.mem.Allocator,
 io: std.Io,
 /// Parent process environment used as the base for `.overlay` plans.
 /// The caller retains ownership and must keep it alive while this host is used.
 environ_map: ?*const std.process.Environ.Map = null,
+/// Borrowed trusted executable implementing the command worker entry point.
+worker_executable: ?[]const u8 = null,
 children: std.AutoHashMapUnmanaged(Host.Process, ChildRecord) = .empty,
 resources: std.AutoHashMapUnmanaged(CommandPlan.Resource, *FileResource) = .empty,
+/// Protects only the resource table, numeric IDs, and lazy reader creation.
+/// A FIFO open or file close must never hold this mutex.
+resource_mutex: std.Io.Mutex = .init,
 job_terminal_modes: std.AutoHashMapUnmanaged(CommandPlan.ProcessGroup, TerminalModes) = .empty,
 terminal_lease: ?TerminalRecord = null,
 next_process: u32 = 1,
@@ -151,6 +158,7 @@ const vtable: Host.VTable = .{
         .terminal_control = builtin.os.tag != .windows and builtin.os.tag != .wasi,
         .poll = builtin.os.tag != .wasi,
         .signals = builtin.os.tag != .wasi,
+        .parallel_open_file = true,
     },
     .spawn = spawn,
     .wait = wait,
@@ -179,6 +187,8 @@ fn createPipe(userdata: ?*anyopaque) Host.Error!Host.Pipe {
     errdefer files[0].close(system.io);
     errdefer files[1].close(system.io);
 
+    system.resource_mutex.lockUncancelable(system.io);
+    defer system.resource_mutex.unlock(system.io);
     const read_data = try system.gpa.create(FileResource);
     errdefer system.gpa.destroy(read_data);
     const write_data = try system.gpa.create(FileResource);
@@ -201,8 +211,20 @@ fn createPipe(userdata: ?*anyopaque) Host.Error!Host.Pipe {
 
 fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.SpawnError!Host.SpawnOutcome {
     const system: *System = @ptrCast(@alignCast(userdata.?));
-    if (plan.sandbox != .inherit or
-        ((builtin.os.tag == .windows or builtin.os.tag == .wasi) and plan.process_group != .inherit))
+    if (plan.sandbox != .inherit) return .{ .failed = .unsupported };
+    // FIFO opens can wait for another stage. Defer those actions to a fresh
+    // worker so the parent can finish launching its peers. Ordinary file opens
+    // retain their existing structured failures and source-order behavior.
+    if (firstFifoAction(system, plan)) |action_index| {
+        if (system.worker_executable) |worker_executable| {
+            return command_worker.launch(system.gpa, system.host(), worker_executable, plan) catch |err| switch (err) {
+                error.Unsupported => fileActionFailure(action_index, .unsupported),
+                else => |other| return other,
+            };
+        }
+        return fileActionFailure(action_index, .unsupported);
+    }
+    if ((builtin.os.tag == .windows or builtin.os.tag == .wasi) and plan.process_group != .inherit)
         return .{ .failed = .unsupported };
     if (plan.process_group == .join and
         !system.ownsProcessGroup(plan.process_group.join))
@@ -272,9 +294,14 @@ fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.SpawnError!Host.SpawnOut
             .use_resource => |use| {
                 const target = stdioIndex(use.target) orelse
                     return fileActionFailure(action_index, .unsupported);
-                const resource = system.resources.get(use.resource) orelse
+                system.resource_mutex.lockUncancelable(system.io);
+                const resource = system.resources.get(use.resource) orelse {
+                    system.resource_mutex.unlock(system.io);
                     return fileActionFailure(action_index, .unsupported);
-                bindings[target] = .{ .file = resource.file() };
+                };
+                const file = resource.file();
+                system.resource_mutex.unlock(system.io);
+                bindings[target] = .{ .file = file };
             },
         }
     }
@@ -356,6 +383,29 @@ fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.SpawnError!Host.SpawnOut
     } };
 }
 
+fn firstFifoAction(system: *System, plan: CommandPlan) ?u32 {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return null;
+    const has_open = for (plan.file_actions) |action| {
+        if (action == .open) break true;
+    } else false;
+    if (!has_open) return null;
+    var owned_directory: ?std.Io.Dir = null;
+    defer if (owned_directory) |directory| directory.close(system.io);
+    const directory = switch (plan.cwd) {
+        .inherit => std.Io.Dir.cwd(),
+        .path => |path| dir: {
+            owned_directory = std.Io.Dir.cwd().openDir(system.io, path, .{}) catch return null;
+            break :dir owned_directory.?;
+        },
+    };
+    for (plan.file_actions, 0..) |action, index| {
+        if (action != .open) continue;
+        const stat = directory.statFile(system.io, action.open.path, .{}) catch continue;
+        if (stat.kind == .named_pipe) return std.math.cast(u32, index);
+    }
+    return null;
+}
+
 fn nativeProcessId(child: std.process.Child) ?runtime_types.ProcessId {
     if (builtin.os.tag == .wasi) return null;
     if (builtin.os.tag != .windows)
@@ -393,21 +443,28 @@ fn openFile(
     };
     errdefer file.close(system.io);
 
-    const resource_data = try system.gpa.create(FileResource);
-    errdefer system.gpa.destroy(resource_data);
-    resource_data.* = .{
+    const resource = try system.registerResource(.{
         .storage = .{ .file = file },
         .writer = if (open.access == .read)
             null
         else
             file.writerStreaming(system.io, &.{}),
         .readable = open.access != .write,
-    };
+    });
+    return .{ .opened = resource };
+}
+
+fn registerResource(system: *System, initial: FileResource) std.mem.Allocator.Error!CommandPlan.Resource {
+    system.resource_mutex.lockUncancelable(system.io);
+    defer system.resource_mutex.unlock(system.io);
+    const data = try system.gpa.create(FileResource);
+    errdefer system.gpa.destroy(data);
     try system.resources.ensureUnusedCapacity(system.gpa, 1);
+    data.* = initial;
     const resource: CommandPlan.Resource = @enumFromInt(system.next_resource);
     system.next_resource +%= 1;
-    system.resources.putAssumeCapacityNoClobber(resource, resource_data);
-    return .{ .opened = resource };
+    system.resources.putAssumeCapacityNoClobber(resource, data);
+    return resource;
 }
 
 fn createInput(userdata: ?*anyopaque, bytes: []const u8) Host.Error!CommandPlan.Resource {
@@ -458,18 +515,11 @@ fn createInput(userdata: ?*anyopaque, bytes: []const u8) Host.Error!CommandPlan.
     var writer = owned_temporary.file.writerStreaming(system.io, &.{});
     writer.seekTo(0) catch return error.ResourceUnavailable;
 
-    const resource_data = system.gpa.create(FileResource) catch return error.OutOfMemory;
-    errdefer system.gpa.destroy(resource_data);
-    resource_data.* = .{
+    return system.registerResource(.{
         .storage = .{ .temporary = owned_temporary },
         .writer = null,
         .readable = true,
-    };
-    system.resources.ensureUnusedCapacity(system.gpa, 1) catch return error.OutOfMemory;
-    const resource: CommandPlan.Resource = @enumFromInt(system.next_resource);
-    system.next_resource +%= 1;
-    system.resources.putAssumeCapacityNoClobber(resource, resource_data);
-    return resource;
+    });
 }
 
 const InputResourceDirectory = struct {
@@ -503,13 +553,20 @@ fn inputResourceDirectory(system: *System) InputResourceDirectory {
 
 fn closeResource(userdata: ?*anyopaque, resource: CommandPlan.Resource) void {
     const system: *System = @ptrCast(@alignCast(userdata.?));
-    const data = system.resources.fetchRemove(resource) orelse return;
+    const data = blk: {
+        system.resource_mutex.lockUncancelable(system.io);
+        defer system.resource_mutex.unlock(system.io);
+        break :blk system.resources.fetchRemove(resource) orelse return;
+    };
+    // Closing a file can block; no table lock is held after removing it.
     data.value.deinit(system.io);
     system.gpa.destroy(data.value);
 }
 
 fn resourceWriter(userdata: ?*anyopaque, resource: CommandPlan.Resource) ?*std.Io.Writer {
     const system: *System = @ptrCast(@alignCast(userdata.?));
+    system.resource_mutex.lockUncancelable(system.io);
+    defer system.resource_mutex.unlock(system.io);
     const data = system.resources.get(resource) orelse return null;
     const writer = &(data.writer orelse return null);
     return &writer.interface;
@@ -517,6 +574,8 @@ fn resourceWriter(userdata: ?*anyopaque, resource: CommandPlan.Resource) ?*std.I
 
 fn resourceReader(userdata: ?*anyopaque, resource: CommandPlan.Resource) ?*std.Io.Reader {
     const system: *System = @ptrCast(@alignCast(userdata.?));
+    system.resource_mutex.lockUncancelable(system.io);
+    defer system.resource_mutex.unlock(system.io);
     const data = system.resources.get(resource) orelse return null;
     if (!data.readable) return null;
     if (data.reader == null)

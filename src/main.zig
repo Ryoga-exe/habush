@@ -28,6 +28,8 @@ pub fn main(init: std.process.Init) !habush.runtime.ExitStatus {
     const stderr = &stderr_writer.interface;
 
     const args = try init.minimal.args.toSlice(arena);
+    if (args.len >= 2 and std.mem.eql(u8, args[1], habush.worker.argument))
+        return habush.worker.run(init, args[2..]);
     const invocation = Invocation.parse(args) orelse {
         try stderr.print("habush: usage: {s}\n", .{Invocation.usage});
         return 2;
@@ -63,10 +65,16 @@ pub fn main(init: std.process.Init) !habush.runtime.ExitStatus {
     else
         .{};
 
+    const worker_executable: ?[:0]u8 = if (builtin.os.tag == .windows)
+        null
+    else
+        try std.process.executablePathAlloc(io, gpa);
+    defer if (worker_executable) |path| gpa.free(path);
     var system_host: habush.Host.System = .{
         .gpa = gpa,
         .io = io,
         .environ_map = init.environ_map,
+        .worker_executable = worker_executable,
     };
     defer system_host.deinit();
     var system_resolver = habush.CommandResolver.System.init(io, resolver_options);
