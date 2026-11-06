@@ -18,11 +18,11 @@ test "session executes with its runtime configuration" {
     defer fake_resolver.deinit();
     fake_resolver.result = "/usr/bin/echo";
 
-    const search_path = [_][]const u8{ "/bin", "/usr/bin" };
+    const default_search_path = [_][]const u8{ "/bin", "/usr/bin" };
     var session = try Session.init(std.testing.allocator, fake_host.host(), .{
         .resolver = fake_resolver.resolver(),
         .cwd = "/work",
-        .search_path = &search_path,
+        .default_search_path = &default_search_path,
         .variables = &.{
             .{ .name = "greeting", .value = "from session", .exported = true },
         },
@@ -56,11 +56,9 @@ test "session replaces owned runtime configuration" {
     defer session.deinit();
 
     var cwd = [_]u8{ '/', 'n', 'e', 'w' };
-    var first_path = [_]u8{ '/', 'o', 'n', 'e' };
     var positional = [_]u8{ 'v', 'a', 'l', 'u', 'e' };
     var allowed_path = [_]u8{ '/', 'n', 'e', 'w' };
     try session.setWorkingDirectory(&cwd);
-    try session.setCommandSearchPath(&.{ &first_path, "/two" });
     try session.setPositionalParameters(&.{&positional});
     const rules = [_]SandboxPolicy.PathRule{
         .{ .path = &allowed_path, .access = .{ .write = true } },
@@ -72,13 +70,10 @@ test "session replaces owned runtime configuration" {
     try session.setVariableExported("name", true);
 
     cwd[1] = 'x';
-    first_path[1] = 'x';
     positional[0] = 'x';
     allowed_path[1] = 'x';
 
     try std.testing.expectEqualStrings("/new", session.workingDirectory().?);
-    try std.testing.expectEqual(@as(usize, 2), session.commandSearchPath().len);
-    try std.testing.expectEqualStrings("/one", session.commandSearchPath()[0]);
     try std.testing.expectEqualStrings("value", session.positionalParameters()[0]);
     try std.testing.expectEqualStrings(
         "/new",
@@ -411,6 +406,159 @@ test "cd changes resolution and spawn directories for later commands" {
     );
 }
 
+test "PATH assignment, unset, and empty value have distinct search paths" {
+    var fake_host = FakeHost.init(std.testing.allocator);
+    defer fake_host.deinit();
+    var fake_resolver = FakeResolver.init(std.testing.allocator);
+    defer fake_resolver.deinit();
+    fake_resolver.result = "/bin/tool";
+    var session = try Session.init(std.testing.allocator, fake_host.host(), .{
+        .resolver = fake_resolver.resolver(),
+        .default_search_path = &.{"/fallback"},
+    });
+    defer session.deinit();
+
+    var assigned = try generate("PATH=/persisted; tool");
+    defer assigned.deinit(std.testing.allocator);
+    _ = try session.execute(assigned);
+    try std.testing.expectEqualStrings("/persisted", session.variable("PATH").?);
+    try std.testing.expectEqual(@as(usize, 1), fake_resolver.calls.items[0].search_path.len);
+    try std.testing.expectEqualStrings("/persisted", fake_resolver.calls.items[0].search_path[0]);
+
+    try std.testing.expect(session.unsetVariable("PATH"));
+    var plain = try generate("tool");
+    defer plain.deinit(std.testing.allocator);
+    _ = try session.execute(plain);
+    try std.testing.expectEqual(@as(usize, 1), fake_resolver.calls.items[1].search_path.len);
+    try std.testing.expectEqualStrings("/fallback", fake_resolver.calls.items[1].search_path[0]);
+
+    var empty = try generate("PATH=; tool");
+    defer empty.deinit(std.testing.allocator);
+    _ = try session.execute(empty);
+    try std.testing.expectEqualStrings("", session.variable("PATH").?);
+    try std.testing.expectEqual(@as(usize, 1), fake_resolver.calls.items[2].search_path.len);
+    try std.testing.expectEqualStrings("", fake_resolver.calls.items[2].search_path[0]);
+}
+
+test "unexported PATH controls lookup and a command-local PATH stays scoped" {
+    var fake_host = FakeHost.init(std.testing.allocator);
+    defer fake_host.deinit();
+    var fake_resolver = FakeResolver.init(std.testing.allocator);
+    defer fake_resolver.deinit();
+    fake_resolver.result = "/bin/tool";
+    var session = try Session.init(std.testing.allocator, fake_host.host(), .{
+        .resolver = fake_resolver.resolver(),
+        .default_search_path = &.{"/fallback"},
+        .variables = &.{
+            .{ .name = "PATH", .value = "/private" },
+            .{ .name = "VISIBLE", .value = "yes", .exported = true },
+        },
+    });
+    defer session.deinit();
+
+    var hir = try generate("tool; PATH=/temporary tool; tool");
+    defer hir.deinit(std.testing.allocator);
+    _ = try session.execute(hir);
+
+    try std.testing.expectEqual(@as(usize, 3), fake_resolver.calls.items.len);
+    try std.testing.expectEqualStrings("/private", fake_resolver.calls.items[0].search_path[0]);
+    try std.testing.expectEqualStrings("/temporary", fake_resolver.calls.items[1].search_path[0]);
+    try std.testing.expectEqualStrings("/private", fake_resolver.calls.items[2].search_path[0]);
+    try std.testing.expectEqualStrings("/private", session.variable("PATH").?);
+    try std.testing.expect(!session.isVariableExported("PATH"));
+
+    try std.testing.expectEqual(@as(usize, 3), fake_host.spawn_calls.items.len);
+    const first_environment = fake_host.spawn_calls.items[0].environment.replace;
+    try std.testing.expectEqual(@as(usize, 1), first_environment.len);
+    try std.testing.expectEqualStrings("VISIBLE", first_environment[0].name);
+    const temporary_environment = fake_host.spawn_calls.items[1].environment.replace;
+    try std.testing.expectEqual(@as(usize, 2), temporary_environment.len);
+    var found_temporary_path = false;
+    for (temporary_environment) |binding| {
+        if (std.mem.eql(u8, binding.name, "PATH")) {
+            try std.testing.expectEqualStrings("/temporary", binding.value);
+            found_temporary_path = true;
+        }
+    }
+    try std.testing.expect(found_temporary_path);
+    const final_environment = fake_host.spawn_calls.items[2].environment.replace;
+    try std.testing.expectEqual(@as(usize, 1), final_environment.len);
+    try std.testing.expectEqualStrings("VISIBLE", final_environment[0].name);
+}
+
+test "pipeline stages use their own PATH without changing the session" {
+    var fake_host = FakeHost.init(std.testing.allocator);
+    defer fake_host.deinit();
+    var fake_resolver = FakeResolver.init(std.testing.allocator);
+    defer fake_resolver.deinit();
+    fake_resolver.result = "/bin/tool";
+    var session = try Session.init(std.testing.allocator, fake_host.host(), .{
+        .resolver = fake_resolver.resolver(),
+        .variables = &.{.{ .name = "PATH", .value = "/parent" }},
+    });
+    defer session.deinit();
+
+    var hir = try generate("PATH=/left left | PATH=/right right; tool");
+    defer hir.deinit(std.testing.allocator);
+    _ = try session.execute(hir);
+
+    try std.testing.expectEqual(@as(usize, 3), fake_resolver.calls.items.len);
+    const expected_paths = [_][]const u8{ "/left", "/right", "/parent" };
+    var seen = [_]bool{false} ** expected_paths.len;
+    for (fake_resolver.calls.items) |request| {
+        const index: usize = if (std.mem.eql(u8, request.name, "left"))
+            0
+        else if (std.mem.eql(u8, request.name, "right"))
+            1
+        else if (std.mem.eql(u8, request.name, "tool"))
+            2
+        else {
+            try std.testing.expect(false);
+            continue;
+        };
+        try std.testing.expect(!seen[index]);
+        seen[index] = true;
+        try std.testing.expectEqual(@as(usize, 1), request.search_path.len);
+        try std.testing.expectEqualStrings(expected_paths[index], request.search_path[0]);
+    }
+    for (seen) |found| try std.testing.expect(found);
+    try std.testing.expectEqualStrings("/parent", session.variable("PATH").?);
+}
+
+test "relative and empty PATH entries retain the command working directory" {
+    var fake_host = FakeHost.init(std.testing.allocator);
+    defer fake_host.deinit();
+    fake_host.working_directory_result = "/workspace/next";
+    var fake_resolver = FakeResolver.init(std.testing.allocator);
+    defer fake_resolver.deinit();
+    fake_resolver.result = "/bin/tool";
+    var session = try Session.init(std.testing.allocator, fake_host.host(), .{
+        .resolver = fake_resolver.resolver(),
+        .cwd = "/workspace",
+    });
+    defer session.deinit();
+
+    const path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "relative{c}{c}/absolute",
+        .{ std.fs.path.delimiter, std.fs.path.delimiter },
+    );
+    defer std.testing.allocator.free(path);
+    try session.setVariable("PATH", path);
+
+    var hir = try generate("cd next; tool");
+    defer hir.deinit(std.testing.allocator);
+    _ = try session.execute(hir);
+
+    try std.testing.expectEqual(@as(usize, 1), fake_resolver.calls.items.len);
+    const request = fake_resolver.calls.items[0];
+    try std.testing.expectEqualStrings("/workspace/next", request.cwd.?);
+    try std.testing.expectEqual(@as(usize, 3), request.search_path.len);
+    try std.testing.expectEqualStrings("relative", request.search_path[0]);
+    try std.testing.expectEqualStrings("", request.search_path[1]);
+    try std.testing.expectEqualStrings("/absolute", request.search_path[2]);
+}
+
 test "session executes HIR through the system resolver and host" {
     var environ_map = try std.process.Environ.createMap(
         std.testing.environ,
@@ -454,7 +602,7 @@ test "session executes HIR through the system resolver and host" {
     var session = try Session.init(std.testing.allocator, system_host.host(), .{
         .resolver = system_resolver.resolver(),
         .cwd = cwd,
-        .search_path = &search_path_storage,
+        .default_search_path = &search_path_storage,
         .variables = &.{
             .{ .name = "EXPECTED", .value = cwd, .exported = true },
             .{ .name = "STATUS", .value = "23", .exported = true },

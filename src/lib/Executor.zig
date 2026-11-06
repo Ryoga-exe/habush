@@ -27,7 +27,7 @@ gpa: std.mem.Allocator,
 host: Host,
 sandbox: CommandPlan.Sandbox,
 resolver: ?CommandResolver,
-search_path: []const []const u8,
+default_search_path: []const []const u8,
 invocation_name: []const u8,
 shell_process_id: ?runtime.ProcessId,
 positional_parameters: []const []const u8,
@@ -59,7 +59,8 @@ pub const Error = Builtin.Error || Host.Error || Expander.Error || CommandResolv
 pub const Options = struct {
     sandbox: CommandPlan.Sandbox = .inherit,
     resolver: ?CommandResolver = null,
-    search_path: []const []const u8 = &.{},
+    /// Used only when neither the command bindings nor shell variables set PATH.
+    default_search_path: []const []const u8 = &.{},
     invocation_name: []const u8 = "habush",
     shell_process_id: ?runtime.ProcessId = null,
     positional_parameters: []const []const u8 = &.{},
@@ -169,7 +170,7 @@ pub fn initWithOptions(gpa: std.mem.Allocator, host: Host, options: Options) Exe
         .host = host,
         .sandbox = options.sandbox,
         .resolver = options.resolver,
-        .search_path = options.search_path,
+        .default_search_path = options.default_search_path,
         .invocation_name = options.invocation_name,
         .shell_process_id = options.shell_process_id,
         .positional_parameters = options.positional_parameters,
@@ -199,7 +200,7 @@ pub fn initWithState(
         .host = host,
         .sandbox = .inherit,
         .resolver = resolver,
-        .search_path = &.{},
+        .default_search_path = &.{},
         .invocation_name = "",
         .shell_process_id = null,
         .positional_parameters = &.{},
@@ -924,7 +925,7 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
     const resolver = executor.resolver orelse return error.CommandResolutionUnavailable;
     const executable = (resolver.resolve(allocator, .{
         .name = argv.items[0],
-        .search_path = executor.commandSearchPath(),
+        .search_path = try executor.commandSearchPath(allocator, &command_variables),
         .cwd = executor.workingDirectory(),
     }) catch |err| switch (err) {
         error.AccessDenied => return executor.commandFailure(
@@ -1476,9 +1477,25 @@ fn shellProcessId(executor: Executor) ?runtime.ProcessId {
     return executor.shell_process_id;
 }
 
-fn commandSearchPath(executor: Executor) []const []const u8 {
-    if (executor.runtime_state) |state| return state.commandSearchPath();
-    return executor.search_path;
+fn commandSearchPath(
+    executor: Executor,
+    allocator: std.mem.Allocator,
+    overrides: *const VariableStore,
+) std.mem.Allocator.Error![]const []const u8 {
+    const path = overrides.get("PATH") orelse path: {
+        if (executor.variableStore()) |variables|
+            if (variables.get("PATH")) |value| break :path value;
+        return if (executor.runtime_state) |state|
+            state.defaultSearchPath()
+        else
+            executor.default_search_path;
+    };
+
+    var entries: std.ArrayList([]const u8) = .empty;
+    errdefer entries.deinit(allocator);
+    var iterator = std.mem.splitScalar(u8, path, std.fs.path.delimiter);
+    while (iterator.next()) |entry| try entries.append(allocator, entry);
+    return entries.toOwnedSlice(allocator);
 }
 
 fn positionalParameters(executor: Executor) []const []const u8 {

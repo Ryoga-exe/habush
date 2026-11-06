@@ -13,7 +13,7 @@ gpa: std.mem.Allocator,
 cwd: ?[]u8,
 invocation_name: []u8,
 shell_process_id: ?types.ProcessId,
-search_path: []const []const u8,
+default_search_path: []const []const u8,
 positional_parameters: []const []const u8,
 sandbox: CommandPlan.Sandbox,
 variables: VariableStore,
@@ -23,7 +23,8 @@ pub const Options = struct {
     cwd: ?[]const u8 = null,
     invocation_name: []const u8 = "habush",
     shell_process_id: ?types.ProcessId = null,
-    search_path: []const []const u8 = &.{},
+    /// Immutable fallback used only when the shell variable PATH is unset.
+    default_search_path: []const []const u8 = &.{},
     positional_parameters: []const []const u8 = &.{},
     sandbox: CommandPlan.Sandbox = .inherit,
     /// Complete initial shell variable state. The caller should import the
@@ -40,8 +41,8 @@ pub fn init(gpa: std.mem.Allocator, options: Options) Error!State {
     const invocation_name = try gpa.dupe(u8, options.invocation_name);
     errdefer gpa.free(invocation_name);
 
-    const search_path = try cloneStrings(gpa, options.search_path);
-    errdefer deinitStrings(gpa, search_path);
+    const default_search_path = try cloneStrings(gpa, options.default_search_path);
+    errdefer deinitStrings(gpa, default_search_path);
 
     const positional_parameters = try cloneStrings(gpa, options.positional_parameters);
     errdefer deinitStrings(gpa, positional_parameters);
@@ -58,7 +59,7 @@ pub fn init(gpa: std.mem.Allocator, options: Options) Error!State {
         .cwd = cwd,
         .invocation_name = invocation_name,
         .shell_process_id = options.shell_process_id,
-        .search_path = search_path,
+        .default_search_path = default_search_path,
         .positional_parameters = positional_parameters,
         .sandbox = try options.sandbox.clone(gpa),
         .variables = variables,
@@ -69,7 +70,7 @@ pub fn init(gpa: std.mem.Allocator, options: Options) Error!State {
 pub fn deinit(state: *State) void {
     if (state.cwd) |cwd| state.gpa.free(cwd);
     state.gpa.free(state.invocation_name);
-    deinitStrings(state.gpa, state.search_path);
+    deinitStrings(state.gpa, state.default_search_path);
     deinitStrings(state.gpa, state.positional_parameters);
     state.sandbox.deinit(state.gpa);
     state.variables.deinit();
@@ -84,8 +85,8 @@ pub fn clone(state: State) std.mem.Allocator.Error!State {
     const invocation_name = try state.gpa.dupe(u8, state.invocation_name);
     errdefer state.gpa.free(invocation_name);
 
-    const search_path = try cloneStrings(state.gpa, state.search_path);
-    errdefer deinitStrings(state.gpa, search_path);
+    const default_search_path = try cloneStrings(state.gpa, state.default_search_path);
+    errdefer deinitStrings(state.gpa, default_search_path);
 
     const positional_parameters = try cloneStrings(state.gpa, state.positional_parameters);
     errdefer deinitStrings(state.gpa, positional_parameters);
@@ -101,7 +102,7 @@ pub fn clone(state: State) std.mem.Allocator.Error!State {
         .cwd = cwd,
         .invocation_name = invocation_name,
         .shell_process_id = state.shell_process_id,
-        .search_path = search_path,
+        .default_search_path = default_search_path,
         .positional_parameters = positional_parameters,
         .sandbox = sandbox,
         .variables = variables,
@@ -125,8 +126,8 @@ pub fn shellProcessId(state: State) ?types.ProcessId {
     return state.shell_process_id;
 }
 
-pub fn commandSearchPath(state: State) []const []const u8 {
-    return state.search_path;
+pub fn defaultSearchPath(state: State) []const []const u8 {
+    return state.default_search_path;
 }
 
 pub fn positionalParameters(state: State) []const []const u8 {
@@ -224,15 +225,6 @@ fn setKnownVariable(
     };
 }
 
-pub fn setCommandSearchPath(
-    state: *State,
-    search_path: []const []const u8,
-) std.mem.Allocator.Error!void {
-    const copy = try cloneStrings(state.gpa, search_path);
-    deinitStrings(state.gpa, state.search_path);
-    state.search_path = copy;
-}
-
 pub fn setPositionalParameters(
     state: *State,
     positional_parameters: []const []const u8,
@@ -287,7 +279,7 @@ test "runtime state owns mutable session values" {
     var state = try State.init(std.testing.allocator, .{
         .cwd = &cwd,
         .invocation_name = &invocation_name,
-        .search_path = &.{&search},
+        .default_search_path = &.{&search},
         .positional_parameters = &.{&positional},
         .sandbox = .{ .restrict = .{ .file_system = .{ .allow = &rules } } },
         .variables = &.{.{ .name = &name, .value = &value, .exported = true }},
@@ -304,7 +296,7 @@ test "runtime state owns mutable session values" {
 
     try std.testing.expectEqualStrings("/old", state.workingDirectory().?);
     try std.testing.expectEqualStrings("script", state.invocationName());
-    try std.testing.expectEqualStrings("/bin", state.commandSearchPath()[0]);
+    try std.testing.expectEqualStrings("/bin", state.defaultSearchPath()[0]);
     try std.testing.expectEqualStrings("value", state.positionalParameters()[0]);
     try std.testing.expectEqualStrings(
         "/old",
@@ -330,7 +322,7 @@ test "runtime state clone is independent" {
         .cwd = "/old",
         .invocation_name = "script.hb",
         .shell_process_id = @enumFromInt(12345),
-        .search_path = &.{"/bin"},
+        .default_search_path = &.{"/bin"},
         .positional_parameters = &.{"argument"},
         .sandbox = .{ .restrict = .{ .file_system = .{ .allow = &rules } } },
         .variables = &.{.{ .name = "name", .value = "original", .exported = true }},
@@ -341,7 +333,7 @@ test "runtime state clone is independent" {
 
     copy.invocation_name[0] = 'x';
     try copy.setWorkingDirectory("/new");
-    try copy.setCommandSearchPath(&.{"/usr/bin"});
+    @constCast(copy.default_search_path[0])[1] = 'x';
     try copy.setPositionalParameters(&.{"changed"});
     try copy.setSandbox(.inherit);
     try copy.setVariable("name", "changed");
@@ -350,7 +342,7 @@ test "runtime state clone is independent" {
     try std.testing.expectEqualStrings("script.hb", state.invocationName());
     try std.testing.expectEqual(@as(?types.ProcessId, @enumFromInt(12345)), state.shellProcessId());
     try std.testing.expectEqual(state.shellProcessId(), copy.shellProcessId());
-    try std.testing.expectEqualStrings("/bin", state.commandSearchPath()[0]);
+    try std.testing.expectEqualStrings("/bin", state.defaultSearchPath()[0]);
     try std.testing.expectEqualStrings("argument", state.positionalParameters()[0]);
     try std.testing.expectEqualStrings("original", state.variable("name").?);
     try std.testing.expect(state.isVariableExported("name"));
@@ -425,7 +417,7 @@ fn initWithAllocator(gpa: std.mem.Allocator) !void {
     var state = try State.init(gpa, .{
         .cwd = "/workspace",
         .invocation_name = "script.hb",
-        .search_path = &search_path,
+        .default_search_path = &search_path,
         .positional_parameters = &.{ "one", "two" },
         .sandbox = .{ .restrict = .{ .file_system = .{ .allow = &rules } } },
         .variables = &.{
@@ -443,7 +435,7 @@ fn cloneWithAllocator(gpa: std.mem.Allocator) !void {
     var state = try State.init(gpa, .{
         .cwd = "/workspace",
         .invocation_name = "script.hb",
-        .search_path = &.{"/bin"},
+        .default_search_path = &.{"/bin"},
         .positional_parameters = &.{"argument"},
         .sandbox = .{ .restrict = .{ .file_system = .{ .allow = &rules } } },
         .variables = &.{.{ .name = "name", .value = "value", .exported = true }},

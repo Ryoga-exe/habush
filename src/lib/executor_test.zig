@@ -2080,10 +2080,10 @@ test "resolves command names and explicit paths through the resolver" {
     var fake_resolver = FakeResolver.init(std.testing.allocator);
     defer fake_resolver.deinit();
     fake_resolver.result = "/usr/bin/echo";
-    const search_path = [_][]const u8{ "/bin", "/usr/bin" };
+    const default_search_path = [_][]const u8{ "/bin", "/usr/bin" };
     const executor = Executor.initWithOptions(std.testing.allocator, fake_host.host(), .{
         .resolver = fake_resolver.resolver(),
-        .search_path = &search_path,
+        .default_search_path = &default_search_path,
         .cwd = "/workspace",
     });
 
@@ -2290,6 +2290,8 @@ fn executeAssignmentsWithAllocator(
     }).execute(standalone_hir);
     try variables.set("inherited", "value");
     try variables.setExported("inherited", true);
+    // Exercise PATH projection allocations as part of command preparation.
+    try variables.set("PATH", "/bin");
     _ = try Executor.initWithOptions(gpa, fake.host(), .{
         .resolver = CommandResolver.preResolved(),
         .variables = &variables,

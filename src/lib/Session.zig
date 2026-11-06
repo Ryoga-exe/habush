@@ -24,7 +24,9 @@ pub const Options = struct {
     cwd: ?[]const u8 = null,
     invocation_name: []const u8 = "habush",
     shell_process_id: ?runtime.ProcessId = null,
-    search_path: []const []const u8 = &.{},
+    /// Immutable fallback used only when PATH is unset. Set PATH through
+    /// `variables` or `setVariable` to change the active search path.
+    default_search_path: []const []const u8 = &.{},
     positional_parameters: []const []const u8 = &.{},
     sandbox: CommandPlan.Sandbox = .inherit,
     /// Complete initial shell variable state. The caller should import the
@@ -52,7 +54,7 @@ pub fn init(
             .cwd = options.cwd,
             .invocation_name = options.invocation_name,
             .shell_process_id = options.shell_process_id,
-            .search_path = options.search_path,
+            .default_search_path = options.default_search_path,
             .positional_parameters = options.positional_parameters,
             .sandbox = options.sandbox,
             .variables = options.variables,
@@ -93,10 +95,6 @@ pub fn invocationName(session: Session) []const u8 {
     return session.state.invocationName();
 }
 
-pub fn commandSearchPath(session: Session) []const []const u8 {
-    return session.state.commandSearchPath();
-}
-
 pub fn positionalParameters(session: Session) []const []const u8 {
     return session.state.positionalParameters();
 }
@@ -135,10 +133,6 @@ pub fn setVariableExported(
 
 pub fn setWorkingDirectory(session: *Session, cwd: ?[]const u8) !void {
     return session.state.setWorkingDirectory(cwd);
-}
-
-pub fn setCommandSearchPath(session: *Session, search_path: []const []const u8) !void {
-    return session.state.setCommandSearchPath(search_path);
 }
 
 pub fn setPositionalParameters(

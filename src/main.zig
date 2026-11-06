@@ -49,10 +49,6 @@ pub fn main(init: std.process.Init) !habush.runtime.ExitStatus {
         .script => |script| try argumentSlices(arena, script.arguments),
         else => &.{},
     };
-    const search_path = if (init.environ_map.get("PATH")) |path|
-        try splitEnvironmentList(arena, path, std.fs.path.delimiter)
-    else
-        &.{};
     const resolver_options: habush.CommandResolver.System.Options = if (builtin.os.tag == .windows)
         if (init.environ_map.get("PATHEXT")) |extensions|
             .{ .executable_extensions = try splitEnvironmentList(
@@ -77,7 +73,6 @@ pub fn main(init: std.process.Init) !habush.runtime.ExitStatus {
         .cwd = cwd,
         .invocation_name = invocation_name,
         .shell_process_id = platform.processId(),
-        .search_path = search_path,
         .positional_parameters = positional_parameters,
         .variables = variables,
         .io = .{
@@ -173,7 +168,14 @@ fn environmentBindings(
     var len: usize = 0;
     for (environ_map.keys(), environ_map.values()) |name, value| {
         if (!habush.VariableStore.isValidName(name)) continue;
-        bindings[len] = .{ .name = name, .value = value, .exported = true };
+        // Native Windows environment names are case-insensitive. Expose its
+        // PATH entry under the shell's canonical spelling before lookup moves
+        // into the case-sensitive shell variable store.
+        const shell_name = if (builtin.os.tag == .windows and std.ascii.eqlIgnoreCase(name, "PATH"))
+            "PATH"
+        else
+            name;
+        bindings[len] = .{ .name = shell_name, .value = value, .exported = true };
         len += 1;
     }
     return bindings[0..len];
