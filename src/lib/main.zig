@@ -23,6 +23,7 @@ pub const runtime = @import("runtime.zig");
 pub const SandboxPolicy = @import("SandboxPolicy.zig");
 pub const SandboxBackend = @import("SandboxBackend.zig");
 pub const Session = @import("Session.zig");
+pub const Source = @import("Source.zig");
 pub const VariableStore = @import("VariableStore.zig");
 
 test {

@@ -23,6 +23,7 @@ const Pipeline = @import("Pipeline.zig");
 const runtime = @import("runtime.zig");
 const SandboxPolicy = @import("SandboxPolicy.zig");
 const VariableStore = @import("VariableStore.zig");
+const Tokenizer = @import("tokenizer.zig").Tokenizer;
 
 gpa: std.mem.Allocator,
 host: Host,
@@ -45,7 +46,6 @@ background: bool = false,
 job_control: bool = false,
 concurrent_pipeline: ?ConcurrentPipeline = null,
 cancel_io: ?std.Io = null,
-diagnostic_locations: bool = true,
 loop_depth: u32,
 function_depth: u32,
 
@@ -273,13 +273,7 @@ pub fn execute(executor: Executor, hir: Hir) Error!Result {
 
 fn executeInstruction(parent: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
     var executor = parent;
-    executor.io.diagnostic_source = if (executor.diagnostic_locations and hir.instructionTag(index) == .simple_command) blk: {
-        for (hir.simpleCommandParts(index)) |part| {
-            if (hir.instructionTag(part) == .word)
-                break :blk .{ .start = hir.instructionData(part).pl.src_start };
-        }
-        break :blk .{ .start = hir.instructionData(index).pl.src_start };
-    } else null;
+    executor.io.diagnostic_source = instructionSource(hir, index);
     if (executor.cancel_io) |io| try io.checkCancel();
     if (executor.background) {
         if (executor.jobs == null) return error.UnsupportedInstruction;
@@ -316,7 +310,7 @@ fn executeSubshell(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
     var subshell_executor = executor;
     var positional_parameters = executor.positionalParameters();
     subshell_executor.positional_parameters_override = &positional_parameters;
-    var jobs: runtime.Jobs = .{ .gpa = executor.gpa };
+    var jobs: runtime.Jobs = .{ .gpa = executor.gpa, .diagnostic_io = executor.io };
     defer jobs.deinit();
     defer jobs.cancelAll();
     subshell_executor.jobs = &jobs;
@@ -660,7 +654,7 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
         if (executor.concurrent_pipeline) |config|
             stage.arena = std.heap.ArenaAllocator.init(config.allocator);
         const stage_allocator = stage.allocator(executor.gpa);
-        stage.jobs = .{ .gpa = stage_allocator };
+        stage.jobs = .{ .gpa = stage_allocator, .diagnostic_io = executor.io };
         stage.context = try executor.context.clone(stage_allocator);
         // A surrounding compound redirection changes the current executor's
         // streams without replacing the session's context. Stage snapshots
@@ -800,6 +794,8 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
 
     for (0..stages.items.len) |stage_index| {
         if (try pipeline.wait(stage_index)) |termination| {
+            if (pipeline.takeStartupFailure(stage_index)) |failure|
+                try executor.io.reportStartupFailure(failure.context, failure.reason);
             const status = try terminationStatus(termination);
             if (stage_index + 1 == stages.items.len) result.status = status;
         }
@@ -976,6 +972,8 @@ fn executeConcurrentPipeline(
             return err;
         };
         if (termination) |value| {
+            if (pipeline.takeStartupFailure(stage_index)) |failure|
+                try executor.io.reportStartupFailure(failure.context, failure.reason);
             if (stage_index + 1 == prepared.len)
                 result.status = try terminationStatus(value);
         }
@@ -984,11 +982,13 @@ fn executeConcurrentPipeline(
 }
 
 fn preparePipelineStage(
-    executor: Executor,
+    parent: Executor,
     hir: Hir,
     index: Hir.Inst.Index,
     allocator: std.mem.Allocator,
 ) Error!PipelineStagePreparation {
+    var executor = parent;
+    executor.io.diagnostic_source = instructionSource(hir, index);
     if (hir.instructionTag(index) != .simple_command) return switch (hir.instructionTag(index)) {
         .subshell,
         .brace_group,
@@ -1274,6 +1274,7 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
         const jobs = executor.jobs orelse return error.UnsupportedInstruction;
         var started = try Pipeline.startWithOptions(executor.gpa, executor.host, &.{plan}, .{
             .process_group = executor.host.capabilities().process_groups,
+            .origins = &.{executor.io.diagnostic_source},
         });
         switch (started) {
             .failed => |failure| return executor.spawnFailure(
@@ -1296,7 +1297,7 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
         }
     }
     const spawn_outcome = (if (executor.pipeline_stage) |stage|
-        stage.pipeline.spawn(stage.index, plan)
+        stage.pipeline.spawnWithOrigin(stage.index, plan, executor.io.diagnostic_source)
     else
         executor.host.spawn(plan)) catch |err| switch (err) {
         error.OutOfMemory, error.InvalidArguments, error.Unexpected => return err,
@@ -1331,6 +1332,11 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
         _ = executor.host.wait(spawned.process) catch {};
         return err;
     };
+    if (termination == .spawn_failed) try executor.io.reportStartupFailure(.{
+        .command = argv.items[0],
+        .file_actions = effective_file_actions.items,
+        .source = executor.io.diagnostic_source,
+    }, termination.spawn_failed);
     return .{
         .status = try terminationStatus(termination),
         .sandbox_coverage = spawned.sandbox_coverage,
@@ -1391,7 +1397,7 @@ fn beginHirRedirections(
 }
 
 fn appendRedirectActions(
-    executor: Executor,
+    parent: Executor,
     hir: Hir,
     redirect_index: Hir.Inst.Index,
     allocator: std.mem.Allocator,
@@ -1400,7 +1406,9 @@ fn appendRedirectActions(
     actions: *std.ArrayList(CommandPlan.FileAction),
     resources: *std.ArrayList(CommandPlan.Resource),
 ) Error!?Result {
+    var executor = parent;
     const redirect = hir.redirect(redirect_index);
+    executor.io.diagnostic_source = instructionSource(hir, redirect.target);
     const target = if (redirect.io_number) |io_number| target: {
         const descriptor = CommandPlan.FileDescriptor.parse(io_number) orelse
             return try executor.redirectFailure(.{ .invalid_file_descriptor = io_number });
@@ -1790,9 +1798,6 @@ fn executeFunction(executor: Executor, argv: []const []const u8) Error!Result {
     defer definition.deinit(executor.gpa);
 
     var function_executor = executor;
-    // Function HIR can originate from an earlier input, whose source is not
-    // retained. Do not attach those offsets to the invoking input's diagnostics.
-    function_executor.diagnostic_locations = false;
     var positional_parameters = argv[1..];
     function_executor.positional_parameters_override = &positional_parameters;
     function_executor.loop_depth = 0;
@@ -1903,6 +1908,42 @@ fn commandFailure(
     return .{
         .status = diagnostic.status(),
         .sandbox_coverage = .not_requested,
+    };
+}
+
+fn instructionSource(hir: Hir, index: Hir.Inst.Index) ?runtime.Diagnostic.Source {
+    const location_index = if (hir.instructionTag(index) == .simple_command) command: {
+        for (hir.simpleCommandParts(index)) |part|
+            if (hir.instructionTag(part) == .word) break :command part;
+        break :command index;
+    } else index;
+    const start = switch (hir.instructionTag(location_index)) {
+        .simple_command,
+        .word,
+        .assignment,
+        .redirect,
+        .list,
+        .here_document,
+        .subshell,
+        .brace_group,
+        .if_clause,
+        .while_clause,
+        .until_clause,
+        .for_clause,
+        .function_definition,
+        => hir.instructionData(location_index).pl.src_start,
+        .negated_pipeline => hir.instructionData(location_index).un.src_start,
+        .pipe, .pipe_and, .and_if, .or_if => return instructionSource(hir, hir.instructionData(location_index).bin.lhs),
+        else => return null,
+    };
+    const origin = hir.sourceView() orelse return .{ .start = start };
+    if (start >= origin.text.len) return .{ .start = start, .origin = origin };
+    var tokenizer = Tokenizer.init(origin.text[start.. :0]);
+    const token = tokenizer.next();
+    return .{
+        .start = start,
+        .end = std.math.cast(u32, @as(usize, start) + token.loc.end),
+        .origin = origin,
     };
 }
 

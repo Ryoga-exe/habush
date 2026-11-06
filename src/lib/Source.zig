@@ -2,7 +2,6 @@
 //! adapter can retain a name, revision, and physical line/byte base separately.
 
 const std = @import("std");
-const Tokenizer = @import("tokenizer.zig").Tokenizer;
 const Source = @This();
 
 text: [:0]u8,
@@ -20,17 +19,6 @@ pub const View = struct {
     revision: ?u64 = null,
     line_offset: usize = 0,
     base_offset: u32 = 0,
-
-    pub fn tokenLocation(source: View, start: u32) Location {
-        if (start >= source.text.len) return .{ .start = start, .origin = source };
-        var tokenizer = Tokenizer.init(source.text[start.. :0]);
-        const token = tokenizer.next();
-        return .{
-            .start = start,
-            .end = std.math.cast(u32, @as(usize, start) + token.loc.end),
-            .origin = source,
-        };
-    }
 };
 
 pub const Location = struct {

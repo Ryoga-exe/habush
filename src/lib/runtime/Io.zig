@@ -2,6 +2,8 @@
 
 const std = @import("std");
 const Diagnostic = @import("Diagnostic.zig");
+const Pipeline = @import("../Pipeline.zig");
+const Host = @import("../Host.zig");
 const Io = @This();
 
 /// A null output stream discards output. A null input stream is at EOF.
@@ -26,9 +28,18 @@ pub fn reportDiagnostic(
         sink.report(sink.userdata, located);
         return;
     }
+    if (located.worker_reported) return;
     const writer = runtime_io.stderr orelse return;
     try located.render(writer, runtime_io.diagnostic_options);
     try writer.writeByte('\n');
+}
+
+/// Startup attribution belongs to the original request, never to a later
+/// `wait`/`jobs` input. The worker's stderr output is retained without adding a
+/// second default rendering in the parent.
+pub fn reportStartupFailure(runtime_io: Io, context: Pipeline.FailureContext, failure: Host.SpawnFailure) error{Unexpected}!void {
+    const diagnostic = try Diagnostic.fromStartupFailure(context, failure);
+    if (runtime_io.diagnostic_sink) |sink| sink.report(sink.userdata, diagnostic);
 }
 
 test "reports diagnostics to stderr" {
@@ -42,6 +53,11 @@ test "reports diagnostics to stderr" {
     try runtime_io.reportDiagnostic(.{
         .subject = .{ .command = "missing" },
         .kind = .command_not_found,
+    });
+    try runtime_io.reportDiagnostic(.{
+        .subject = .{ .command = "missing" },
+        .kind = .command_not_found,
+        .worker_reported = true,
     });
 
     try std.testing.expectEqualStrings(

@@ -9,6 +9,7 @@ const CommandPlan = @import("CommandPlan.zig");
 const Host = @import("Host.zig");
 const SandboxPolicy = @import("SandboxPolicy.zig");
 const ProcessId = @import("runtime/types.zig").ProcessId;
+const Source = @import("Source.zig");
 const Pipeline = @This();
 
 gpa: std.mem.Allocator,
@@ -30,6 +31,58 @@ pub const StageResult = struct {
     sandbox_coverage: SandboxPolicy.Coverage,
 };
 
+/// The original request information needed to explain a delayed startup
+/// failure. It contains no environment, output capture, or language state.
+/// Views borrow this pipeline until deinit.
+pub const FailureContext = struct {
+    command: []const u8,
+    file_actions: []const CommandPlan.FileAction,
+    source: ?Source.Location,
+
+    const Owned = struct {
+        command: []u8,
+        file_actions: []CommandPlan.FileAction,
+        origin: ?Source,
+        location: ?Source.Location,
+
+        fn init(gpa: std.mem.Allocator, plan: CommandPlan, location: ?Source.Location) std.mem.Allocator.Error!Owned {
+            const command = try gpa.dupe(u8, plan.argv[0]);
+            errdefer gpa.free(command);
+            const actions = try gpa.dupe(CommandPlan.FileAction, plan.file_actions);
+            var initialized: usize = 0;
+            errdefer {
+                for (actions[0..initialized]) |action| if (action == .open) gpa.free(action.open.path);
+                gpa.free(actions);
+            }
+            for (actions) |*action| {
+                if (action.* == .open) action.open.path = try gpa.dupe(u8, action.open.path);
+                initialized += 1;
+            }
+            const origin = if (location) |value|
+                if (value.origin) |input| try Source.init(gpa, input) else null
+            else
+                null;
+            return .{ .command = command, .file_actions = actions, .origin = origin, .location = location };
+        }
+
+        fn view(owned: Owned) FailureContext {
+            var location = owned.location;
+            if (location) |*value| value.origin = if (owned.origin) |origin| origin.view() else null;
+            return .{ .command = owned.command, .file_actions = owned.file_actions, .source = location };
+        }
+
+        fn deinit(owned: *Owned, gpa: std.mem.Allocator) void {
+            gpa.free(owned.command);
+            for (owned.file_actions) |action| if (action == .open) gpa.free(action.open.path);
+            gpa.free(owned.file_actions);
+            if (owned.origin) |*origin| origin.deinit(gpa);
+            owned.* = undefined;
+        }
+    };
+};
+
+pub const StartupFailure = struct { context: FailureContext, reason: Host.SpawnFailure };
+
 pub const State = enum { running, stopped, completed };
 
 pub const StageStatus = union(enum) {
@@ -44,7 +97,12 @@ pub const StartResult = union(enum) {
     failed: RunResult.Failure,
 };
 
-pub const StartOptions = struct { process_group: bool = false };
+pub const StartOptions = struct {
+    process_group: bool = false,
+    /// Empty, or one source location per submitted plan. Borrowed until start
+    /// returns; each successfully spawned stage owns its attribution copy.
+    origins: []const ?Source.Location = &.{},
+};
 
 pub const RunResult = union(enum) {
     completed: []StageResult,
@@ -77,6 +135,8 @@ const ProcessRecord = struct {
     stopped: ?u32 = null,
     sandbox_coverage: SandboxPolicy.Coverage = .not_requested,
     process_id: ?ProcessId = null,
+    context: ?FailureContext.Owned = null,
+    failure_reported: bool = false,
 
     fn observe(record: *ProcessRecord, termination: Host.Termination) void {
         if (termination == .stopped) {
@@ -147,9 +207,24 @@ pub fn spawn(
     index: usize,
     plan: CommandPlan,
 ) Host.SpawnError!Host.SpawnOutcome {
+    return pipeline.spawnWithOrigin(index, plan, null);
+}
+
+/// Copies command/path/source attribution before spawning. These values remain
+/// available even if the caller frees its plan before the worker completes.
+pub fn spawnWithOrigin(
+    pipeline: *Pipeline,
+    index: usize,
+    plan: CommandPlan,
+    origin: ?Source.Location,
+) Host.SpawnError!Host.SpawnOutcome {
+    try plan.validate();
     std.debug.assert(index < pipeline.processes.len);
     const record = &pipeline.processes[index];
     if (record.spawned) return error.InvalidArguments;
+    var context = try FailureContext.Owned.init(pipeline.gpa, plan, origin);
+    var context_owned = true;
+    defer if (context_owned) context.deinit(pipeline.gpa);
     var effective_plan = plan;
     if (pipeline.create_group) {
         if (plan.process_group != .inherit) return error.InvalidArguments;
@@ -162,11 +237,28 @@ pub fn spawn(
             record.result = result;
             record.sandbox_coverage = result.sandbox_coverage;
             record.process_id = result.process_id;
+            record.context = context;
+            context_owned = false;
             if (pipeline.create_group) pipeline.process_group = result.process_group;
         },
         .failed => {},
     }
     return outcome;
+}
+
+pub fn failureContext(pipeline: *const Pipeline, index: usize) ?FailureContext {
+    return if (pipeline.processes[index].context) |context| context.view() else null;
+}
+
+/// Delivers each delayed startup failure at most once. Ordinary exit statuses
+/// and stopped processes do not become startup failures.
+pub fn takeStartupFailure(pipeline: *Pipeline, index: usize) ?StartupFailure {
+    const record = &pipeline.processes[index];
+    const termination = record.termination orelse return null;
+    if (termination != .spawn_failed or record.failure_reported) return null;
+    const context = record.context orelse return null;
+    record.failure_reported = true;
+    return .{ .context = context.view(), .reason = termination.spawn_failed };
 }
 
 /// A successful wait consumes the process record; an unspawned or already
@@ -296,6 +388,7 @@ pub fn deinit(pipeline: *Pipeline) void {
             _ = pipeline.host.wait(spawned.process) catch {};
             record.result = null;
         }
+        if (record.context) |*context| context.deinit(pipeline.gpa);
     }
     pipeline.gpa.free(pipeline.pipes);
     pipeline.gpa.free(pipeline.processes);
@@ -362,6 +455,7 @@ pub fn startWithOptions(
     plans: []const CommandPlan,
     options: StartOptions,
 ) Error!StartResult {
+    if (options.origins.len != 0 and options.origins.len != plans.len) return error.InvalidArguments;
     // Plans are already concrete: reject malformed input before creating
     // resources or launching any of the neighbouring commands.
     for (plans) |plan| try plan.validate();
@@ -402,7 +496,7 @@ pub fn startWithOptions(
         @memcpy(actions[next_action..], plans[index].file_actions);
         var plan = plans[index];
         plan.file_actions = actions;
-        const outcome = try pipeline.spawn(index, plan);
+        const outcome = try pipeline.spawnWithOrigin(index, plan, if (options.origins.len == 0) null else options.origins[index]);
         switch (outcome) {
             .spawned => {},
             .failed => |reason| return .{ .failed = .{ .stage = index, .reason = reason } },

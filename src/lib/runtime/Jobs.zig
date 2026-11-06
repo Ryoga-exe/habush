@@ -5,6 +5,7 @@ const std = @import("std");
 const Host = @import("../Host.zig");
 const Pipeline = @import("../Pipeline.zig");
 const ExitStatus = @import("types.zig").ExitStatus;
+const Io = @import("Io.zig");
 const Jobs = @This();
 
 gpa: std.mem.Allocator,
@@ -13,6 +14,7 @@ next_id: u32 = 1,
 terminal_control: bool = false,
 last_background_process_id: ?@import("types.zig").ProcessId = null,
 process_id_buffer: [10]u8 = undefined,
+diagnostic_io: Io = .{},
 
 pub const Id = enum(u32) { _ };
 pub const Options = struct { negated: bool = false, background: bool = true };
@@ -122,12 +124,16 @@ pub fn latest(jobs: *Jobs) ?Id {
 }
 
 pub fn poll(jobs: *Jobs) Host.Error!void {
-    for (jobs.entries.items) |*entry| _ = try entry.pipeline.poll();
+    for (jobs.entries.items) |*entry| {
+        _ = try entry.pipeline.poll();
+        try jobs.reportFailures(&entry.pipeline);
+    }
 }
 
 pub fn wait(jobs: *Jobs, id: Id) Host.Error!?ExitStatus {
     const entry = jobs.get(id) orelse return null;
     _ = try entry.pipeline.waitEvents();
+    try jobs.reportFailures(&entry.pipeline);
     const status = entry.exitStatus() orelse return error.Unexpected;
     if (entry.pipeline.state() == .completed) jobs.remove(id);
     return status;
@@ -180,9 +186,17 @@ pub fn foreground(jobs: *Jobs, id: Id) Host.Error!?ExitStatus {
         try host.releaseTerminal(token);
         lease = null;
     }
+    try jobs.reportFailures(&entry.pipeline);
     const result = entry.exitStatus() orelse return error.Unexpected;
     if (entry.pipeline.state() == .completed) jobs.remove(id);
     return result;
+}
+
+fn reportFailures(jobs: Jobs, pipeline: *Pipeline) Host.Error!void {
+    for (0..pipeline.stageCount()) |index| {
+        if (pipeline.takeStartupFailure(index)) |failure|
+            try jobs.diagnostic_io.reportStartupFailure(failure.context, failure.reason);
+    }
 }
 
 fn remove(jobs: *Jobs, id: Id) void {
