@@ -56,6 +56,7 @@ const FileResource = struct {
     writer: ?std.Io.File.Writer,
     readable: bool = false,
     reader: ?std.Io.File.Reader = null,
+    positional_read: bool = false,
     // `read` uses takeByte, so a one-byte buffer does not read past the
     // consumed byte before a child inherits the descriptor. Other Reader
     // operations can still read ahead and need shared input ownership.
@@ -197,6 +198,7 @@ const vtable: Host.VTable = .{
     .open_file = openFile,
     .create_pipe = createPipe,
     .create_input = createInput,
+    .create_capture = createCapture,
     .close_resource = closeResource,
     .resource_writer = resourceWriter,
     .resource_reader = resourceReader,
@@ -550,6 +552,17 @@ fn registerResource(system: *System, initial: FileResource) std.mem.Allocator.Er
     return resource;
 }
 
+fn createCapture(userdata: ?*anyopaque) Host.Error!CommandPlan.Resource {
+    const system: *System = @ptrCast(@alignCast(userdata.?));
+    const resource = try createInput(userdata, &.{});
+    system.resource_mutex.lockUncancelable(system.io);
+    defer system.resource_mutex.unlock(system.io);
+    const data = system.resources.get(resource).?;
+    data.writer = data.file().writerStreaming(system.io, &.{});
+    data.positional_read = true;
+    return resource;
+}
+
 fn createInput(userdata: ?*anyopaque, bytes: []const u8) Host.Error!CommandPlan.Resource {
     const system: *System = @ptrCast(@alignCast(userdata.?));
     const permissions: std.Io.File.Permissions = switch (builtin.os.tag) {
@@ -661,8 +674,10 @@ fn resourceReader(userdata: ?*anyopaque, resource: CommandPlan.Resource) ?*std.I
     defer system.resource_mutex.unlock(system.io);
     const data = system.resources.get(resource) orelse return null;
     if (!data.readable) return null;
-    if (data.reader == null)
-        data.reader = data.file().readerStreaming(system.io, &data.read_buffer);
+    if (data.reader == null) data.reader = if (data.positional_read)
+        data.file().reader(system.io, &data.read_buffer)
+    else
+        data.file().readerStreaming(system.io, &data.read_buffer);
     const reader = &(data.reader orelse return null);
     return &reader.interface;
 }
@@ -1772,6 +1787,29 @@ test "system host provides seekable input resources to child processes" {
     );
     defer std.testing.allocator.free(output);
     try std.testing.expectEqualStrings("ere-document contents\n", output);
+}
+
+test "capture reads from zero after both parent and child output exceed a pipe buffer" {
+    var system: System = .{ .gpa = std.testing.allocator, .io = std.testing.io };
+    defer system.deinit();
+    const system_host = system.host();
+    const capture = try system_host.createCapture();
+    defer system_host.closeResource(capture);
+    const writer = system_host.resourceWriter(capture).?;
+    const bytes = try std.testing.allocator.alloc(u8, 256 * 1024);
+    defer std.testing.allocator.free(bytes);
+    @memset(bytes, 'a');
+    try writer.writeAll(bytes);
+    try writer.flush();
+    var plan = outputCommand("tail");
+    plan.file_actions = &.{.{ .use_resource = .{ .resource = capture, .target = .stdout } }};
+    try expectExitStatus(system_host, plan, 0);
+    const reader = system_host.resourceReader(capture).?;
+    var actual: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer actual.deinit();
+    _ = try reader.streamRemaining(&actual.writer);
+    try std.testing.expectEqualSlices(u8, bytes, actual.written()[0..bytes.len]);
+    try std.testing.expectEqualStrings(if (builtin.os.tag == .windows) "tail\r\n" else "tail", actual.written()[bytes.len..]);
 }
 
 test "system host creates and closes pipeline resources" {

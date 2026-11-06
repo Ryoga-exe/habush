@@ -33,6 +33,7 @@ pub const VTable = struct {
     ) SpawnError!OpenFileOutcome,
     create_pipe: *const fn (?*anyopaque) Error!Pipe,
     create_input: *const fn (?*anyopaque, []const u8) Error!CommandPlan.Resource,
+    create_capture: ?*const fn (?*anyopaque) Error!CommandPlan.Resource = null,
     close_resource: *const fn (?*anyopaque, CommandPlan.Resource) void,
     resource_writer: *const fn (?*anyopaque, CommandPlan.Resource) ?*std.Io.Writer,
     resource_reader: ?*const fn (?*anyopaque, CommandPlan.Resource) ?*std.Io.Reader = null,
@@ -278,6 +279,16 @@ pub fn resourceWriter(host: Host, resource: CommandPlan.Resource) ?*std.Io.Write
 pub fn resourceReader(host: Host, resource: CommandPlan.Resource) ?*std.Io.Reader {
     const callback = host.vtable.resource_reader orelse return null;
     return callback(host.userdata, resource);
+}
+
+/// Creates a host-owned output capture. Write through resourceWriter or an
+/// inherited child stdout, then flush and finish all writers before requesting
+/// resourceReader. Its reader starts at offset zero independently of the write
+/// position. The host may spool to storage instead of a bounded pipe; callers
+/// decide how much data to retain while reading. Close with closeResource.
+pub fn createCapture(host: Host) Error!CommandPlan.Resource {
+    const callback = host.vtable.create_capture orelse return error.Unsupported;
+    return callback(host.userdata);
 }
 
 /// Resolves and validates a directory using the host platform's path rules.
