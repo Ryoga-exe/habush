@@ -220,6 +220,50 @@ test "delayed worker diagnostics preserve background command and path attributio
     try std.testing.expectEqual(@as(usize, 1), capture.count);
 }
 
+test "nested substitution diagnostics map through raw CRLF here-document sources" {
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var resolver = FakeResolver.init(std.testing.allocator);
+    defer resolver.deinit();
+    var capture: DiagnosticCapture = .{};
+    defer capture.deinit();
+    var session = try Session.init(std.testing.allocator, fake.host(), .{
+        .resolver = resolver.resolver(),
+        .context = .{ .io = .{
+            .diagnostic_sink = .{ .userdata = &capture, .report = DiagnosticCapture.report },
+        } },
+    });
+    defer session.deinit();
+    const scripts = [_][:0]const u8{
+        "value=$(missing)",
+        "value=$(inner=$(missing))",
+        "value=$(cat <<EOF\r\nlong body\r\nEOF\r\nmissing)",
+        "value=$(cat <<EOF\r\nlong body\r\nEOF\r\ninner=$(missing))",
+    };
+    for (scripts, 0..) |script, index| {
+        var result = try session.evaluate(script, .{
+            .source_name = "nested.hb",
+            .source_base_offset = 200,
+            .source_line_offset = 4,
+            .source_revision = 12,
+        });
+        defer result.deinit(session.allocator());
+        const expected = std.mem.indexOf(u8, script, "missing").?;
+        const source = capture.source.?;
+        const origin = capture.origin.?.view();
+        try std.testing.expectEqualStrings("missing", source.originalSlice().?);
+        try std.testing.expectEqualStrings("nested.hb", origin.name.?);
+        try std.testing.expectEqual(@as(?u64, index + 1), origin.id);
+        try std.testing.expectEqual(@as(?u64, 12), origin.revision);
+        try std.testing.expectEqual(@as(u32, @intCast(200 + expected)), source.absoluteRange().?.start);
+        const actual_line = origin.line_offset + std.mem.count(u8, origin.text[0..source.start], "\n");
+        try std.testing.expectEqual(4 + std.mem.count(u8, script[0..expected], "\n"), actual_line);
+    }
+    var unknown = try session.evaluate("value=$(missing)", .{ .source_base_offset = null });
+    defer unknown.deinit(session.allocator());
+    try std.testing.expect(capture.source.?.absoluteRange() == null);
+}
+
 test "background jobs retain process state until wait consumes the result" {
     var fake = FakeHost.init(std.testing.allocator);
     defer fake.deinit();

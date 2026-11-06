@@ -18,6 +18,9 @@ io: ?std.Io = null,
 line_edit: bool = false,
 integration: ?ShellIntegration = null,
 input_line: usize = 0,
+/// Known only for a fixed script/command source buffer.
+input_byte_offset: ?u32 = null,
+last_line_ending: LineEnding = .lf,
 
 pub fn run(self: *Shell) !habush.runtime.ExitStatus {
     return self.runInput(null);
@@ -56,6 +59,9 @@ fn runInput(self: *Shell, source_name: ?[]const u8) !habush.runtime.ExitStatus {
             input.here_documents,
             source_name,
             input.source_line,
+            input.original_source,
+            input.mappings,
+            input.source_offset,
         );
         if (command_open) {
             command_open = false;
@@ -86,19 +92,27 @@ pub fn runSource(
     const previous_stdin = self.stdin;
     const previous_interactive = self.interactive;
     const previous_input_line = self.input_line;
+    const previous_input_offset = self.input_byte_offset;
+    const previous_line_ending = self.last_line_ending;
     self.stdin = &reader;
     self.interactive = false;
     self.input_line = 0;
+    self.input_byte_offset = 0;
     defer {
         self.stdin = previous_stdin;
         self.interactive = previous_interactive;
         self.input_line = previous_input_line;
+        self.input_byte_offset = previous_input_offset;
+        self.last_line_ending = previous_line_ending;
     }
     return self.runInput(source_name);
 }
 
 const CommandInput = struct {
     source: [:0]u8,
+    original_source: [:0]u8,
+    mappings: []habush.Source.Mapping,
+    source_offset: ?u32,
     here_documents: []habush.heredoc.Collected,
     incomplete_here_document: bool,
     source_line: usize,
@@ -106,6 +120,8 @@ const CommandInput = struct {
 
     fn deinit(input: *CommandInput, allocator: std.mem.Allocator) void {
         allocator.free(input.source);
+        allocator.free(input.original_source);
+        allocator.free(input.mappings);
         for (input.here_documents) |document| {
             allocator.free(document.delimiter);
             allocator.free(document.body);
@@ -115,10 +131,88 @@ const CommandInput = struct {
     }
 };
 
+const LineEnding = enum {
+    none,
+    lf,
+    crlf,
+    cr,
+
+    fn bytes(ending: LineEnding) []const u8 {
+        return switch (ending) {
+            .none => "",
+            .lf => "\n",
+            .crlf => "\r\n",
+            .cr => "\r",
+        };
+    }
+};
+
+fn appendInputLine(
+    allocator: std.mem.Allocator,
+    command: *Io.Writer.Allocating,
+    original: *Io.Writer.Allocating,
+    mappings: *std.ArrayList(habush.Source.Mapping),
+    line: []const u8,
+    ending: LineEnding,
+    placeholder: bool,
+) !void {
+    const raw_start = original.written().len;
+    try original.writer.writeAll(line);
+    try original.writer.writeAll(ending.bytes());
+    if (!placeholder) {
+        if (line.len != 0) try mappings.append(allocator, .{
+            .parser_start = std.math.cast(u32, command.written().len) orelse return error.SourceTooLarge,
+            .original_start = std.math.cast(u32, raw_start) orelse return error.SourceTooLarge,
+            .len = std.math.cast(u32, line.len) orelse return error.SourceTooLarge,
+        });
+        try command.writer.writeAll(line);
+    }
+    if (ending == .lf or ending == .crlf) try mappings.append(allocator, .{
+        .parser_start = std.math.cast(u32, command.written().len) orelse return error.SourceTooLarge,
+        .original_start = std.math.cast(u32, raw_start + line.len + ending.bytes().len - 1) orelse return error.SourceTooLarge,
+        .len = 1,
+    });
+    try command.writer.writeByte('\n');
+}
+
+fn finishInput(
+    allocator: std.mem.Allocator,
+    command: *Io.Writer.Allocating,
+    original: *Io.Writer.Allocating,
+    mappings: *std.ArrayList(habush.Source.Mapping),
+    documents: *std.ArrayList(habush.heredoc.Collected),
+    source_line: usize,
+    source_offset: ?u32,
+    incomplete: bool,
+    emit_marks: bool,
+) !CommandInput {
+    const source = try command.toOwnedSliceSentinel(0);
+    errdefer allocator.free(source);
+    const raw = try original.toOwnedSliceSentinel(0);
+    errdefer allocator.free(raw);
+    const map = try mappings.toOwnedSlice(allocator);
+    errdefer allocator.free(map);
+    return .{
+        .source = source,
+        .original_source = raw,
+        .mappings = map,
+        .source_offset = source_offset,
+        .here_documents = try documents.toOwnedSlice(allocator),
+        .incomplete_here_document = incomplete,
+        .source_line = source_line,
+        .emit_execution_marks = emit_marks,
+    };
+}
+
 fn readCommand(self: *Shell) !?CommandInput {
     const source_line = self.input_line;
+    const source_offset = self.input_byte_offset;
     var command: Io.Writer.Allocating = .init(self.allocator);
     errdefer command.deinit();
+    var original: Io.Writer.Allocating = .init(self.allocator);
+    errdefer original.deinit();
+    var mappings: std.ArrayList(habush.Source.Mapping) = .empty;
+    errdefer mappings.deinit(self.allocator);
     var documents: std.ArrayList(habush.heredoc.Collected) = .empty;
     errdefer {
         for (documents.items) |document| {
@@ -135,19 +229,15 @@ fn readCommand(self: *Shell) !?CommandInput {
             if (self.interactive) try self.stderr.writeByte('\n');
             if (command.written().len == 0) {
                 command.deinit();
+                original.deinit();
+                mappings.deinit(self.allocator);
+                documents.deinit(self.allocator);
                 return null;
             }
-            return .{
-                .source = try command.toOwnedSliceSentinel(0),
-                .here_documents = try documents.toOwnedSlice(self.allocator),
-                .incomplete_here_document = false,
-                .source_line = source_line,
-            };
+            return try finishInput(self.allocator, &command, &original, &mappings, &documents, source_line, source_offset, false, true);
         };
         defer self.allocator.free(line);
-
-        try command.writer.writeAll(line);
-        try command.writer.writeByte('\n');
+        try appendInputLine(self.allocator, &command, &original, &mappings, line, self.last_line_ending, false);
 
         const source_len = command.written().len;
         try command.writer.writeByte(0);
@@ -159,18 +249,10 @@ fn readCommand(self: *Shell) !?CommandInput {
         if (inspection.ready_here_document_count > documents.items.len) {
             for (documents.items.len..inspection.ready_here_document_count) |document_index| {
                 const metadata = inspection.here_documents[document_index];
-                const document_start_line = self.input_line;
-                const body = try self.readHereDocument(metadata) orelse {
+                const body = try self.readHereDocument(metadata, &command, &original, &mappings) orelse {
                     incomplete_here_document = true;
                     break;
                 };
-                // Here-document bodies are not part of the parser source. Keep
-                // equivalent blank lines so token locations still refer to
-                // physical input lines when the command continues afterwards.
-                try command.writer.splatByteAll(
-                    '\n',
-                    self.input_line - document_start_line,
-                );
                 errdefer self.allocator.free(body);
                 const delimiter = try self.allocator.dupe(u8, metadata.delimiter);
                 errdefer self.allocator.free(delimiter);
@@ -182,21 +264,11 @@ fn readCommand(self: *Shell) !?CommandInput {
                 });
             }
         }
-        if (incomplete_here_document) return .{
-            .source = try command.toOwnedSliceSentinel(0),
-            .here_documents = try documents.toOwnedSlice(self.allocator),
-            .incomplete_here_document = true,
-            .source_line = source_line,
-        };
-
+        if (incomplete_here_document)
+            return try finishInput(self.allocator, &command, &original, &mappings, &documents, source_line, source_offset, true, true);
         const ready = inspection.errors or !inspection.incomplete;
-        if (ready) return .{
-            .source = try command.toOwnedSliceSentinel(0),
-            .here_documents = try documents.toOwnedSlice(self.allocator),
-            .incomplete_here_document = false,
-            .source_line = source_line,
-            .emit_execution_marks = !inspection.empty,
-        };
+        if (ready)
+            return try finishInput(self.allocator, &command, &original, &mappings, &documents, source_line, source_offset, false, !inspection.empty);
         continuation = true;
     }
 }
@@ -263,6 +335,9 @@ fn inspectCommand(
 fn readHereDocument(
     self: *Shell,
     metadata: CommandInspection.HereDocumentMetadata,
+    command: *Io.Writer.Allocating,
+    original: *Io.Writer.Allocating,
+    mappings: *std.ArrayList(habush.Source.Mapping),
 ) !?[]u8 {
     var body: Io.Writer.Allocating = .init(self.allocator);
     errdefer body.deinit();
@@ -277,6 +352,7 @@ fn readHereDocument(
             return null;
         };
         defer self.allocator.free(line);
+        try appendInputLine(self.allocator, command, original, mappings, line, self.last_line_ending, true);
         const stripped = habush.heredoc.lineAfterTabStripping(line, metadata.strip_tabs);
         try pending.writer.writeAll(stripped);
         try pending.writer.writeByte('\n');
@@ -304,8 +380,10 @@ fn hasLineContinuation(line: []const u8) bool {
 }
 
 fn readInputLine(self: *Shell, prompt: []const u8, prefix: []const u8, allow_completion: bool) !?[:0]u8 {
-    const line = if (self.interactive and self.line_edit and self.io != null)
-        ((LineEditor{
+    const line = if (self.interactive and self.line_edit and self.io != null) editor: {
+        self.last_line_ending = .lf;
+        self.input_byte_offset = null;
+        break :editor ((LineEditor{
             .gpa = self.allocator,
             .io = self.io.?,
             .input = self.stdin,
@@ -315,13 +393,18 @@ fn readInputLine(self: *Shell, prompt: []const u8, prefix: []const u8, allow_com
             .prefix = prefix,
             .allow_completion = allow_completion,
         }).read() catch |err| switch (err) {
-            error.EditorUnavailable => try readLineAlloc(self.stdin, self.allocator),
+            error.EditorUnavailable => try readLineAlloc(self.stdin, self.allocator, &self.last_line_ending),
             error.EndOfStream => null,
             else => return err,
-        }) orelse return null
-    else
-        try readLineAlloc(self.stdin, self.allocator) orelse return null;
+        }) orelse return null;
+    } else try readLineAlloc(self.stdin, self.allocator, &self.last_line_ending) orelse return null;
     self.input_line += 1;
+    if (self.input_byte_offset) |offset| {
+        self.input_byte_offset = offset: {
+            const len = std.math.cast(u32, line.len + self.last_line_ending.bytes().len) orelse break :offset null;
+            break :offset std.math.add(u32, offset, len) catch null;
+        };
+    }
     return line;
 }
 
@@ -353,11 +436,17 @@ fn handleInput(
     collected_here_documents: []const habush.heredoc.Collected,
     source_name: ?[]const u8,
     source_line: usize,
+    original_source: [:0]const u8,
+    mappings: []const habush.Source.Mapping,
+    source_offset: ?u32,
 ) !habush.runtime.ControlFlow {
     var evaluation = try self.session.evaluate(source, .{
         .collected_here_documents = collected_here_documents,
         .source_name = source_name,
         .source_line_offset = source_line,
+        .source_base_offset = source_offset,
+        .original_source = original_source,
+        .source_mappings = mappings,
     });
     defer evaluation.deinit(self.session.allocator());
     switch (evaluation) {
@@ -389,7 +478,7 @@ fn handleInput(
     }
 }
 
-fn readLineAlloc(reader: *Io.Reader, allocator: std.mem.Allocator) !?[:0]u8 {
+fn readLineAlloc(reader: *Io.Reader, allocator: std.mem.Allocator, ending: *LineEnding) !?[:0]u8 {
     var out: Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
 
@@ -406,11 +495,66 @@ fn readLineAlloc(reader: *Io.Reader, allocator: std.mem.Allocator) !?[:0]u8 {
     }
 
     const written = out.written();
+    ending.* = if (found_newline) .lf else .none;
 
     // CRLF
     if (written.len > 0 and written[written.len - 1] == '\r') {
         out.shrinkRetainingCapacity(written.len - 1);
+        ending.* = if (found_newline) .crlf else .cr;
     }
 
     return try out.toOwnedSliceSentinel(0);
+}
+
+test "script diagnostics retain raw CRLF here-document and final-line byte ranges" {
+    const Capture = struct {
+        ranges: [3]?habush.Source.Range = undefined,
+        count: usize = 0,
+        correct_name: bool = true,
+
+        fn report(userdata: ?*anyopaque, diagnostic: habush.runtime.Diagnostic) void {
+            const capture: *@This() = @ptrCast(@alignCast(userdata.?));
+            const location = diagnostic.source.?;
+            capture.ranges[capture.count] = location.absoluteRange();
+            capture.count += 1;
+            capture.correct_name = capture.correct_name and std.mem.eql(u8, location.origin.?.name.?, "script.hb");
+        }
+    };
+    const MissingResolver = struct {
+        fn resolve(_: ?*anyopaque, _: std.mem.Allocator, _: habush.CommandResolver.Request) habush.CommandResolver.Error!?[]u8 {
+            return null;
+        }
+    };
+    var system: habush.Host.System = .{ .gpa = std.testing.allocator, .io = std.testing.io };
+    defer system.deinit();
+    var capture: Capture = .{};
+    var stderr: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer stderr.deinit();
+    var session = try habush.Session.init(std.testing.allocator, system.host(), .{
+        .resolver = .{ .userdata = null, .vtable = &.{ .resolve = MissingResolver.resolve } },
+        .context = .{ .io = .{
+            .stderr = &stderr.writer,
+            .diagnostic_sink = .{ .userdata = &capture, .report = Capture.report },
+        } },
+    });
+    defer session.deinit();
+    var reader: Io.Reader = .fixed("");
+    var shell: Shell = .{
+        .allocator = std.testing.allocator,
+        .stdin = &reader,
+        .stderr = &stderr.writer,
+        .session = &session,
+        .interactive = false,
+    };
+    const script = ":\r\n{\r\n : <<EOF\r\nlong body\r\nEOF\r\n missing\r\n}\r\nvalue=$(: <<EOF\r\ninner body\r\nEOF\r\ninner=$(missing_nested))\r\nmissing_final";
+    try std.testing.expectEqual(@as(u8, 127), try shell.runSource(script, "script.hb"));
+    try std.testing.expectEqual(@as(usize, 3), capture.count);
+    try std.testing.expect(capture.correct_name);
+    const first = std.mem.indexOf(u8, script, "missing").?;
+    const nested = std.mem.indexOf(u8, script, "missing_nested").?;
+    const last = std.mem.indexOf(u8, script, "missing_final").?;
+    try std.testing.expectEqualDeep(habush.Source.Range{ .start = @intCast(first), .end = @intCast(first + 7) }, capture.ranges[0].?);
+    try std.testing.expectEqualDeep(habush.Source.Range{ .start = @intCast(nested), .end = @intCast(nested + "missing_nested".len) }, capture.ranges[1].?);
+    try std.testing.expectEqualDeep(habush.Source.Range{ .start = @intCast(last), .end = @intCast(script.len) }, capture.ranges[2].?);
+    try std.testing.expectEqualStrings("", stderr.written());
 }
