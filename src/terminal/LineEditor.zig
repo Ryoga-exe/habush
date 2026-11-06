@@ -30,11 +30,29 @@ pub fn read(editor: LineEditor) !?[:0]u8 {
     }
     var buffer: habush.edit.Buffer = .{ .gpa = editor.gpa };
     defer buffer.deinit();
+    var pending: [4]u8 = undefined;
+    var pending_len: usize = 0;
+    var expected_len: usize = 0;
     while (true) {
         const byte = try takeByte(editor.input) orelse {
             try terminal.restore();
             return null;
         };
+        if (pending_len != 0) {
+            if (byte & 0xc0 == 0x80) {
+                pending[pending_len] = byte;
+                pending_len += 1;
+                if (pending_len != expected_len) continue;
+                try editor.insertTyped(&buffer, pending[0..pending_len]);
+                pending_len = 0;
+                try render.redraw(editor.output, editor.prompt, buffer.text(), buffer.cursor, terminal.columns());
+                continue;
+            }
+            // Preserve an invalid or incomplete prefix, then process this key
+            // normally. In particular, Enter and editing keys are never lost.
+            try editor.insertTyped(&buffer, pending[0..pending_len]);
+            pending_len = 0;
+        }
         switch (byte) {
             '\r', '\n' => {
                 try editor.output.writeAll("\r\n");
@@ -79,14 +97,39 @@ pub fn read(editor: LineEditor) !?[:0]u8 {
                 if (std.mem.eql(u8, key, "[D") or std.mem.eql(u8, key, "OD")) buffer.left() else if (std.mem.eql(u8, key, "[C") or std.mem.eql(u8, key, "OC")) buffer.right() else if (std.mem.eql(u8, key, "[H") or std.mem.eql(u8, key, "OH") or std.mem.eql(u8, key, "[1~")) buffer.cursor = 0 else if (std.mem.eql(u8, key, "[F") or std.mem.eql(u8, key, "OF") or std.mem.eql(u8, key, "[4~")) buffer.cursor = buffer.text().len else if (std.mem.eql(u8, key, "[3~")) try buffer.delete() else if (std.mem.eql(u8, key, "[200~")) try editor.paste(&buffer) else try editor.output.writeByte(7);
             },
             else => {
-                if (byte >= 0x20 and buffer.text().len < max_input_bytes)
-                    try buffer.insert(&.{byte})
-                else
+                if (byte >= 0x20) {
+                    expected_len = std.unicode.utf8ByteSequenceLength(byte) catch 1;
+                    if (expected_len > 1) {
+                        pending[0] = byte;
+                        pending_len = 1;
+                        continue;
+                    }
+                    try editor.insertTyped(&buffer, &.{byte});
+                } else {
                     try editor.output.writeByte(7);
+                }
             },
         }
         try render.redraw(editor.output, editor.prompt, buffer.text(), buffer.cursor, terminal.columns());
     }
+}
+
+/// A typed Unicode scalar is one edit and therefore one Undo operation. Invalid
+/// input stays byte-preserving; the size limit never leaves half a valid scalar.
+fn insertTyped(editor: LineEditor, buffer: *habush.edit.Buffer, bytes: []const u8) !void {
+    if (!std.unicode.utf8ValidateSlice(bytes)) {
+        for (bytes) |byte| {
+            if (buffer.text().len < max_input_bytes)
+                try buffer.insert(&.{byte})
+            else
+                try editor.output.writeByte(7);
+        }
+        return;
+    }
+    if (bytes.len <= max_input_bytes -| buffer.text().len)
+        try buffer.insert(bytes)
+    else
+        try editor.output.writeByte(7);
 }
 
 fn paste(editor: LineEditor, buffer: *habush.edit.Buffer) !void {
