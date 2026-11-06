@@ -7,6 +7,8 @@ const FakeHost = @This();
 arena: std.heap.ArenaAllocator,
 spawn_calls: std.ArrayList(CommandPlan) = .empty,
 wait_calls: std.ArrayList(Host.Process) = .empty,
+try_wait_calls: std.ArrayList(Host.Process) = .empty,
+signal_calls: std.ArrayList(SignalCall) = .empty,
 resolve_working_directory_calls: std.ArrayList(Host.WorkingDirectoryRequest) = .empty,
 open_file_calls: std.ArrayList(OpenFileCall) = .empty,
 create_input_calls: std.ArrayList([]const u8) = .empty,
@@ -14,6 +16,7 @@ create_pipe_calls: usize = 0,
 closed_resource_count: usize = 0,
 redirected_output: std.Io.Writer.Allocating,
 resource_writer_override: ?*std.Io.Writer = null,
+resource_reader_override: ?*std.Io.Reader = null,
 next_process: u32 = 1,
 next_process_group: u32 = 1,
 next_resource: u32 = 1,
@@ -22,6 +25,9 @@ spawn_error: ?Host.SpawnError = null,
 spawn_failure: ?Host.SpawnFailure = null,
 spawn_failure_after: usize = 0,
 wait_error: ?Host.Error = null,
+try_wait_error: ?Host.Error = null,
+try_wait_termination: ?Host.Termination = .{ .exited = 0 },
+signal_error: ?Host.Error = null,
 resolve_working_directory_error: ?Host.Error = null,
 working_directory_result: ?[]const u8 = null,
 initial_working_directory: []const u8 = "/",
@@ -34,6 +40,8 @@ pub const OpenFileCall = struct {
     cwd: CommandPlan.WorkingDirectory,
     open: CommandPlan.FileAction.Open,
 };
+
+pub const SignalCall = struct { process: Host.Process, signal: Host.Signal };
 
 pub fn init(gpa: std.mem.Allocator) FakeHost {
     return .{
@@ -58,11 +66,14 @@ pub fn host(fake: *FakeHost) Host {
 const vtable: Host.VTable = .{
     .spawn = spawn,
     .wait = wait,
+    .try_wait = tryWait,
+    .signal = signal,
     .open_file = openFile,
     .create_pipe = createPipe,
     .create_input = createInput,
     .close_resource = closeResource,
     .resource_writer = resourceWriter,
+    .resource_reader = resourceReader,
     .resolve_working_directory = resolveWorkingDirectory,
 };
 
@@ -126,6 +137,12 @@ fn resourceWriter(userdata: ?*anyopaque, resource: CommandPlan.Resource) ?*std.I
     if (@intFromEnum(resource) == 0 or @intFromEnum(resource) >= fake.next_resource) return null;
     if (fake.resource_writer_override) |writer| return writer;
     return &fake.redirected_output.writer;
+}
+
+fn resourceReader(userdata: ?*anyopaque, resource: CommandPlan.Resource) ?*std.Io.Reader {
+    const fake: *FakeHost = @ptrCast(@alignCast(userdata.?));
+    if (@intFromEnum(resource) == 0 or @intFromEnum(resource) >= fake.next_resource) return null;
+    return fake.resource_reader_override;
 }
 
 fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.SpawnError!Host.SpawnOutcome {
@@ -225,6 +242,19 @@ fn wait(userdata: ?*anyopaque, process: Host.Process) Host.Error!Host.Terminatio
     if (fake.wait_error) |err| return err;
     try fake.wait_calls.append(fake.arena.allocator(), process);
     return fake.termination;
+}
+
+fn tryWait(userdata: ?*anyopaque, process: Host.Process) Host.Error!?Host.Termination {
+    const fake: *FakeHost = @ptrCast(@alignCast(userdata.?));
+    if (fake.try_wait_error) |err| return err;
+    try fake.try_wait_calls.append(fake.arena.allocator(), process);
+    return fake.try_wait_termination;
+}
+
+fn signal(userdata: ?*anyopaque, process: Host.Process, request: Host.Signal) Host.Error!void {
+    const fake: *FakeHost = @ptrCast(@alignCast(userdata.?));
+    if (fake.signal_error) |err| return err;
+    try fake.signal_calls.append(fake.arena.allocator(), .{ .process = process, .signal = request });
 }
 
 fn resolveWorkingDirectory(
