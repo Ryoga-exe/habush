@@ -112,6 +112,9 @@ const TerminalRecord = struct {
 };
 
 pub fn deinit(system: *System) void {
+    const io = system.io;
+    const previous_protection = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(previous_protection);
     if (system.terminal_lease) |lease| {
         releaseTerminal(system, lease.token) catch {};
         if (system.terminal_lease) |still_active| {
@@ -771,8 +774,23 @@ fn applyEnvironmentVariables(
 
 fn wait(userdata: ?*anyopaque, process: Host.Process) Host.Error!Host.Termination {
     const system: *System = @ptrCast(@alignCast(userdata.?));
+    while (true) {
+        if (try tryWait(userdata, process)) |termination| {
+            if (termination != .stopped) return termination;
+        }
+        // Child.wait may clean up its native handle even on cancellation.
+        // Polling retains ownership until a terminal result has been observed.
+        try std.Io.sleep(system.io, .fromMilliseconds(2), .awake);
+    }
+}
+
+fn reapWindows(system: *System, process: Host.Process) Host.Error!Host.Termination {
     const record = system.children.getPtr(process) orelse return error.InvalidArguments;
     const group = record.process_group;
+    // Called only after the process handle is signaled. Finish the native
+    // cleanup atomically with respect to task cancellation.
+    const previous_protection = system.io.swapCancelProtection(.blocked);
+    defer _ = system.io.swapCancelProtection(previous_protection);
     const termination = record.child.wait(system.io) catch |err| return switch (err) {
         error.AccessDenied => error.AccessDenied,
         else => error.Unexpected,
@@ -796,11 +814,7 @@ fn tryWait(userdata: ?*anyopaque, process: Host.Process) Host.Error!?Host.Termin
 }
 
 fn waitEvent(userdata: ?*anyopaque, process: Host.Process) Host.Error!Host.Termination {
-    const system: *System = @ptrCast(@alignCast(userdata.?));
-    const record = system.children.getPtr(process) orelse return error.InvalidArguments;
-    if (builtin.os.tag == .windows) return wait(userdata, process);
-    if (builtin.os.tag == .wasi) return error.Unsupported;
-    return (try waitForPosix(system, process, record, std.posix.W.UNTRACED)) orelse error.Unexpected;
+    return (try waitAny(userdata, &.{process})).termination;
 }
 
 fn waitAny(userdata: ?*anyopaque, processes: []const Host.Process) Host.Error!Host.ProcessEvent {
@@ -889,7 +903,7 @@ fn tryWaitWindows(
     const handle = record.child.id orelse return error.InvalidArguments;
     const timeout: windows.LARGE_INTEGER = 0;
     return switch (windows.ntdll.NtWaitForSingleObject(handle, .FALSE, &timeout)) {
-        windows.NTSTATUS.WAIT_0 => try wait(system, process),
+        windows.NTSTATUS.WAIT_0 => try reapWindows(system, process),
         .TIMEOUT => null,
         .ACCESS_DENIED => error.AccessDenied,
         else => error.Unexpected,
@@ -1285,7 +1299,7 @@ test "system host owns foreground processes until wait" {
     );
 }
 
-test "canceled wait-any retains the native child for later reaping" {
+test "canceled native waits retain the child for later reaping" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
     const CanceledSleep = struct {
         fn sleep(_: ?*anyopaque, _: std.Io.Timeout) std.Io.Cancelable!void {
@@ -1311,7 +1325,11 @@ test "canceled wait-any retains the native child for later reaping" {
     system_host.closeResource(input.read_end);
 
     try std.testing.expectError(error.Canceled, system_host.waitAny(&.{spawned.process}));
+    try std.testing.expectError(error.Canceled, system_host.waitEvent(spawned.process));
+    try std.testing.expectError(error.Canceled, system_host.wait(spawned.process));
     try std.testing.expect(system.children.contains(spawned.process));
+    try std.testing.expect(system.children.get(spawned.process).?.child.id != null);
+    system.io = std.testing.io;
     system_host.closeResource(input.write_end);
     try std.testing.expectEqualDeep(Host.Termination{ .exited = 23 }, try system_host.wait(spawned.process));
     try std.testing.expect(!system.children.contains(spawned.process));
