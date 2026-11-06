@@ -107,10 +107,41 @@ fn checkFileActions(
         .sandbox = .{ .restrict = policy },
     };
     const denied = try runOne(gpa, io, host, denied_plan);
-    try check(io, exitedWith(denied, 126), "worker redirection denial must fail before target exec");
+    try check(io, denied.termination == .spawn_failed and
+        denied.termination.spawn_failed == .file_action and
+        denied.termination.spawn_failed.file_action.action_index == 0 and
+        denied.termination.spawn_failed.file_action.reason == .access_denied, "worker redirection denial must report its file action before target exec");
     try check(io, denied.sandbox_coverage == .complete, "denial coverage must be complete");
     try expectMissing(io, denied_output);
     try expectMissing(io, marker);
+
+    const input = try host.createInput("borrowed input\n");
+    defer host.closeResource(input);
+    const prefixed_actions = [_]exec.CommandPlan.FileAction{
+        .{ .use_resource = .{ .resource = input, .target = .stdin } },
+        denied_action[0],
+    };
+    var prefixed_plan = denied_plan;
+    prefixed_plan.file_actions = &prefixed_actions;
+    const prefixed = try runOne(gpa, io, host, prefixed_plan);
+    try check(io, prefixed.termination == .spawn_failed and
+        prefixed.termination.spawn_failed == .file_action and
+        prefixed.termination.spawn_failed.file_action.action_index == 1, "startup report must retain original file-action indexes after resource bindings");
+
+    const missing_path = try std.fs.path.join(gpa, &.{ scratch, "missing-executable" });
+    defer gpa.free(missing_path);
+    const missing = try runOne(gpa, io, host, .{
+        .executable = missing_path,
+        .argv = &.{missing_path},
+        .sandbox = .{ .restrict = policy },
+    });
+    try check(io, missing.termination == .spawn_failed and missing.termination.spawn_failed == .command_not_found, "worker exec failure must retain its structured reason");
+    const target_126 = try runOne(gpa, io, host, .{
+        .executable = "/bin/sh",
+        .argv = &.{ "/bin/sh", "-c", "exit 126" },
+        .sandbox = .{ .restrict = policy },
+    });
+    try check(io, exitedWith(target_126, 126), "target exit 126 must remain distinct from worker startup failure");
 
     const allowed_action = [_]exec.CommandPlan.FileAction{.{ .open = .{
         .path = allowed_output,

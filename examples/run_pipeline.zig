@@ -70,6 +70,11 @@ fn terminationStatus(termination: exec.Host.Termination) u8 {
         .exited => |status| status,
         .signal => |number| @truncate(number +% 128),
         .stopped, .unknown => 1,
+        .spawn_failed => |failure| switch (failure) {
+            .command_not_found => 127,
+            .file_action => 1,
+            else => 126,
+        },
     };
 }
 

@@ -37,6 +37,11 @@ pub const Entry = struct {
                 .signal => |number| @truncate(@as(u64, 128) + number),
                 .stopped => unreachable,
                 .unknown => 1,
+                .spawn_failed => |failure| switch (failure) {
+                    .command_not_found => 127,
+                    .file_action => 1,
+                    else => 126,
+                },
             },
             .stopped => |number| @truncate(@as(u64, 128) + number),
             else => return null,
