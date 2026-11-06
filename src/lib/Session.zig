@@ -20,6 +20,7 @@ resolver: ?CommandResolver,
 context: ExecutionContext,
 state: runtime.State,
 jobs: runtime.Jobs,
+concurrent_pipeline: ?Executor.ConcurrentPipeline,
 last_result: Executor.Result = .{
     .status = 0,
     .sandbox_coverage = .not_requested,
@@ -28,6 +29,9 @@ last_result: Executor.Result = .{
 pub const Options = struct {
     /// Enables explicit controlling-terminal handoff for external foreground jobs.
     job_control: bool = false,
+    /// Enables concurrent in-process pipeline stages. The supplied allocator
+    /// and Host/Resolver adapters must outlive this session.
+    concurrent_pipeline: ?Executor.ConcurrentPipeline = null,
     resolver: ?CommandResolver = null,
     context: ExecutionContext.View = .{},
     invocation_name: []const u8 = "habush",
@@ -70,6 +74,7 @@ pub fn init(
         .resolver = options.resolver,
         .context = context,
         .jobs = .{ .gpa = gpa, .terminal_control = options.job_control },
+        .concurrent_pipeline = options.concurrent_pipeline,
         .state = try runtime.State.init(gpa, .{
             .invocation_name = options.invocation_name,
             .shell_process_id = options.shell_process_id,
@@ -104,6 +109,7 @@ pub fn execute(session: *Session, hir: Hir) Executor.Error!Executor.Result {
     );
     executor.jobs = &session.jobs;
     executor.job_control = session.jobs.terminal_control;
+    executor.concurrent_pipeline = session.concurrent_pipeline;
     const result = try executor.execute(hir);
     session.last_result = result;
     return result;
@@ -219,6 +225,9 @@ pub fn setPositionalParameters(
     return session.state.setPositionalParameters(positional_parameters);
 }
 
+/// Sets the default request for future external spawns. This does not confine
+/// the parent evaluator, change already running jobs, or apply OS restrictions
+/// to this application. A fresh restricted evaluator is needed for that scope.
 pub fn setSandbox(session: *Session, sandbox: CommandPlan.Sandbox) !void {
     return session.context.setSandbox(sandbox);
 }
