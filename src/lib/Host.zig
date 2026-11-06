@@ -55,6 +55,7 @@ pub const Pipe = struct {
 
 pub const Error = error{
     OutOfMemory,
+    Canceled,
     InvalidArguments,
     CommandNotFound,
     AccessDenied,
@@ -98,6 +99,10 @@ pub const Capabilities = struct {
     terminal_control: bool = false,
     poll: bool = false,
     signals: bool = false,
+    /// openFile may run concurrently with other Host operations. The host
+    /// synchronizes resource registration without holding its lock across a
+    /// potentially blocking filesystem open.
+    parallel_open_file: bool = false,
 };
 
 pub fn capabilities(host: Host) Capabilities {

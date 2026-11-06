@@ -1,6 +1,6 @@
 //! Owned execution settings shared by commands in one shell session.
 //!
-//! The standard streams are borrowed; their writers must outlive executions
+//! The standard streams are borrowed; their readers/writers must outlive executions
 //! that use this context. Directory and sandbox values are owned by the context.
 
 const std = @import("std");

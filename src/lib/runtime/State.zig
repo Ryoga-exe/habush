@@ -67,26 +67,31 @@ pub fn deinit(state: *State) void {
 }
 
 pub fn clone(state: State) std.mem.Allocator.Error!State {
-    const invocation_name = try state.gpa.dupe(u8, state.invocation_name);
-    errdefer state.gpa.free(invocation_name);
+    return state.cloneWithAllocator(state.gpa);
+}
 
-    const default_search_path = try cloneStrings(state.gpa, state.default_search_path);
-    errdefer deinitStrings(state.gpa, default_search_path);
+/// Makes a fully owned copy whose future mutations use `allocator`.
+pub fn cloneWithAllocator(state: State, gpa: std.mem.Allocator) std.mem.Allocator.Error!State {
+    const invocation_name = try gpa.dupe(u8, state.invocation_name);
+    errdefer gpa.free(invocation_name);
 
-    const positional_parameters = try cloneStrings(state.gpa, state.positional_parameters);
-    errdefer deinitStrings(state.gpa, positional_parameters);
+    const default_search_path = try cloneStrings(gpa, state.default_search_path);
+    errdefer deinitStrings(gpa, default_search_path);
 
-    var variables = try state.variables.clone(state.gpa);
+    const positional_parameters = try cloneStrings(gpa, state.positional_parameters);
+    errdefer deinitStrings(gpa, positional_parameters);
+
+    var variables = try state.variables.clone(gpa);
     errdefer variables.deinit();
 
     return .{
-        .gpa = state.gpa,
+        .gpa = gpa,
         .invocation_name = invocation_name,
         .shell_process_id = state.shell_process_id,
         .default_search_path = default_search_path,
         .positional_parameters = positional_parameters,
         .variables = variables,
-        .functions = try state.functions.clone(state.gpa),
+        .functions = try state.functions.clone(gpa),
     };
 }
 
@@ -289,7 +294,7 @@ test "runtime state clone is independent" {
 test "runtime state clone handles every allocation failure" {
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
-        cloneWithAllocator,
+        exerciseCloneAllocations,
         .{},
     );
 }
@@ -359,7 +364,7 @@ fn initWithAllocator(gpa: std.mem.Allocator) !void {
     defer state.deinit();
 }
 
-fn cloneWithAllocator(gpa: std.mem.Allocator) !void {
+fn exerciseCloneAllocations(gpa: std.mem.Allocator) !void {
     var state = try State.init(gpa, .{
         .invocation_name = "script.hb",
         .default_search_path = &.{"/bin"},

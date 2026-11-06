@@ -3,6 +3,7 @@ const Ast = @import("Ast.zig");
 const AstGen = @import("AstGen.zig");
 const CommandPlan = @import("CommandPlan.zig");
 const CommandResolver = @import("CommandResolver.zig");
+const ConcurrentHost = @import("concurrent/Host.zig");
 const FakeResolver = @import("CommandResolver/FakeResolver.zig");
 const Executor = @import("Executor.zig");
 const ExecutionContext = @import("ExecutionContext.zig");
@@ -1011,6 +1012,72 @@ test "multiple general in-process pipeline stages remain unsupported" {
     );
     try std.testing.expectEqual(@as(usize, 0), fake.create_pipe_calls);
     try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+}
+
+test "concurrent stage failure kills external peers and closes pipes" {
+    var hir = try generate("/bin/source | true | pwd");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var base_vtable = fake.host().vtable.*;
+    base_vtable.capabilities.poll = true;
+    base_vtable.capabilities.signals = true;
+    const base_host: @import("Host.zig") = .{ .userdata = &fake, .vtable = &base_vtable };
+    var adapter = try ConcurrentHost.init(std.testing.allocator, base_host, std.testing.io);
+    defer adapter.deinit();
+    var state = try runtime.State.init(std.testing.allocator, .{});
+    defer state.deinit();
+    var failing_writer: std.Io.Writer = .failing;
+    var context = try ExecutionContext.init(std.testing.allocator, .{
+        .cwd = "/workspace",
+        .io = .{ .stdout = &failing_writer },
+    });
+    defer context.deinit();
+    var executor = Executor.initWithState(adapter.host(), null, &state, &context, 0);
+    executor.concurrent_pipeline = .{ .io = std.testing.io, .allocator = std.testing.allocator };
+    executor.resolver = CommandResolver.preResolved();
+
+    try std.testing.expectError(error.WriteFailed, executor.execute(hir));
+    try std.testing.expectEqual(@as(usize, 1), fake.spawn_calls.items.len);
+    try std.testing.expectEqual(@as(usize, 1), fake.signal_calls.items.len);
+    try std.testing.expectEqual(@as(usize, 1), fake.try_wait_calls.items.len);
+    try std.testing.expectEqual(@as(usize, 4), fake.closed_resource_count);
+}
+
+test "concurrency reservation failure launches no stage and closes pipes" {
+    const FailingIo = struct {
+        fn groupConcurrent(
+            _: ?*anyopaque,
+            _: *std.Io.Group,
+            _: []const u8,
+            _: std.mem.Alignment,
+            _: *const fn (*const anyopaque) void,
+        ) std.Io.ConcurrentError!void {
+            return error.ConcurrencyUnavailable;
+        }
+    };
+    var hir = try generate("true | read VALUE");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var base_vtable = fake.host().vtable.*;
+    base_vtable.capabilities.poll = true;
+    const base_host: @import("Host.zig") = .{ .userdata = &fake, .vtable = &base_vtable };
+    var adapter = try ConcurrentHost.init(std.testing.allocator, base_host, std.testing.io);
+    defer adapter.deinit();
+    var state = try runtime.State.init(std.testing.allocator, .{});
+    defer state.deinit();
+    var context = try ExecutionContext.init(std.testing.allocator, .{});
+    defer context.deinit();
+    var io_vtable = std.testing.io.vtable.*;
+    io_vtable.groupConcurrent = FailingIo.groupConcurrent;
+    const failing_io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &io_vtable };
+    var executor = Executor.initWithState(adapter.host(), null, &state, &context, 0);
+    executor.concurrent_pipeline = .{ .io = failing_io, .allocator = std.testing.allocator };
+
+    try std.testing.expectError(error.UnsupportedInstruction, executor.execute(hir));
+    try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+    try std.testing.expectEqual(@as(usize, 2), fake.closed_resource_count);
 }
 
 test "compound pipeline stage runs after adjacent external stages launch" {
@@ -2332,6 +2399,33 @@ test "forwards the active sandbox policy to the host" {
     const policy = fake.spawn_calls.items[0].sandbox.restrict;
     try std.testing.expectEqual(SandboxPolicy.Enforcement.required, policy.enforcement);
     try std.testing.expectEqualStrings("/usr", policy.file_system.allow[0].path);
+}
+
+test "child-only sandbox rejects parent-side redirection setup before effects" {
+    const sources = [_][:0]const u8{
+        "{ :; } >first >second",
+        "{ :; } <<<payload",
+    };
+    for (sources) |source| {
+        var hir = try generate(source);
+        defer hir.deinit(std.testing.allocator);
+        var fake = FakeHost.init(std.testing.allocator);
+        defer fake.deinit();
+        var diagnostics: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer diagnostics.deinit();
+
+        const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+            .context = .{
+                .sandbox = .{ .restrict = .{} },
+                .io = .{ .stderr = &diagnostics.writer },
+            },
+        }).execute(hir);
+
+        try std.testing.expectEqual(@as(u8, 126), result.status);
+        try std.testing.expectEqualStrings("required sandbox unavailable\n", diagnostics.written());
+        try std.testing.expectEqual(@as(usize, 0), fake.open_file_calls.items.len);
+        try std.testing.expectEqual(@as(usize, 0), fake.create_input_calls.items.len);
+    }
 }
 
 test "reports partial best-effort sandbox coverage" {

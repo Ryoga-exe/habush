@@ -28,6 +28,8 @@ pub fn main(init: std.process.Init) !habush.runtime.ExitStatus {
     const stderr = &stderr_writer.interface;
 
     const args = try init.minimal.args.toSlice(arena);
+    if (args.len >= 2 and std.mem.eql(u8, args[1], habush.worker.argument))
+        return habush.worker.run(init, args[2..]);
     const invocation = Invocation.parse(args) orelse {
         try stderr.print("habush: usage: {s}\n", .{Invocation.usage});
         return 2;
@@ -63,16 +65,37 @@ pub fn main(init: std.process.Init) !habush.runtime.ExitStatus {
     else
         .{};
 
+    const worker_executable: ?[:0]u8 = if (builtin.os.tag == .windows)
+        null
+    else
+        try std.process.executablePathAlloc(io, gpa);
+    defer if (worker_executable) |path| gpa.free(path);
     var system_host: habush.Host.System = .{
         .gpa = gpa,
         .io = io,
         .environ_map = init.environ_map,
+        .worker_executable = worker_executable,
     };
     defer system_host.deinit();
     var system_resolver = habush.CommandResolver.System.init(io, resolver_options);
-    var session = try habush.Session.init(gpa, system_host.host(), .{
-        .job_control = interactive and system_host.host().capabilities().terminal_control,
-        .resolver = system_resolver.resolver(),
+    var concurrent_host: ?habush.concurrent.Host = habush.concurrent.Host.init(
+        gpa,
+        system_host.host(),
+        io,
+    ) catch |err| switch (err) {
+        error.Unsupported => null,
+        else => return err,
+    };
+    defer if (concurrent_host) |*adapter| adapter.deinit();
+    var concurrent_resolver: habush.concurrent.Resolver = .{
+        .inner = system_resolver.resolver(),
+        .io = io,
+    };
+    const runtime_host = if (concurrent_host) |*adapter| adapter.host() else system_host.host();
+    var session = try habush.Session.init(gpa, runtime_host, .{
+        .job_control = interactive and runtime_host.capabilities().terminal_control,
+        .concurrent_pipeline = if (concurrent_host != null) .{ .io = io, .allocator = gpa } else null,
+        .resolver = concurrent_resolver.resolver(),
         .invocation_name = invocation_name,
         .shell_process_id = platform.processId(),
         .positional_parameters = positional_parameters,

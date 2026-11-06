@@ -4,17 +4,16 @@
 //! lists, and-or commands, pipeline negation, brace groups, if clauses,
 //! while/until/for loops with break/continue control, standalone assignments,
 //! builtins, external simple commands, and foreground pipelines of external
-//! simple commands, builtins, and at most one
-//! general in-process stage such as `read`, a shell function, or a compound command.
-//! Standard-stream redirections are supported for simple and compound
-//! commands, including here-documents and here-strings. Background execution
-//! and pipelines containing multiple general in-process stages remain explicit
-//! `UnsupportedInstruction` boundaries.
+//! simple commands, builtins, and in-process stages such as `read`, shell
+//! functions, and compound commands. Standard-stream redirections support
+//! simple and compound commands, including here-documents and here-strings.
+//! Multiple in-process pipeline stages require the opt-in concurrent runtime.
 
 const std = @import("std");
 const Builtin = @import("Builtin.zig");
 const CommandPlan = @import("CommandPlan.zig");
 const CommandResolver = @import("CommandResolver.zig");
+const ConcurrentWriter = @import("concurrent/Writer.zig");
 const Executor = @This();
 const ExecutionContext = @import("ExecutionContext.zig");
 const Expander = @import("Expander.zig");
@@ -44,6 +43,8 @@ last_status: runtime.ExitStatus,
 jobs: ?*runtime.Jobs = null,
 background: bool = false,
 job_control: bool = false,
+concurrent_pipeline: ?ConcurrentPipeline = null,
+cancel_io: ?std.Io = null,
 loop_depth: u32,
 function_depth: u32,
 
@@ -58,10 +59,20 @@ pub const Error = Builtin.Error || Host.Error || Expander.Error || CommandResolv
     UnexpectedTermination,
     VariableStateUnavailable,
     FunctionStateUnavailable,
+    Canceled,
+};
+
+/// Opt-in scheduling resources for multiple in-process pipeline stages.
+/// `allocator` must be safe for concurrent use. The Host and resolver must
+/// also be shared through synchronization adapters for this execution.
+pub const ConcurrentPipeline = struct {
+    io: std.Io,
+    allocator: std.mem.Allocator,
 };
 
 pub const Options = struct {
     context: ExecutionContext.View = .{},
+    concurrent_pipeline: ?ConcurrentPipeline = null,
     resolver: ?CommandResolver = null,
     /// Used only when neither the command bindings nor shell variables set PATH.
     default_search_path: []const []const u8 = &.{},
@@ -137,32 +148,57 @@ const PipelineStagePreparation = union(enum) {
 const PreparedPipelineStage = struct {
     index: Hir.Inst.Index,
     plan: ?PipelineStagePlan = null,
+    arena: ?std.heap.ArenaAllocator = null,
+    stdout_writer: ?ConcurrentWriter = null,
+    stderr_writer: ?ConcurrentWriter = null,
     state: ?runtime.State = null,
     variables: ?VariableStore = null,
     context: ?ExecutionContext = null,
     jobs: ?runtime.Jobs = null,
 
-    fn deinit(stage: *PreparedPipelineStage) void {
-        if (stage.jobs) |*jobs| {
-            jobs.cancelAll();
-            jobs.deinit();
+    fn finishJobs(stage: *PreparedPipelineStage, cancel_io: ?std.Io) void {
+        const jobs = if (stage.jobs) |*owned| owned else return;
+        const previous_protection = if (cancel_io) |io|
+            io.swapCancelProtection(.blocked)
+        else
+            null;
+        defer {
+            if (previous_protection) |previous|
+                _ = cancel_io.?.swapCancelProtection(previous);
         }
+        jobs.cancelAll();
+        jobs.deinit();
+        stage.jobs = null;
+    }
+
+    fn deinit(stage: *PreparedPipelineStage) void {
+        stage.finishJobs(null);
         if (stage.state) |*state| state.deinit();
         if (stage.variables) |*variables| variables.deinit();
         if (stage.context) |*context| context.deinit();
+        if (stage.arena) |*arena| arena.deinit();
     }
 
     fn executor(stage: *PreparedPipelineStage, base: Executor) Executor {
         var result = base;
+        if (stage.arena) |*arena| result.gpa = arena.allocator();
         if (stage.state) |*state| result.runtime_state = state;
         if (stage.variables) |*variables| result.variables = variables;
-        if (stage.context) |*context| result.context = .{ .mutable = context };
+        if (stage.context) |*context| {
+            result.context = .{ .mutable = context };
+            result.io = context.io;
+        }
         result.jobs = if (stage.jobs) |*jobs| jobs else null;
         result.prepared_simple = if (stage.plan) |plan| switch (plan) {
             .simple => |simple| simple,
             .definition, .compound => null,
         } else null;
         return result;
+    }
+
+    fn allocator(stage: *PreparedPipelineStage, fallback: std.mem.Allocator) std.mem.Allocator {
+        if (stage.arena) |*arena| return arena.allocator();
+        return fallback;
     }
 };
 
@@ -183,6 +219,7 @@ pub fn initWithOptions(gpa: std.mem.Allocator, host: Host, options: Options) Exe
         .positional_parameters_override = null,
         .variables = options.variables,
         .runtime_state = null,
+        .concurrent_pipeline = options.concurrent_pipeline,
         .io = options.context.io,
         .scoped_file_actions = &.{},
         .pipeline_stage = null,
@@ -232,6 +269,7 @@ pub fn execute(executor: Executor, hir: Hir) Error!Result {
 }
 
 fn executeInstruction(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
+    if (executor.cancel_io) |io| try io.checkCancel();
     if (executor.background) {
         if (executor.jobs == null) return error.UnsupportedInstruction;
         switch (hir.instructionTag(index)) {
@@ -594,14 +632,36 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
 
     const prepared = try allocator.alloc(PreparedPipelineStage, stages.items.len);
     for (prepared, stages.items) |*stage, stage_index| stage.* = .{ .index = stage_index };
-    defer for (prepared) |*stage| stage.deinit();
+    var prepared_owned = true;
+    defer if (prepared_owned) for (prepared) |*stage| stage.deinit();
+    var writer_mutex: std.Io.Mutex = .init;
     var in_process_count: usize = 0;
+    var non_external_count: usize = 0;
     var upstream_builtin = false;
     for (prepared) |*stage| {
-        stage.jobs = .{ .gpa = executor.gpa };
-        stage.context = try executor.context.clone(executor.gpa);
-        if (executor.runtime_state) |state| stage.state = try state.clone();
-        if (executor.variables) |variables| stage.variables = try variables.clone(executor.gpa);
+        if (executor.concurrent_pipeline) |config|
+            stage.arena = std.heap.ArenaAllocator.init(config.allocator);
+        const stage_allocator = stage.allocator(executor.gpa);
+        stage.jobs = .{ .gpa = stage_allocator };
+        stage.context = try executor.context.clone(stage_allocator);
+        // A surrounding compound redirection changes the current executor's
+        // streams without replacing the session's context. Stage snapshots
+        // must inherit those effective streams.
+        stage.context.?.io = executor.io;
+        if (executor.concurrent_pipeline) |config| {
+            if (stage.context.?.io.stdout) |stdout| {
+                stage.stdout_writer = ConcurrentWriter.init(stdout, &writer_mutex, config.io);
+                stage.context.?.io.stdout = &stage.stdout_writer.?.interface;
+            }
+            if (stage.context.?.io.stderr) |stderr| {
+                stage.stderr_writer = ConcurrentWriter.init(stderr, &writer_mutex, config.io);
+                stage.context.?.io.stderr = &stage.stderr_writer.?.interface;
+            }
+        }
+        if (executor.runtime_state) |state|
+            stage.state = try state.cloneWithAllocator(stage_allocator);
+        if (executor.variables) |variables|
+            stage.variables = try variables.clone(stage_allocator);
         const stage_executor = stage.executor(executor);
         const plan = switch (try stage_executor.preparePipelineStage(hir, stage.index, allocator)) {
             .ready => |value| value,
@@ -609,14 +669,17 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
         };
         stage.plan = plan;
         if (plan.kind() == .in_process) in_process_count += 1;
-        if (plan.kind() == .in_process and upstream_builtin) return error.UnsupportedInstruction;
+        if (plan.kind() != .external) non_external_count += 1;
+        if (plan.kind() == .in_process and upstream_builtin and executor.concurrent_pipeline == null)
+            return error.UnsupportedInstruction;
         if (plan.kind() == .builtin) upstream_builtin = true;
         if (executor.background and plan.kind() != .external) return error.UnsupportedInstruction;
     }
     // A general in-process stage may read from its pipeline input. External
     // neighbours are launched first so one such stage can run synchronously;
     // two such stages require a concurrent runtime scheduler.
-    if (in_process_count > 1) return error.UnsupportedInstruction;
+    if (in_process_count > 1 and executor.concurrent_pipeline == null)
+        return error.UnsupportedInstruction;
 
     var pipeline = Pipeline.init(executor.gpa, executor.host, stages.items.len) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -625,10 +688,36 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
         else => |other| return other,
     };
     var transferred = false;
-    defer if (!transferred) pipeline.deinit();
+    defer {
+        // This pipeline can itself be a stage of a canceled outer pipeline.
+        // Its children and stage-local jobs must still be killed and reaped.
+        const previous_protection = if (executor.cancel_io) |io|
+            io.swapCancelProtection(.blocked)
+        else
+            null;
+        defer {
+            if (previous_protection) |previous|
+                _ = executor.cancel_io.?.swapCancelProtection(previous);
+        }
+        // Stage-local jobs can inherit an outer pipe end. Terminate them
+        // before waiting for the outer pipeline to drain.
+        for (prepared) |*stage| stage.deinit();
+        prepared_owned = false;
+        if (!transferred) pipeline.deinit();
+    }
     const foreground_job = !executor.background and in_process_count == 0 and !upstream_builtin and
         executor.jobs != null and executor.jobs.?.terminal_control;
     pipeline.create_group = (executor.background or foreground_job) and executor.host.capabilities().process_groups;
+
+    if (executor.concurrent_pipeline) |config| {
+        if (non_external_count > 1) return executor.executeConcurrentPipeline(
+            hir,
+            prepared,
+            pipe_stderr.items,
+            &pipeline,
+            config,
+        );
+    }
 
     var result: Result = .{ .status = 0, .sandbox_coverage = .not_requested };
     const phase_count: usize = if (in_process_count == 0) 1 else 2;
@@ -653,7 +742,9 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
                 .pipeline = &pipeline,
                 .index = stage_index,
             };
-            var stage_result = stage_executor.executeInstruction(hir, prepared[stage_index].index) catch |err| switch (err) {
+            const executed = stage_executor.executeInstruction(hir, prepared[stage_index].index);
+            prepared[stage_index].finishJobs(stage_executor.cancel_io);
+            var stage_result = executed catch |err| switch (err) {
                 // A non-final in-process stage observes a closed pipeline as a
                 // command failure, not as an executor infrastructure failure.
                 error.WriteFailed => if (stage_index + 1 == stages.items.len)
@@ -693,6 +784,182 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
         if (try pipeline.wait(stage_index)) |termination| {
             const status = try terminationStatus(termination);
             if (stage_index + 1 == stages.items.len) result.status = status;
+        }
+    }
+    return result;
+}
+
+const ConcurrentStageTask = struct {
+    index: usize,
+    base: Executor,
+    hir: Hir,
+    stage: *PreparedPipelineStage,
+    pipeline: *Pipeline,
+    pipe_stderr: bool,
+    gate: *std.Io.Event,
+    abort: *std.atomic.Value(bool),
+    completions: *std.Io.Queue(usize),
+    io: std.Io,
+    outcome: ?Error!Result = null,
+
+    fn run(task: *ConcurrentStageTask) std.Io.Cancelable!void {
+        task.gate.waitUncancelable(task.io);
+        if (task.abort.load(.acquire)) return;
+
+        const stage_index = task.index;
+        var stage_executor = task.stage.executor(task.base);
+        const connections = task.pipeline.stage(stage_index);
+        stage_executor.pipeline_stage = .{
+            .input = connections.input,
+            .output = connections.output,
+            .pipe_stderr = task.pipe_stderr,
+            .pipeline = task.pipeline,
+            .index = stage_index,
+        };
+        stage_executor.cancel_io = task.io;
+        const executed = stage_executor.executeInstruction(task.hir, task.stage.index);
+        task.stage.finishJobs(task.io);
+        if (executed) |completed| {
+            var result = completed;
+            result.control_flow = .none;
+            task.outcome = result;
+        } else |err| {
+            task.outcome = if (err == error.WriteFailed and stage_index + 1 < task.pipeline.stageCount())
+                Result{ .status = 1, .sandbox_coverage = .not_requested }
+            else
+                err;
+        }
+        // The owning stage closes its ends before publishing completion. The
+        // coordinator never frees a live task's borrowed resource reader.
+        task.pipeline.closeStage(stage_index);
+        task.completions.putOneUncancelable(task.io, stage_index) catch unreachable;
+    }
+};
+
+fn executeConcurrentPipeline(
+    executor: Executor,
+    hir: Hir,
+    prepared: []PreparedPipelineStage,
+    pipe_stderr: []const bool,
+    pipeline: *Pipeline,
+    config: ConcurrentPipeline,
+) Error!Result {
+    var task_count: usize = 0;
+    var requires_signals = false;
+    for (prepared) |stage| {
+        if (stage.plan.?.kind() != .external) task_count += 1;
+        switch (stage.plan.?) {
+            .simple => |simple| switch (simple.command) {
+                .external, .function => requires_signals = true,
+                .builtin => {},
+            },
+            .compound => requires_signals = true,
+            .definition => {},
+        }
+    }
+    if (requires_signals and !executor.host.capabilities().signals)
+        return error.UnsupportedInstruction;
+
+    var arena = std.heap.ArenaAllocator.init(executor.gpa);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const task_slots = try allocator.alloc(ConcurrentStageTask, task_count);
+    const completion_buffer = try allocator.alloc(usize, task_count);
+    var completions = std.Io.Queue(usize).init(completion_buffer);
+    const results = try allocator.alloc(?Result, prepared.len);
+    @memset(results, null);
+    var gate: std.Io.Event = .unset;
+    var abort: std.atomic.Value(bool) = .init(false);
+    var group: std.Io.Group = .init;
+    var joined = false;
+    var gate_open = false;
+    defer if (!joined) {
+        if (!gate_open) {
+            abort.store(true, .release);
+            gate.set(config.io);
+        }
+        pipeline.signal(.kill) catch {};
+        group.cancel(config.io);
+    };
+
+    var next_task: usize = 0;
+    for (prepared, 0..) |*stage, stage_index| {
+        if (stage.plan.?.kind() == .external) continue;
+        task_slots[next_task] = .{
+            .index = stage_index,
+            .base = executor,
+            .hir = hir,
+            .stage = stage,
+            .pipeline = pipeline,
+            .pipe_stderr = stage_index < pipe_stderr.len and pipe_stderr[stage_index],
+            .gate = &gate,
+            .abort = &abort,
+            .completions = &completions,
+            .io = config.io,
+        };
+        group.concurrent(config.io, ConcurrentStageTask.run, .{&task_slots[next_task]}) catch
+            return error.UnsupportedInstruction;
+        next_task += 1;
+    }
+
+    // Workers are gated, so all external stages can be spawned without a
+    // concurrent Host operation or an in-process consumer observing partial
+    // pipeline setup.
+    var remaining = prepared.len;
+    while (remaining != 0) {
+        remaining -= 1;
+        if (prepared[remaining].plan.?.kind() != .external) continue;
+        var stage_executor = prepared[remaining].executor(executor);
+        const connections = pipeline.stage(remaining);
+        stage_executor.pipeline_stage = .{
+            .input = connections.input,
+            .output = connections.output,
+            .pipe_stderr = remaining < pipe_stderr.len and pipe_stderr[remaining],
+            .pipeline = pipeline,
+            .index = remaining,
+        };
+        var stage_result = try stage_executor.executeInstruction(hir, prepared[remaining].index);
+        stage_result.control_flow = .none;
+        results[remaining] = stage_result;
+        pipeline.closeStage(remaining);
+    }
+
+    gate.set(config.io);
+    gate_open = true;
+    for (0..task_count) |_| {
+        const stage_index = completions.getOne(config.io) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.Closed => unreachable,
+        };
+        const task = for (task_slots) |*candidate| {
+            if (candidate.index == stage_index) break candidate;
+        } else unreachable;
+        if (task.outcome.?) |stage_result| {
+            results[stage_index] = stage_result;
+        } else |err| {
+            return err;
+        }
+    }
+    try group.await(config.io);
+    joined = true;
+
+    var result: Result = .{ .status = 0, .sandbox_coverage = .not_requested };
+    for (prepared, 0..) |_, stage_index| {
+        const stage_result = results[stage_index].?;
+        if (stage_index + 1 == prepared.len) result.status = stage_result.status;
+        result.sandbox_coverage = combineSandboxCoverage(
+            result.sandbox_coverage,
+            stage_result.sandbox_coverage,
+        );
+    }
+    for (prepared, 0..) |_, stage_index| {
+        const termination = pipeline.wait(stage_index) catch |err| {
+            pipeline.signal(.kill) catch {};
+            return err;
+        };
+        if (termination) |value| {
+            if (stage_index + 1 == prepared.len)
+                result.status = try terminationStatus(value);
         }
     }
     return result;
@@ -944,6 +1211,8 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
     if (executor.background and !executor.job_control and
         (executor.pipeline_stage == null or executor.pipeline_stage.?.input == null))
     {
+        if (executor.activeSandbox() == .restrict)
+            return executor.commandFailure(argv.items[0], .{ .cannot_execute = .sandbox_unavailable });
         const input = try executor.host.createInput(&.{});
         redirect_resources.append(allocator, input) catch |err| {
             executor.host.closeResource(input);
@@ -1023,8 +1292,24 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
             .sandbox_coverage = spawned.sandbox_coverage,
         };
     }
+    const termination = executor.host.wait(spawned.process) catch |err| {
+        // A cancelled in-process pipeline stage may interrupt its nested wait.
+        // The child is still host-owned; stop it and make one final reap attempt
+        // before the stage releases its redirection resources.
+        const previous_protection = if (executor.cancel_io) |io|
+            io.swapCancelProtection(.blocked)
+        else
+            null;
+        defer {
+            if (previous_protection) |previous|
+                _ = executor.cancel_io.?.swapCancelProtection(previous);
+        }
+        executor.host.signal(spawned.process, .kill) catch {};
+        _ = executor.host.wait(spawned.process) catch {};
+        return err;
+    };
     return .{
-        .status = try terminationStatus(try executor.host.wait(spawned.process)),
+        .status = try terminationStatus(termination),
         .sandbox_coverage = spawned.sandbox_coverage,
     };
 }
@@ -1194,6 +1479,10 @@ fn appendInputResource(
     actions: *std.ArrayList(CommandPlan.FileAction),
     resources: *std.ArrayList(CommandPlan.Resource),
 ) Error!?Result {
+    // Host.createInput may create a temporary file in the shell process.
+    // A child-only sandbox cannot constrain that preparation step.
+    if (executor.activeSandbox() == .restrict)
+        return try executor.redirectFailure(.{ .cannot_execute = .sandbox_unavailable });
     try actions.ensureUnusedCapacity(allocator, 1);
     try resources.ensureUnusedCapacity(allocator, 1);
     const resource = executor.host.createInput(bytes) catch |err| switch (err) {
@@ -1215,6 +1504,12 @@ fn beginRedirections(
     owned_resources: *std.ArrayList(CommandPlan.Resource),
     allocator: std.mem.Allocator,
 ) Error!RedirectionStart {
+    // Opens happen in the shell process. Check every action before performing
+    // any of them so a later open cannot leave an earlier one behind.
+    if (executor.activeSandbox() == .restrict) for (actions) |action| {
+        if (action == .open)
+            return .{ .failed = try executor.redirectFailure(.{ .cannot_execute = .sandbox_unavailable }) };
+    };
     var scoped_executor = executor;
     var resources = owned_resources.*;
     owned_resources.* = .empty;
