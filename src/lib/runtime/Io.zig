@@ -4,8 +4,9 @@ const std = @import("std");
 const Diagnostic = @import("Diagnostic.zig");
 const Io = @This();
 
-/// A null stream discards output. Non-null writers must remain valid for every
-/// execution using this value.
+/// A null output stream discards output. A null input stream is at EOF.
+/// Non-null streams are borrowed and must remain valid during execution.
+stdin: ?*std.Io.Reader = null,
 stdout: ?*std.Io.Writer = null,
 stderr: ?*std.Io.Writer = null,
 diagnostic_options: Diagnostic.RenderOptions = .{},

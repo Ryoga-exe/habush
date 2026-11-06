@@ -20,6 +20,7 @@ pub const Tag = enum {
     cd,
     exit,
     pwd,
+    read,
     @"return",
     @"export",
     unset,
@@ -30,6 +31,9 @@ pub const PipelineSupport = enum {
     /// The builtin does not consume pipeline input. It may write output after
     /// the downstream stage has been launched.
     no_stdin,
+    /// The builtin may block on pipeline input, so it requires the single
+    /// general in-process stage slot in the current pipeline executor.
+    reads_stdin,
 };
 
 pub const Result = struct {
@@ -63,6 +67,7 @@ const definitions = std.StaticStringMap(Builtin).initComptime(.{
     .{ "cd", Builtin{ .tag = .cd, .pipeline_support = .no_stdin } },
     .{ "exit", Builtin{ .tag = .exit, .special = true, .pipeline_support = .no_stdin } },
     .{ "pwd", Builtin{ .tag = .pwd, .pipeline_support = .no_stdin } },
+    .{ "read", Builtin{ .tag = .read, .pipeline_support = .reads_stdin } },
     .{ "return", Builtin{ .tag = .@"return", .special = true, .pipeline_support = .no_stdin } },
     .{ "export", Builtin{ .tag = .@"export", .special = true, .pipeline_support = .no_stdin } },
     .{ "unset", Builtin{ .tag = .unset, .special = true, .pipeline_support = .no_stdin } },
@@ -86,6 +91,7 @@ pub fn run(builtin: Builtin, context: Context, argv: []const []const u8) Error!R
         .cd => runCd(context, argv),
         .exit => runExit(context, argv),
         .pwd => runPwd(context, argv),
+        .read => runRead(context, argv),
         .@"return" => runReturn(context, argv),
         .@"export" => runExport(context, argv),
         .unset => runUnset(context, argv),
@@ -234,6 +240,160 @@ fn runPwd(context: Context, argv: []const []const u8) Error!Result {
     return .{ .status = 0 };
 }
 
+fn runRead(context: Context, argv: []const []const u8) Error!Result {
+    const state = context.runtime_state orelse return error.RuntimeStateUnavailable;
+    var operand_index: usize = 1;
+    var raw = false;
+    while (operand_index < argv.len) : (operand_index += 1) {
+        const operand = argv[operand_index];
+        if (std.mem.eql(u8, operand, "--")) {
+            operand_index += 1;
+            break;
+        }
+        if (std.mem.eql(u8, operand, "-r")) {
+            raw = true;
+            continue;
+        }
+        if (operand.len != 0 and operand[0] == '-')
+            return commandFailure(context, argv[0], .{ .unsupported_option = operand });
+        break;
+    }
+    // A name is required by POSIX. REPLY is the usual shell extension for an
+    // omitted name and keeps `read` useful at the interactive prompt.
+    const use_reply = operand_index == argv.len;
+    const names: []const []const u8 = if (use_reply)
+        &.{"REPLY"}
+    else
+        argv[operand_index..];
+    for (names) |name| {
+        if (!VariableStore.isValidName(name))
+            return commandFailure(context, argv[0], .{ .invalid_name = name });
+    }
+
+    var input: ReadInput = .{};
+    defer input.deinit(state.allocator());
+    const complete = if (context.io.stdin) |reader|
+        try input.readLine(state.allocator(), reader, raw)
+    else
+        false;
+
+    if (use_reply) {
+        try setVariable(state, "REPLY", input.bytes.items);
+        return .{ .status = if (complete) 0 else 1 };
+    }
+
+    const ifs = variable(context, "IFS") orelse " \t\n";
+    var values: std.ArrayList([]const u8) = .empty;
+    defer values.deinit(state.allocator());
+    try values.ensureTotalCapacity(state.allocator(), names.len);
+    var cursor: usize = 0;
+    for (names, 0..) |_, index| {
+        const value = if (index + 1 == names.len)
+            input.remainingField(&cursor, ifs)
+        else
+            input.nextField(&cursor, ifs);
+        values.appendAssumeCapacity(value);
+    }
+    // Split every field before updating variables: assigning to IFS itself
+    // can invalidate the borrowed separator value.
+    for (names, values.items) |name, value| try setVariable(state, name, value);
+    return .{ .status = if (complete) 0 else 1 };
+}
+
+const ReadInput = struct {
+    bytes: std.ArrayList(u8) = .empty,
+    escaped: std.ArrayList(bool) = .empty,
+
+    fn deinit(input: *ReadInput, allocator: std.mem.Allocator) void {
+        input.bytes.deinit(allocator);
+        input.escaped.deinit(allocator);
+    }
+
+    /// Returns true only when a logical line ended with an unescaped newline.
+    /// A partial final line still assigns its fields but gives read status 1.
+    fn readLine(
+        input: *ReadInput,
+        allocator: std.mem.Allocator,
+        reader: *std.Io.Reader,
+        raw: bool,
+    ) std.mem.Allocator.Error!bool {
+        var pending_escape = false;
+        while (true) {
+            const byte = reader.takeByte() catch break;
+            if (!raw and pending_escape) {
+                pending_escape = false;
+                if (byte == '\n') continue;
+                try input.append(allocator, byte, true);
+                continue;
+            }
+            if (byte == '\n') return true;
+            if (!raw and byte == '\\') {
+                pending_escape = true;
+                continue;
+            }
+            try input.append(allocator, byte, false);
+        }
+        if (pending_escape) try input.append(allocator, '\\', false);
+        return false;
+    }
+
+    fn append(input: *ReadInput, allocator: std.mem.Allocator, byte: u8, is_escaped: bool) std.mem.Allocator.Error!void {
+        try input.bytes.append(allocator, byte);
+        try input.escaped.append(allocator, is_escaped);
+    }
+
+    fn nextField(input: ReadInput, cursor: *usize, ifs: []const u8) []const u8 {
+        cursor.* = input.skipWhitespace(cursor.*, ifs);
+        if (cursor.* == input.bytes.items.len) return "";
+        if (input.separator(cursor.*, ifs) == .other) {
+            cursor.* = input.skipWhitespace(cursor.* + 1, ifs);
+            return "";
+        }
+
+        const start = cursor.*;
+        while (cursor.* < input.bytes.items.len and input.separator(cursor.*, ifs) == .none)
+            cursor.* += 1;
+        const end = cursor.*;
+        if (cursor.* < input.bytes.items.len) {
+            const kind = input.separator(cursor.*, ifs);
+            cursor.* = input.skipWhitespace(cursor.*, ifs);
+            if (kind == .other or
+                (cursor.* < input.bytes.items.len and input.separator(cursor.*, ifs) == .other))
+            {
+                cursor.* += 1;
+                cursor.* = input.skipWhitespace(cursor.*, ifs);
+            }
+        }
+        return input.bytes.items[start..end];
+    }
+
+    fn remainingField(input: ReadInput, cursor: *usize, ifs: []const u8) []const u8 {
+        cursor.* = input.skipWhitespace(cursor.*, ifs);
+        var end = input.bytes.items.len;
+        while (end > cursor.* and input.separator(end - 1, ifs) == .whitespace)
+            end -= 1;
+        return input.bytes.items[cursor.*..end];
+    }
+
+    const Separator = enum { none, whitespace, other };
+
+    fn separator(input: ReadInput, index: usize, ifs: []const u8) Separator {
+        if (input.escaped.items[index] or std.mem.indexOfScalar(u8, ifs, input.bytes.items[index]) == null)
+            return .none;
+        return switch (input.bytes.items[index]) {
+            ' ', '\t', '\n' => .whitespace,
+            else => .other,
+        };
+    }
+
+    fn skipWhitespace(input: ReadInput, start: usize, ifs: []const u8) usize {
+        var index = start;
+        while (index < input.bytes.items.len and input.separator(index, ifs) == .whitespace)
+            index += 1;
+        return index;
+    }
+};
+
 fn runExport(context: Context, argv: []const []const u8) Error!Result {
     const state = context.runtime_state orelse return error.RuntimeStateUnavailable;
     var status: runtime.ExitStatus = 0;
@@ -368,6 +528,8 @@ test "looks up core builtins by command name" {
     try std.testing.expect(lookup("true").?.supportsPipeline());
     try std.testing.expect(lookup("false").?.supportsPipeline());
     try std.testing.expect(lookup("pwd").?.supportsPipeline());
+    try std.testing.expect(lookup("read").?.supportsPipeline());
+    try std.testing.expectEqual(PipelineSupport.reads_stdin, lookup("read").?.pipeline_support);
     try std.testing.expect(lookup("cd").?.supportsPipeline());
     try std.testing.expect(lookup("export").?.supportsPipeline());
     try std.testing.expect(lookup("unset").?.supportsPipeline());
@@ -381,6 +543,68 @@ test "runs status-only core builtins" {
     try std.testing.expectEqual(@as(u8, 0), (try lookup(":").?.run(.{}, &.{":"})).status);
     try std.testing.expectEqual(@as(u8, 0), (try lookup("true").?.run(.{}, &.{"true"})).status);
     try std.testing.expectEqual(@as(u8, 1), (try lookup("false").?.run(.{}, &.{"false"})).status);
+}
+
+test "read splits IFS fields and assigns the remaining input to the last name" {
+    var state = try runtime.State.init(std.testing.allocator, .{});
+    defer state.deinit();
+    try state.setVariable("IFS", ":");
+    var input: std.Io.Reader = .fixed("first:second:third\nnext:tail\n  reply  \n");
+    const context: Context = .{ .runtime_state = &state, .io = .{ .stdin = &input } };
+
+    try std.testing.expectEqual(@as(u8, 0), (try lookup("read").?.run(
+        context,
+        &.{ "read", "FIRST", "REST" },
+    )).status);
+    try std.testing.expectEqualStrings("first", state.variable("FIRST").?);
+    try std.testing.expectEqualStrings("second:third", state.variable("REST").?);
+
+    // The input is read through the same reader on the next invocation.
+    try std.testing.expectEqual(@as(u8, 0), (try lookup("read").?.run(
+        context,
+        &.{ "read", "NEXT" },
+    )).status);
+    try std.testing.expectEqualStrings("next:tail", state.variable("NEXT").?);
+
+    try std.testing.expectEqual(@as(u8, 0), (try lookup("read").?.run(
+        context,
+        &.{"read"},
+    )).status);
+    try std.testing.expectEqualStrings("  reply  ", state.variable("REPLY").?);
+}
+
+test "read handles escaped separators, raw input, continuation, and partial EOF" {
+    var state = try runtime.State.init(std.testing.allocator, .{});
+    defer state.deinit();
+    var input: std.Io.Reader = .fixed("a\\ b c\nnext\\\ncontinued word\nraw\\ text\npartial");
+    const context: Context = .{ .runtime_state = &state, .io = .{ .stdin = &input } };
+
+    try std.testing.expectEqual(@as(u8, 0), (try lookup("read").?.run(
+        context,
+        &.{ "read", "FIRST", "SECOND" },
+    )).status);
+    try std.testing.expectEqualStrings("a b", state.variable("FIRST").?);
+    try std.testing.expectEqualStrings("c", state.variable("SECOND").?);
+
+    try std.testing.expectEqual(@as(u8, 0), (try lookup("read").?.run(
+        context,
+        &.{ "read", "CONTINUED", "WORD" },
+    )).status);
+    try std.testing.expectEqualStrings("nextcontinued", state.variable("CONTINUED").?);
+    try std.testing.expectEqualStrings("word", state.variable("WORD").?);
+
+    try std.testing.expectEqual(@as(u8, 0), (try lookup("read").?.run(
+        context,
+        &.{ "read", "-r", "RAW", "TAIL" },
+    )).status);
+    try std.testing.expectEqualStrings("raw\\", state.variable("RAW").?);
+    try std.testing.expectEqualStrings("text", state.variable("TAIL").?);
+
+    try std.testing.expectEqual(@as(u8, 1), (try lookup("read").?.run(
+        context,
+        &.{ "read", "PARTIAL" },
+    )).status);
+    try std.testing.expectEqualStrings("partial", state.variable("PARTIAL").?);
 }
 
 test "break and continue request loop control" {
