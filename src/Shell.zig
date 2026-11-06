@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const habush = @import("habush");
+const ShellIntegration = @import("terminal/ShellIntegration.zig");
 const Io = std.Io;
 const Shell = @This();
 
@@ -12,6 +13,7 @@ stdin: *Io.Reader,
 stderr: *Io.Writer,
 session: *habush.Session,
 interactive: bool,
+integration: ?ShellIntegration = null,
 input_line: usize = 0,
 
 pub fn run(self: *Shell) !habush.runtime.ExitStatus {
@@ -24,20 +26,33 @@ fn runInput(self: *Shell, source_name: ?[]const u8) !habush.runtime.ExitStatus {
         defer input.deinit(self.allocator);
 
         if (input.incomplete_here_document) {
+            try self.beginCommand(true);
+            var command_open = true;
+            errdefer if (command_open) self.endCommand(null) catch {};
             try self.stderr.writeAll("habush: incomplete here-document\n");
             self.session.rejectInput();
+            command_open = false;
+            try self.endCommand(2);
             continue;
         }
         if (std.mem.trim(u8, input.source, &std.ascii.whitespace).len == 0) {
             continue;
         }
 
-        switch (try self.handleInput(
+        try self.beginCommand(input.emit_execution_marks);
+        var command_open = input.emit_execution_marks;
+        errdefer if (command_open) self.endCommand(null) catch {};
+        const control_flow = try self.handleInput(
             input.source,
             input.here_documents,
             source_name,
             input.source_line,
-        )) {
+        );
+        if (command_open) {
+            command_open = false;
+            try self.endCommand(self.session.lastResult().status);
+        }
+        switch (control_flow) {
             .none => continue,
             .exit => return self.session.lastResult().status,
             .@"return", .@"break", .@"continue" => unreachable,
@@ -78,6 +93,7 @@ const CommandInput = struct {
     here_documents: []habush.heredoc.Collected,
     incomplete_here_document: bool,
     source_line: usize,
+    emit_execution_marks: bool = true,
 
     fn deinit(input: *CommandInput, allocator: std.mem.Allocator) void {
         allocator.free(input.source);
@@ -170,6 +186,7 @@ fn readCommand(self: *Shell) !?CommandInput {
             .here_documents = try documents.toOwnedSlice(self.allocator),
             .incomplete_here_document = false,
             .source_line = source_line,
+            .emit_execution_marks = !inspection.empty,
         };
         continuation = true;
     }
@@ -178,6 +195,7 @@ fn readCommand(self: *Shell) !?CommandInput {
 const CommandInspection = struct {
     errors: bool,
     incomplete: bool,
+    empty: bool,
     ready_here_document_count: usize,
     here_documents: []HereDocumentMetadata,
 
@@ -226,6 +244,8 @@ fn inspectCommand(
     return .{
         .errors = tree.errors.len != 0,
         .incomplete = tree.status == .incomplete,
+        .empty = tree.errors.len == 0 and tree.status == .complete and
+            tree.nodeData(.root).opt_node == .none,
         .ready_here_document_count = tree.ready_here_document_count,
         .here_documents = metadata,
     };
@@ -281,8 +301,25 @@ fn readInputLine(self: *Shell) !?[:0]u8 {
 }
 
 fn printPrompt(self: *Shell, continuation: bool) !void {
+    if (!continuation) {
+        if (self.integration) |*integration|
+            try integration.beginPrompt(self.session.workingDirectory());
+    }
     try self.stderr.writeAll(if (continuation) "> " else "habush> ");
+    if (!continuation) {
+        if (self.integration) |*integration| try integration.endPrompt();
+    }
     try self.stderr.flush();
+}
+
+fn beginCommand(self: *Shell, emit: bool) !void {
+    if (!self.interactive or !emit) return;
+    if (self.integration) |*integration| try integration.beginCommand();
+}
+
+fn endCommand(self: *Shell, status: ?u8) !void {
+    if (!self.interactive) return;
+    if (self.integration) |*integration| try integration.endCommand(status);
 }
 
 fn handleInput(

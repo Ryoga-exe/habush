@@ -4,6 +4,7 @@ const habush = @import("habush");
 const Io = std.Io;
 const platform = @import("platform.zig");
 const Shell = @import("Shell.zig");
+const ShellIntegration = @import("terminal/ShellIntegration.zig");
 
 pub fn main(init: std.process.Init) !habush.runtime.ExitStatus {
     const arena = init.arena.allocator();
@@ -112,12 +113,34 @@ pub fn main(init: std.process.Init) !habush.runtime.ExitStatus {
     });
     defer session.deinit();
 
+    // Terminal metadata uses a dedicated presentation writer, never a command's
+    // redirected stdout. Explicit opt-in still requires interactive TTYs.
+    const integration_enabled = ShellIntegration.enabled(.{
+        .interactive_terminal = interactive,
+        .setting = init.environ_map.get("HABUSH_SHELL_INTEGRATION"),
+        .term = init.environ_map.get("TERM"),
+        .term_program = init.environ_map.get("TERM_PROGRAM"),
+        .kitty = init.environ_map.get("KITTY_WINDOW_ID") != null,
+        .windows_terminal = init.environ_map.get("WT_SESSION") != null,
+    });
+    var hostname_buffer: [if (builtin.os.tag == .windows or builtin.os.tag == .wasi) 0 else std.posix.HOST_NAME_MAX]u8 = undefined;
+    const hostname: []const u8 = if (!integration_enabled)
+        ""
+    else if (builtin.os.tag == .windows)
+        init.environ_map.get("COMPUTERNAME") orelse ""
+    else
+        std.posix.gethostname(&hostname_buffer) catch "";
     var shell: Shell = .{
         .allocator = gpa,
         .stdin = stdin,
         .stderr = stderr,
         .session = &session,
         .interactive = interactive,
+        .integration = if (integration_enabled) .{
+            .writer = stderr,
+            .hostname = hostname,
+            .path_style = if (builtin.os.tag == .windows) .windows else .posix,
+        } else null,
     };
 
     return switch (invocation) {
