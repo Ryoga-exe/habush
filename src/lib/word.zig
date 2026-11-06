@@ -4,6 +4,7 @@
 //! perform parameter expansion, quote removal, field splitting, or globbing.
 
 const std = @import("std");
+const heredoc = @import("heredoc.zig");
 
 pub const ByteOffset = u32;
 
@@ -128,14 +129,36 @@ pub fn commandSubstitutionEnd(source: []const u8, start: usize) ?usize {
 }
 
 fn substitutionEnd(source: []const u8, start: usize, nesting: usize) ?usize {
-    if (nesting == 128) return null;
+    if (nesting >= 128) return null;
     var index = start + 2;
     var parentheses: usize = 1;
     var word_start = true;
+    var document_header: ?usize = null;
     while (index < source.len) {
         switch (source[index]) {
+            '\n' => if (document_header) |header| {
+                index = skipHereDocuments(source, header, index, index + 1) orelse return null;
+                document_header = null;
+                word_start = true;
+                continue;
+            },
+            '<' => if (isHereDocument(source, index)) {
+                const delimiter = scanHereDocument(source, index) orelse return null;
+                if (document_header == null) document_header = index;
+                index = delimiter.end;
+                word_start = false;
+                continue;
+            },
             '\\' => {
                 if (index + 1 == source.len) return null;
+                if (source[index + 1] == '\n') {
+                    index += 2;
+                    continue;
+                }
+                if (source[index + 1] == '\r' and index + 2 < source.len and source[index + 2] == '\n') {
+                    index += 3;
+                    continue;
+                }
                 index += 2;
                 word_start = false;
                 continue;
@@ -175,6 +198,139 @@ fn substitutionEnd(source: []const u8, start: usize, nesting: usize) ?usize {
     return null;
 }
 
+const HereDocumentDelimiter = struct {
+    raw: []const u8,
+    end: usize,
+    strip_tabs: bool,
+    quoted: bool,
+};
+
+fn isHereDocument(source: []const u8, index: usize) bool {
+    return index + 1 < source.len and source[index] == '<' and source[index + 1] == '<' and
+        (index == 0 or source[index - 1] != '<') and
+        (index + 2 == source.len or source[index + 2] != '<');
+}
+
+fn scanHereDocument(source: []const u8, start: usize) ?HereDocumentDelimiter {
+    var index = start + 2;
+    const strip_tabs = index < source.len and source[index] == '-';
+    if (strip_tabs) index += 1;
+    while (index < source.len and (source[index] == ' ' or source[index] == '\t')) index += 1;
+    const begin = index;
+    var quoted = false;
+    while (index < source.len) {
+        if (source[index] == '\'' or source[index] == '"') {
+            quoted = true;
+            index = (quotedEnd(source, index, source[index], 0) orelse return null) + 1;
+        } else if (source[index] == '\\') {
+            quoted = true;
+            if (index + 1 == source.len) return null;
+            index += 2;
+        } else if (std.mem.indexOfScalar(u8, " \t\r\n;|&()<>", source[index]) != null) break else index += 1;
+    }
+    if (begin == index) return null;
+    return .{ .raw = source[begin..index], .end = index, .strip_tabs = strip_tabs, .quoted = quoted };
+}
+
+fn skipHereDocuments(source: []const u8, header: usize, header_end: usize, body_start: usize) ?usize {
+    var index = header;
+    var body = body_start;
+    var word_start = true;
+    while (index < header_end) {
+        if (isHereDocument(source, index)) {
+            const delimiter = scanHereDocument(source, index) orelse return null;
+            index = delimiter.end;
+            word_start = false;
+            var candidate_start = body;
+            while (true) {
+                if (body == source.len) return null;
+                const end = std.mem.indexOfScalarPos(u8, source, body, '\n') orelse source.len;
+                var line = source[body..if (end > body and source[end - 1] == '\r') end - 1 else end];
+                if (delimiter.strip_tabs) line = std.mem.trimStart(u8, line, "\t");
+                body = @min(end + 1, source.len);
+                if (!delimiter.quoted and heredoc.hasLineContinuation(line)) continue;
+                if (delimiterMatches(delimiter.raw, source[candidate_start..body], delimiter.strip_tabs, !delimiter.quoted)) break;
+                candidate_start = body;
+            }
+        } else if (source[index] == '\'' or source[index] == '"') {
+            index = (quotedEnd(source, index, source[index], 0) orelse return null) + 1;
+            word_start = false;
+        } else if (source[index] == '\\') {
+            index += @min(@as(usize, 2), source.len - index);
+            word_start = false;
+        } else if (source[index] == '$' and index + 1 < source.len and source[index + 1] == '(') {
+            index = (substitutionEnd(source, index, 0) orelse return null) + 1;
+            word_start = false;
+        } else if (source[index] == '$' and index + 1 < source.len and source[index + 1] == '{') {
+            index = (parameterBraceEnd(source, index, 0) orelse return null) + 1;
+            word_start = false;
+        } else if (source[index] == '#' and word_start) break else {
+            word_start = std.mem.indexOfScalar(u8, " \t\r\n;|&()<>", source[index]) != null;
+            index += 1;
+        }
+    }
+    return body;
+}
+
+const LogicalBody = struct {
+    source: []const u8,
+    strip_tabs: bool,
+    expand: bool,
+    cursor: usize = 0,
+    end: usize = 0,
+    after: usize = 0,
+
+    fn next(self: *LogicalBody) ?u8 {
+        while (self.cursor == self.end) {
+            if (self.after == self.source.len) return null;
+            const begin = self.after;
+            const end = std.mem.indexOfScalarPos(u8, self.source, begin, '\n') orelse self.source.len;
+            self.after = @min(end + 1, self.source.len);
+            var line = self.source[begin..if (end > begin and self.source[end - 1] == '\r') end - 1 else end];
+            if (self.strip_tabs) line = std.mem.trimStart(u8, line, "\t");
+            if (self.expand and heredoc.hasLineContinuation(line)) line = line[0 .. line.len - 1];
+            self.cursor = @intFromPtr(line.ptr) - @intFromPtr(self.source.ptr);
+            self.end = self.cursor + line.len;
+        }
+        defer self.cursor += 1;
+        return self.source[self.cursor];
+    }
+};
+
+fn delimiterMatches(raw: []const u8, physical: []const u8, strip_tabs: bool, expand: bool) bool {
+    var body: LogicalBody = .{ .source = physical, .strip_tabs = strip_tabs, .expand = expand };
+    var quote: ?u8 = null;
+    var index: usize = 0;
+    while (index < raw.len) {
+        var byte = raw[index];
+        if (quote) |active| {
+            if (byte == active) {
+                quote = null;
+                index += 1;
+                continue;
+            }
+        } else if (byte == '\'' or byte == '"') {
+            quote = byte;
+            index += 1;
+            continue;
+        }
+        if (byte == '\\' and quote != '\'' and index + 1 < raw.len) {
+            const next = raw[index + 1];
+            if (quote == null or std.mem.indexOfScalar(u8, "$`\"\\\n", next) != null) {
+                index += 1;
+                byte = next;
+                if (byte == '\n') {
+                    index += 1;
+                    continue;
+                }
+            }
+        }
+        if ((body.next() orelse return false) != byte) return false;
+        index += 1;
+    }
+    return body.next() == null;
+}
+
 fn quotedEnd(source: []const u8, start: usize, quote: u8, nesting: usize) ?usize {
     var index = start + 1;
     while (index < source.len) {
@@ -199,7 +355,7 @@ fn quotedEnd(source: []const u8, start: usize, quote: u8, nesting: usize) ?usize
 }
 
 fn parameterBraceEnd(source: []const u8, start: usize, nesting: usize) ?usize {
-    if (nesting == 128) return null;
+    if (nesting >= 128) return null;
     var index = start + 2;
     while (index < source.len) {
         switch (source[index]) {

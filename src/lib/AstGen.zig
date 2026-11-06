@@ -439,7 +439,13 @@ fn word(astgen: *AstGen, node: Ast.Node.Index) Error!Hir.Inst.Index {
             .tag = switch (part.tag) {
                 inline else => |tag| @field(Hir.Inst.Tag, @tagName(tag)),
             },
-            .data = .{ .str = value },
+            .data = switch (part.tag) {
+                .command_substitution, .double_quoted_command_substitution => .{ .pl = .{
+                    .src_start = part.start,
+                    .payload_index = try astgen.addExtra(value),
+                } },
+                else => .{ .str = value },
+            },
         });
         try astgen.scratch.append(astgen.gpa, @intFromEnum(instruction));
     }

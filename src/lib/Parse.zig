@@ -1,6 +1,7 @@
 //! In-progress parser state. Converted to an `Ast` after parsing.
 
 const std = @import("std");
+const SourceInput = @import("SourceInput.zig");
 const Allocator = std.mem.Allocator;
 const Ast = @import("Ast.zig");
 const Node = Ast.Node;
@@ -1097,9 +1098,12 @@ fn validateWordSubstitutions(parser: *Parse, source: []const u8) Ast.ParseError!
     var iterator = word.Iterator.init(source, 0);
     while (iterator.next()) |part| switch (part.tag) {
         .command_substitution, .double_quoted_command_substitution => {
-            const content = try parser.gpa.dupeZ(u8, source[part.start..part.end]);
-            defer parser.gpa.free(content);
-            var inner = try Ast.parse(parser.gpa, content);
+            var input = SourceInput.collect(parser.gpa, source[part.start..part.end]) catch |err| switch (err) {
+                error.UnterminatedHereDocument => return false,
+                else => |other| return other,
+            };
+            defer input.deinit(parser.gpa);
+            var inner = try Ast.parseWithOptions(parser.gpa, input.source, .{ .collected_here_documents = input.here_documents });
             defer inner.deinit(parser.gpa);
             if (inner.status != .complete or inner.errors.len != 0) return false;
         },

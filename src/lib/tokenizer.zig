@@ -214,6 +214,7 @@ pub const Tokenizer = struct {
         var parameter_start: usize = undefined;
         var parameter_depth: u32 = 0;
         var parameter_return_state: State = undefined;
+        var word_has_content = false;
         state: switch (State.start) {
             .start => switch (self.buffer[self.index]) {
                 0 => {
@@ -310,22 +311,26 @@ pub const Tokenizer = struct {
                 '\r' => {
                     if (self.buffer[self.index + 1] != '\n') {
                         result.tag = .word;
+                        word_has_content = true;
                         self.index += 1;
                         continue :state .word;
                     }
                 },
                 '0'...'9' => {
+                    word_has_content = true;
                     self.index += 1;
                     continue :state .word;
                 },
                 '\'' => {
                     result.tag = .word;
+                    word_has_content = true;
                     quote_start = self.index;
                     self.index += 1;
                     continue :state .single_quote;
                 },
                 '"' => {
                     result.tag = .word;
+                    word_has_content = true;
                     quote_start = self.index;
                     self.index += 1;
                     continue :state .double_quote;
@@ -337,6 +342,7 @@ pub const Tokenizer = struct {
                 },
                 '$' => {
                     result.tag = .word;
+                    word_has_content = true;
                     if (self.buffer[self.index + 1] == '{') {
                         parameter_start = self.index;
                         parameter_depth = 1;
@@ -359,6 +365,7 @@ pub const Tokenizer = struct {
                 },
                 else => {
                     result.tag = .word;
+                    word_has_content = true;
                     self.index += 1;
                     continue :state .word;
                 },
@@ -378,6 +385,10 @@ pub const Tokenizer = struct {
                         result.tag = .unterminated_escape;
                         result.loc.start = escape_start;
                     } else {
+                        if (!word_has_content) {
+                            result.loc.start = self.index;
+                            continue :state .start;
+                        }
                         continue :state .word;
                     }
                 },
@@ -388,16 +399,22 @@ pub const Tokenizer = struct {
                             result.tag = .unterminated_escape;
                             result.loc.start = escape_start;
                         } else {
+                            if (!word_has_content) {
+                                result.loc.start = self.index;
+                                continue :state .start;
+                            }
                             continue :state .word;
                         }
                     } else {
                         result.tag = .word;
+                        word_has_content = true;
                         self.index += 1;
                         continue :state .word;
                     }
                 },
                 else => {
                     result.tag = .word;
+                    word_has_content = true;
                     self.index += 1;
                     continue :state .word;
                 },
@@ -726,6 +743,8 @@ test "words, digits and operators" {
 test "command substitutions retain inner quotes operators and newlines" {
     try testTokenize("echo pre$(printf '%s' \"$(echo nested)\")post \"$(echo ')')\" ${unset:-$(echo '}')}", &.{ .word, .word, .word, .word, .eof });
     try testTokenize("echo $(echo one # ignored )\necho two)", &.{ .word, .word, .eof });
+    try testTokenize("echo \"$(echo \\\n# ignored )\nprintf yes\n)\"", &.{ .word, .word, .eof });
+    try testTokenize("echo \\\n# ignored )\nprintf yes", &.{ .word, .newline, .word, .word, .eof });
     try testTokenize("echo \"$(echo", &.{ .word, .unterminated_command_substitution, .eof });
 }
 

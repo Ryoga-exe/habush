@@ -17,6 +17,9 @@ const ConcurrentWriter = @import("concurrent/Writer.zig");
 const Executor = @This();
 const ExecutionContext = @import("ExecutionContext.zig");
 const Expander = @import("Expander.zig");
+const Ast = @import("Ast.zig");
+const AstGen = @import("AstGen.zig");
+const SourceInput = @import("SourceInput.zig");
 const Hir = @import("Hir.zig");
 const Host = @import("Host.zig");
 const Pipeline = @import("Pipeline.zig");
@@ -109,12 +112,14 @@ const PipelineStageKind = enum {
 };
 
 const CommandSelection = union(enum) {
+    empty,
     external,
     builtin: Builtin,
     function,
 
     fn pipelineStageKind(command: CommandSelection) PipelineStageKind {
         return switch (command) {
+            .empty => .builtin,
             .external => .external,
             .builtin => |builtin| if (builtin.pipeline_support == .reads_stdin) .in_process else .builtin,
             .function => .in_process,
@@ -125,6 +130,7 @@ const CommandSelection = union(enum) {
 const PreparedSimpleCommand = struct {
     argv: []const []const u8,
     command: CommandSelection,
+    substitution_status: ?runtime.ExitStatus = null,
 };
 
 const PipelineStagePlan = union(enum) {
@@ -867,6 +873,7 @@ fn executeConcurrentPipeline(
         if (stage.plan.?.kind() != .external) task_count += 1;
         switch (stage.plan.?) {
             .simple => |simple| switch (simple.command) {
+                .empty => {},
                 .external, .function => requires_signals = true,
                 .builtin => {},
             },
@@ -1006,8 +1013,35 @@ fn preparePipelineStage(
         else => error.UnsupportedInstruction,
     };
 
+    // Substitutions may read this stage's stdin or wait for peer stages. They
+    // must execute after pipeline startup, with this stage's stream bindings.
+    for (hir.simpleCommandParts(index)) |part| {
+        const value = switch (hir.instructionTag(part)) {
+            .word => part,
+            .assignment => hir.assignment(part).value,
+            .redirect => hir.redirect(part).target,
+            else => continue,
+        };
+        for (hir.wordParts(value)) |word_part| switch (hir.instructionTag(word_part)) {
+            .command_substitution, .double_quoted_command_substitution => return .{ .ready = .compound },
+            .braced_parameter, .double_quoted_braced_parameter => {
+                if (std.mem.indexOf(u8, hir.wordPart(word_part), "$(") != null)
+                    return .{ .ready = .compound };
+            },
+            else => {},
+        };
+        if (hir.instructionTag(part) == .redirect) {
+            if (hir.redirect(part).here_document.unwrap()) |document| {
+                const body = hir.hereDocument(document);
+                if (body.expand_body and body.body != null and std.mem.indexOf(u8, body.body.?, "$(") != null)
+                    return .{ .ready = .compound };
+            }
+        }
+    }
     var expansion_failure: Expander.Failure = undefined;
-    const expander = executor.wordExpander(allocator, null, &expansion_failure);
+    var substitution_status: ?runtime.ExitStatus = null;
+    var expander = executor.wordExpander(allocator, null, &expansion_failure);
+    expander.context.substitution_status = &substitution_status;
     var argv: std.ArrayList([]const u8) = .empty;
     for (hir.simpleCommandParts(index)) |part| switch (hir.instructionTag(part)) {
         .assignment, .redirect => {},
@@ -1023,10 +1057,13 @@ fn preparePipelineStage(
         },
         else => return error.UnsupportedInstruction,
     };
-    if (argv.items.len == 0) return error.UnsupportedInstruction;
     const expanded_argv = try argv.toOwnedSlice(allocator);
-    const command = executor.resolveCommand(expanded_argv[0]);
-    return .{ .ready = .{ .simple = .{ .argv = expanded_argv, .command = command } } };
+    const command: CommandSelection = if (expanded_argv.len == 0) .empty else executor.resolveCommand(expanded_argv[0]);
+    return .{ .ready = .{ .simple = .{
+        .argv = expanded_argv,
+        .command = command,
+        .substitution_status = substitution_status,
+    } } };
 }
 
 fn resolveCommand(executor: Executor, name: []const u8) CommandSelection {
@@ -1060,9 +1097,22 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
     var arena = std.heap.ArenaAllocator.init(executor.gpa);
     defer arena.deinit();
     const allocator = arena.allocator();
+    if (executor.pipeline_stage != null and executor.prepared_simple == null) {
+        var resources: std.ArrayList(CommandPlan.Resource) = .empty;
+        defer closeRedirectResources(executor.host, &resources);
+        var scope = switch (try executor.beginSimpleCommandRedirections(&.{}, &resources, allocator)) {
+            .ready => |ready| ready,
+            .failed => |failure| return failure,
+        };
+        defer scope.deinit();
+        scope.executor.pipeline_stage = null;
+        return scope.executor.executeSimpleCommand(hir, index);
+    }
     const variables = executor.variableStore();
     var expansion_failure: Expander.Failure = undefined;
-    const expander = executor.wordExpander(allocator, null, &expansion_failure);
+    var substitution_status: ?runtime.ExitStatus = if (executor.prepared_simple) |prepared| prepared.substitution_status else null;
+    var expander = executor.wordExpander(allocator, null, &expansion_failure);
+    expander.context.substitution_status = &substitution_status;
 
     var argv: std.ArrayList([]const u8) = .empty;
     if (executor.prepared_simple) |prepared| try argv.appendSlice(allocator, prepared.argv);
@@ -1107,7 +1157,6 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
         )) |failure| return failure;
     }
     if (argv.items.len == 0) {
-        if (executor.pipeline_stage != null) return error.UnsupportedInstruction;
         var scope = switch (try executor.beginRedirections(
             file_actions.items,
             &redirect_resources,
@@ -1118,7 +1167,7 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
         };
         defer scope.deinit();
         if (!has_assignments) return if (has_words or has_redirects)
-            .{ .status = 0, .sandbox_coverage = .not_requested }
+            .{ .status = substitution_status orelse 0, .sandbox_coverage = .not_requested }
         else
             error.UnsupportedInstruction;
         const mutable_variables = variables orelse return error.VariableStateUnavailable;
@@ -1134,7 +1183,7 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
             };
             try mutable_variables.set(assignment.name, value);
         }
-        return .{ .status = 0, .sandbox_coverage = .not_requested };
+        return .{ .status = substitution_status orelse 0, .sandbox_coverage = .not_requested };
     }
 
     var command_variables = VariableStore.init(allocator);
@@ -1143,11 +1192,12 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
         for (parts) |part| {
             if (hir.instructionTag(part) != .assignment) continue;
             const assignment = hir.assignment(part);
-            const assignment_expander = executor.wordExpander(
+            var assignment_expander = executor.wordExpander(
                 allocator,
                 &command_variables,
                 &expansion_failure,
             );
+            assignment_expander.context.substitution_status = &substitution_status;
             const value = assignment_expander.expandAssignment(hir, assignment.value) catch |err| switch (err) {
                 error.ParameterExpansionFailed => return executor.parameterExpansionFailure(
                     allocator,
@@ -1163,6 +1213,7 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
     else
         executor.resolveCommand(argv.items[0]);
     switch (command) {
+        .empty => unreachable,
         .builtin => |candidate| {
             if (executor.background) return error.UnsupportedInstruction;
             if (executor.pipeline_stage != null and !candidate.supportsPipeline())
@@ -1820,7 +1871,7 @@ fn variableStore(executor: Executor) ?*VariableStore {
 }
 
 fn wordExpander(
-    executor: Executor,
+    executor: *const Executor,
     allocator: std.mem.Allocator,
     overrides: ?*const VariableStore,
     failure: *Expander.Failure,
@@ -1834,7 +1885,132 @@ fn wordExpander(
         .background_process_id = if (executor.jobs) |jobs| jobs.backgroundProcessIdText() else null,
         .last_status = executor.last_status,
         .failure = failure,
+        .command_substitution = .{
+            .userdata = executor,
+            .run = runCommandSubstitution,
+        },
     });
+}
+
+fn runCommandSubstitution(
+    userdata: *const anyopaque,
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    location: ?@import("Source.zig").Location,
+    overrides: ?*const VariableStore,
+    last_status: runtime.ExitStatus,
+) Expander.Error!Expander.CommandSubstitution.Result {
+    const parent: *const Executor = @ptrCast(@alignCast(userdata));
+    // A context restriction governs external children, not this evaluator.
+    // Restricting the whole shell process permits these operations inside its
+    // domain; a child-only request cannot confine temporary capture or builtins.
+    if (parent.activeSandbox() != .inherit) return error.SandboxUnavailable;
+    var input = SourceInput.collect(allocator, source) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.CommandSubstitutionFailed,
+    };
+    defer input.deinit(allocator);
+    var tree = Ast.parseWithOptions(allocator, input.source, .{ .collected_here_documents = input.here_documents }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.CommandSubstitutionFailed,
+    };
+    defer tree.deinit(allocator);
+    if (tree.errors.len != 0 or tree.status != .complete) return error.CommandSubstitutionFailed;
+    var hir = AstGen.generate(allocator, tree) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.CommandSubstitutionFailed,
+    };
+    defer hir.deinit(allocator);
+    try hir.source.?.setInputMapping(allocator, input.original_source, input.mappings);
+    if (location) |span| {
+        if (span.origin) |origin| {
+            if (span.originalSlice()) |raw| {
+                const mappings = try Hir.Source.composeMappings(allocator, input.mappings, span);
+                defer allocator.free(mappings);
+                try hir.source.?.setInputMapping(allocator, raw, mappings);
+            }
+            var inner = origin;
+            const raw_range = span.originalRange();
+            inner.base_offset = if (origin.base_offset) |base|
+                if (raw_range) |range| std.math.add(u32, base, range.start) catch null else null
+            else
+                null;
+            inner.line_offset += if (raw_range) |range|
+                std.mem.count(u8, origin.originalBytes()[0..range.start], "\n")
+            else
+                std.mem.count(u8, origin.text[0..span.start], "\n");
+            try hir.source.?.setOrigin(allocator, inner);
+        }
+    }
+
+    const capture = try parent.host.createCapture();
+    defer parent.host.closeResource(capture);
+    const output = parent.host.resourceWriter(capture) orelse return error.CommandSubstitutionUnavailable;
+    var nested = parent.*;
+    nested.last_status = last_status;
+    var state = if (parent.runtime_state) |state| try state.cloneWithAllocator(allocator) else null;
+    defer if (state) |*owned| owned.deinit();
+    if (state) |*owned| nested.runtime_state = owned;
+    var variables = if (parent.variables) |variables|
+        try variables.clone(allocator)
+    else if (parent.runtime_state == null)
+        VariableStore.init(allocator)
+    else
+        null;
+    defer if (variables) |*owned| owned.deinit();
+    if (variables) |*owned| nested.variables = owned;
+    if (overrides) |bindings| {
+        const destination = nested.variableStore() orelse return error.VariableStateUnavailable;
+        try applyAssignments(destination, bindings);
+        var iterator = bindings.iterator();
+        while (iterator.next()) |binding| try destination.setExported(binding.name, true);
+    }
+    var context = try parent.context.clone(allocator);
+    defer context.deinit();
+    nested.context = .{ .mutable = &context };
+    nested.io = parent.io;
+    nested.io.stdout = output;
+    nested.io.diagnostic_source = null;
+    context.io = nested.io;
+    nested.gpa = allocator;
+    nested.background = false;
+    nested.job_control = false;
+    nested.pipeline_stage = null;
+    nested.prepared_simple = null;
+    nested.loop_depth = 0;
+    var parameters = parent.positionalParameters();
+    nested.positional_parameters_override = &parameters;
+    var actions: std.ArrayList(CommandPlan.FileAction) = .empty;
+    defer actions.deinit(allocator);
+    try actions.appendSlice(allocator, parent.scoped_file_actions);
+    try actions.append(allocator, .{ .use_resource = .{ .resource = capture, .target = .stdout } });
+    nested.scoped_file_actions = actions.items;
+    var jobs: runtime.Jobs = .{
+        .gpa = allocator,
+        .diagnostic_io = nested.io,
+        .last_background_process_id = if (parent.jobs) |jobs| jobs.last_background_process_id else null,
+    };
+    defer finishSubstitutionJobs(parent.*, &jobs);
+    nested.jobs = &jobs;
+    const result = try nested.execute(hir);
+    finishSubstitutionJobs(parent.*, &jobs);
+    jobs = .{ .gpa = allocator, .diagnostic_io = nested.io };
+    try output.flush();
+    const reader = parent.host.resourceReader(capture) orelse return error.CommandSubstitutionUnavailable;
+    const bytes = reader.allocRemaining(allocator, .unlimited) catch |err| switch (err) {
+        error.StreamTooLong => return error.ResourceUnavailable,
+        else => |other| return other,
+    };
+    return .{ .output = bytes, .status = result.status };
+}
+
+fn finishSubstitutionJobs(executor: Executor, jobs: *runtime.Jobs) void {
+    const previous = if (executor.cancel_io) |io| io.swapCancelProtection(.blocked) else null;
+    defer {
+        if (previous) |value| _ = executor.cancel_io.?.swapCancelProtection(value);
+    }
+    jobs.cancelAll();
+    jobs.deinit();
 }
 
 fn parameterExpansionFailure(

@@ -8,9 +8,12 @@
 const std = @import("std");
 const Expander = @This();
 const Hir = @import("Hir.zig");
+const Host = @import("Host.zig");
+const CommandResolver = @import("CommandResolver.zig");
 const runtime_types = @import("runtime/types.zig");
 const VariableStore = @import("VariableStore.zig");
 const Word = @import("word.zig");
+const Source = @import("Source.zig");
 
 allocator: std.mem.Allocator,
 context: Context,
@@ -25,6 +28,10 @@ pub const Context = struct {
     positional_parameters: []const []const u8 = &.{},
     last_status: runtime_types.ExitStatus = 0,
     failure: ?*Failure = null,
+    command_substitution: ?CommandSubstitution = null,
+    /// Last completed substitution status in this expansion scope.
+    substitution_status: ?*?runtime_types.ExitStatus = null,
+    substitution_origin: ?Source.Location = null,
 
     fn variable(context: Context, name: []const u8) ?[]const u8 {
         if (context.overrides) |overrides| {
@@ -35,12 +42,34 @@ pub const Context = struct {
     }
 };
 
-pub const Error = std.mem.Allocator.Error || error{
+pub const Error = std.mem.Allocator.Error || Host.Error || CommandResolver.Error || VariableStore.Error || std.Io.Writer.Error || std.Io.Reader.Error || error{
     ParameterAssignmentUnavailable,
     ParameterExpansionFailed,
     ParameterExpansionUnsupported,
     PathnameExpansionUnsupported,
     TildeExpansionUnsupported,
+    CommandSubstitutionUnavailable,
+    CommandSubstitutionFailed,
+    UnsupportedInstruction,
+    CommandResolutionUnavailable,
+    UnexpectedTermination,
+    VariableStateUnavailable,
+    FunctionStateUnavailable,
+    HostUnavailable,
+    RuntimeStateUnavailable,
+    ExecutionContextUnavailable,
+};
+
+pub const CommandSubstitution = struct {
+    /// Borrowed for the synchronous expansion call. Returned output is owned
+    /// by the supplied allocator and released after insertion into the word.
+    userdata: *const anyopaque,
+    run: *const fn (*const anyopaque, std.mem.Allocator, []const u8, ?Source.Location, ?*const VariableStore, runtime_types.ExitStatus) Error!Result,
+
+    pub const Result = struct {
+        output: []const u8,
+        status: runtime_types.ExitStatus,
+    };
 };
 
 pub const Failure = struct {
@@ -65,10 +94,13 @@ pub fn initWithContext(allocator: std.mem.Allocator, context: Context) Expander 
 ///
 /// Returned slices are owned by `allocator`.
 pub fn expandArgument(
-    expander: Expander,
+    parent: Expander,
     hir: Hir,
     word: Hir.Inst.Index,
 ) Error![]const []const u8 {
+    var expander = parent;
+    var local_status: ?runtime_types.ExitStatus = null;
+    if (expander.context.substitution_status == null) expander.context.substitution_status = &local_status;
     var bytes: std.ArrayList(u8) = .empty;
     defer bytes.deinit(expander.allocator);
     var fields: std.ArrayList([]const u8) = .empty;
@@ -80,7 +112,9 @@ pub fn expandArgument(
     for (hir.wordParts(word), 0..) |part, part_index| {
         const tag = hir.instructionTag(part);
         const value = hir.wordPart(part);
-        try expander.appendArgumentPart(
+        var located = expander;
+        located.context.substitution_origin = commandSubstitutionOrigin(hir, part);
+        try located.appendArgumentPart(
             hirPartTag(tag),
             value,
             part_index == 0,
@@ -100,16 +134,21 @@ pub fn expandArgument(
 ///
 /// The returned slice is owned by `allocator`.
 pub fn expandAssignment(
-    expander: Expander,
+    parent: Expander,
     hir: Hir,
     word: Hir.Inst.Index,
 ) Error![]const u8 {
+    var expander = parent;
+    var local_status: ?runtime_types.ExitStatus = null;
+    if (expander.context.substitution_status == null) expander.context.substitution_status = &local_status;
     var bytes: std.ArrayList(u8) = .empty;
     errdefer bytes.deinit(expander.allocator);
     for (hir.wordParts(word), 0..) |part, part_index| {
         const tag = hir.instructionTag(part);
         const value = hir.wordPart(part);
-        try expander.appendAssignmentPart(
+        var located = expander;
+        located.context.substitution_origin = commandSubstitutionOrigin(hir, part);
+        try located.appendAssignmentPart(
             hirPartTag(tag),
             value,
             part_index == 0,
@@ -124,7 +163,10 @@ pub fn expandAssignment(
 /// parameter expansion and the restricted here-document backslash rules are
 /// applied here. Command and arithmetic substitutions remain unsupported by
 /// the language frontend.
-pub fn expandHereDocument(expander: Expander, source: []const u8) Error![]const u8 {
+pub fn expandHereDocument(parent: Expander, source: []const u8) Error![]const u8 {
+    var expander = parent;
+    var local_status: ?runtime_types.ExitStatus = null;
+    if (expander.context.substitution_status == null) expander.context.substitution_status = &local_status;
     var bytes: std.ArrayList(u8) = .empty;
     errdefer bytes.deinit(expander.allocator);
 
@@ -167,6 +209,17 @@ pub fn expandHereDocument(expander: Expander, source: []const u8) Error![]const 
                     index = content_end + 1;
                     continue;
                 }
+                if (source[parameter_start] == '(') {
+                    if (parameter_start + 1 < source.len and source[parameter_start + 1] == '(')
+                        return error.ParameterExpansionUnsupported;
+                    const end = Word.commandSubstitutionEnd(source, index) orelse
+                        return error.ParameterExpansionUnsupported;
+                    const result = try expander.runCommandSubstitution(source[parameter_start + 1 .. end]);
+                    defer expander.allocator.free(result.output);
+                    try bytes.appendSlice(expander.allocator, std.mem.trimEnd(u8, result.output, "\n"));
+                    index = end + 1;
+                    continue;
+                }
 
                 const first = source[parameter_start];
                 const parameter_end = if (Word.isSpecialParameter(first) or
@@ -201,6 +254,9 @@ fn findParameterEnd(source: []const u8, content_start: usize) ?usize {
             '$' => if (index + 1 < source.len and source[index + 1] == '{') {
                 depth += 1;
                 index += 2;
+                continue;
+            } else if (index + 1 < source.len and source[index + 1] == '(') {
+                index = (Word.commandSubstitutionEnd(source, index) orelse return null) + 1;
                 continue;
             },
             '}' => {
@@ -280,7 +336,18 @@ fn appendArgumentPart(
             bytes,
             current_field_active,
         ),
-        .command_substitution, .double_quoted_command_substitution, .arithmetic_substitution => return error.ParameterExpansionUnsupported,
+        .command_substitution, .double_quoted_command_substitution => {
+            const result = try expander.runCommandSubstitution(value);
+            defer expander.allocator.free(result.output);
+            try expander.appendScalarArgument(
+                std.mem.trimEnd(u8, result.output, "\n"),
+                force_quoted or tag == .double_quoted_command_substitution,
+                fields,
+                bytes,
+                current_field_active,
+            );
+        },
+        .arithmetic_substitution => return error.ParameterExpansionUnsupported,
     }
 }
 
@@ -446,7 +513,12 @@ fn appendAssignmentPart(
             value,
             true,
         ),
-        .command_substitution, .double_quoted_command_substitution, .arithmetic_substitution => return error.ParameterExpansionUnsupported,
+        .command_substitution, .double_quoted_command_substitution => {
+            const result = try expander.runCommandSubstitution(value);
+            defer expander.allocator.free(result.output);
+            try bytes.appendSlice(expander.allocator, std.mem.trimEnd(u8, result.output, "\n"));
+        },
+        .arithmetic_substitution => return error.ParameterExpansionUnsupported,
     }
 }
 
@@ -503,6 +575,30 @@ fn appendExpansionWordScalar(
         );
     }
     if (iterator.status != .complete) return error.ParameterExpansionUnsupported;
+}
+
+fn runCommandSubstitution(expander: Expander, source: []const u8) Error!CommandSubstitution.Result {
+    const callback = expander.context.command_substitution orelse
+        return error.CommandSubstitutionUnavailable;
+    const result = try callback.run(callback.userdata, expander.allocator, source, expander.context.substitution_origin, expander.context.overrides, expander.lastStatus());
+    if (expander.context.substitution_status) |status| status.* = result.status;
+    return result;
+}
+
+fn lastStatus(expander: Expander) runtime_types.ExitStatus {
+    if (expander.context.substitution_status) |status| return status.* orelse expander.context.last_status;
+    return expander.context.last_status;
+}
+
+fn commandSubstitutionOrigin(hir: Hir, part: Hir.Inst.Index) ?Source.Location {
+    switch (hir.instructionTag(part)) {
+        .command_substitution, .double_quoted_command_substitution => {},
+        else => return null,
+    }
+    const origin = hir.sourceView() orelse return null;
+    const start = hir.instructionData(part).pl.src_start;
+    const end = std.math.cast(u32, @as(usize, start) + hir.wordPart(part).len) orelse return null;
+    return .{ .start = start, .end = end, .origin = origin };
 }
 
 fn assignParameter(
@@ -568,7 +664,7 @@ fn appendParameter(
     }
     if (std.mem.eql(u8, name, "?")) {
         var buffer: [3]u8 = undefined;
-        const value = std.fmt.bufPrint(&buffer, "{d}", .{expander.context.last_status}) catch
+        const value = std.fmt.bufPrint(&buffer, "{d}", .{expander.lastStatus()}) catch
             unreachable;
         try bytes.appendSlice(expander.allocator, value);
         return;

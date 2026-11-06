@@ -124,6 +124,13 @@ pub fn lineAfterTabStripping(line: []const u8, strip_tabs: bool) []const u8 {
     return line[index..];
 }
 
+pub fn hasLineContinuation(line: []const u8) bool {
+    var count: usize = 0;
+    var index = line.len;
+    while (index != 0 and line[index - 1] == '\\') : (index -= 1) count += 1;
+    return count % 2 == 1;
+}
+
 test "decodes here-document delimiters" {
     const allocator = std.testing.allocator;
 
