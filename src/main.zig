@@ -14,7 +14,9 @@ pub fn main(init: std.process.Init) !habush.runtime.ExitStatus {
     const stdout_file = Io.File.stdout();
     const stderr_file = Io.File.stderr();
 
-    var stdin_buffer: [4096]u8 = undefined;
+    // The shell and external children share this descriptor. One-byte buffering
+    // prevents the parser or a builtin from hiding later input from a child.
+    var stdin_buffer: [1]u8 = undefined;
     var stdout_buffer: [0]u8 = undefined; // TODO: add buffer
 
     var stdin_reader = stdin_file.readerStreaming(io, &stdin_buffer);
@@ -77,6 +79,7 @@ pub fn main(init: std.process.Init) !habush.runtime.ExitStatus {
         .context = .{
             .cwd = cwd,
             .io = .{
+                .stdin = stdin,
                 .stdout = stdout,
                 .stderr = stderr,
                 .diagnostic_options = .{ .program_name = "habush" },

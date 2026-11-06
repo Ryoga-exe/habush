@@ -4,8 +4,8 @@
 //! lists, and-or commands, pipeline negation, brace groups, if clauses,
 //! while/until/for loops with break/continue control, standalone assignments,
 //! builtins, external simple commands, and foreground pipelines of external
-//! simple commands, builtins that do not consume stdin, and at most one
-//! general in-process stage such as a shell function or compound command.
+//! simple commands, builtins, and at most one
+//! general in-process stage such as `read`, a shell function, or a compound command.
 //! Standard-stream redirections are supported for simple and compound
 //! commands, including here-documents and here-strings. Background execution
 //! and pipelines containing multiple general in-process stages remain explicit
@@ -101,7 +101,7 @@ const CommandSelection = union(enum) {
     fn pipelineStageKind(command: CommandSelection) PipelineStageKind {
         return switch (command) {
             .external => .external,
-            .builtin => .builtin,
+            .builtin => |builtin| if (builtin.pipeline_support == .reads_stdin) .in_process else .builtin,
             .function => .in_process,
         };
     }
@@ -1166,10 +1166,14 @@ fn beginRedirections(
                 .resource = resource,
                 .target = open.target,
             } });
-            scoped_executor.setRuntimeWriter(
-                open.target,
-                executor.host.resourceWriter(resource),
-            );
+            if (open.target == .stdin) {
+                scoped_executor.io.stdin = executor.host.resourceReader(resource);
+            } else {
+                scoped_executor.setRuntimeWriter(
+                    open.target,
+                    executor.host.resourceWriter(resource),
+                );
+            }
         },
         .duplicate => |duplicate| {
             _ = standardStreamIndex(duplicate.source) orelse
@@ -1178,21 +1182,28 @@ fn beginRedirections(
                 return error.UnsupportedInstruction;
             const writer = scoped_executor.runtimeWriter(duplicate.source);
             scoped_executor.setRuntimeWriter(duplicate.target, writer);
+            if (duplicate.target == .stdin)
+                scoped_executor.io.stdin = if (duplicate.source == .stdin) scoped_executor.io.stdin else null;
             try scoped_actions.append(allocator, action);
         },
         .close => |descriptor| {
             _ = standardStreamIndex(descriptor) orelse
                 return error.UnsupportedInstruction;
             scoped_executor.setRuntimeWriter(descriptor, null);
+            if (descriptor == .stdin) scoped_executor.io.stdin = null;
             try scoped_actions.append(allocator, action);
         },
         .use_resource => |use| {
             _ = standardStreamIndex(use.target) orelse
                 return error.UnsupportedInstruction;
-            scoped_executor.setRuntimeWriter(
-                use.target,
-                executor.host.resourceWriter(use.resource),
-            );
+            if (use.target == .stdin) {
+                scoped_executor.io.stdin = executor.host.resourceReader(use.resource);
+            } else {
+                scoped_executor.setRuntimeWriter(
+                    use.target,
+                    executor.host.resourceWriter(use.resource),
+                );
+            }
             try scoped_actions.append(allocator, action);
         },
     };

@@ -6,6 +6,8 @@ const Io = std.Io;
 const Shell = @This();
 
 allocator: std.mem.Allocator,
+/// Command source reader. runSource swaps this without changing the session's
+/// runtime stdin, so `-c` and script `read` commands use process input.
 stdin: *Io.Reader,
 stderr: *Io.Writer,
 session: *habush.Session,

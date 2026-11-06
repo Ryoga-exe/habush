@@ -1230,6 +1230,55 @@ test "builtin redirections replace runtime output only for the command scope" {
     try std.testing.expectEqual(@as(usize, 1), fake.closed_resource_count);
 }
 
+test "read uses redirected input only within its command scope" {
+    var hir = try generate("read FIRST <input; read SECOND");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var redirected: std.Io.Reader = .fixed("redirected\n");
+    fake.resource_reader_override = &redirected;
+    var original: std.Io.Reader = .fixed("original\n");
+    var state = try runtime.State.init(std.testing.allocator, .{});
+    defer state.deinit();
+    var context = try ExecutionContext.init(std.testing.allocator, .{
+        .io = .{ .stdin = &original },
+    });
+    defer context.deinit();
+
+    const result = try Executor.initWithState(fake.host(), null, &state, &context, 0).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqualStrings("redirected", state.variable("FIRST").?);
+    try std.testing.expectEqualStrings("original", state.variable("SECOND").?);
+    try std.testing.expectEqual(@as(usize, 1), fake.closed_resource_count);
+}
+
+test "read consumes a pipeline input in an isolated stage" {
+    var hir = try generate("/bin/producer | read VALUE");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var pipeline_input: std.Io.Reader = .fixed("pipeline data\n");
+    fake.resource_reader_override = &pipeline_input;
+    var state = try runtime.State.init(std.testing.allocator, .{});
+    defer state.deinit();
+    var context = try ExecutionContext.init(std.testing.allocator, .{});
+    defer context.deinit();
+
+    const result = try Executor.initWithState(
+        fake.host(),
+        CommandResolver.preResolved(),
+        &state,
+        &context,
+        0,
+    ).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqual(@as(usize, 0), pipeline_input.bufferedLen());
+    try std.testing.expect(state.variable("VALUE") == null);
+    try std.testing.expectEqual(@as(usize, 1), fake.spawn_calls.items.len);
+}
+
 test "standalone assignment redirections preserve assignment side effects" {
     var hir = try generate("persisted=changed >out");
     defer hir.deinit(std.testing.allocator);
