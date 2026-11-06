@@ -7,6 +7,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Hir = @This();
+pub const Source = @import("Source.zig");
 
 instructions: std.MultiArrayList(Inst).Slice,
 /// Storage for strings referenced by instructions and extra payloads.
@@ -14,6 +15,8 @@ instructions: std.MultiArrayList(Inst).Slice,
 string_bytes: []u8,
 /// The meaning of this data is determined by `Inst.Tag`.
 extra: []u32,
+/// Original parser-input bytes and origin, owned independently of the AST.
+source: ?Source = null,
 
 pub const ByteOffset = u32;
 
@@ -60,6 +63,7 @@ pub fn deinit(hir: *Hir, gpa: Allocator) void {
     hir.instructions.deinit(gpa);
     gpa.free(hir.string_bytes);
     gpa.free(hir.extra);
+    if (hir.source) |*source| source.deinit(gpa);
     hir.* = undefined;
 }
 
@@ -71,12 +75,25 @@ pub fn clone(hir: Hir, gpa: Allocator) Allocator.Error!Hir {
 
     const string_bytes = try gpa.dupe(u8, hir.string_bytes);
     errdefer gpa.free(string_bytes);
+    var source = if (hir.source) |value| try value.clone(gpa) else null;
+    errdefer if (source) |*value| value.deinit(gpa);
 
     return .{
         .instructions = instructions,
         .string_bytes = string_bytes,
         .extra = try gpa.dupe(u32, hir.extra),
+        .source = source,
     };
+}
+
+pub fn sourceView(hir: Hir) ?Source.View {
+    return if (hir.source) |source| source.view() else null;
+}
+
+pub fn setSource(hir: *Hir, gpa: Allocator, source: Source.View) Allocator.Error!void {
+    const copy = try Source.init(gpa, source);
+    if (hir.source) |*previous| previous.deinit(gpa);
+    hir.source = copy;
 }
 
 pub fn instructionTag(hir: Hir, index: Inst.Index) Inst.Tag {

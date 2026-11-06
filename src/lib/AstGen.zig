@@ -58,11 +58,13 @@ fn finish(astgen: *AstGen) Error!Hir {
     errdefer astgen.gpa.free(string_bytes);
     const extra = try astgen.extra.toOwnedSlice(astgen.gpa);
     errdefer astgen.gpa.free(extra);
+    const source = try Hir.Source.init(astgen.gpa, .{ .text = astgen.tree.source });
 
     return .{
         .instructions = instructions,
         .string_bytes = string_bytes,
         .extra = extra,
+        .source = source,
     };
 }
 
