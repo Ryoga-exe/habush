@@ -14,6 +14,11 @@ const command_worker = @import("../worker.zig");
 const runtime_types = @import("../runtime/types.zig");
 const append_file = @import("System/append_file.zig");
 const pipe = @import("System/pipe.zig");
+const worker_channel = if (builtin.os.tag == .windows or builtin.os.tag == .wasi)
+    struct {}
+else
+    @import("System/worker_channel.zig");
+const WorkerReport = if (builtin.os.tag == .windows or builtin.os.tag == .wasi) void else worker_channel.Report;
 const terminal = if (builtin.os.tag == .windows or builtin.os.tag == .wasi)
     struct {}
 else
@@ -100,6 +105,7 @@ const FileResource = struct {
 const ChildRecord = struct {
     child: std.process.Child,
     process_group: ?CommandPlan.ProcessGroup,
+    report: ?WorkerReport = null,
 };
 
 const TerminalRecord = struct {
@@ -131,6 +137,9 @@ pub fn deinit(system: *System) void {
     }
     var children = system.children.valueIterator();
     while (children.next()) |record| {
+        if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+            if (record.report) |report| report.deinit();
+        }
         if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
             record.child.kill(system.io);
         } else {
@@ -157,6 +166,16 @@ pub fn host(system: *System) Host {
         .vtable = &vtable,
     };
 }
+
+fn workerHost(system: *System) Host {
+    return .{ .userdata = system, .vtable = &worker_vtable };
+}
+
+const worker_vtable: Host.VTable = blk: {
+    var value = vtable;
+    value.spawn = spawnWorker;
+    break :blk value;
+};
 
 const vtable: Host.VTable = .{
     .capabilities = .{
@@ -220,20 +239,42 @@ fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.SpawnError!Host.SpawnOut
     if (plan.sandbox == .restrict) {
         const backend = system.sandbox_backend orelse return .{ .failed = .sandbox_unavailable };
         const worker_executable = system.worker_executable orelse return .{ .failed = .sandbox_unavailable };
-        return backend.launch(system.gpa, system.io, system.host(), worker_executable, plan);
+        return backend.launch(system.gpa, system.io, system.workerHost(), worker_executable, plan);
     }
     // FIFO opens can wait for another stage. Defer those actions to a fresh
     // worker so the parent can finish launching its peers. Ordinary file opens
     // retain their existing structured failures and source-order behavior.
     if (firstFifoAction(system, plan)) |action_index| {
         if (system.worker_executable) |worker_executable| {
-            return command_worker.launch(system.gpa, system.host(), worker_executable, plan) catch |err| switch (err) {
+            return command_worker.launch(system.gpa, system.workerHost(), worker_executable, plan) catch |err| switch (err) {
                 error.Unsupported => fileActionFailure(action_index, .unsupported),
                 else => |other| return other,
             };
         }
         return fileActionFailure(action_index, .unsupported);
     }
+    return system.spawnNative(plan, false);
+}
+
+fn spawnWorker(userdata: ?*anyopaque, plan: CommandPlan) Host.SpawnError!Host.SpawnOutcome {
+    const system: *System = @ptrCast(@alignCast(userdata.?));
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return .{ .failed = .unsupported };
+    const worker_index = for (plan.argv, 0..) |value, index| {
+        if (std.mem.eql(u8, value, command_worker.argument)) break index;
+    } else return error.InvalidArguments;
+    // This host is private to trusted launch preparation. No public plan field
+    // or environment value is interpreted as worker-channel configuration.
+    var arguments: std.ArrayList([]const u8) = .empty;
+    defer arguments.deinit(system.gpa);
+    try arguments.appendSlice(system.gpa, plan.argv[0 .. worker_index + 1]);
+    try arguments.append(system.gpa, command_worker.bootstrap_argument);
+    try arguments.appendSlice(system.gpa, plan.argv[worker_index + 1 ..]);
+    var wrapped = plan;
+    wrapped.argv = arguments.items;
+    return system.spawnNative(wrapped, true);
+}
+
+fn spawnNative(system: *System, plan: CommandPlan, bootstrap_worker: bool) Host.SpawnError!Host.SpawnOutcome {
     if ((builtin.os.tag == .windows or builtin.os.tag == .wasi) and plan.process_group != .inherit)
         return .{ .failed = .unsupported };
     if (plan.process_group == .join and
@@ -316,11 +357,20 @@ fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.SpawnError!Host.SpawnOut
         }
     }
 
-    const child_io = [_]std.process.SpawnOptions.StdIo{
+    var child_io = [_]std.process.SpawnOptions.StdIo{
         spawnStdio(bindings[0], .stdin),
         spawnStdio(bindings[1], .stdout),
         spawnStdio(bindings[2], .stderr),
     };
+    var channel: if (builtin.os.tag == .windows or builtin.os.tag == .wasi) ?void else ?worker_channel.Parent = null;
+    defer if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+        if (channel) |*parent| parent.deinit();
+    };
+    if (bootstrap_worker) {
+        if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return .{ .failed = .unsupported };
+        channel = worker_channel.Parent.init(bindingFile(bindings[0])) catch return .{ .failed = .resource_unavailable };
+        child_io[0] = .{ .file = channel.?.childInput() };
+    }
 
     var owned_argv: ?[][]const u8 = null;
     defer if (owned_argv) |argv| system.gpa.free(argv);
@@ -340,7 +390,7 @@ fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.SpawnError!Host.SpawnOut
     defer if (environment) |*map| map.deinit();
 
     try system.children.ensureUnusedCapacity(system.gpa, 1);
-    const child = if (builtin.os.tag == .windows and needsWindowsHandleSpawn(bindings)) child: {
+    var child = if (builtin.os.tag == .windows and needsWindowsHandleSpawn(bindings)) child: {
         const outcome = try windows_spawn.spawn(
             system.gpa,
             argv,
@@ -372,6 +422,18 @@ fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.SpawnError!Host.SpawnOut
         .pgid = pgid,
     }) catch |err| return .{ .failed = try mapSpawnFailure(err) };
 
+    if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+        if (channel) |*parent| parent.sendInput() catch {
+            // Spawn has already transferred a native process to us. A failed
+            // bootstrap must release it before reporting a startup failure.
+            const previous_protection = system.io.swapCancelProtection(.blocked);
+            defer _ = system.io.swapCancelProtection(previous_protection);
+            if (child.id) |pid| std.posix.kill(pid, .KILL) catch {};
+            _ = child.wait(system.io) catch {};
+            return .{ .failed = .resource_unavailable };
+        };
+    }
+
     const process_group: ?CommandPlan.ProcessGroup = switch (plan.process_group) {
         .inherit => null,
         .create => if (builtin.os.tag == .windows or builtin.os.tag == .wasi)
@@ -384,6 +446,12 @@ fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.SpawnError!Host.SpawnOut
     system.children.putAssumeCapacityNoClobber(process, .{
         .child = child,
         .process_group = process_group,
+        .report = if (builtin.os.tag == .windows or builtin.os.tag == .wasi)
+            null
+        else if (channel) |*parent|
+            parent.takeReport(std.math.cast(u32, plan.file_actions.len) orelse unreachable)
+        else
+            null,
     });
     return .{ .spawned = .{
         .process = process,
@@ -857,7 +925,7 @@ fn waitForPosix(
             .SUCCESS => {
                 if (rc == 0) return null;
                 const bits: u32 = @bitCast(status);
-                const result: Host.Termination = if (std.posix.W.IFEXITED(bits))
+                var result: Host.Termination = if (std.posix.W.IFEXITED(bits))
                     .{ .exited = std.posix.W.EXITSTATUS(bits) }
                 else if (std.posix.W.IFSIGNALED(bits))
                     .{ .signal = @intFromEnum(std.posix.W.TERMSIG(bits)) }
@@ -868,12 +936,23 @@ fn waitForPosix(
                 switch (result) {
                     .exited, .signal => {
                         const group = record.process_group;
+                        const report = record.report;
                         cleanupWaitedChildPosix(&record.child, system.io);
                         _ = system.children.remove(process);
                         system.discardTerminalModesIfUnowned(group);
+                        if (report) |startup| {
+                            if (startup.read()) |failure| {
+                                if (failure) |reported| result = .{ .spawn_failed = reported };
+                            } else |_| {
+                                // waitpid already consumed the process. Return
+                                // a terminal result so upper layers release its
+                                // handle even when the private protocol failed.
+                                result = .{ .unknown = 0 };
+                            }
+                        }
                     },
                     .stopped => {},
-                    .unknown => unreachable,
+                    .unknown, .spawn_failed => unreachable,
                 }
                 return result;
             },
@@ -1908,4 +1987,23 @@ fn expectExitStatus(system_host: Host, plan: CommandPlan, expected: u8) !void {
         Host.Termination{ .exited = expected },
         try system_host.wait(spawned.process),
     );
+}
+
+test "malformed worker report still consumes the terminal process handle" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    var system: System = .{ .gpa = std.testing.allocator, .io = std.testing.io };
+    defer system.deinit();
+    const outcome = try system.host().spawn(.{
+        .executable = "/bin/sh",
+        .argv = &.{ "/bin/sh", "-c", "exit 0" },
+    });
+    const process = outcome.spawned.process;
+    var channel = try worker_channel.Parent.init(null);
+    defer channel.deinit();
+    try channel.childInput().writeStreamingAll(std.testing.io, "HBW1");
+    system.children.getPtr(process).?.report = channel.takeReport(0);
+    const termination = try system.host().wait(process);
+    try std.testing.expectEqualDeep(Host.Termination{ .unknown = 0 }, termination);
+    try std.testing.expect(!system.children.contains(process));
+    try std.testing.expectError(error.InvalidArguments, system.host().tryWait(process));
 }

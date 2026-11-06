@@ -162,7 +162,13 @@ pub const Termination = union(enum) {
     exited: runtime_types.ExitStatus,
     signal: u32,
     stopped: u32,
+    /// Terminal result that could not be interpreted, including a malformed
+    /// private worker report after native process reaping. The handle is consumed.
     unknown: u32,
+    /// A fresh worker reported a failure before replacing itself with the
+    /// requested executable. This is distinct from a target exiting with 126.
+    /// File action indices refer to the original submitted plan.
+    spawn_failed: SpawnFailure,
 };
 
 pub const ProcessEvent = struct {

@@ -2064,6 +2064,11 @@ fn combineSandboxCoverage(
 fn terminationStatus(termination: Host.Termination) Error!u8 {
     return switch (termination) {
         .exited => |status| status,
+        .spawn_failed => |failure| switch (failure) {
+            .command_not_found => 127,
+            .file_action => 1,
+            else => 126,
+        },
         .signal => |signal| status: {
             const capped_signal: u32 = @min(signal, 127);
             const status: u32 = 128 + capped_signal;

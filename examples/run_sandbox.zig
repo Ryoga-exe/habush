@@ -51,6 +51,11 @@ pub fn main(init: std.process.Init) !u8 {
         .completed => |stages| switch (stages[0].termination) {
             .exited => |status| status,
             .signal => |number| @truncate(number +% 128),
+            .spawn_failed => |failure| switch (failure) {
+                .command_not_found => 127,
+                .file_action => 1,
+                else => 126,
+            },
             else => 1,
         },
         .failed => |failure| {

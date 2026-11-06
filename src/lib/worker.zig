@@ -11,8 +11,15 @@ const builtin = @import("builtin");
 const CommandPlan = @import("CommandPlan.zig");
 const Host = @import("Host.zig");
 const append_file = @import("Host/System/append_file.zig");
+const worker_channel = if (builtin.os.tag == .windows or builtin.os.tag == .wasi)
+    struct {}
+else
+    @import("Host/System/worker_channel.zig");
+const Reporter = if (builtin.os.tag == .windows or builtin.os.tag == .wasi) void else worker_channel.Reporter;
 
 pub const argument = "--internal-command-worker";
+/// Used only by the private System worker host; not part of the public plan.
+pub const bootstrap_argument = "--stdio-channel";
 const version = "1";
 
 pub const PrepareError = std.mem.Allocator.Error || error{ InvalidArguments, Unsupported };
@@ -89,8 +96,9 @@ pub fn prepare(gpa: std.mem.Allocator, plan: CommandPlan) PrepareError!Prepared 
 /// as `error.Unsupported` so the caller can choose an explicit fallback.
 ///
 /// This helper adds no restrictions; restricted plans require SandboxBackend.
-/// Payloads borrow the plan until the inner spawn returns. Worker failures are
-/// reported through that process's status and stderr, rather than SpawnFailure.
+/// Payloads borrow the plan until the inner spawn returns. System's private
+/// worker host reports late startup failures through Termination.spawn_failed.
+/// Other hosts may retain exit status and stderr reporting.
 pub fn launch(
     gpa: std.mem.Allocator,
     host: Host,
@@ -181,13 +189,37 @@ pub fn parse(gpa: std.mem.Allocator, arguments: []const []const u8) ParseError!D
 /// that a failed launcher or failed worker actually reached that target.
 pub fn run(init: std.process.Init, arguments: []const [:0]const u8) u8 {
     const gpa = init.gpa;
-    const values = gpa.alloc([]const u8, arguments.len) catch {
+    var reporter: ?Reporter = null;
+    const bootstrap = arguments.len != 0 and std.mem.eql(u8, arguments[0], bootstrap_argument);
+    if (bootstrap) {
+        if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+            report(init.io, "unsupported platform");
+            return 126;
+        } else {
+            reporter = worker_channel.Reporter.receive() catch {
+                report(init.io, "invalid bootstrap");
+                return 126;
+            };
+        }
+    }
+    defer if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+        if (reporter) |channel| channel.deinit();
+    };
+    const payload = if (bootstrap) arguments[1..] else arguments;
+    const values = gpa.alloc([]const u8, payload.len) catch {
+        if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+            if (reporter) |channel| channel.send(.resource_unavailable);
+        }
         report(init.io, "out of memory");
         return 126;
     };
     defer gpa.free(values);
-    for (arguments, values) |value, *destination| destination.* = value;
+    for (payload, values) |value, *destination| destination.* = value;
     var decoded = parse(gpa, values) catch |err| {
+        if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+            if (reporter) |channel|
+                channel.send(if (err == error.OutOfMemory) .resource_unavailable else .unsupported);
+        }
         report(init.io, @errorName(err));
         return 126;
     };
@@ -198,6 +230,10 @@ pub fn run(init: std.process.Init, arguments: []const [:0]const u8) u8 {
         return 126;
     } else {
         for (decoded.actions, 0..) |action, index| applyAction(init.io, action) catch |err| {
+            if (reporter) |channel| channel.send(.{ .file_action = .{
+                .action_index = @intCast(index),
+                .reason = fileActionReason(err),
+            } });
             reportActionFailure(init.io, index, err);
             return 126;
         };
@@ -205,9 +241,47 @@ pub fn run(init: std.process.Init, arguments: []const [:0]const u8) u8 {
             .argv = decoded.argv,
             .environ_map = init.environ_map,
         });
+        if (reporter) |channel| channel.send(executeFailure(err));
         report(init.io, @errorName(err));
         return 126;
     }
+}
+
+fn fileActionReason(err: anyerror) Host.FileActionFailure.Reason {
+    return switch (err) {
+        error.FileNotFound, error.NotDir, error.NetworkNotFound => .not_found,
+        error.AccessDenied, error.PermissionDenied, error.IsDir => .access_denied,
+        error.InvalidName, error.BadPathName, error.NameTooLong => .invalid_path,
+        error.PathAlreadyExists => .path_already_exists,
+        error.OutOfMemory,
+        error.NoDevice,
+        error.SystemResources,
+        error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded,
+        error.NoSpaceLeft,
+        error.DiskQuota,
+        error.FileTooBig,
+        error.FileBusy,
+        error.PipeBusy,
+        => .resource_unavailable,
+        else => .unsupported,
+    };
+}
+
+fn executeFailure(err: anyerror) Host.SpawnFailure {
+    return switch (err) {
+        error.FileNotFound, error.NotDir => .command_not_found,
+        error.AccessDenied, error.PermissionDenied => .access_denied,
+        error.InvalidExe, error.IsDir => .invalid_executable,
+        error.OutOfMemory,
+        error.NoDevice,
+        error.SystemResources,
+        error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded,
+        error.ResourceLimitReached,
+        => .resource_unavailable,
+        else => .unsupported,
+    };
 }
 
 fn standardDescriptor(descriptor: CommandPlan.FileDescriptor) bool {

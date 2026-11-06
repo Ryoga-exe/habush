@@ -130,7 +130,9 @@ pub fn prepare(
 /// Coverage describes the restrictions guaranteed if target code executes.
 /// A launcher/profile/worker failure cannot fall back to an unrestricted target;
 /// it appears as launcher failure or the worker's exit status and diagnostic.
-/// Worker file-action diagnostics index the tail after `resource_prefix`.
+/// System's private worker host reports late startup failures through
+/// Termination.spawn_failed, including original file-action indexes. A generic
+/// host may retain worker exit status and tail-relative stderr diagnostics.
 /// `worker_executable` must be a trusted executable implementing `worker.run`.
 pub fn launch(
     backend: SandboxBackend,
