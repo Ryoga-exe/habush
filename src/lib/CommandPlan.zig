@@ -14,6 +14,9 @@ cwd: WorkingDirectory = .inherit,
 /// source order because shell redirections are order-dependent.
 file_actions: []const FileAction = &.{},
 process_group: ProcessGroupAction = .inherit,
+/// Start stopped before target code. Hosts may prepare native file bindings
+/// first. The caller observes the stop and resumes after any TTY handoff.
+suspend_before_execute: bool = false,
 sandbox: Sandbox = .inherit,
 /// A resolved, expected lookup failure. File actions still run in source
 /// order before this outcome is published; no executable is started. A host

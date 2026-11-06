@@ -160,6 +160,13 @@ pub fn foreground(jobs: *Jobs, id: Id) Host.Error!?ExitStatus {
     var lease: ?Host.TerminalLease = null;
     const host = entry.pipeline.host;
     defer if (lease) |token| host.releaseTerminal(token) catch {};
+    if (entry.pipeline.suspend_on_start) {
+        // Every worker stops before the target can read the TTY. Observe the
+        // startup barrier before handing over the terminal and resuming the
+        // group; no reader can race into SIGTTIN before this point.
+        _ = try entry.pipeline.waitEvents();
+        entry.pipeline.suspend_on_start = false;
+    }
     _ = try entry.pipeline.poll();
     if (entry.pipeline.state() != .completed) {
         if (jobs.terminal_control) {

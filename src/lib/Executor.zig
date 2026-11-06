@@ -720,6 +720,7 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
     const foreground_job = !executor.background and in_process_count == 0 and !upstream_builtin and
         executor.jobs != null and executor.jobs.?.terminal_control;
     pipeline.create_group = (executor.background or foreground_job) and executor.host.capabilities().process_groups;
+    pipeline.suspend_on_start = foreground_job and executor.host.capabilities().suspend_before_execute;
 
     if (executor.concurrent_pipeline) |config| {
         if (non_external_count > 1) return executor.executeConcurrentPipeline(
@@ -1278,6 +1279,8 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
         const jobs = executor.jobs orelse return error.UnsupportedInstruction;
         var started = try Pipeline.startWithOptions(executor.gpa, executor.host, &.{plan}, .{
             .process_group = executor.host.capabilities().process_groups,
+            .suspend_on_start = !executor.background and jobs.terminal_control and
+                executor.host.capabilities().suspend_before_execute,
             .origins = &.{executor.io.diagnostic_source},
         });
         switch (started) {

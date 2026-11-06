@@ -182,6 +182,7 @@ const vtable: Host.VTable = .{
     .capabilities = .{
         .process_groups = builtin.os.tag != .windows and builtin.os.tag != .wasi,
         .terminal_control = builtin.os.tag != .windows and builtin.os.tag != .wasi,
+        .suspend_before_execute = builtin.os.tag != .windows and builtin.os.tag != .wasi,
         .poll = builtin.os.tag != .wasi,
         .signals = builtin.os.tag != .wasi,
         .parallel_open_file = true,
@@ -243,6 +244,17 @@ fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.SpawnError!Host.SpawnOut
         const worker_executable = system.worker_executable orelse return .{ .failed = .sandbox_unavailable };
         return backend.launch(system.gpa, system.io, system.workerHost(), worker_executable, plan);
     }
+    if (plan.suspend_before_execute) {
+        if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return .{ .failed = .unsupported };
+        const worker_executable = system.worker_executable orelse return .{ .failed = .unsupported };
+        return command_worker.launch(system.gpa, system.workerHost(), worker_executable, plan) catch |err| switch (err) {
+            error.Unsupported => if (firstFifoAction(system, plan) == null)
+                system.launchPreboundWorker(worker_executable, plan)
+            else
+                .{ .failed = .unsupported },
+            else => |other| return other,
+        };
+    }
     // FIFO opens can wait for another stage. Defer those actions to a fresh
     // worker so the parent can finish launching its peers. Ordinary file opens
     // retain their existing structured failures and source-order behavior.
@@ -256,6 +268,30 @@ fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.SpawnError!Host.SpawnOut
         return fileActionFailure(action_index, .unsupported);
     }
     return system.spawnNative(plan, false);
+}
+
+/// Ordinary interleaved resource actions already work through native stdio
+/// preparation. Preserve their order instead of making interactive execution
+/// less capable. Blocking FIFO and restricted opens never enter this fallback.
+fn launchPreboundWorker(system: *System, executable: []const u8, plan: CommandPlan) Host.SpawnError!Host.SpawnOutcome {
+    std.debug.assert(plan.sandbox == .inherit);
+    var target = plan;
+    target.file_actions = &.{};
+    var prepared = command_worker.prepare(system.gpa, target) catch |err| switch (err) {
+        error.Unsupported => return .{ .failed = .unsupported },
+        else => |other| return other,
+    };
+    defer prepared.deinit(system.gpa);
+    var arguments: std.ArrayList([]const u8) = .empty;
+    defer arguments.deinit(system.gpa);
+    try arguments.appendSlice(system.gpa, &.{ executable, command_worker.argument });
+    try arguments.appendSlice(system.gpa, prepared.arguments);
+    var wrapped = plan;
+    wrapped.executable = executable;
+    wrapped.argv = arguments.items;
+    wrapped.command_failure = null;
+    wrapped.suspend_before_execute = false;
+    return system.workerHost().spawn(wrapped);
 }
 
 fn spawnWorker(userdata: ?*anyopaque, plan: CommandPlan) Host.SpawnError!Host.SpawnOutcome {
@@ -2080,4 +2116,16 @@ test "malformed worker report still consumes the terminal process handle" {
     try std.testing.expectEqualDeep(Host.Termination{ .unknown = 0 }, termination);
     try std.testing.expect(!system.children.contains(process));
     try std.testing.expectError(error.InvalidArguments, system.host().tryWait(process));
+}
+
+test "startup suspension without a worker is rejected before creating children" {
+    var system: System = .{ .gpa = std.testing.allocator, .io = std.testing.io };
+    defer system.deinit();
+    const outcome = try system.host().spawn(.{
+        .executable = "/bin/cat",
+        .argv = &.{"/bin/cat"},
+        .suspend_before_execute = true,
+    });
+    try std.testing.expectEqualDeep(Host.SpawnOutcome{ .failed = .unsupported }, outcome);
+    try std.testing.expectEqual(@as(usize, 0), system.children.count());
 }

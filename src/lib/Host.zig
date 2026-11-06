@@ -98,6 +98,8 @@ pub const Signal = enum {
 pub const Capabilities = struct {
     process_groups: bool = false,
     terminal_control: bool = false,
+    /// A fresh worker can stop before target execution and terminal IO.
+    suspend_before_execute: bool = false,
     poll: bool = false,
     signals: bool = false,
     /// openFile may run concurrently with other Host operations. The host
@@ -179,6 +181,8 @@ pub const ProcessEvent = struct {
 
 pub fn spawn(host: Host, plan: CommandPlan) SpawnError!SpawnOutcome {
     plan.validate() catch return error.InvalidArguments;
+    if (plan.suspend_before_execute and !host.capabilities().suspend_before_execute)
+        return .{ .failed = .unsupported };
     return host.vtable.spawn(host.userdata, plan);
 }
 

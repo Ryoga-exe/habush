@@ -17,6 +17,8 @@ host: Host,
 pipes: []PipeState,
 processes: []ProcessRecord,
 create_group: bool = false,
+/// Pending initial stop, consumed by the caller before granting TTY ownership.
+suspend_on_start: bool = false,
 process_group: ?CommandPlan.ProcessGroup = null,
 
 pub const Error = Host.Error || Host.SpawnError;
@@ -99,6 +101,7 @@ pub const StartResult = union(enum) {
 
 pub const StartOptions = struct {
     process_group: bool = false,
+    suspend_on_start: bool = false,
     /// Empty, or one source location per submitted plan. Borrowed until start
     /// returns; each successfully spawned stage owns its attribution copy.
     origins: []const ?Source.Location = &.{},
@@ -236,6 +239,7 @@ pub fn spawnWithOrigin(
     var context_owned = true;
     defer if (context_owned) context.deinit(pipeline.gpa);
     var effective_plan = plan;
+    if (pipeline.suspend_on_start) effective_plan.suspend_before_execute = true;
     if (pipeline.create_group) {
         if (plan.process_group != .inherit) return error.InvalidArguments;
         effective_plan.process_group = if (pipeline.process_group) |group| .{ .join = group } else .create;
@@ -470,8 +474,10 @@ pub fn startWithOptions(
     // resources or launching any of the neighbouring commands.
     for (plans) |plan| try plan.validate();
     if (options.process_group and !host.capabilities().process_groups) return error.Unsupported;
+    if (options.suspend_on_start and !host.capabilities().suspend_before_execute) return error.Unsupported;
     var pipeline = try Pipeline.init(gpa, host, plans.len);
     pipeline.create_group = options.process_group;
+    pipeline.suspend_on_start = options.suspend_on_start;
     var transferred = false;
     defer if (!transferred) {
         pipeline.signal(.kill) catch {};

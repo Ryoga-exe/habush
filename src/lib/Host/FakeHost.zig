@@ -251,6 +251,7 @@ fn clonePlan(allocator: std.mem.Allocator, plan: CommandPlan) !CommandPlan {
         },
         .file_actions = actions,
         .process_group = plan.process_group,
+        .suspend_before_execute = plan.suspend_before_execute,
         .sandbox = try plan.sandbox.clone(allocator),
         .command_failure = plan.command_failure,
     };
