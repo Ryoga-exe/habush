@@ -29,9 +29,33 @@ test "expands and joins static argument parts" {
 }
 
 test "classifies unsupported argument expansions" {
-    try expectExpansionError("command ${#name}", error.ParameterExpansionUnsupported);
+    try expectExpansionError("command ${name%pattern}", error.ParameterExpansionUnsupported);
     try expectExpansionError("command *.zig", error.PathnameExpansionUnsupported);
     try expectExpansionError("command ~other/work", error.TildeExpansionUnsupported);
+}
+
+test "parameter lengths count Unicode scalars and preserve scalar expansion rules" {
+    var hir = try generate("command ${#name} \"${#empty}\" ${#missing} ${#1} ${#@} ${#*} ${##} ${#} \"${#invalid}\" ${#name:-fallback}");
+    defer hir.deinit(std.testing.allocator);
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+    try variables.set("name", "日本語");
+    try variables.set("empty", "");
+    try variables.set("invalid", "\xff\xfe");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const expander = Expander.initWithContext(arena.allocator(), .{
+        .variables = &variables,
+        .positional_parameters = &.{ "é", "second" },
+    });
+    const parts = firstCommandParts(hir);
+    const expected: []const []const u8 = &.{ "3", "0", "0", "1", "2", "2", "1", "2", "2" };
+    for (expected, parts[1..10]) |value, part| {
+        try std.testing.expectEqualDeep(@as([]const []const u8, &.{value}), try expander.expandArgument(hir, part));
+    }
+    try std.testing.expectError(error.ParameterExpansionUnsupported, expander.expandArgument(hir, parts[10]));
+    const scalar = try expander.expandHereDocument("length=${#name}, count=${#@}");
+    try std.testing.expectEqualStrings("length=3, count=2", scalar);
 }
 
 test "expands the shell process id" {
