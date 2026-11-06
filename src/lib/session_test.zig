@@ -21,7 +21,7 @@ test "session executes with its runtime configuration" {
     const default_search_path = [_][]const u8{ "/bin", "/usr/bin" };
     var session = try Session.init(std.testing.allocator, fake_host.host(), .{
         .resolver = fake_resolver.resolver(),
-        .cwd = "/work",
+        .context = .{ .cwd = "/work" },
         .default_search_path = &default_search_path,
         .variables = &.{
             .{ .name = "greeting", .value = "from session", .exported = true },
@@ -49,6 +49,39 @@ test "session executes with its runtime configuration" {
     try std.testing.expectEqualStrings("/work", fake_host.spawn_calls.items[0].cwd.path);
 }
 
+test "sessions keep working directory and output independent" {
+    var fake_host = FakeHost.init(std.testing.allocator);
+    defer fake_host.deinit();
+    var first_output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer first_output.deinit();
+    var second_output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer second_output.deinit();
+
+    var first = try Session.init(std.testing.allocator, fake_host.host(), .{
+        .context = .{ .cwd = "/one", .io = .{ .stdout = &first_output.writer } },
+    });
+    defer first.deinit();
+    var second = try Session.init(std.testing.allocator, fake_host.host(), .{
+        .context = .{ .cwd = "/two", .io = .{ .stdout = &second_output.writer } },
+    });
+    defer second.deinit();
+
+    var hir = try generate("pwd");
+    defer hir.deinit(std.testing.allocator);
+    _ = try first.execute(hir);
+    _ = try second.execute(hir);
+
+    fake_host.working_directory_result = "/one/project";
+    try first.changeWorkingDirectory("project");
+    _ = try first.execute(hir);
+    _ = try second.execute(hir);
+
+    try std.testing.expectEqualStrings("/one/project", first.workingDirectory().?);
+    try std.testing.expectEqualStrings("/two", second.workingDirectory().?);
+    try std.testing.expectEqualStrings("/one\n/one/project\n", first_output.written());
+    try std.testing.expectEqualStrings("/two\n/two\n", second_output.written());
+}
+
 test "session replaces owned runtime configuration" {
     var fake_host = FakeHost.init(std.testing.allocator);
     defer fake_host.deinit();
@@ -58,7 +91,8 @@ test "session replaces owned runtime configuration" {
     var cwd = [_]u8{ '/', 'n', 'e', 'w' };
     var positional = [_]u8{ 'v', 'a', 'l', 'u', 'e' };
     var allowed_path = [_]u8{ '/', 'n', 'e', 'w' };
-    try session.setWorkingDirectory(&cwd);
+    fake_host.working_directory_result = &cwd;
+    try session.changeWorkingDirectory(&cwd);
     try session.setPositionalParameters(&.{&positional});
     const rules = [_]SandboxPolicy.PathRule{
         .{ .path = &allowed_path, .access = .{ .write = true } },
@@ -159,8 +193,7 @@ test "function call redirections scope builtin and external output together" {
     defer output.deinit();
     var session = try Session.init(std.testing.allocator, fake_host.host(), .{
         .resolver = CommandResolver.preResolved(),
-        .cwd = "/workspace",
-        .io = .{ .stdout = &output.writer },
+        .context = .{ .cwd = "/workspace", .io = .{ .stdout = &output.writer } },
     });
     defer session.deinit();
 
@@ -304,7 +337,7 @@ test "recursive functions stop at the runtime call-depth limit" {
     var diagnostics: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer diagnostics.deinit();
     var session = try Session.init(std.testing.allocator, fake_host.host(), .{
-        .io = .{ .stderr = &diagnostics.writer },
+        .context = .{ .io = .{ .stderr = &diagnostics.writer } },
     });
     defer session.deinit();
 
@@ -359,7 +392,7 @@ test "session routes builtin output" {
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
     var session = try Session.init(std.testing.allocator, fake_host.host(), .{
-        .io = .{ .stdout = &output.writer },
+        .context = .{ .io = .{ .stdout = &output.writer } },
         .variables = &.{
             .{ .name = "EXPORTED", .value = "value", .exported = true },
             .{ .name = "LOCAL", .value = "hidden" },
@@ -384,7 +417,7 @@ test "cd changes resolution and spawn directories for later commands" {
     fake_resolver.result = "/bin/echo";
     var session = try Session.init(std.testing.allocator, fake_host.host(), .{
         .resolver = fake_resolver.resolver(),
-        .cwd = "/workspace",
+        .context = .{ .cwd = "/workspace" },
     });
     defer session.deinit();
 
@@ -534,7 +567,7 @@ test "relative and empty PATH entries retain the command working directory" {
     fake_resolver.result = "/bin/tool";
     var session = try Session.init(std.testing.allocator, fake_host.host(), .{
         .resolver = fake_resolver.resolver(),
-        .cwd = "/workspace",
+        .context = .{ .cwd = "/workspace" },
     });
     defer session.deinit();
 
@@ -601,7 +634,7 @@ test "session executes HIR through the system resolver and host" {
     };
     var session = try Session.init(std.testing.allocator, system_host.host(), .{
         .resolver = system_resolver.resolver(),
-        .cwd = cwd,
+        .context = .{ .cwd = cwd },
         .default_search_path = &search_path_storage,
         .variables = &.{
             .{ .name = "EXPECTED", .value = cwd, .exported = true },

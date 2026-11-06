@@ -16,6 +16,7 @@ const Builtin = @import("Builtin.zig");
 const CommandPlan = @import("CommandPlan.zig");
 const CommandResolver = @import("CommandResolver.zig");
 const Executor = @This();
+const ExecutionContext = @import("ExecutionContext.zig");
 const Expander = @import("Expander.zig");
 const Hir = @import("Hir.zig");
 const Host = @import("Host.zig");
@@ -25,14 +26,13 @@ const VariableStore = @import("VariableStore.zig");
 
 gpa: std.mem.Allocator,
 host: Host,
-sandbox: CommandPlan.Sandbox,
+context: ExecutionContext.Ref,
 resolver: ?CommandResolver,
 default_search_path: []const []const u8,
 invocation_name: []const u8,
 shell_process_id: ?runtime.ProcessId,
 positional_parameters: []const []const u8,
 positional_parameters_override: ?[]const []const u8,
-cwd: ?[]const u8,
 variables: ?*VariableStore,
 runtime_state: ?*runtime.State,
 io: runtime.Io,
@@ -57,18 +57,16 @@ pub const Error = Builtin.Error || Host.Error || Expander.Error || CommandResolv
 };
 
 pub const Options = struct {
-    sandbox: CommandPlan.Sandbox = .inherit,
+    context: ExecutionContext.View = .{},
     resolver: ?CommandResolver = null,
     /// Used only when neither the command bindings nor shell variables set PATH.
     default_search_path: []const []const u8 = &.{},
     invocation_name: []const u8 = "habush",
     shell_process_id: ?runtime.ProcessId = null,
     positional_parameters: []const []const u8 = &.{},
-    cwd: ?[]const u8 = null,
     /// Complete shell variable state. When present, exported bindings become
     /// an exact replacement environment; `null` preserves host inheritance.
     variables: ?*VariableStore = null,
-    io: runtime.Io = .{},
     /// Status visible to a command such as `exit` when no operand is given.
     last_status: runtime.ExitStatus = 0,
 };
@@ -142,16 +140,19 @@ const PreparedPipelineStage = struct {
     plan: ?PipelineStagePlan = null,
     state: ?runtime.State = null,
     variables: ?VariableStore = null,
+    context: ?ExecutionContext = null,
 
     fn deinit(stage: *PreparedPipelineStage) void {
         if (stage.state) |*state| state.deinit();
         if (stage.variables) |*variables| variables.deinit();
+        if (stage.context) |*context| context.deinit();
     }
 
     fn executor(stage: *PreparedPipelineStage, base: Executor) Executor {
         var result = base;
         if (stage.state) |*state| result.runtime_state = state;
         if (stage.variables) |*variables| result.variables = variables;
+        if (stage.context) |*context| result.context = .{ .mutable = context };
         result.prepared_simple = if (stage.plan) |plan| switch (plan) {
             .simple => |simple| simple,
             .definition, .compound => null,
@@ -168,17 +169,16 @@ pub fn initWithOptions(gpa: std.mem.Allocator, host: Host, options: Options) Exe
     return .{
         .gpa = gpa,
         .host = host,
-        .sandbox = options.sandbox,
+        .context = .{ .view = options.context },
         .resolver = options.resolver,
         .default_search_path = options.default_search_path,
         .invocation_name = options.invocation_name,
         .shell_process_id = options.shell_process_id,
         .positional_parameters = options.positional_parameters,
         .positional_parameters_override = null,
-        .cwd = options.cwd,
         .variables = options.variables,
         .runtime_state = null,
-        .io = options.io,
+        .io = options.context.io,
         .scoped_file_actions = &.{},
         .pipeline_stage = null,
         .prepared_simple = null,
@@ -192,23 +192,22 @@ pub fn initWithState(
     host: Host,
     resolver: ?CommandResolver,
     state: *runtime.State,
-    io: runtime.Io,
+    context: *ExecutionContext,
     last_status: runtime.ExitStatus,
 ) Executor {
     return .{
         .gpa = state.allocator(),
         .host = host,
-        .sandbox = .inherit,
+        .context = .{ .mutable = context },
         .resolver = resolver,
         .default_search_path = &.{},
         .invocation_name = "",
         .shell_process_id = null,
         .positional_parameters = &.{},
         .positional_parameters_override = null,
-        .cwd = null,
         .variables = null,
         .runtime_state = state,
-        .io = io,
+        .io = context.io,
         .scoped_file_actions = &.{},
         .pipeline_stage = null,
         .prepared_simple = null,
@@ -254,6 +253,18 @@ fn executeFunctionDefinition(executor: Executor, hir: Hir, index: Hir.Inst.Index
 fn executeSubshell(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
     const group = hir.groupedCommand(index);
     var subshell_executor = executor;
+    var context_copy = try executor.context.clone(executor.gpa);
+    defer context_copy.deinit();
+    subshell_executor.context = .{ .mutable = &context_copy };
+    var state_copy = if (executor.runtime_state) |state| try state.clone() else null;
+    defer if (state_copy) |*state| state.deinit();
+    if (state_copy) |*state| subshell_executor.runtime_state = state;
+    var variables_copy = if (executor.variables) |variables|
+        try variables.clone(executor.gpa)
+    else
+        null;
+    defer if (variables_copy) |*variables| variables.deinit();
+    if (variables_copy) |*variables| subshell_executor.variables = variables;
     var arena = std.heap.ArenaAllocator.init(executor.gpa);
     defer arena.deinit();
     var scope = switch (try subshell_executor.beginHirRedirections(
@@ -267,18 +278,6 @@ fn executeSubshell(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
     defer scope.deinit();
     subshell_executor = scope.executor;
     subshell_executor.loop_depth = 0;
-    if (executor.runtime_state) |state| {
-        var state_copy = try state.clone();
-        defer state_copy.deinit();
-        subshell_executor.runtime_state = &state_copy;
-        return subshell_executor.executeSubshellBody(hir, group.body);
-    }
-    if (executor.variables) |variables| {
-        var variables_copy = try variables.clone(executor.gpa);
-        defer variables_copy.deinit();
-        subshell_executor.variables = &variables_copy;
-        return subshell_executor.executeSubshellBody(hir, group.body);
-    }
     return subshell_executor.executeSubshellBody(hir, group.body);
 }
 
@@ -582,6 +581,7 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
     defer for (prepared) |*stage| stage.deinit();
     var in_process_count: usize = 0;
     for (prepared) |*stage| {
+        stage.context = try executor.context.clone(executor.gpa);
         if (executor.runtime_state) |state| stage.state = try state.clone();
         if (executor.variables) |variables| stage.variables = try variables.clone(executor.gpa);
         const stage_executor = stage.executor(executor);
@@ -1389,6 +1389,7 @@ fn executeBuiltin(
     }
     const result = try builtin.run(.{
         .host = executor.host,
+        .execution_context = executor.context,
         .runtime_state = executor.runtime_state,
         .variable_overrides = command_variables,
         .io = executor.io,
@@ -1463,8 +1464,7 @@ fn parameterExpansionFailure(
 }
 
 fn workingDirectory(executor: Executor) ?[]const u8 {
-    if (executor.runtime_state) |state| return state.workingDirectory();
-    return executor.cwd;
+    return executor.context.get().cwd;
 }
 
 fn invocationName(executor: Executor) []const u8 {
@@ -1505,8 +1505,7 @@ fn positionalParameters(executor: Executor) []const []const u8 {
 }
 
 fn activeSandbox(executor: Executor) CommandPlan.Sandbox {
-    if (executor.runtime_state) |state| return state.activeSandbox();
-    return executor.sandbox;
+    return executor.context.get().sandbox;
 }
 
 fn commandFailure(

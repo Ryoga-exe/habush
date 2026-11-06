@@ -5,6 +5,7 @@ const CommandPlan = @import("CommandPlan.zig");
 const CommandResolver = @import("CommandResolver.zig");
 const FakeResolver = @import("CommandResolver/FakeResolver.zig");
 const Executor = @import("Executor.zig");
+const ExecutionContext = @import("ExecutionContext.zig");
 const FakeHost = @import("Host/FakeHost.zig");
 const SandboxPolicy = @import("SandboxPolicy.zig");
 const runtime = @import("runtime.zig");
@@ -203,7 +204,7 @@ test "closes earlier here-document resources when later expansion fails" {
 
     const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
         .resolver = CommandResolver.preResolved(),
-        .io = .{ .stderr = &diagnostics.writer },
+        .context = .{ .io = .{ .stderr = &diagnostics.writer } },
     }).execute(hir);
 
     try std.testing.expectEqual(@as(u8, 1), result.status);
@@ -230,7 +231,7 @@ test "reports here-document input resource creation failures" {
 
     const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
         .resolver = CommandResolver.preResolved(),
-        .io = .{ .stderr = &diagnostics.writer },
+        .context = .{ .io = .{ .stderr = &diagnostics.writer } },
     }).execute(hir);
 
     try std.testing.expectEqual(@as(u8, 1), result.status);
@@ -260,7 +261,7 @@ test "closes here-document resources after spawn failures" {
 
     const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
         .resolver = CommandResolver.preResolved(),
-        .io = .{ .stderr = &diagnostics.writer },
+        .context = .{ .io = .{ .stderr = &diagnostics.writer } },
     }).execute(hir);
 
     try std.testing.expectEqual(@as(u8, 126), result.status);
@@ -311,7 +312,7 @@ test "diagnoses invalid external command redirects before spawning" {
         const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
             .resolver = CommandResolver.preResolved(),
             .variables = &variables,
-            .io = .{ .stderr = &diagnostics.writer },
+            .context = .{ .io = .{ .stderr = &diagnostics.writer } },
         }).execute(hir);
 
         try std.testing.expectEqual(@as(u8, 1), result.status);
@@ -334,7 +335,7 @@ test "reports the path and reason for host file action failures" {
 
     const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
         .resolver = CommandResolver.preResolved(),
-        .io = .{ .stderr = &diagnostics.writer },
+        .context = .{ .io = .{ .stderr = &diagnostics.writer } },
     }).execute(hir);
 
     try std.testing.expectEqual(@as(u8, 1), result.status);
@@ -358,7 +359,7 @@ test "reports unsupported non-open host file actions" {
 
     const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
         .resolver = CommandResolver.preResolved(),
-        .io = .{ .stderr = &diagnostics.writer },
+        .context = .{ .io = .{ .stderr = &diagnostics.writer } },
     }).execute(hir);
 
     try std.testing.expectEqual(@as(u8, 126), result.status);
@@ -653,12 +654,14 @@ test "pipeline command words expand once in their isolated stage state" {
     defer fake.deinit();
     var state = try runtime.State.init(std.testing.allocator, .{});
     defer state.deinit();
+    var context = try ExecutionContext.init(std.testing.allocator, .{});
+    defer context.deinit();
 
     const result = try Executor.initWithState(
         fake.host(),
         CommandResolver.preResolved(),
         &state,
-        .{},
+        &context,
         0,
     ).execute(hir);
 
@@ -720,14 +723,16 @@ test "output builtin runs after its downstream pipeline stage is launched" {
     defer hir.deinit(std.testing.allocator);
     var fake = FakeHost.init(std.testing.allocator);
     defer fake.deinit();
-    var state = try runtime.State.init(std.testing.allocator, .{ .cwd = "/workspace" });
+    var state = try runtime.State.init(std.testing.allocator, .{});
     defer state.deinit();
+    var context = try ExecutionContext.init(std.testing.allocator, .{ .cwd = "/workspace" });
+    defer context.deinit();
 
     const result = try Executor.initWithState(
         fake.host(),
         CommandResolver.preResolved(),
         &state,
-        .{},
+        &context,
         0,
     ).execute(hir);
 
@@ -749,16 +754,18 @@ test "closed downstream pipeline turns builtin write failure into stage status" 
     var full_buffer: [0]u8 = .{};
     var failing_writer: std.Io.Writer = .fixed(&full_buffer);
     fake.resource_writer_override = &failing_writer;
-    var state = try runtime.State.init(std.testing.allocator, .{ .cwd = "/workspace" });
+    var state = try runtime.State.init(std.testing.allocator, .{});
     defer state.deinit();
     var diagnostics: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer diagnostics.deinit();
+    var context = try ExecutionContext.init(std.testing.allocator, .{ .cwd = "/workspace", .io = .{ .stderr = &diagnostics.writer } });
+    defer context.deinit();
 
     const result = try Executor.initWithState(
         fake.host(),
         CommandResolver.preResolved(),
         &state,
-        .{ .stderr = &diagnostics.writer },
+        &context,
         0,
     ).execute(hir);
 
@@ -774,24 +781,25 @@ test "stateful pipeline builtins do not mutate the parent shell" {
     defer fake.deinit();
     fake.working_directory_result = "/workspace/child";
     var state = try runtime.State.init(std.testing.allocator, .{
-        .cwd = "/workspace",
         .variables = &.{
             .{ .name = "NAME", .value = "outside" },
             .{ .name = "KEEP", .value = "present", .exported = true },
         },
     });
     defer state.deinit();
+    var context = try ExecutionContext.init(std.testing.allocator, .{ .cwd = "/workspace" });
+    defer context.deinit();
 
     const result = try Executor.initWithState(
         fake.host(),
         CommandResolver.preResolved(),
         &state,
-        .{},
+        &context,
         0,
     ).execute(hir);
 
     try std.testing.expectEqual(@as(u8, 0), result.status);
-    try std.testing.expectEqualStrings("/workspace", state.workingDirectory().?);
+    try std.testing.expectEqualStrings("/workspace", context.workingDirectory().?);
     try std.testing.expectEqualStrings("outside", state.variable("NAME").?);
     try std.testing.expect(!state.isVariableExported("NAME"));
     try std.testing.expectEqualStrings("present", state.variable("KEEP").?);
@@ -810,12 +818,14 @@ test "export output flows to a downstream pipeline stage" {
         .variables = &.{.{ .name = "SENTINEL", .value = "value", .exported = true }},
     });
     defer state.deinit();
+    var context = try ExecutionContext.init(std.testing.allocator, .{});
+    defer context.deinit();
 
     const result = try Executor.initWithState(
         fake.host(),
         CommandResolver.preResolved(),
         &state,
-        .{},
+        &context,
         0,
     ).execute(hir);
 
@@ -851,12 +861,14 @@ test "return in a pipeline does not leave the calling function" {
     defer fake.deinit();
     var state = try runtime.State.init(std.testing.allocator, .{});
     defer state.deinit();
+    var context = try ExecutionContext.init(std.testing.allocator, .{});
+    defer context.deinit();
 
     const result = try Executor.initWithState(
         fake.host(),
         CommandResolver.preResolved(),
         &state,
-        .{},
+        &context,
         0,
     ).execute(hir);
 
@@ -884,7 +896,7 @@ test "loop control in a pipeline does not leave the parent loop" {
         const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
             .resolver = CommandResolver.preResolved(),
             .variables = &variables,
-            .io = .{ .stderr = &diagnostics.writer },
+            .context = .{ .io = .{ .stderr = &diagnostics.writer } },
         }).execute(hir);
 
         try std.testing.expectEqual(@as(u8, 0), result.status);
@@ -904,12 +916,14 @@ test "shell function pipeline stage runs after adjacent external stages launch" 
     defer fake.deinit();
     var state = try runtime.State.init(std.testing.allocator, .{});
     defer state.deinit();
+    var context = try ExecutionContext.init(std.testing.allocator, .{});
+    defer context.deinit();
 
     const result = try Executor.initWithState(
         fake.host(),
         CommandResolver.preResolved(),
         &state,
-        .{},
+        &context,
         0,
     ).execute(hir);
 
@@ -935,12 +949,14 @@ test "prepared pipeline command preserves function precedence over regular built
     defer fake.deinit();
     var state = try runtime.State.init(std.testing.allocator, .{});
     defer state.deinit();
+    var context = try ExecutionContext.init(std.testing.allocator, .{});
+    defer context.deinit();
 
     const result = try Executor.initWithState(
         fake.host(),
         CommandResolver.preResolved(),
         &state,
-        .{},
+        &context,
         0,
     ).execute(hir);
 
@@ -959,21 +975,22 @@ test "shell function pipeline stage state does not escape" {
     defer fake.deinit();
     fake.working_directory_result = "/workspace/child";
     var state = try runtime.State.init(std.testing.allocator, .{
-        .cwd = "/workspace",
         .variables = &.{.{ .name = "NAME", .value = "outside" }},
     });
     defer state.deinit();
+    var context = try ExecutionContext.init(std.testing.allocator, .{ .cwd = "/workspace" });
+    defer context.deinit();
 
     const result = try Executor.initWithState(
         fake.host(),
         CommandResolver.preResolved(),
         &state,
-        .{},
+        &context,
         0,
     ).execute(hir);
 
     try std.testing.expectEqual(@as(u8, 0), result.status);
-    try std.testing.expectEqualStrings("/workspace", state.workingDirectory().?);
+    try std.testing.expectEqualStrings("/workspace", context.workingDirectory().?);
     try std.testing.expectEqualStrings("outside", state.variable("NAME").?);
     try std.testing.expect(!state.isVariableExported("NAME"));
 }
@@ -985,10 +1002,12 @@ test "multiple general in-process pipeline stages remain unsupported" {
     defer fake.deinit();
     var state = try runtime.State.init(std.testing.allocator, .{});
     defer state.deinit();
+    var context = try ExecutionContext.init(std.testing.allocator, .{});
+    defer context.deinit();
 
     try std.testing.expectError(
         error.UnsupportedInstruction,
-        Executor.initWithState(fake.host(), null, &state, .{}, 0).execute(hir),
+        Executor.initWithState(fake.host(), null, &state, &context, 0).execute(hir),
     );
     try std.testing.expectEqual(@as(usize, 0), fake.create_pipe_calls);
     try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
@@ -1090,7 +1109,7 @@ test "upstream pipeline spawn failures reap downstream processes" {
 
     const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
         .resolver = CommandResolver.preResolved(),
-        .io = .{ .stderr = &diagnostics.writer },
+        .context = .{ .io = .{ .stderr = &diagnostics.writer } },
     }).execute(hir);
 
     try std.testing.expectEqual(@as(u8, 0), result.status);
@@ -1190,16 +1209,18 @@ test "builtin redirections replace runtime output only for the command scope" {
     defer hir.deinit(std.testing.allocator);
     var fake = FakeHost.init(std.testing.allocator);
     defer fake.deinit();
-    var state = try runtime.State.init(std.testing.allocator, .{ .cwd = "/workspace" });
+    var state = try runtime.State.init(std.testing.allocator, .{});
     defer state.deinit();
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
+    var context = try ExecutionContext.init(std.testing.allocator, .{ .cwd = "/workspace", .io = .{ .stdout = &output.writer } });
+    defer context.deinit();
 
     const result = try Executor.initWithState(
         fake.host(),
         null,
         &state,
-        .{ .stdout = &output.writer },
+        &context,
         0,
     ).execute(hir);
 
@@ -1242,7 +1263,7 @@ test "failed scoped redirections prevent command side effects" {
 
     const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
         .variables = &variables,
-        .io = .{ .stderr = &diagnostics.writer },
+        .context = .{ .io = .{ .stderr = &diagnostics.writer } },
     }).execute(hir);
 
     try std.testing.expectEqual(@as(u8, 1), result.status);
@@ -1266,7 +1287,7 @@ test "later scoped redirection failure closes earlier resources" {
 
     const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
         .variables = &variables,
-        .io = .{ .stderr = &diagnostics.writer },
+        .context = .{ .io = .{ .stderr = &diagnostics.writer } },
     }).execute(hir);
 
     try std.testing.expectEqual(@as(u8, 1), result.status);
@@ -1300,16 +1321,17 @@ test "subshells isolate runtime state and contain exit control flow" {
     defer fake.deinit();
     fake.working_directory_result = "/workspace/child";
     var state = try runtime.State.init(std.testing.allocator, .{
-        .cwd = "/workspace",
         .variables = &.{.{ .name = "name", .value = "outside" }},
     });
     defer state.deinit();
+    var context = try ExecutionContext.init(std.testing.allocator, .{ .cwd = "/workspace" });
+    defer context.deinit();
 
     const result = try Executor.initWithState(
         fake.host(),
         null,
         &state,
-        .{},
+        &context,
         0,
     ).execute(hir);
 
@@ -1317,7 +1339,7 @@ test "subshells isolate runtime state and contain exit control flow" {
     try std.testing.expect(result.control_flow.isNone());
     try std.testing.expectEqualStrings("outside", state.variable("name").?);
     try std.testing.expectEqualStrings("outside", state.variable("observed").?);
-    try std.testing.expectEqualStrings("/workspace", state.workingDirectory().?);
+    try std.testing.expectEqualStrings("/workspace", context.workingDirectory().?);
     try std.testing.expect(state.variable("PWD") == null);
 }
 
@@ -1354,6 +1376,25 @@ test "subshell redirections are inherited without leaking state" {
     try std.testing.expectEqual(@as(usize, 1), fake.closed_resource_count);
 }
 
+test "subshell redirect expansion stays in the subshell state" {
+    var hir = try generate("(/bin/tool \"$NAME\") >\"${NAME:=inside}\"");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+
+    const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .resolver = CommandResolver.preResolved(),
+        .variables = &variables,
+    }).execute(hir);
+
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expect(variables.get("NAME") == null);
+    try std.testing.expectEqualStrings("inside", fake.open_file_calls.items[0].open.path);
+    try std.testing.expectEqualStrings("inside", fake.spawn_calls.items[0].argv[1]);
+}
+
 test "subshells do not inherit the surrounding loop context" {
     var hir = try generate(
         "condition=true; while \"$condition\"; do " ++
@@ -1369,7 +1410,7 @@ test "subshells do not inherit the surrounding loop context" {
 
     const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
         .variables = &variables,
-        .io = .{ .stderr = &diagnostics.writer },
+        .context = .{ .io = .{ .stderr = &diagnostics.writer } },
     }).execute(hir);
 
     try std.testing.expectEqual(@as(u8, 0), result.status);
@@ -1431,16 +1472,18 @@ test "if clause redirections cover the condition and selected branch" {
     defer hir.deinit(std.testing.allocator);
     var fake = FakeHost.init(std.testing.allocator);
     defer fake.deinit();
-    var state = try runtime.State.init(std.testing.allocator, .{ .cwd = "/workspace" });
+    var state = try runtime.State.init(std.testing.allocator, .{});
     defer state.deinit();
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
+    var context = try ExecutionContext.init(std.testing.allocator, .{ .cwd = "/workspace", .io = .{ .stdout = &output.writer } });
+    defer context.deinit();
 
     const result = try Executor.initWithState(
         fake.host(),
         null,
         &state,
-        .{ .stdout = &output.writer },
+        &context,
         0,
     ).execute(hir);
 
@@ -1530,10 +1573,12 @@ test "loop clause redirections are opened once across condition reevaluation" {
     defer hir.deinit(std.testing.allocator);
     var fake = FakeHost.init(std.testing.allocator);
     defer fake.deinit();
-    var state = try runtime.State.init(std.testing.allocator, .{ .cwd = "/workspace" });
+    var state = try runtime.State.init(std.testing.allocator, .{});
     defer state.deinit();
+    var context = try ExecutionContext.init(std.testing.allocator, .{ .cwd = "/workspace" });
+    defer context.deinit();
 
-    const result = try Executor.initWithState(fake.host(), null, &state, .{}, 0).execute(hir);
+    const result = try Executor.initWithState(fake.host(), null, &state, &context, 0).execute(hir);
 
     try std.testing.expectEqual(@as(u8, 0), result.status);
     try std.testing.expectEqualStrings("/workspace\n", fake.redirected_output.written());
@@ -1743,7 +1788,7 @@ test "break outside a loop reports a command failure" {
     defer diagnostics.deinit();
 
     const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
-        .io = .{ .stderr = &diagnostics.writer },
+        .context = .{ .io = .{ .stderr = &diagnostics.writer } },
     }).execute(hir);
 
     try std.testing.expectEqual(@as(u8, 1), result.status);
@@ -1953,10 +1998,10 @@ test "parameter expansion failures become shell diagnostics" {
 
     const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
         .variables = &variables,
-        .io = .{
+        .context = .{ .io = .{
             .stderr = &diagnostics.writer,
             .diagnostic_options = .{ .program_name = "habush" },
-        },
+        } },
     }).execute(hir);
 
     try std.testing.expectEqual(@as(u8, 1), result.status);
@@ -2084,7 +2129,7 @@ test "resolves command names and explicit paths through the resolver" {
     const executor = Executor.initWithOptions(std.testing.allocator, fake_host.host(), .{
         .resolver = fake_resolver.resolver(),
         .default_search_path = &default_search_path,
-        .cwd = "/workspace",
+        .context = .{ .cwd = "/workspace" },
     });
 
     _ = try executor.execute(hir);
@@ -2125,7 +2170,7 @@ test "does not spawn when command resolution finds no executable" {
 
     const result = try Executor.initWithOptions(std.testing.allocator, fake_host.host(), .{
         .resolver = fake_resolver.resolver(),
-        .io = .{ .stderr = &diagnostics.writer },
+        .context = .{ .io = .{ .stderr = &diagnostics.writer } },
     }).execute(hir);
 
     try std.testing.expectEqual(@as(u8, 127), result.status);
@@ -2146,7 +2191,7 @@ test "reports denied command resolution as not executable" {
 
     const result = try Executor.initWithOptions(std.testing.allocator, fake_host.host(), .{
         .resolver = fake_resolver.resolver(),
-        .io = .{ .stderr = &diagnostics.writer },
+        .context = .{ .io = .{ .stderr = &diagnostics.writer } },
     }).execute(hir);
 
     try std.testing.expectEqual(@as(u8, 126), result.status);
@@ -2207,7 +2252,7 @@ test "reports host spawn failures as command diagnostics" {
 
         const result = try Executor.initWithOptions(std.testing.allocator, fake_host.host(), .{
             .resolver = fake_resolver.resolver(),
-            .io = .{ .stderr = &diagnostics.writer },
+            .context = .{ .io = .{ .stderr = &diagnostics.writer } },
         }).execute(hir);
 
         try std.testing.expectEqual(case.status, result.status);
@@ -2227,10 +2272,10 @@ test "forwards the active sandbox policy to the host" {
     };
     const executor = Executor.initWithOptions(std.testing.allocator, fake.host(), .{
         .resolver = CommandResolver.preResolved(),
-        .sandbox = .{ .restrict = .{
+        .context = .{ .sandbox = .{ .restrict = .{
             .enforcement = .required,
             .file_system = .{ .allow = &rules },
-        } },
+        } } },
     });
 
     _ = try executor.execute(hir);
@@ -2344,12 +2389,14 @@ fn executeStatefulPipelineWithAllocator(
     defer fake.deinit();
     var state = try runtime.State.init(gpa, .{});
     defer state.deinit();
+    var context = try ExecutionContext.init(gpa, .{});
+    defer context.deinit();
 
     const result = Executor.initWithState(
         fake.host(),
         CommandResolver.preResolved(),
         &state,
-        .{},
+        &context,
         0,
     ).execute(hir) catch |err| {
         try expectPipelineResourcesReleased(&fake);

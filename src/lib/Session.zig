@@ -4,6 +4,7 @@ const std = @import("std");
 const CommandPlan = @import("CommandPlan.zig");
 const CommandResolver = @import("CommandResolver.zig");
 const Executor = @import("Executor.zig");
+const ExecutionContext = @import("ExecutionContext.zig");
 const Hir = @import("Hir.zig");
 const Host = @import("Host.zig");
 const runtime = @import("runtime.zig");
@@ -12,7 +13,7 @@ const Session = @This();
 
 host: Host,
 resolver: ?CommandResolver,
-io: runtime.Io,
+context: ExecutionContext,
 state: runtime.State,
 last_result: Executor.Result = .{
     .status = 0,
@@ -21,18 +22,16 @@ last_result: Executor.Result = .{
 
 pub const Options = struct {
     resolver: ?CommandResolver = null,
-    cwd: ?[]const u8 = null,
+    context: ExecutionContext.View = .{},
     invocation_name: []const u8 = "habush",
     shell_process_id: ?runtime.ProcessId = null,
     /// Immutable fallback used only when PATH is unset. Set PATH through
     /// `variables` or `setVariable` to change the active search path.
     default_search_path: []const []const u8 = &.{},
     positional_parameters: []const []const u8 = &.{},
-    sandbox: CommandPlan.Sandbox = .inherit,
     /// Complete initial shell variable state. The caller should import the
     /// host environment here and mark those bindings exported when desired.
     variables: []const VariableStore.Binding = &.{},
-    io: runtime.Io = .{},
 };
 
 pub const ExecutionOptions = struct {
@@ -46,17 +45,17 @@ pub fn init(
     host: Host,
     options: Options,
 ) VariableStore.Error!Session {
+    var context = try ExecutionContext.init(gpa, options.context);
+    errdefer context.deinit();
     return .{
         .host = host,
         .resolver = options.resolver,
-        .io = options.io,
+        .context = context,
         .state = try runtime.State.init(gpa, .{
-            .cwd = options.cwd,
             .invocation_name = options.invocation_name,
             .shell_process_id = options.shell_process_id,
             .default_search_path = options.default_search_path,
             .positional_parameters = options.positional_parameters,
-            .sandbox = options.sandbox,
             .variables = options.variables,
         }),
     };
@@ -64,6 +63,7 @@ pub fn init(
 
 pub fn deinit(session: *Session) void {
     session.state.deinit();
+    session.context.deinit();
     session.* = undefined;
 }
 
@@ -80,7 +80,7 @@ pub fn executeWithOptions(
         session.host,
         session.resolver,
         &session.state,
-        session.io,
+        &session.context,
         options.last_status orelse session.last_result.status,
     ).execute(hir);
     session.last_result = result;
@@ -88,7 +88,7 @@ pub fn executeWithOptions(
 }
 
 pub fn workingDirectory(session: Session) ?[]const u8 {
-    return session.state.workingDirectory();
+    return session.context.workingDirectory();
 }
 
 pub fn invocationName(session: Session) []const u8 {
@@ -100,7 +100,7 @@ pub fn positionalParameters(session: Session) []const []const u8 {
 }
 
 pub fn activeSandbox(session: Session) CommandPlan.Sandbox {
-    return session.state.activeSandbox();
+    return session.context.activeSandbox();
 }
 
 pub fn lastResult(session: Session) Executor.Result {
@@ -131,8 +131,13 @@ pub fn setVariableExported(
     return session.state.setVariableExported(name, exported);
 }
 
-pub fn setWorkingDirectory(session: *Session, cwd: ?[]const u8) !void {
-    return session.state.setWorkingDirectory(cwd);
+pub fn changeWorkingDirectory(session: *Session, path: []const u8) !void {
+    const cwd = try session.host.resolveWorkingDirectory(session.state.allocator(), .{
+        .current = session.context.workingDirectory(),
+        .path = path,
+    });
+    defer session.state.allocator().free(cwd);
+    return session.state.changeWorkingDirectory(&session.context, cwd);
 }
 
 pub fn setPositionalParameters(
@@ -143,7 +148,7 @@ pub fn setPositionalParameters(
 }
 
 pub fn setSandbox(session: *Session, sandbox: CommandPlan.Sandbox) !void {
-    return session.state.setSandbox(sandbox);
+    return session.context.setSandbox(sandbox);
 }
 
 test {

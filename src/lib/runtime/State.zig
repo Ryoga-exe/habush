@@ -1,32 +1,27 @@
 //! Owned mutable state shared by commands in one shell session.
 
 const std = @import("std");
-const CommandPlan = @import("../CommandPlan.zig");
+const ExecutionContext = @import("../ExecutionContext.zig");
 const FunctionStore = @import("../FunctionStore.zig");
 const Hir = @import("../Hir.zig");
 const State = @This();
-const SandboxPolicy = @import("../SandboxPolicy.zig");
 const types = @import("types.zig");
 const VariableStore = @import("../VariableStore.zig");
 
 gpa: std.mem.Allocator,
-cwd: ?[]u8,
 invocation_name: []u8,
 shell_process_id: ?types.ProcessId,
 default_search_path: []const []const u8,
 positional_parameters: []const []const u8,
-sandbox: CommandPlan.Sandbox,
 variables: VariableStore,
 functions: FunctionStore,
 
 pub const Options = struct {
-    cwd: ?[]const u8 = null,
     invocation_name: []const u8 = "habush",
     shell_process_id: ?types.ProcessId = null,
     /// Immutable fallback used only when the shell variable PATH is unset.
     default_search_path: []const []const u8 = &.{},
     positional_parameters: []const []const u8 = &.{},
-    sandbox: CommandPlan.Sandbox = .inherit,
     /// Complete initial shell variable state. The caller should import the
     /// host environment here and mark those bindings exported when desired.
     variables: []const VariableStore.Binding = &.{},
@@ -35,9 +30,6 @@ pub const Options = struct {
 pub const Error = VariableStore.Error;
 
 pub fn init(gpa: std.mem.Allocator, options: Options) Error!State {
-    const cwd = if (options.cwd) |path| try gpa.dupe(u8, path) else null;
-    errdefer if (cwd) |path| gpa.free(path);
-
     const invocation_name = try gpa.dupe(u8, options.invocation_name);
     errdefer gpa.free(invocation_name);
 
@@ -56,32 +48,25 @@ pub fn init(gpa: std.mem.Allocator, options: Options) Error!State {
 
     return .{
         .gpa = gpa,
-        .cwd = cwd,
         .invocation_name = invocation_name,
         .shell_process_id = options.shell_process_id,
         .default_search_path = default_search_path,
         .positional_parameters = positional_parameters,
-        .sandbox = try options.sandbox.clone(gpa),
         .variables = variables,
         .functions = FunctionStore.init(gpa),
     };
 }
 
 pub fn deinit(state: *State) void {
-    if (state.cwd) |cwd| state.gpa.free(cwd);
     state.gpa.free(state.invocation_name);
     deinitStrings(state.gpa, state.default_search_path);
     deinitStrings(state.gpa, state.positional_parameters);
-    state.sandbox.deinit(state.gpa);
     state.variables.deinit();
     state.functions.deinit();
     state.* = undefined;
 }
 
 pub fn clone(state: State) std.mem.Allocator.Error!State {
-    const cwd = if (state.cwd) |path| try state.gpa.dupe(u8, path) else null;
-    errdefer if (cwd) |path| state.gpa.free(path);
-
     const invocation_name = try state.gpa.dupe(u8, state.invocation_name);
     errdefer state.gpa.free(invocation_name);
 
@@ -91,20 +76,15 @@ pub fn clone(state: State) std.mem.Allocator.Error!State {
     const positional_parameters = try cloneStrings(state.gpa, state.positional_parameters);
     errdefer deinitStrings(state.gpa, positional_parameters);
 
-    var sandbox = try state.sandbox.clone(state.gpa);
-    errdefer sandbox.deinit(state.gpa);
-
     var variables = try state.variables.clone(state.gpa);
     errdefer variables.deinit();
 
     return .{
         .gpa = state.gpa,
-        .cwd = cwd,
         .invocation_name = invocation_name,
         .shell_process_id = state.shell_process_id,
         .default_search_path = default_search_path,
         .positional_parameters = positional_parameters,
-        .sandbox = sandbox,
         .variables = variables,
         .functions = try state.functions.clone(state.gpa),
     };
@@ -112,10 +92,6 @@ pub fn clone(state: State) std.mem.Allocator.Error!State {
 
 pub fn allocator(state: State) std.mem.Allocator {
     return state.gpa;
-}
-
-pub fn workingDirectory(state: State) ?[]const u8 {
-    return state.cwd;
 }
 
 pub fn invocationName(state: State) []const u8 {
@@ -132,10 +108,6 @@ pub fn defaultSearchPath(state: State) []const []const u8 {
 
 pub fn positionalParameters(state: State) []const []const u8 {
     return state.positional_parameters;
-}
-
-pub fn activeSandbox(state: State) CommandPlan.Sandbox {
-    return state.sandbox;
 }
 
 pub fn variableStore(state: *State) *VariableStore {
@@ -191,25 +163,22 @@ pub fn setVariableExported(
     return state.variables.setExported(name, exported);
 }
 
-pub fn setWorkingDirectory(state: *State, cwd: ?[]const u8) std.mem.Allocator.Error!void {
-    const copy = if (cwd) |path| try state.gpa.dupe(u8, path) else null;
-    if (state.cwd) |previous| state.gpa.free(previous);
-    state.cwd = copy;
-}
-
 /// Applies a successful `cd` while keeping the directory and its shell
 /// variables unchanged if any allocation fails.
-pub fn changeWorkingDirectory(state: *State, cwd: []const u8) std.mem.Allocator.Error!void {
-    const cwd_copy = try state.gpa.dupe(u8, cwd);
-    errdefer state.gpa.free(cwd_copy);
+pub fn changeWorkingDirectory(
+    state: *State,
+    context: *ExecutionContext,
+    cwd: []const u8,
+) std.mem.Allocator.Error!void {
+    const cwd_copy = try context.allocator().dupe(u8, cwd);
+    errdefer context.allocator().free(cwd_copy);
 
     var variables = try state.variables.clone(state.gpa);
     errdefer variables.deinit();
-    if (state.cwd) |previous| try setKnownVariable(&variables, "OLDPWD", previous);
+    if (context.workingDirectory()) |previous| try setKnownVariable(&variables, "OLDPWD", previous);
     try setKnownVariable(&variables, "PWD", cwd);
 
-    if (state.cwd) |previous| state.gpa.free(previous);
-    state.cwd = cwd_copy;
+    context.replaceWorkingDirectoryOwned(cwd_copy);
     state.variables.deinit();
     state.variables = variables;
 }
@@ -232,15 +201,6 @@ pub fn setPositionalParameters(
     const copy = try cloneStrings(state.gpa, positional_parameters);
     deinitStrings(state.gpa, state.positional_parameters);
     state.positional_parameters = copy;
-}
-
-pub fn setSandbox(
-    state: *State,
-    sandbox: CommandPlan.Sandbox,
-) std.mem.Allocator.Error!void {
-    const copy = try sandbox.clone(state.gpa);
-    state.sandbox.deinit(state.gpa);
-    state.sandbox = copy;
 }
 
 fn cloneStrings(
@@ -266,42 +226,28 @@ fn deinitStrings(allocator_value: std.mem.Allocator, strings: []const []const u8
 }
 
 test "runtime state owns mutable session values" {
-    var cwd = [_]u8{ '/', 'o', 'l', 'd' };
     var invocation_name = [_]u8{ 's', 'c', 'r', 'i', 'p', 't' };
     var search = [_]u8{ '/', 'b', 'i', 'n' };
     var positional = [_]u8{ 'v', 'a', 'l', 'u', 'e' };
-    var allowed = [_]u8{ '/', 'o', 'l', 'd' };
     var name = [_]u8{ 'n', 'a', 'm', 'e' };
     var value = [_]u8{ 'v', 'a', 'l', 'u', 'e' };
-    const rules = [_]SandboxPolicy.PathRule{
-        .{ .path = &allowed, .access = .{ .read = true } },
-    };
     var state = try State.init(std.testing.allocator, .{
-        .cwd = &cwd,
         .invocation_name = &invocation_name,
         .default_search_path = &.{&search},
         .positional_parameters = &.{&positional},
-        .sandbox = .{ .restrict = .{ .file_system = .{ .allow = &rules } } },
         .variables = &.{.{ .name = &name, .value = &value, .exported = true }},
     });
     defer state.deinit();
 
-    cwd[1] = 'x';
     invocation_name[0] = 'x';
     search[1] = 'x';
     positional[0] = 'x';
-    allowed[1] = 'x';
     name[0] = 'x';
     value[0] = 'x';
 
-    try std.testing.expectEqualStrings("/old", state.workingDirectory().?);
     try std.testing.expectEqualStrings("script", state.invocationName());
     try std.testing.expectEqualStrings("/bin", state.defaultSearchPath()[0]);
     try std.testing.expectEqualStrings("value", state.positionalParameters()[0]);
-    try std.testing.expectEqualStrings(
-        "/old",
-        state.activeSandbox().restrict.file_system.allow[0].path,
-    );
     try std.testing.expectEqualStrings("value", state.variable("name").?);
     try std.testing.expect(state.isVariableExported("name"));
 }
@@ -315,16 +261,11 @@ test "runtime state initialization handles every allocation failure" {
 }
 
 test "runtime state clone is independent" {
-    const rules = [_]SandboxPolicy.PathRule{
-        .{ .path = "/allowed", .access = .{ .read = true } },
-    };
     var state = try State.init(std.testing.allocator, .{
-        .cwd = "/old",
         .invocation_name = "script.hb",
         .shell_process_id = @enumFromInt(12345),
         .default_search_path = &.{"/bin"},
         .positional_parameters = &.{"argument"},
-        .sandbox = .{ .restrict = .{ .file_system = .{ .allow = &rules } } },
         .variables = &.{.{ .name = "name", .value = "original", .exported = true }},
     });
     defer state.deinit();
@@ -332,13 +273,10 @@ test "runtime state clone is independent" {
     defer copy.deinit();
 
     copy.invocation_name[0] = 'x';
-    try copy.setWorkingDirectory("/new");
     @constCast(copy.default_search_path[0])[1] = 'x';
     try copy.setPositionalParameters(&.{"changed"});
-    try copy.setSandbox(.inherit);
     try copy.setVariable("name", "changed");
 
-    try std.testing.expectEqualStrings("/old", state.workingDirectory().?);
     try std.testing.expectEqualStrings("script.hb", state.invocationName());
     try std.testing.expectEqual(@as(?types.ProcessId, @enumFromInt(12345)), state.shellProcessId());
     try std.testing.expectEqual(state.shellProcessId(), copy.shellProcessId());
@@ -346,10 +284,6 @@ test "runtime state clone is independent" {
     try std.testing.expectEqualStrings("argument", state.positionalParameters()[0]);
     try std.testing.expectEqualStrings("original", state.variable("name").?);
     try std.testing.expect(state.isVariableExported("name"));
-    try std.testing.expectEqualStrings(
-        "/allowed",
-        state.activeSandbox().restrict.file_system.allow[0].path,
-    );
 }
 
 test "runtime state clone handles every allocation failure" {
@@ -362,7 +296,6 @@ test "runtime state clone handles every allocation failure" {
 
 test "directory change updates PWD and OLDPWD atomically" {
     var state = try State.init(std.testing.allocator, .{
-        .cwd = "/old",
         .variables = &.{
             .{ .name = "PWD", .value = "/old", .exported = true },
             .{ .name = "OLDPWD", .value = "/older", .exported = true },
@@ -370,10 +303,12 @@ test "directory change updates PWD and OLDPWD atomically" {
         },
     });
     defer state.deinit();
+    var context = try ExecutionContext.init(std.testing.allocator, .{ .cwd = "/old" });
+    defer context.deinit();
 
-    try state.changeWorkingDirectory("/new");
+    try state.changeWorkingDirectory(&context, "/new");
 
-    try std.testing.expectEqualStrings("/new", state.workingDirectory().?);
+    try std.testing.expectEqualStrings("/new", context.workingDirectory().?);
     try std.testing.expectEqualStrings("/new", state.variable("PWD").?);
     try std.testing.expectEqualStrings("/old", state.variable("OLDPWD").?);
     try std.testing.expect(state.isVariableExported("PWD"));
@@ -391,7 +326,6 @@ test "directory change handles every allocation failure" {
 
 fn changeWorkingDirectoryWithAllocator(gpa: std.mem.Allocator) !void {
     var state = try State.init(gpa, .{
-        .cwd = "/old",
         .variables = &.{
             .{ .name = "PWD", .value = "/old", .exported = true },
             .{ .name = "OLDPWD", .value = "/older", .exported = true },
@@ -399,9 +333,11 @@ fn changeWorkingDirectoryWithAllocator(gpa: std.mem.Allocator) !void {
         },
     });
     defer state.deinit();
+    var context = try ExecutionContext.init(gpa, .{ .cwd = "/old" });
+    defer context.deinit();
 
-    state.changeWorkingDirectory("/new") catch |err| {
-        try std.testing.expectEqualStrings("/old", state.workingDirectory().?);
+    state.changeWorkingDirectory(&context, "/new") catch |err| {
+        try std.testing.expectEqualStrings("/old", context.workingDirectory().?);
         try std.testing.expectEqualStrings("/old", state.variable("PWD").?);
         try std.testing.expectEqualStrings("/older", state.variable("OLDPWD").?);
         try std.testing.expectEqualStrings("value", state.variable("LOCAL").?);
@@ -411,15 +347,10 @@ fn changeWorkingDirectoryWithAllocator(gpa: std.mem.Allocator) !void {
 
 fn initWithAllocator(gpa: std.mem.Allocator) !void {
     const search_path = [_][]const u8{ "/bin", "/usr/bin" };
-    const rules = [_]SandboxPolicy.PathRule{
-        .{ .path = "/workspace", .access = .{ .read = true } },
-    };
     var state = try State.init(gpa, .{
-        .cwd = "/workspace",
         .invocation_name = "script.hb",
         .default_search_path = &search_path,
         .positional_parameters = &.{ "one", "two" },
-        .sandbox = .{ .restrict = .{ .file_system = .{ .allow = &rules } } },
         .variables = &.{
             .{ .name = "first", .value = "one", .exported = true },
             .{ .name = "second", .value = "two" },
@@ -429,15 +360,10 @@ fn initWithAllocator(gpa: std.mem.Allocator) !void {
 }
 
 fn cloneWithAllocator(gpa: std.mem.Allocator) !void {
-    const rules = [_]SandboxPolicy.PathRule{
-        .{ .path = "/workspace", .access = .{ .read = true } },
-    };
     var state = try State.init(gpa, .{
-        .cwd = "/workspace",
         .invocation_name = "script.hb",
         .default_search_path = &.{"/bin"},
         .positional_parameters = &.{"argument"},
-        .sandbox = .{ .restrict = .{ .file_system = .{ .allow = &rules } } },
         .variables = &.{.{ .name = "name", .value = "value", .exported = true }},
     });
     defer state.deinit();

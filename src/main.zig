@@ -70,15 +70,17 @@ pub fn main(init: std.process.Init) !habush.runtime.ExitStatus {
     var system_resolver = habush.CommandResolver.System.init(io, resolver_options);
     var session = try habush.Session.init(gpa, system_host.host(), .{
         .resolver = system_resolver.resolver(),
-        .cwd = cwd,
         .invocation_name = invocation_name,
         .shell_process_id = platform.processId(),
         .positional_parameters = positional_parameters,
         .variables = variables,
-        .io = .{
-            .stdout = stdout,
-            .stderr = stderr,
-            .diagnostic_options = .{ .program_name = "habush" },
+        .context = .{
+            .cwd = cwd,
+            .io = .{
+                .stdout = stdout,
+                .stderr = stderr,
+                .diagnostic_options = .{ .program_name = "habush" },
+            },
         },
     });
     defer session.deinit();
