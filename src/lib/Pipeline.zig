@@ -27,6 +27,20 @@ pub const StageResult = struct {
     sandbox_coverage: SandboxPolicy.Coverage,
 };
 
+pub const State = enum { running, stopped, completed };
+
+pub const StageStatus = union(enum) {
+    pending,
+    running,
+    stopped: u32,
+    completed: StageResult,
+};
+
+pub const StartResult = union(enum) {
+    started: Pipeline,
+    failed: RunResult.Failure,
+};
+
 pub const RunResult = union(enum) {
     completed: []StageResult,
     failed: Failure,
@@ -54,6 +68,19 @@ const PipeState = struct {
 const ProcessRecord = struct {
     spawned: bool = false,
     result: ?Host.SpawnResult = null,
+    termination: ?Host.Termination = null,
+    stopped: ?u32 = null,
+    sandbox_coverage: SandboxPolicy.Coverage = .not_requested,
+
+    fn observe(record: *ProcessRecord, termination: Host.Termination) void {
+        if (termination == .stopped) {
+            record.stopped = termination.stopped;
+            return;
+        }
+        record.termination = termination;
+        record.stopped = null;
+        record.result = null;
+    }
 };
 
 pub fn init(gpa: std.mem.Allocator, host: Host, stage_count: usize) Host.Error!Pipeline {
@@ -95,6 +122,10 @@ pub fn stage(pipeline: *const Pipeline, index: usize) Stage {
     };
 }
 
+pub fn stageCount(pipeline: *const Pipeline) usize {
+    return pipeline.processes.len;
+}
+
 /// Records only a successfully spawned process. Each stage can spawn once;
 /// failed attempts may be retried while their pipe endpoints remain open.
 pub fn spawn(
@@ -110,6 +141,7 @@ pub fn spawn(
         .spawned => |result| {
             record.spawned = true;
             record.result = result;
+            record.sandbox_coverage = result.sandbox_coverage;
         },
         .failed => {},
     }
@@ -123,8 +155,66 @@ pub fn wait(pipeline: *Pipeline, index: usize) Host.Error!?Host.Termination {
     const record = &pipeline.processes[index];
     const spawned = record.result orelse return null;
     const termination = try pipeline.host.wait(spawned.process);
-    record.result = null;
+    record.observe(termination);
     return termination;
+}
+
+/// Completed results remain available until deinit. A stopped stage still
+/// owns its process and can be resumed or terminated.
+pub fn status(pipeline: *const Pipeline, index: usize) StageStatus {
+    const record = &pipeline.processes[index];
+    if (record.termination) |termination| return .{ .completed = .{
+        .termination = termination,
+        .sandbox_coverage = record.sandbox_coverage,
+    } };
+    if (record.stopped) |signal_number| return .{ .stopped = signal_number };
+    return if (record.spawned) .running else .pending;
+}
+
+pub fn state(pipeline: *const Pipeline) State {
+    var running = false;
+    for (pipeline.processes) |record| {
+        if (record.stopped != null) return .stopped;
+        if (record.termination == null) running = true;
+    }
+    return if (running) .running else .completed;
+}
+
+/// Observes each live process without waiting for it to finish. Unsupported
+/// polling is reported by the host; it never silently becomes a blocking wait.
+pub fn poll(pipeline: *Pipeline) Host.Error!State {
+    for (pipeline.processes) |*record| {
+        const spawned = record.result orelse continue;
+        if (try pipeline.host.tryWait(spawned.process)) |termination|
+            record.observe(termination);
+    }
+    return pipeline.state();
+}
+
+/// Sends a request to all live stages. Completed stages are never signalled.
+/// A partial delivery cannot be rolled back; remaining stages are attempted
+/// even if an earlier request fails.
+pub fn signal(pipeline: *Pipeline, request: Host.Signal) Host.Error!void {
+    var failure: ?Host.Error = null;
+    for (pipeline.processes) |*record| {
+        const spawned = record.result orelse continue;
+        pipeline.host.signal(spawned.process, request) catch |err| {
+            failure = failure orelse err;
+            continue;
+        };
+        if (request == .cont) record.stopped = null;
+    }
+    if (failure) |err| return err;
+}
+
+pub fn waitAll(pipeline: *Pipeline) Host.Error!State {
+    if (pipeline.state() == .stopped) return .stopped;
+    for (0..pipeline.processes.len) |index| {
+        if (try pipeline.wait(index)) |termination| {
+            if (termination == .stopped) return .stopped;
+        }
+    }
+    return pipeline.state();
 }
 
 /// Releases the parent copies of the endpoints adjacent to this stage.
@@ -178,15 +268,42 @@ pub fn run(
     host: Host,
     plans: []const CommandPlan,
 ) Error!RunResult {
+    var started = try Pipeline.start(gpa, host, plans);
+    const pipeline = switch (started) {
+        .started => |*value| value,
+        .failed => |failure| return .{ .failed = failure },
+    };
+    defer pipeline.deinit();
+
+    const stages = try gpa.alloc(StageResult, plans.len);
+    errdefer gpa.free(stages);
+    for (stages, 0..) |*stage_result, index| {
+        _ = try pipeline.wait(index);
+        stage_result.* = pipeline.status(index).completed;
+    }
+    return .{ .completed = stages };
+}
+
+/// Starts every external stage and returns ownership without waiting. Plans
+/// and argument storage are borrowed only until this call returns; Host.spawn
+/// must consume or copy them before returning. Parent pipe ends are closed
+/// after each stage inherits them, so delayed waiting cannot keep a pipe alive.
+/// On startup failure a kill request is attempted for already started peers
+/// before waiting for them. Hosts without that operation may still block.
+pub fn start(
+    gpa: std.mem.Allocator,
+    host: Host,
+    plans: []const CommandPlan,
+) Error!StartResult {
     // Plans are already concrete: reject malformed input before creating
     // resources or launching any of the neighbouring commands.
     for (plans) |plan| try plan.validate();
     var pipeline = try Pipeline.init(gpa, host, plans.len);
-    defer pipeline.deinit();
-
-    const stages = try gpa.alloc(StageResult, plans.len);
-    var result_owns_stages = false;
-    defer if (!result_owns_stages) gpa.free(stages);
+    var transferred = false;
+    defer if (!transferred) {
+        pipeline.signal(.kill) catch {};
+        pipeline.deinit();
+    };
 
     for (0..plans.len) |offset| {
         const index = plans.len - 1 - offset;
@@ -218,17 +335,14 @@ pub fn run(
         plan.file_actions = actions;
         const outcome = try pipeline.spawn(index, plan);
         switch (outcome) {
-            .spawned => |spawned| stages[index].sandbox_coverage = spawned.sandbox_coverage,
+            .spawned => {},
             .failed => |reason| return .{ .failed = .{ .stage = index, .reason = reason } },
         }
         pipeline.closeStage(index);
     }
 
-    for (stages, 0..) |*stage_result, index| {
-        stage_result.termination = (try pipeline.wait(index)).?;
-    }
-    result_owns_stages = true;
-    return .{ .completed = stages };
+    transferred = true;
+    return .{ .started = pipeline };
 }
 
 test "run connects stages before explicit actions and reaps in stage order" {
@@ -409,6 +523,95 @@ fn runWithAllocator(gpa: std.mem.Allocator) !void {
     defer result.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 2), result.completed.len);
     try std.testing.expectEqual(@as(usize, 2), fake.closed_resource_count);
+}
+
+test "start returns live ownership and poll retains completed results" {
+    const FakeHost = @import("Host/FakeHost.zig");
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    fake.try_wait_termination = null;
+    fake.sandbox_coverage = .partial;
+    const plans = [_]CommandPlan{
+        .{ .executable = "/first", .argv = &.{"/first"} },
+        .{ .executable = "/last", .argv = &.{"/last"} },
+    };
+    var result = try Pipeline.start(std.testing.allocator, fake.host(), &plans);
+    const pipeline = &result.started;
+    defer pipeline.deinit();
+    try std.testing.expectEqual(@as(usize, 0), fake.wait_calls.items.len);
+    try std.testing.expectEqual(@as(usize, 2), fake.closed_resource_count);
+    try std.testing.expectEqual(State.running, try pipeline.poll());
+
+    fake.try_wait_termination = .{ .exited = 23 };
+    try std.testing.expectEqual(State.completed, try pipeline.poll());
+    try std.testing.expectEqual(@as(u8, 23), pipeline.status(0).completed.termination.exited);
+    try std.testing.expectEqual(SandboxPolicy.Coverage.partial, pipeline.status(1).completed.sandbox_coverage);
+    const calls = fake.try_wait_calls.items.len;
+    try std.testing.expectEqual(State.completed, try pipeline.poll());
+    try std.testing.expectEqual(State.completed, try pipeline.waitAll());
+    try pipeline.signal(.kill);
+    try std.testing.expectEqual(calls, fake.try_wait_calls.items.len);
+    try std.testing.expectEqual(@as(usize, 0), fake.signal_calls.items.len);
+    try std.testing.expectEqual(@as(usize, 0), fake.wait_calls.items.len);
+}
+
+test "stopped stages retain ownership until resumed and waited" {
+    const FakeHost = @import("Host/FakeHost.zig");
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    const plans = [_]CommandPlan{.{ .executable = "/command", .argv = &.{"/command"} }};
+    var result = try Pipeline.start(std.testing.allocator, fake.host(), &plans);
+    const pipeline = &result.started;
+    defer pipeline.deinit();
+    fake.try_wait_termination = .{ .stopped = 19 };
+    try std.testing.expectEqual(State.stopped, try pipeline.poll());
+    try std.testing.expectEqual(@as(u32, 19), pipeline.status(0).stopped);
+    try std.testing.expectEqual(State.stopped, try pipeline.waitAll());
+    try std.testing.expectEqual(@as(usize, 0), fake.wait_calls.items.len);
+    try pipeline.signal(.cont);
+    try std.testing.expectEqual(State.running, pipeline.state());
+    fake.termination = .{ .exited = 7 };
+    try std.testing.expectEqual(State.completed, try pipeline.waitAll());
+    try std.testing.expectEqual(@as(u8, 7), pipeline.status(0).completed.termination.exited);
+    try std.testing.expectEqual(Host.Signal.cont, fake.signal_calls.items[0].signal);
+}
+
+test "unsupported polling preserves a live pipeline for blocking wait" {
+    const FakeHost = @import("Host/FakeHost.zig");
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    fake.try_wait_error = error.Unsupported;
+    const plans = [_]CommandPlan{.{ .executable = "/command", .argv = &.{"/command"} }};
+    var result = try Pipeline.start(std.testing.allocator, fake.host(), &plans);
+    const pipeline = &result.started;
+    defer pipeline.deinit();
+    try std.testing.expectError(error.Unsupported, pipeline.poll());
+    try std.testing.expectEqual(State.running, pipeline.state());
+    try std.testing.expectEqual(State.completed, try pipeline.waitAll());
+}
+
+test "a real input-blocked process can be started polled and killed" {
+    const builtin = @import("builtin");
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    var system: Host.System = .{ .gpa = std.testing.allocator, .io = std.testing.io };
+    defer system.deinit();
+    const host = system.host();
+    const input = try host.createPipe();
+    defer host.closeResource(input.read_end);
+    defer host.closeResource(input.write_end);
+    const plans = [_]CommandPlan{.{
+        .executable = "/bin/cat",
+        .argv = &.{"/bin/cat"},
+        .file_actions = &.{.{ .use_resource = .{ .resource = input.read_end, .target = .stdin } }},
+    }};
+    var result = try Pipeline.start(std.testing.allocator, host, &plans);
+    const pipeline = &result.started;
+    defer pipeline.deinit();
+    try std.testing.expectEqual(State.running, try pipeline.poll());
+    try pipeline.signal(.kill);
+    try std.testing.expectEqual(State.completed, try pipeline.waitAll());
+    try std.testing.expect(pipeline.status(0).completed.termination == .signal);
+    try std.testing.expectEqual(@as(usize, 0), system.children.count());
 }
 
 test {

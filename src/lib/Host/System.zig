@@ -27,6 +27,12 @@ next_resource: u32 = 1,
 const FileResource = struct {
     storage: Storage,
     writer: ?std.Io.File.Writer,
+    readable: bool = false,
+    reader: ?std.Io.File.Reader = null,
+    // `read` uses takeByte, so a one-byte buffer does not read past the
+    // consumed byte before a child inherits the descriptor. Other Reader
+    // operations can still read ahead and need shared input ownership.
+    read_buffer: [1]u8 = undefined,
 
     const Storage = union(enum) {
         file: std.Io.File,
@@ -76,7 +82,16 @@ const ChildRecord = struct {
 
 pub fn deinit(system: *System) void {
     var children = system.children.valueIterator();
-    while (children.next()) |record| record.child.kill(system.io);
+    while (children.next()) |record| {
+        if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+            record.child.kill(system.io);
+        } else {
+            // TERM cannot be handled while a child is stopped. KILL lets the
+            // host reap every process it still owns during teardown.
+            if (record.child.id) |pid| std.posix.kill(pid, .KILL) catch {};
+            _ = record.child.wait(system.io) catch {};
+        }
+    }
     system.children.deinit(system.gpa);
     var resources = system.resources.valueIterator();
     while (resources.next()) |resource| {
@@ -95,13 +110,21 @@ pub fn host(system: *System) Host {
 }
 
 const vtable: Host.VTable = .{
+    .capabilities = .{
+        .process_groups = builtin.os.tag != .windows and builtin.os.tag != .wasi,
+        .poll = builtin.os.tag != .wasi,
+        .signals = builtin.os.tag != .wasi,
+    },
     .spawn = spawn,
     .wait = wait,
+    .try_wait = tryWait,
+    .signal = signal,
     .open_file = openFile,
     .create_pipe = createPipe,
     .create_input = createInput,
     .close_resource = closeResource,
     .resource_writer = resourceWriter,
+    .resource_reader = resourceReader,
     .resolve_working_directory = resolveWorkingDirectory,
 };
 
@@ -120,7 +143,7 @@ fn createPipe(userdata: ?*anyopaque) Host.Error!Host.Pipe {
     errdefer system.gpa.destroy(write_data);
     try system.resources.ensureUnusedCapacity(system.gpa, 2);
 
-    read_data.* = .{ .storage = .{ .file = files[0] }, .writer = null };
+    read_data.* = .{ .storage = .{ .file = files[0] }, .writer = null, .readable = true };
     write_data.* = .{
         .storage = .{ .file = files[1] },
         .writer = files[1].writerStreaming(system.io, &.{}),
@@ -318,6 +341,7 @@ fn openFile(
             null
         else
             file.writerStreaming(system.io, &.{}),
+        .readable = open.access != .write,
     };
     try system.resources.ensureUnusedCapacity(system.gpa, 1);
     const resource: CommandPlan.Resource = @enumFromInt(system.next_resource);
@@ -376,7 +400,11 @@ fn createInput(userdata: ?*anyopaque, bytes: []const u8) Host.Error!CommandPlan.
 
     const resource_data = system.gpa.create(FileResource) catch return error.OutOfMemory;
     errdefer system.gpa.destroy(resource_data);
-    resource_data.* = .{ .storage = .{ .temporary = owned_temporary }, .writer = null };
+    resource_data.* = .{
+        .storage = .{ .temporary = owned_temporary },
+        .writer = null,
+        .readable = true,
+    };
     system.resources.ensureUnusedCapacity(system.gpa, 1) catch return error.OutOfMemory;
     const resource: CommandPlan.Resource = @enumFromInt(system.next_resource);
     system.next_resource +%= 1;
@@ -425,6 +453,16 @@ fn resourceWriter(userdata: ?*anyopaque, resource: CommandPlan.Resource) ?*std.I
     const data = system.resources.get(resource) orelse return null;
     const writer = &(data.writer orelse return null);
     return &writer.interface;
+}
+
+fn resourceReader(userdata: ?*anyopaque, resource: CommandPlan.Resource) ?*std.Io.Reader {
+    const system: *System = @ptrCast(@alignCast(userdata.?));
+    const data = system.resources.get(resource) orelse return null;
+    if (!data.readable) return null;
+    if (data.reader == null)
+        data.reader = data.file().readerStreaming(system.io, &data.read_buffer);
+    const reader = &(data.reader orelse return null);
+    return &reader.interface;
 }
 
 const StdioBinding = union(enum) {
@@ -615,10 +653,127 @@ fn wait(userdata: ?*anyopaque, process: Host.Process) Host.Error!Host.Terminatio
     _ = system.children.remove(process);
     return switch (termination) {
         .exited => |status| .{ .exited = status },
-        .signal => |signal| .{ .signal = @intFromEnum(signal) },
-        .stopped => |signal| .{ .stopped = @intFromEnum(signal) },
+        .signal => |native_signal| .{ .signal = @intFromEnum(native_signal) },
+        .stopped => |native_signal| .{ .stopped = @intFromEnum(native_signal) },
         .unknown => |status| .{ .unknown = status },
     };
+}
+
+fn tryWait(userdata: ?*anyopaque, process: Host.Process) Host.Error!?Host.Termination {
+    const system: *System = @ptrCast(@alignCast(userdata.?));
+    const record = system.children.getPtr(process) orelse return error.InvalidArguments;
+    if (builtin.os.tag == .windows) return tryWaitWindows(system, process, record);
+    if (builtin.os.tag == .wasi) return error.Unsupported;
+    return tryWaitPosix(system, process, record);
+}
+
+fn tryWaitPosix(
+    system: *System,
+    process: Host.Process,
+    record: *ChildRecord,
+) Host.Error!?Host.Termination {
+    const pid = record.child.id orelse return error.InvalidArguments;
+    var status: if (builtin.link_libc) c_int else u32 = undefined;
+    while (true) {
+        const rc = std.posix.system.waitpid(
+            pid,
+            &status,
+            std.posix.W.NOHANG | std.posix.W.UNTRACED,
+        );
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => {
+                if (rc == 0) return null;
+                const bits: u32 = @bitCast(status);
+                const result: Host.Termination = if (std.posix.W.IFEXITED(bits))
+                    .{ .exited = std.posix.W.EXITSTATUS(bits) }
+                else if (std.posix.W.IFSIGNALED(bits))
+                    .{ .signal = @intFromEnum(std.posix.W.TERMSIG(bits)) }
+                else if (std.posix.W.IFSTOPPED(bits))
+                    .{ .stopped = @intFromEnum(std.posix.W.STOPSIG(bits)) }
+                else
+                    return error.Unexpected;
+                switch (result) {
+                    .exited, .signal => {
+                        cleanupWaitedChildPosix(&record.child, system.io);
+                        _ = system.children.remove(process);
+                    },
+                    .stopped => {},
+                    .unknown => unreachable,
+                }
+                return result;
+            },
+            .INTR => continue,
+            .CHILD => return error.InvalidArguments,
+            else => return error.Unexpected,
+        }
+    }
+}
+
+fn cleanupWaitedChildPosix(child: *std.process.Child, io: std.Io) void {
+    if (child.stdin) |file| file.close(io);
+    if (child.stdout) |file| file.close(io);
+    if (child.stderr) |file| file.close(io);
+    child.stdin = null;
+    child.stdout = null;
+    child.stderr = null;
+    child.id = null;
+}
+
+fn tryWaitWindows(
+    system: *System,
+    process: Host.Process,
+    record: *ChildRecord,
+) Host.Error!?Host.Termination {
+    const windows = std.os.windows;
+    const handle = record.child.id orelse return error.InvalidArguments;
+    const timeout: windows.LARGE_INTEGER = 0;
+    return switch (windows.ntdll.NtWaitForSingleObject(handle, .FALSE, &timeout)) {
+        windows.NTSTATUS.WAIT_0 => try wait(system, process),
+        .TIMEOUT => null,
+        .ACCESS_DENIED => error.AccessDenied,
+        else => error.Unexpected,
+    };
+}
+
+fn signal(userdata: ?*anyopaque, process: Host.Process, requested: Host.Signal) Host.Error!void {
+    const system: *System = @ptrCast(@alignCast(userdata.?));
+    const record = system.children.getPtr(process) orelse return error.InvalidArguments;
+    if (builtin.os.tag == .windows) return signalWindows(record, requested);
+    if (builtin.os.tag == .wasi) return error.Unsupported;
+    return signalPosix(record, requested);
+}
+
+fn signalPosix(record: *ChildRecord, requested: Host.Signal) Host.Error!void {
+    const pid = record.child.id orelse return error.InvalidArguments;
+    const native: std.posix.SIG = switch (requested) {
+        .interrupt => .INT,
+        .terminate => .TERM,
+        .kill => .KILL,
+        .stop => .STOP,
+        .cont => .CONT,
+    };
+    std.posix.kill(pid, native) catch |err| return switch (err) {
+        // An owned child can have exited between lookup and delivery; wait
+        // still owns and reaps it.
+        error.ProcessNotFound => return,
+        error.PermissionDenied => error.AccessDenied,
+        else => error.Unexpected,
+    };
+}
+
+fn signalWindows(record: *ChildRecord, requested: Host.Signal) Host.Error!void {
+    const windows = std.os.windows;
+    const code: u32 = switch (requested) {
+        .terminate => 143,
+        .kill => 137,
+        else => return error.Unsupported,
+    };
+    const handle = record.child.id orelse return error.InvalidArguments;
+    switch (windows.ntdll.NtTerminateProcess(handle, @enumFromInt(code))) {
+        .SUCCESS, .PROCESS_IS_TERMINATING => {},
+        .ACCESS_DENIED => return error.AccessDenied,
+        else => return error.Unexpected,
+    }
 }
 
 fn ownsProcessGroup(system: *System, group: CommandPlan.ProcessGroup) bool {
@@ -859,6 +1014,65 @@ test "system host owns foreground processes until wait" {
     );
 }
 
+test "system host polls and reaps an exited child once" {
+    var system: System = .{ .gpa = std.testing.allocator, .io = std.testing.io };
+    defer system.deinit();
+    const system_host = system.host();
+    try std.testing.expect(system_host.capabilities().poll);
+
+    const spawned = (try system_host.spawn(exitCommand(23))).spawned;
+    var result: ?Host.Termination = null;
+    for (0..1000) |_| {
+        result = try system_host.tryWait(spawned.process);
+        if (result != null) break;
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqualDeep(Host.Termination{ .exited = 23 }, result.?);
+    try std.testing.expectEqual(@as(usize, 0), system.children.count());
+    try std.testing.expectError(error.InvalidArguments, system_host.wait(spawned.process));
+}
+
+test "system host keeps a stopped POSIX child until it resumes and exits" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    var system: System = .{ .gpa = std.testing.allocator, .io = std.testing.io };
+    defer system.deinit();
+    const system_host = system.host();
+    try std.testing.expect(system_host.capabilities().signals);
+    const input = try system_host.createPipe();
+    defer system_host.closeResource(input.read_end);
+    defer system_host.closeResource(input.write_end);
+
+    const spawned = (try system_host.spawn(.{
+        .executable = "/bin/sh",
+        .argv = &.{ "shell-spelling", "-c", "read value; exit 0" },
+        .file_actions = &.{.{ .use_resource = .{
+            .resource = input.read_end,
+            .target = .stdin,
+        } }},
+    })).spawned;
+    system_host.closeResource(input.read_end);
+    try system_host.signal(spawned.process, .stop);
+
+    var stopped: ?Host.Termination = null;
+    for (0..1000) |_| {
+        stopped = try system_host.tryWait(spawned.process);
+        if (stopped != null) break;
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqualDeep(
+        Host.Termination{ .stopped = @intFromEnum(std.posix.SIG.STOP) },
+        stopped.?,
+    );
+    try std.testing.expectEqual(@as(usize, 1), system.children.count());
+    try system_host.signal(spawned.process, .cont);
+    system_host.closeResource(input.write_end);
+    try std.testing.expectEqualDeep(
+        Host.Termination{ .exited = 0 },
+        try system_host.wait(spawned.process),
+    );
+}
+
 test "system host creates a POSIX process group" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
 
@@ -1047,6 +1261,8 @@ test "system host provides seekable input resources to child processes" {
     const system_host = system.host();
     const input = try system_host.createInput("here-document contents\n");
     defer system_host.closeResource(input);
+    const reader = system_host.resourceReader(input).?;
+    try std.testing.expectEqual(@as(u8, 'h'), try reader.takeByte());
 
     try expectExitStatus(system_host, .{
         .executable = "/bin/cat",
@@ -1070,7 +1286,7 @@ test "system host provides seekable input resources to child processes" {
         .limited(64),
     );
     defer std.testing.allocator.free(output);
-    try std.testing.expectEqualStrings("here-document contents\n", output);
+    try std.testing.expectEqualStrings("ere-document contents\n", output);
 }
 
 test "system host creates and closes pipeline resources" {
@@ -1082,6 +1298,8 @@ test "system host creates and closes pipeline resources" {
     try std.testing.expectEqual(@as(usize, 2), system.resources.count());
     try std.testing.expect(system_host.resourceWriter(pipeline_pipe.read_end) == null);
     try std.testing.expect(system_host.resourceWriter(pipeline_pipe.write_end) != null);
+    try std.testing.expect(system_host.resourceReader(pipeline_pipe.read_end) != null);
+    try std.testing.expect(system_host.resourceReader(pipeline_pipe.write_end) == null);
 
     system_host.closeResource(pipeline_pipe.write_end);
     system_host.closeResource(pipeline_pipe.read_end);

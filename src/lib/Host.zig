@@ -16,8 +16,11 @@ userdata: ?*anyopaque,
 vtable: *const VTable,
 
 pub const VTable = struct {
+    capabilities: Capabilities = .{},
     spawn: *const fn (?*anyopaque, CommandPlan) SpawnError!SpawnOutcome,
     wait: *const fn (?*anyopaque, Process) Error!Termination,
+    try_wait: ?*const fn (?*anyopaque, Process) Error!?Termination = null,
+    signal: ?*const fn (?*anyopaque, Process, Signal) Error!void = null,
     open_file: *const fn (
         ?*anyopaque,
         CommandPlan.WorkingDirectory,
@@ -27,6 +30,7 @@ pub const VTable = struct {
     create_input: *const fn (?*anyopaque, []const u8) Error!CommandPlan.Resource,
     close_resource: *const fn (?*anyopaque, CommandPlan.Resource) void,
     resource_writer: *const fn (?*anyopaque, CommandPlan.Resource) ?*std.Io.Writer,
+    resource_reader: ?*const fn (?*anyopaque, CommandPlan.Resource) ?*std.Io.Reader = null,
     resolve_working_directory: ?*const fn (
         ?*anyopaque,
         std.mem.Allocator,
@@ -68,6 +72,27 @@ pub const SpawnError = error{
 pub const Process = enum(u32) {
     _,
 };
+
+pub const Signal = enum {
+    interrupt,
+    terminate,
+    kill,
+    stop,
+    cont,
+};
+
+/// Features available from a host implementation. Individual signal kinds
+/// may still return `Unsupported` (for example, stop on Windows).
+pub const Capabilities = struct {
+    process_groups: bool = false,
+    terminal_control: bool = false,
+    poll: bool = false,
+    signals: bool = false,
+};
+
+pub fn capabilities(host: Host) Capabilities {
+    return host.vtable.capabilities;
+}
 
 pub const SpawnResult = struct {
     process: Process,
@@ -131,6 +156,19 @@ pub fn wait(host: Host, process: Process) Error!Termination {
     return host.vtable.wait(host.userdata, process);
 }
 
+/// Polls one host-owned process without blocking. A stopped notification does
+/// not consume its process handle; only terminal results do.
+pub fn tryWait(host: Host, process: Process) Error!?Termination {
+    const callback = host.vtable.try_wait orelse return error.Unsupported;
+    return callback(host.userdata, process);
+}
+
+/// Sends a request to one host-owned process. This does not wait for it.
+pub fn signal(host: Host, process: Process, requested: Signal) Error!void {
+    const callback = host.vtable.signal orelse return error.Unsupported;
+    return callback(host.userdata, process, requested);
+}
+
 /// Opens a file once for a shell redirection scope. The returned resource may
 /// be inherited by child processes through `FileAction.use_resource`.
 pub fn openFile(
@@ -162,6 +200,15 @@ pub fn createInput(host: Host, bytes: []const u8) Error!CommandPlan.Resource {
 /// Read-only and unknown resources do not provide a writer.
 pub fn resourceWriter(host: Host, resource: CommandPlan.Resource) ?*std.Io.Writer {
     return host.vtable.resource_writer(host.userdata, resource);
+}
+
+/// Returns a borrowed reader for a host-owned readable resource, when the
+/// backend supports in-process reading. It is invalid after closeResource.
+/// Reader methods may buffer past the requested bytes; callers sharing the
+/// resource with a child must avoid read-ahead until input ownership is unified.
+pub fn resourceReader(host: Host, resource: CommandPlan.Resource) ?*std.Io.Reader {
+    const callback = host.vtable.resource_reader orelse return null;
+    return callback(host.userdata, resource);
 }
 
 /// Resolves and validates a directory using the host platform's path rules.
