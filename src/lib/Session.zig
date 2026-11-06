@@ -110,6 +110,13 @@ pub fn execute(session: *Session, hir: Hir) Executor.Error!Executor.Result {
     executor.jobs = &session.jobs;
     executor.job_control = session.jobs.terminal_control;
     executor.concurrent_pipeline = session.concurrent_pipeline;
+    var serialized_sink: runtime.Diagnostic.Sink.Serialized = undefined;
+    if (executor.io.diagnostic_sink) |sink| {
+        if (session.concurrent_pipeline) |config| {
+            serialized_sink = .{ .target = sink, .io = config.io };
+            executor.io.diagnostic_sink = serialized_sink.sink();
+        }
+    }
     const result = try executor.execute(hir);
     session.last_result = result;
     return result;

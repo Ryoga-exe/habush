@@ -9,6 +9,56 @@ const FakeHost = @import("Host/FakeHost.zig");
 const Hir = @import("Hir.zig");
 const SandboxPolicy = @import("SandboxPolicy.zig");
 const Session = @import("Session.zig");
+const Diagnostic = @import("runtime/Diagnostic.zig");
+
+test "session delivers borrowed structured diagnostics with original command offsets" {
+    const Capture = struct {
+        count: usize = 0,
+        source: ?Diagnostic.Source = null,
+        command: [32]u8 = undefined,
+        command_len: usize = 0,
+
+        fn report(userdata: ?*anyopaque, diagnostic: Diagnostic) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.count += 1;
+            self.source = diagnostic.source;
+            const command = diagnostic.subject.command;
+            @memcpy(self.command[0..command.len], command);
+            self.command_len = command.len;
+        }
+    };
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var resolver = FakeResolver.init(std.testing.allocator);
+    defer resolver.deinit();
+    resolver.result = null;
+    var capture: Capture = .{};
+    var stderr: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer stderr.deinit();
+    var session = try Session.init(std.testing.allocator, fake.host(), .{
+        .resolver = resolver.resolver(),
+        .context = .{ .io = .{
+            .stderr = &stderr.writer,
+            .diagnostic_sink = .{ .userdata = &capture, .report = Capture.report },
+        } },
+    });
+    defer session.deinit();
+    var result = try session.evaluate("command_name=missing; X=y \"$command_name\" arg", .{});
+    defer result.deinit(session.allocator());
+    try std.testing.expectEqual(@as(u8, 127), result.executed.status);
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqual(@as(u32, 26), capture.source.?.start);
+    try std.testing.expect(capture.source.?.end == null);
+    try std.testing.expectEqualStrings("missing", capture.command[0..capture.command_len]);
+    try std.testing.expectEqualStrings("", stderr.written());
+
+    var definition = try session.evaluate("f() { missing; }", .{});
+    defer definition.deinit(session.allocator());
+    var invocation = try session.evaluate("f", .{});
+    defer invocation.deinit(session.allocator());
+    try std.testing.expectEqual(@as(usize, 2), capture.count);
+    try std.testing.expect(capture.source == null);
+}
 
 test "background jobs retain process state until wait consumes the result" {
     var fake = FakeHost.init(std.testing.allocator);

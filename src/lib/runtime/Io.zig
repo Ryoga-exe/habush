@@ -10,13 +10,24 @@ stdin: ?*std.Io.Reader = null,
 stdout: ?*std.Io.Writer = null,
 stderr: ?*std.Io.Writer = null,
 diagnostic_options: Diagnostic.RenderOptions = .{},
+/// When present, receives structured diagnostics instead of the default stderr
+/// rendering. The sink decides whether/how to render and must copy retained data.
+diagnostic_sink: ?Diagnostic.Sink = null,
+/// Set by the evaluator for the currently executing source instruction.
+diagnostic_source: ?Diagnostic.Source = null,
 
 pub fn reportDiagnostic(
     runtime_io: Io,
     diagnostic: Diagnostic,
 ) std.Io.Writer.Error!void {
+    var located = diagnostic;
+    if (located.source == null) located.source = runtime_io.diagnostic_source;
+    if (runtime_io.diagnostic_sink) |sink| {
+        sink.report(sink.userdata, located);
+        return;
+    }
     const writer = runtime_io.stderr orelse return;
-    try diagnostic.render(writer, runtime_io.diagnostic_options);
+    try located.render(writer, runtime_io.diagnostic_options);
     try writer.writeByte('\n');
 }
 

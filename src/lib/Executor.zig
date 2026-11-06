@@ -45,6 +45,7 @@ background: bool = false,
 job_control: bool = false,
 concurrent_pipeline: ?ConcurrentPipeline = null,
 cancel_io: ?std.Io = null,
+diagnostic_locations: bool = true,
 loop_depth: u32,
 function_depth: u32,
 
@@ -268,7 +269,15 @@ pub fn execute(executor: Executor, hir: Hir) Error!Result {
     return executor.executeInstruction(hir, root);
 }
 
-fn executeInstruction(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
+fn executeInstruction(parent: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
+    var executor = parent;
+    executor.io.diagnostic_source = if (executor.diagnostic_locations and hir.instructionTag(index) == .simple_command) blk: {
+        for (hir.simpleCommandParts(index)) |part| {
+            if (hir.instructionTag(part) == .word)
+                break :blk .{ .start = hir.instructionData(part).pl.src_start };
+        }
+        break :blk .{ .start = hir.instructionData(index).pl.src_start };
+    } else null;
     if (executor.cancel_io) |io| try io.checkCancel();
     if (executor.background) {
         if (executor.jobs == null) return error.UnsupportedInstruction;
@@ -1766,6 +1775,9 @@ fn executeFunction(executor: Executor, argv: []const []const u8) Error!Result {
     defer definition.deinit(executor.gpa);
 
     var function_executor = executor;
+    // Function HIR can originate from an earlier input, whose source is not
+    // retained. Do not attach those offsets to the invoking input's diagnostics.
+    function_executor.diagnostic_locations = false;
     function_executor.positional_parameters_override = argv[1..];
     function_executor.loop_depth = 0;
     function_executor.function_depth += 1;
