@@ -6,7 +6,8 @@ const AstGen = @import("AstGen.zig");
 const CommandPlan = @import("CommandPlan.zig");
 const CommandResolver = @import("CommandResolver.zig");
 const Executor = @import("Executor.zig");
-const Evaluation = @import("evaluation.zig").Result;
+const evaluation = @import("evaluation.zig");
+const Evaluation = evaluation.Result;
 const ExecutionContext = @import("ExecutionContext.zig");
 const Hir = @import("Hir.zig");
 const Host = @import("Host.zig");
@@ -21,12 +22,18 @@ context: ExecutionContext,
 state: runtime.State,
 jobs: runtime.Jobs,
 concurrent_pipeline: ?Executor.ConcurrentPipeline,
+observer: ?Observer,
+next_evaluation_id: u64 = 0,
+evaluating: bool = false,
 last_result: Executor.Result = .{
     .status = 0,
     .sandbox_coverage = .not_requested,
 },
 
 pub const Options = struct {
+    /// Synchronous submitted-input observation; borrowed userdata must outlive
+    /// this session. The callback cannot reenter or change this session.
+    observer: ?Observer = null,
     /// Enables explicit controlling-terminal handoff for external foreground jobs.
     job_control: bool = false,
     /// Enables concurrent in-process pipeline stages. The supplied allocator
@@ -49,7 +56,14 @@ pub const EvaluateOptions = struct {
     collected_here_documents: []const heredoc.Collected = &.{},
 };
 
-pub const EvaluateError = Ast.ParseError || AstGen.Error || Executor.Error;
+pub const EvaluationId = evaluation.Id;
+pub const Event = evaluation.Event;
+pub const Observer = evaluation.Observer;
+
+pub const EvaluateError = Ast.ParseError || AstGen.Error || Executor.Error || error{
+    EvaluationInProgress,
+    EvaluationIdExhausted,
+};
 pub const InitError = VariableStore.Error || Host.Error;
 
 pub fn init(
@@ -75,6 +89,7 @@ pub fn init(
         .context = context,
         .jobs = .{ .gpa = gpa, .terminal_control = options.job_control },
         .concurrent_pipeline = options.concurrent_pipeline,
+        .observer = options.observer,
         .state = try runtime.State.init(gpa, .{
             .invocation_name = options.invocation_name,
             .shell_process_id = options.shell_process_id,
@@ -127,6 +142,42 @@ pub fn execute(session: *Session, hir: Hir) Executor.Error!Executor.Result {
 /// The caller must deinit the returned value with this session's allocator;
 /// a syntax result borrows `source` and collected here-document bodies.
 pub fn evaluate(
+    session: *Session,
+    source: [:0]const u8,
+    options: EvaluateOptions,
+) EvaluateError!Evaluation {
+    if (session.evaluating) return error.EvaluationInProgress;
+    session.next_evaluation_id = std.math.add(u64, session.next_evaluation_id, 1) catch
+        return error.EvaluationIdExhausted;
+    const id: EvaluationId = @enumFromInt(session.next_evaluation_id);
+    const observer = session.observer;
+    session.evaluating = true;
+    defer session.evaluating = false;
+
+    if (observer) |sink| sink.notify(sink.userdata, .{ .started = .{
+        .id = id,
+        .source = source,
+        .cwd = session.workingDirectory(),
+    } });
+    const result = session.evaluateInput(source, options) catch |err| {
+        if (observer) |sink| sink.notify(sink.userdata, .{ .finished = .{
+            .id = id,
+            .outcome = .{ .failed = err },
+        } });
+        return err;
+    };
+    if (observer) |sink| sink.notify(sink.userdata, .{ .finished = .{
+        .id = id,
+        .outcome = switch (result) {
+            .executed => |executed| .{ .executed = executed },
+            .syntax => .syntax,
+            .unsupported => |unsupported| .{ .unsupported = unsupported },
+        },
+    } });
+    return result;
+}
+
+fn evaluateInput(
     session: *Session,
     source: [:0]const u8,
     options: EvaluateOptions,

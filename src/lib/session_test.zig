@@ -11,6 +11,86 @@ const SandboxPolicy = @import("SandboxPolicy.zig");
 const Session = @import("Session.zig");
 const Diagnostic = @import("runtime/Diagnostic.zig");
 
+test "evaluation events pair outcomes and reject callback reentry" {
+    const Capture = struct {
+        const Kind = enum { started, executed, syntax, unsupported, failed };
+        const Record = struct { id: Session.EvaluationId, kind: Kind, status: ?u8 = null };
+        records: [12]Record = undefined,
+        count: usize = 0,
+        session: ?*Session = null,
+        reentry_error: ?anyerror = null,
+        failure: ?anyerror = null,
+        saw_cwd: bool = false,
+
+        fn notify(userdata: ?*anyopaque, event: Session.Event) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.records[self.count] = switch (event) {
+                .started => |started| .{ .id = started.id, .kind = .started },
+                .finished => |finished| .{
+                    .id = finished.id,
+                    .kind = switch (finished.outcome) {
+                        .executed => .executed,
+                        .syntax => .syntax,
+                        .unsupported => .unsupported,
+                        .failed => .failed,
+                    },
+                    .status = if (finished.outcome == .executed) finished.outcome.executed.status else null,
+                },
+            };
+            self.count += 1;
+            if (event == .finished and event.finished.outcome == .failed)
+                self.failure = event.finished.outcome.failed;
+            if (event == .started) {
+                self.saw_cwd = std.mem.eql(u8, event.started.cwd.?, "/work");
+                if (self.reentry_error == null) {
+                    var nested = self.session.?.evaluate("true", .{}) catch |err| {
+                        self.reentry_error = err;
+                        return;
+                    };
+                    nested.deinit(self.session.?.allocator());
+                }
+            }
+        }
+    };
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var resolver = FakeResolver.init(std.testing.allocator);
+    defer resolver.deinit();
+    var capture: Capture = .{};
+    var session = try Session.init(std.testing.allocator, fake.host(), .{
+        .context = .{ .cwd = "/work" },
+        .resolver = resolver.resolver(),
+        .observer = .{ .userdata = &capture, .notify = Capture.notify },
+    });
+    defer session.deinit();
+    capture.session = &session;
+
+    const inputs = [_][:0]const u8{ "exit 7", "# comment", "if", "tool *.txt" };
+    for (inputs) |input| {
+        var result = try session.evaluate(input, .{});
+        result.deinit(session.allocator());
+    }
+    resolver.resolve_error = error.Unexpected;
+    try std.testing.expectError(error.Unexpected, session.evaluate("tool", .{}));
+    try std.testing.expectEqual(error.EvaluationInProgress, capture.reentry_error.?);
+    try std.testing.expect(capture.saw_cwd);
+    try std.testing.expectEqual(@as(usize, 10), capture.count);
+    const kinds = [_]Capture.Kind{ .executed, .executed, .syntax, .unsupported, .failed };
+    for (kinds, 0..) |kind, index| {
+        try std.testing.expectEqual(@as(u64, index + 1), @intFromEnum(capture.records[index * 2].id));
+        try std.testing.expectEqual(capture.records[index * 2].id, capture.records[index * 2 + 1].id);
+        try std.testing.expectEqual(Capture.Kind.started, capture.records[index * 2].kind);
+        try std.testing.expectEqual(kind, capture.records[index * 2 + 1].kind);
+    }
+    try std.testing.expectEqual(@as(u8, 7), capture.records[1].status.?);
+    try std.testing.expectEqual(@as(u8, 7), capture.records[3].status.?);
+    try std.testing.expectEqual(error.Unexpected, capture.failure.?);
+
+    session.next_evaluation_id = std.math.maxInt(u64);
+    try std.testing.expectError(error.EvaluationIdExhausted, session.evaluate("true", .{}));
+    try std.testing.expectEqual(@as(usize, 10), capture.count);
+}
+
 test "session delivers borrowed structured diagnostics with original command offsets" {
     const Capture = struct {
         count: usize = 0,
