@@ -817,7 +817,7 @@ fn waitAny(userdata: ?*anyopaque, processes: []const Host.Process) Host.Error!Ho
                 .termination = termination,
             };
         }
-        std.Io.sleep(system.io, .fromMilliseconds(2), .awake) catch return error.Unexpected;
+        try std.Io.sleep(system.io, .fromMilliseconds(2), .awake);
     }
 }
 
@@ -1283,6 +1283,38 @@ test "system host owns foreground processes until wait" {
         error.InvalidArguments,
         system_host.wait(spawned.process),
     );
+}
+
+test "canceled wait-any retains the native child for later reaping" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const CanceledSleep = struct {
+        fn sleep(_: ?*anyopaque, _: std.Io.Timeout) std.Io.Cancelable!void {
+            return error.Canceled;
+        }
+    };
+    var io_vtable = std.testing.io.vtable.*;
+    io_vtable.sleep = CanceledSleep.sleep;
+    var system: System = .{
+        .gpa = std.testing.allocator,
+        .io = .{ .userdata = std.testing.io.userdata, .vtable = &io_vtable },
+    };
+    defer system.deinit();
+    const system_host = system.host();
+    const input = try system_host.createPipe();
+    defer system_host.closeResource(input.read_end);
+    defer system_host.closeResource(input.write_end);
+    const spawned = (try system_host.spawn(.{
+        .executable = "/bin/sh",
+        .argv = &.{ "/bin/sh", "-c", "read value; exit 23" },
+        .file_actions = &.{.{ .use_resource = .{ .resource = input.read_end, .target = .stdin } }},
+    })).spawned;
+    system_host.closeResource(input.read_end);
+
+    try std.testing.expectError(error.Canceled, system_host.waitAny(&.{spawned.process}));
+    try std.testing.expect(system.children.contains(spawned.process));
+    system_host.closeResource(input.write_end);
+    try std.testing.expectEqualDeep(Host.Termination{ .exited = 23 }, try system_host.wait(spawned.process));
+    try std.testing.expect(!system.children.contains(spawned.process));
 }
 
 test "system host polls and reaps an exited child once" {
