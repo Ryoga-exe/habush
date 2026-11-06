@@ -9,6 +9,7 @@
         "build.zig.zon",
         "src",
         "examples",
+        "test",
         "README.md",
     },
 }

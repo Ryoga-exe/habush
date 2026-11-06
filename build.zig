@@ -51,9 +51,39 @@ pub fn build(b: *std.Build) void {
     run_pipeline_step.dependOn(&run_pipeline_cmd.step);
     if (b.args) |args| run_pipeline_cmd.addArgs(args);
 
+    const sandbox_example = b.addExecutable(.{
+        .name = "run-sandbox",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/run_sandbox.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    sandbox_example.root_module.addImport("habush-exec", habush_exec);
+    const run_sandbox_step = b.step("run-sandbox", "Run the explicit sandbox backend example");
+    const run_sandbox_cmd = b.addRunArtifact(sandbox_example);
+    run_sandbox_step.dependOn(&run_sandbox_cmd.step);
+    if (b.args) |args| run_sandbox_cmd.addArgs(args);
+
+    const sandbox_probe = b.addExecutable(.{
+        .name = "sandbox-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/sandbox.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    sandbox_probe.root_module.addImport("habush-exec", habush_exec);
+    const sandbox_test_step = b.step("test-sandbox", "Verify the optional sandbox backend with real workers");
+    const sandbox_test_cmd = b.addRunArtifact(sandbox_probe);
+    sandbox_test_cmd.addArtifactArg(exe);
+    sandbox_test_step.dependOn(&sandbox_test_cmd.step);
+
     const check_step = b.step("check", "Compile the CLI and structured pipeline example");
     check_step.dependOn(&exe.step);
     check_step.dependOn(&pipeline_example.step);
+    check_step.dependOn(&sandbox_example.step);
+    check_step.dependOn(&sandbox_probe.step);
 
     const lib_tests = b.addTest(.{
         .root_module = habush,
@@ -64,6 +94,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&exe.step);
     test_step.dependOn(&pipeline_example.step);
+    test_step.dependOn(&sandbox_example.step);
 
     const command_control_test = b.addRunArtifact(exe);
     command_control_test.setName("test cli exit control flow");
