@@ -1213,17 +1213,21 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
     );
 
     const resolver = executor.resolver orelse return error.CommandResolutionUnavailable;
+    var command_failure: ?CommandPlan.CommandFailure = null;
     const executable = (resolver.resolve(allocator, .{
         .name = argv.items[0],
         .search_path = try executor.commandSearchPath(allocator, &command_variables),
         .cwd = executor.workingDirectory(),
     }) catch |err| switch (err) {
-        error.AccessDenied => return executor.commandFailure(
-            argv.items[0],
-            .{ .cannot_execute = .access_denied },
-        ),
+        error.AccessDenied => denied: {
+            command_failure = .access_denied;
+            break :denied null;
+        },
         error.OutOfMemory, error.Unexpected => return err,
-    }) orelse return executor.commandFailure(argv.items[0], .command_not_found);
+    }) orelse unresolved: {
+        if (command_failure == null) command_failure = .command_not_found;
+        break :unresolved argv.items[0];
+    };
 
     var effective_file_actions: std.ArrayList(CommandPlan.FileAction) = .empty;
     if (executor.background and !executor.job_control and
@@ -1262,6 +1266,7 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
         .cwd = if (executor.workingDirectory()) |cwd| .{ .path = cwd } else .inherit,
         .file_actions = effective_file_actions.items,
         .sandbox = executor.activeSandbox(),
+        .command_failure = command_failure,
     };
     if (executor.pipeline_stage == null and
         (executor.background or (executor.jobs != null and executor.jobs.?.terminal_control)))

@@ -357,6 +357,11 @@ fn spawnNative(system: *System, plan: CommandPlan, bootstrap_worker: bool) Host.
         }
     }
 
+    if (plan.command_failure) |failure| return .{ .failed = switch (failure) {
+        .command_not_found => .command_not_found,
+        .access_denied => .access_denied,
+    } };
+
     var child_io = [_]std.process.SpawnOptions.StdIo{
         spawnStdio(bindings[0], .stdin),
         spawnStdio(bindings[1], .stdout),
@@ -1784,6 +1789,37 @@ test "system host creates and closes pipeline resources" {
     system_host.closeResource(pipeline_pipe.write_end);
     system_host.closeResource(pipeline_pipe.read_end);
     try std.testing.expectEqual(@as(usize, 0), system.resources.count());
+}
+
+test "known lookup failures preserve ordered redirect effects and errors" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var directory_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const directory_len = try temporary.dir.realPath(std.testing.io, &directory_buffer);
+    var system: System = .{ .gpa = std.testing.allocator, .io = std.testing.io };
+    defer system.deinit();
+    var plan: CommandPlan = .{
+        .executable = "missing",
+        .argv = &.{"missing"},
+        .cwd = .{ .path = directory_buffer[0..directory_len] },
+        .command_failure = .command_not_found,
+        .file_actions = &.{
+            .{ .open = .{ .path = "first", .target = .stdout, .access = .write, .disposition = .create_or_truncate } },
+            .{ .open = .{ .path = "second", .target = .stdout, .access = .write, .disposition = .create_or_truncate } },
+        },
+    };
+    try std.testing.expectEqualDeep(Host.SpawnOutcome{ .failed = .command_not_found }, try system.host().spawn(plan));
+    for ([_][]const u8{ "first", "second" }) |path| {
+        const stat = try temporary.dir.statFile(std.testing.io, path, .{});
+        try std.testing.expectEqual(@as(u64, 0), stat.size);
+    }
+    plan.file_actions = &.{
+        .{ .open = .{ .path = "absent/output", .target = .stdout, .access = .write, .disposition = .create_or_truncate } },
+        .{ .open = .{ .path = "never", .target = .stdout, .access = .write, .disposition = .create_or_truncate } },
+    };
+    try std.testing.expectEqualDeep(Host.SpawnOutcome{ .failed = .{ .file_action = .{ .action_index = 0, .reason = .not_found } } }, try system.host().spawn(plan));
+    try std.testing.expectError(error.FileNotFound, temporary.dir.statFile(std.testing.io, "never", .{}));
+    try std.testing.expectEqual(@as(usize, 0), system.children.count());
 }
 
 test "system host duplicates redirected standard streams" {

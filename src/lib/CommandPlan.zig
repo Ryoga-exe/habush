@@ -15,6 +15,12 @@ cwd: WorkingDirectory = .inherit,
 file_actions: []const FileAction = &.{},
 process_group: ProcessGroupAction = .inherit,
 sandbox: Sandbox = .inherit,
+/// A resolved, expected lookup failure. File actions still run in source
+/// order before this outcome is published; no executable is started. A host
+/// may use a fresh worker when opening those paths would block pipeline setup.
+command_failure: ?CommandFailure = null,
+
+pub const CommandFailure = enum { command_not_found, access_denied };
 
 pub const EnvironmentVariable = struct {
     name: []const u8,

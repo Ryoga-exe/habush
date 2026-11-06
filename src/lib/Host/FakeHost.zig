@@ -149,6 +149,24 @@ fn resourceReader(userdata: ?*anyopaque, resource: CommandPlan.Resource) ?*std.I
 fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.SpawnError!Host.SpawnOutcome {
     const fake: *FakeHost = @ptrCast(@alignCast(userdata.?));
     if (fake.spawn_error) |err| return err;
+    if (plan.command_failure) |failure| {
+        for (plan.file_actions, 0..) |action, action_index| {
+            if (action == .open) {
+                const opened = try openFile(userdata, plan.cwd, action.open);
+                switch (opened) {
+                    .failed => |reason| return .{ .failed = .{ .file_action = .{
+                        .action_index = @intCast(action_index),
+                        .reason = reason,
+                    } } },
+                    .opened => |resource| closeResource(userdata, resource),
+                }
+            }
+        }
+        return .{ .failed = switch (failure) {
+            .command_not_found => .command_not_found,
+            .access_denied => .access_denied,
+        } };
+    }
     if (fake.spawn_failure) |failure| {
         if (fake.spawn_calls.items.len >= fake.spawn_failure_after)
             return .{ .failed = failure };
@@ -211,6 +229,7 @@ fn clonePlan(allocator: std.mem.Allocator, plan: CommandPlan) !CommandPlan {
         .file_actions = actions,
         .process_group = plan.process_group,
         .sandbox = try plan.sandbox.clone(allocator),
+        .command_failure = plan.command_failure,
     };
 }
 
