@@ -20,6 +20,7 @@ const ExecutionContext = @import("ExecutionContext.zig");
 const Expander = @import("Expander.zig");
 const Hir = @import("Hir.zig");
 const Host = @import("Host.zig");
+const Pipeline = @import("Pipeline.zig");
 const runtime = @import("runtime.zig");
 const SandboxPolicy = @import("SandboxPolicy.zig");
 const VariableStore = @import("VariableStore.zig");
@@ -82,13 +83,8 @@ const PipelineStage = struct {
     input: ?CommandPlan.Resource,
     output: ?CommandPlan.Resource,
     pipe_stderr: bool,
-    spawned: *?Host.SpawnResult,
-};
-
-const PipelinePipe = struct {
-    endpoints: Host.Pipe,
-    read_open: bool = true,
-    write_open: bool = true,
+    pipeline: *Pipeline,
+    index: usize,
 };
 
 const PipelineStageKind = enum {
@@ -597,28 +593,13 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
     // two such stages require a concurrent runtime scheduler.
     if (in_process_count > 1) return error.UnsupportedInstruction;
 
-    const pipes = try allocator.alloc(PipelinePipe, pipe_stderr.items.len);
-    var pipe_count: usize = 0;
-    const spawned = try allocator.alloc(?Host.SpawnResult, stages.items.len);
-    @memset(spawned, null);
-    defer {
-        closePipes(executor.host, pipes[0..pipe_count]);
-        for (spawned) |process| {
-            if (process) |value| _ = executor.host.wait(value.process) catch {};
-        }
-    }
-
-    for (pipes) |*pipeline_pipe| {
-        pipeline_pipe.* = .{
-            .endpoints = executor.host.createPipe() catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.ResourceUnavailable => return executor.pipelineFailure(.resource_unavailable),
-                error.Unsupported => return executor.pipelineFailure(.unsupported),
-                else => |other| return other,
-            },
-        };
-        pipe_count += 1;
-    }
+    var pipeline = Pipeline.init(allocator, executor.host, stages.items.len) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.ResourceUnavailable => return executor.pipelineFailure(.resource_unavailable),
+        error.Unsupported => return executor.pipelineFailure(.unsupported),
+        else => |other| return other,
+    };
+    defer pipeline.deinit();
 
     var result: Result = .{ .status = 0, .sandbox_coverage = .not_requested };
     const phase_count: usize = if (in_process_count == 0) 1 else 2;
@@ -634,12 +615,14 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
             }
 
             var stage_executor = prepared[stage_index].executor(executor);
+            const connections = pipeline.stage(stage_index);
             stage_executor.pipeline_stage = .{
-                .input = if (stage_index == 0) null else pipes[stage_index - 1].endpoints.read_end,
-                .output = if (stage_index == pipes.len) null else pipes[stage_index].endpoints.write_end,
+                .input = connections.input,
+                .output = connections.output,
                 .pipe_stderr = stage_index < pipe_stderr.items.len and
                     pipe_stderr.items[stage_index],
-                .spawned = &spawned[stage_index],
+                .pipeline = &pipeline,
+                .index = stage_index,
             };
             var stage_result = stage_executor.executeInstruction(hir, prepared[stage_index].index) catch |err| switch (err) {
                 // A non-final in-process stage observes a closed pipeline as a
@@ -658,15 +641,12 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
                 result.sandbox_coverage,
                 stage_result.sandbox_coverage,
             );
-            if (stage_index != 0) closePipeRead(executor.host, &pipes[stage_index - 1]);
-            if (stage_index != pipes.len) closePipeWrite(executor.host, &pipes[stage_index]);
+            pipeline.closeStage(stage_index);
         }
     }
 
-    for (spawned, 0..) |process, stage_index| {
-        if (process) |value| {
-            const termination = try executor.host.wait(value.process);
-            spawned[stage_index] = null;
+    for (0..stages.items.len) |stage_index| {
+        if (try pipeline.wait(stage_index)) |termination| {
             const status = try terminationStatus(termination);
             if (stage_index + 1 == stages.items.len) result.status = status;
         }
@@ -740,27 +720,6 @@ fn collectPipeline(
         },
         else => stages.append(allocator, index),
     };
-}
-
-fn closePipes(host: Host, pipes: []PipelinePipe) void {
-    var index = pipes.len;
-    while (index != 0) {
-        index -= 1;
-        closePipeWrite(host, &pipes[index]);
-        closePipeRead(host, &pipes[index]);
-    }
-}
-
-fn closePipeRead(host: Host, pipeline_pipe: *PipelinePipe) void {
-    if (!pipeline_pipe.read_open) return;
-    host.closeResource(pipeline_pipe.endpoints.read_end);
-    pipeline_pipe.read_open = false;
-}
-
-fn closePipeWrite(host: Host, pipeline_pipe: *PipelinePipe) void {
-    if (!pipeline_pipe.write_open) return;
-    host.closeResource(pipeline_pipe.endpoints.write_end);
-    pipeline_pipe.write_open = false;
 }
 
 fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
@@ -951,14 +910,18 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
             .duplicate = .{ .source = .stdout, .target = .stderr },
         });
     }
-    const spawn_outcome = executor.host.spawn(.{
+    const plan: CommandPlan = .{
         .executable = executable,
         .argv = argv.items,
         .environment = environment,
         .cwd = if (executor.workingDirectory()) |cwd| .{ .path = cwd } else .inherit,
         .file_actions = effective_file_actions.items,
         .sandbox = executor.activeSandbox(),
-    }) catch |err| switch (err) {
+    };
+    const spawn_outcome = (if (executor.pipeline_stage) |stage|
+        stage.pipeline.spawn(stage.index, plan)
+    else
+        executor.host.spawn(plan)) catch |err| switch (err) {
         error.OutOfMemory, error.InvalidArguments, error.Unexpected => return err,
     };
     const spawned = switch (spawn_outcome) {
@@ -969,9 +932,7 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
             failure,
         ),
     };
-    if (executor.pipeline_stage) |stage| {
-        std.debug.assert(stage.spawned.* == null);
-        stage.spawned.* = spawned;
+    if (executor.pipeline_stage != null) {
         return .{
             .status = 0,
             .sandbox_coverage = spawned.sandbox_coverage,

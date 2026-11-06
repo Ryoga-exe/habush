@@ -14,6 +14,29 @@ test "host rejects an empty executable before dispatch" {
     try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
 }
 
+test "host rejects embedded NUL bytes before dispatch" {
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    const plans = [_]CommandPlan{
+        .{ .executable = "/bin/tool\x00suffix", .argv = &.{"tool"} },
+        .{ .executable = "/bin/tool", .argv = &.{ "tool", "value\x00suffix" } },
+        .{ .executable = "/bin/tool", .argv = &.{"tool"}, .cwd = .{ .path = "/dir\x00suffix" } },
+        .{
+            .executable = "/bin/tool",
+            .argv = &.{"tool"},
+            .file_actions = &.{.{ .open = .{
+                .path = "output\x00suffix",
+                .target = .stdout,
+                .access = .write,
+                .disposition = .create_or_truncate,
+            } }},
+        },
+    };
+    for (plans) |plan|
+        try std.testing.expectError(error.InvalidArguments, fake.host().spawn(plan));
+    try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+}
+
 test "host rejects joining process group zero before dispatch" {
     var fake = FakeHost.init(std.testing.allocator);
     defer fake.deinit();

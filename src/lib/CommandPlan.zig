@@ -128,6 +128,21 @@ pub const Sandbox = union(enum) {
 pub fn validate(plan: CommandPlan) error{InvalidArguments}!void {
     if (plan.executable.len == 0 or plan.argv.len == 0 or plan.argv[0].len == 0)
         return error.InvalidArguments;
+    if (std.mem.indexOfScalar(u8, plan.executable, 0) != null)
+        return error.InvalidArguments;
+    for (plan.argv) |argument|
+        if (std.mem.indexOfScalar(u8, argument, 0) != null)
+            return error.InvalidArguments;
+    switch (plan.cwd) {
+        .inherit => {},
+        .path => |path| if (std.mem.indexOfScalar(u8, path, 0) != null)
+            return error.InvalidArguments,
+    }
+    for (plan.file_actions) |action| switch (action) {
+        .open => |open| if (std.mem.indexOfScalar(u8, open.path, 0) != null)
+            return error.InvalidArguments,
+        .duplicate, .use_resource, .close => {},
+    };
     switch (plan.process_group) {
         .join => |group| if (@intFromEnum(group) == 0) return error.InvalidArguments,
         .inherit, .create => {},
