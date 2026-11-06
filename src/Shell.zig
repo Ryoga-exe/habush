@@ -3,6 +3,7 @@
 const std = @import("std");
 const habush = @import("habush");
 const ShellIntegration = @import("terminal/ShellIntegration.zig");
+const LineEditor = @import("terminal/LineEditor.zig");
 const Io = std.Io;
 const Shell = @This();
 
@@ -13,6 +14,8 @@ stdin: *Io.Reader,
 stderr: *Io.Writer,
 session: *habush.Session,
 interactive: bool,
+io: ?std.Io = null,
+line_edit: bool = false,
 integration: ?ShellIntegration = null,
 input_line: usize = 0,
 
@@ -22,7 +25,13 @@ pub fn run(self: *Shell) !habush.runtime.ExitStatus {
 
 fn runInput(self: *Shell, source_name: ?[]const u8) !habush.runtime.ExitStatus {
     while (true) {
-        var input = try self.readCommand() orelse return self.session.lastResult().status;
+        var input = (self.readCommand() catch |err| switch (err) {
+            error.InputInterrupted => {
+                self.session.interruptInput();
+                continue;
+            },
+            else => return err,
+        }) orelse return self.session.lastResult().status;
         defer input.deinit(self.allocator);
 
         if (input.incomplete_here_document) {
@@ -122,7 +131,7 @@ fn readCommand(self: *Shell) !?CommandInput {
 
     while (true) {
         if (self.interactive) try self.printPrompt(continuation);
-        const line = try self.readInputLine() orelse {
+        const line = try self.readInputLine(if (continuation) "> " else "habush> ", command.written(), true) orelse {
             if (self.interactive) try self.stderr.writeByte('\n');
             if (command.written().len == 0) {
                 command.deinit();
@@ -263,7 +272,7 @@ fn readHereDocument(
     defer delimiter_candidate.deinit();
     while (true) {
         if (self.interactive) try self.printPrompt(true);
-        const line = try self.readInputLine() orelse {
+        const line = try self.readInputLine("> ", "", false) orelse {
             body.deinit();
             return null;
         };
@@ -294,8 +303,24 @@ fn hasLineContinuation(line: []const u8) bool {
     return backslash_count % 2 == 1;
 }
 
-fn readInputLine(self: *Shell) !?[:0]u8 {
-    const line = try readLineAlloc(self.stdin, self.allocator) orelse return null;
+fn readInputLine(self: *Shell, prompt: []const u8, prefix: []const u8, allow_completion: bool) !?[:0]u8 {
+    const line = if (self.interactive and self.line_edit and self.io != null)
+        ((LineEditor{
+            .gpa = self.allocator,
+            .io = self.io.?,
+            .input = self.stdin,
+            .output = self.stderr,
+            .session = self.session,
+            .prompt = prompt,
+            .prefix = prefix,
+            .allow_completion = allow_completion,
+        }).read() catch |err| switch (err) {
+            error.EditorUnavailable => try readLineAlloc(self.stdin, self.allocator),
+            error.EndOfStream => null,
+            else => return err,
+        }) orelse return null
+    else
+        try readLineAlloc(self.stdin, self.allocator) orelse return null;
     self.input_line += 1;
     return line;
 }
@@ -331,6 +356,8 @@ fn handleInput(
 ) !habush.runtime.ControlFlow {
     var evaluation = try self.session.evaluate(source, .{
         .collected_here_documents = collected_here_documents,
+        .source_name = source_name,
+        .source_line_offset = source_line,
     });
     defer evaluation.deinit(self.session.allocator());
     switch (evaluation) {
