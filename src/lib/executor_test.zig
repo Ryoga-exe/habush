@@ -1760,6 +1760,43 @@ test "for loops with no values succeed without variable state" {
     try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
 }
 
+test "shift follows the current parameter frame and preserves for input" {
+    var hir = try generate(
+        \\inner() { shift; inner_seen="$#:$1"; }
+        \\outer() {
+        \\  shift
+        \\  inner child nested
+        \\  nested_after="$#:$1"
+        \\  (shift)
+        \\  subshell_after="$#:$1"
+        \\  shift | true
+        \\  pipeline_after="$#:$1"
+        \\}
+        \\outer first second third
+        \\global_after="$#:$1"
+        \\trace=
+        \\for item; do trace="$trace/$item"; shift; done
+    );
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var state = try runtime.State.init(std.testing.allocator, .{
+        .positional_parameters = &.{ "one", "two", "three" },
+    });
+    defer state.deinit();
+    var context = try ExecutionContext.init(std.testing.allocator, .{});
+    defer context.deinit();
+
+    const result = try Executor.initWithState(fake.host(), null, &state, &context, 0).execute(hir);
+    try std.testing.expectEqual(@as(u8, 0), result.status);
+    try std.testing.expectEqualStrings("1:nested", state.variable("inner_seen").?);
+    for ([_][]const u8{ "nested_after", "subshell_after", "pipeline_after" }) |name|
+        try std.testing.expectEqualStrings("2:second", state.variable(name).?);
+    try std.testing.expectEqualStrings("3:one", state.variable("global_after").?);
+    try std.testing.expectEqualStrings("/one/two/three", state.variable("trace").?);
+    try std.testing.expectEqual(@as(usize, 0), state.positionalParameters().len);
+}
+
 test "for loops consume continue and propagate break across nested loops" {
     const cases = [_][:0]const u8{
         \\for command in continue false; do
