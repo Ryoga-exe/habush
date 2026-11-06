@@ -1,18 +1,27 @@
 //! Native `Host` implementation backed by Zig's cross-platform standard APIs.
 //!
 //! The process backend supports foreground commands and file actions for the
-//! three standard descriptors. POSIX process groups are available for future
-//! job control; non-standard descriptors and sandbox restrictions remain
-//! explicit unsupported boundaries.
+//! three standard descriptors. POSIX process groups and explicit controlling
+//! terminal leases support job control; non-standard descriptors and sandbox
+//! restrictions remain explicit unsupported boundaries.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const CommandPlan = @import("../CommandPlan.zig");
 const Host = @import("../Host.zig");
+const runtime_types = @import("../runtime/types.zig");
 const append_file = @import("System/append_file.zig");
 const pipe = @import("System/pipe.zig");
+const terminal = if (builtin.os.tag == .windows or builtin.os.tag == .wasi)
+    struct {}
+else
+    @import("System/terminal.zig");
 const windows_spawn = if (builtin.os.tag == .windows) @import("System/windows_spawn.zig") else struct {};
 const System = @This();
+const TerminalModes = if (builtin.os.tag == .windows or builtin.os.tag == .wasi)
+    u8
+else
+    terminal.Modes;
 
 gpa: std.mem.Allocator,
 io: std.Io,
@@ -21,8 +30,11 @@ io: std.Io,
 environ_map: ?*const std.process.Environ.Map = null,
 children: std.AutoHashMapUnmanaged(Host.Process, ChildRecord) = .empty,
 resources: std.AutoHashMapUnmanaged(CommandPlan.Resource, *FileResource) = .empty,
+job_terminal_modes: std.AutoHashMapUnmanaged(CommandPlan.ProcessGroup, TerminalModes) = .empty,
+terminal_lease: ?TerminalRecord = null,
 next_process: u32 = 1,
 next_resource: u32 = 1,
+next_terminal_lease: u32 = 1,
 
 const FileResource = struct {
     storage: Storage,
@@ -80,7 +92,30 @@ const ChildRecord = struct {
     process_group: ?CommandPlan.ProcessGroup,
 };
 
+const TerminalRecord = struct {
+    token: Host.TerminalLease,
+    tty: std.Io.File,
+    group: CommandPlan.ProcessGroup,
+    previous_group: u32,
+    shell_modes: TerminalModes,
+    foreground_restored: bool = false,
+};
+
 pub fn deinit(system: *System) void {
+    if (system.terminal_lease) |lease| {
+        releaseTerminal(system, lease.token) catch {};
+        if (system.terminal_lease) |still_active| {
+            if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+                if (!still_active.foreground_restored) {
+                    const previous: std.posix.pid_t = @intCast(still_active.previous_group);
+                    terminal.setForegroundGroup(still_active.tty, previous) catch {};
+                }
+                terminal.setModes(still_active.tty, still_active.shell_modes) catch {};
+            }
+            still_active.tty.close(system.io);
+        }
+        system.terminal_lease = null;
+    }
     var children = system.children.valueIterator();
     while (children.next()) |record| {
         if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
@@ -93,6 +128,7 @@ pub fn deinit(system: *System) void {
         }
     }
     system.children.deinit(system.gpa);
+    system.job_terminal_modes.deinit(system.gpa);
     var resources = system.resources.valueIterator();
     while (resources.next()) |resource| {
         resource.*.deinit(system.io);
@@ -112,13 +148,19 @@ pub fn host(system: *System) Host {
 const vtable: Host.VTable = .{
     .capabilities = .{
         .process_groups = builtin.os.tag != .windows and builtin.os.tag != .wasi,
+        .terminal_control = builtin.os.tag != .windows and builtin.os.tag != .wasi,
         .poll = builtin.os.tag != .wasi,
         .signals = builtin.os.tag != .wasi,
     },
     .spawn = spawn,
     .wait = wait,
+    .wait_event = waitEvent,
+    .wait_any = waitAny,
     .try_wait = tryWait,
     .signal = signal,
+    .signal_group = signalGroup,
+    .acquire_terminal = acquireTerminal,
+    .release_terminal = releaseTerminal,
     .open_file = openFile,
     .create_pipe = createPipe,
     .create_input = createInput,
@@ -308,9 +350,27 @@ fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.SpawnError!Host.SpawnOut
     });
     return .{ .spawned = .{
         .process = process,
+        .process_id = nativeProcessId(child),
         .process_group = process_group,
         .sandbox_coverage = .not_requested,
     } };
+}
+
+fn nativeProcessId(child: std.process.Child) ?runtime_types.ProcessId {
+    if (builtin.os.tag == .wasi) return null;
+    if (builtin.os.tag != .windows)
+        return @enumFromInt(std.math.cast(u32, child.id orelse return null) orelse return null);
+
+    const windows = std.os.windows;
+    var info: windows.PROCESS.BASIC_INFORMATION = undefined;
+    if (windows.ntdll.NtQueryInformationProcess(
+        child.id orelse return null,
+        .BasicInformation,
+        &info,
+        @sizeOf(windows.PROCESS.BASIC_INFORMATION),
+        null,
+    ) != .SUCCESS) return null;
+    return @enumFromInt(std.math.cast(u32, info.UniqueProcessId) orelse return null);
 }
 
 fn openFile(
@@ -646,11 +706,13 @@ fn applyEnvironmentVariables(
 fn wait(userdata: ?*anyopaque, process: Host.Process) Host.Error!Host.Termination {
     const system: *System = @ptrCast(@alignCast(userdata.?));
     const record = system.children.getPtr(process) orelse return error.InvalidArguments;
+    const group = record.process_group;
     const termination = record.child.wait(system.io) catch |err| return switch (err) {
         error.AccessDenied => error.AccessDenied,
         else => error.Unexpected,
     };
     _ = system.children.remove(process);
+    system.discardTerminalModesIfUnowned(group);
     return switch (termination) {
         .exited => |status| .{ .exited = status },
         .signal => |native_signal| .{ .signal = @intFromEnum(native_signal) },
@@ -667,19 +729,50 @@ fn tryWait(userdata: ?*anyopaque, process: Host.Process) Host.Error!?Host.Termin
     return tryWaitPosix(system, process, record);
 }
 
+fn waitEvent(userdata: ?*anyopaque, process: Host.Process) Host.Error!Host.Termination {
+    const system: *System = @ptrCast(@alignCast(userdata.?));
+    const record = system.children.getPtr(process) orelse return error.InvalidArguments;
+    if (builtin.os.tag == .windows) return wait(userdata, process);
+    if (builtin.os.tag == .wasi) return error.Unsupported;
+    return (try waitForPosix(system, process, record, std.posix.W.UNTRACED)) orelse error.Unexpected;
+}
+
+fn waitAny(userdata: ?*anyopaque, processes: []const Host.Process) Host.Error!Host.ProcessEvent {
+    const system: *System = @ptrCast(@alignCast(userdata.?));
+    if (processes.len == 0) return error.InvalidArguments;
+    if (builtin.os.tag == .wasi) return error.Unsupported;
+    for (processes) |process| {
+        if (!system.children.contains(process)) return error.InvalidArguments;
+    }
+    while (true) {
+        for (processes) |process| {
+            if (try system.host().tryWait(process)) |termination| return .{
+                .process = process,
+                .termination = termination,
+            };
+        }
+        std.Io.sleep(system.io, .fromMilliseconds(2), .awake) catch return error.Unexpected;
+    }
+}
+
 fn tryWaitPosix(
     system: *System,
     process: Host.Process,
     record: *ChildRecord,
 ) Host.Error!?Host.Termination {
+    return waitForPosix(system, process, record, std.posix.W.NOHANG | std.posix.W.UNTRACED);
+}
+
+fn waitForPosix(
+    system: *System,
+    process: Host.Process,
+    record: *ChildRecord,
+    flags: u32,
+) Host.Error!?Host.Termination {
     const pid = record.child.id orelse return error.InvalidArguments;
     var status: if (builtin.link_libc) c_int else u32 = undefined;
     while (true) {
-        const rc = std.posix.system.waitpid(
-            pid,
-            &status,
-            std.posix.W.NOHANG | std.posix.W.UNTRACED,
-        );
+        const rc = std.posix.system.waitpid(pid, &status, @intCast(flags));
         switch (std.posix.errno(rc)) {
             .SUCCESS => {
                 if (rc == 0) return null;
@@ -694,8 +787,10 @@ fn tryWaitPosix(
                     return error.Unexpected;
                 switch (result) {
                     .exited, .signal => {
+                        const group = record.process_group;
                         cleanupWaitedChildPosix(&record.child, system.io);
                         _ = system.children.remove(process);
+                        system.discardTerminalModesIfUnowned(group);
                     },
                     .stopped => {},
                     .unknown => unreachable,
@@ -743,6 +838,104 @@ fn signal(userdata: ?*anyopaque, process: Host.Process, requested: Host.Signal) 
     return signalPosix(record, requested);
 }
 
+fn signalGroup(
+    userdata: ?*anyopaque,
+    group: CommandPlan.ProcessGroup,
+    requested: Host.Signal,
+) Host.Error!void {
+    const system: *System = @ptrCast(@alignCast(userdata.?));
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.Unsupported;
+    if (!system.ownsProcessGroup(group)) return error.InvalidArguments;
+    const pgid = std.math.cast(std.posix.pid_t, @intFromEnum(group)) orelse
+        return error.InvalidArguments;
+    if (pgid <= 0) return error.InvalidArguments;
+    const native: std.posix.SIG = switch (requested) {
+        .interrupt => .INT,
+        .terminate => .TERM,
+        .kill => .KILL,
+        .stop => .STOP,
+        .cont => .CONT,
+    };
+    std.posix.kill(-pgid, native) catch |err| return switch (err) {
+        error.ProcessNotFound => return,
+        error.PermissionDenied => error.AccessDenied,
+        else => error.Unexpected,
+    };
+}
+
+fn acquireTerminal(userdata: ?*anyopaque, group: CommandPlan.ProcessGroup) Host.Error!Host.TerminalLease {
+    const system: *System = @ptrCast(@alignCast(userdata.?));
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.Unsupported;
+    if (system.terminal_lease != null) return error.ResourceUnavailable;
+    if (!system.ownsProcessGroup(group)) return error.InvalidArguments;
+    const pgid = std.math.cast(std.posix.pid_t, @intFromEnum(group)) orelse
+        return error.InvalidArguments;
+    if (pgid <= 0) return error.InvalidArguments;
+    // Release must be able to save a stopped job's modes without allocating.
+    if (!system.job_terminal_modes.contains(group))
+        try system.job_terminal_modes.ensureUnusedCapacity(system.gpa, 1);
+
+    const tty = std.Io.Dir.openFileAbsolute(system.io, "/dev/tty", .{
+        .mode = .read_write,
+        .allow_ctty = false,
+    }) catch |err| return switch (err) {
+        error.AccessDenied, error.PermissionDenied => error.AccessDenied,
+        error.FileNotFound, error.NoDevice => error.Unsupported,
+        else => error.ResourceUnavailable,
+    };
+    errdefer tty.close(system.io);
+    const previous = terminal.foregroundGroup(tty) catch |err| return mapTerminalError(err);
+    const shell_group = terminal.currentProcessGroup() catch |err| return mapTerminalError(err);
+    if (previous != shell_group) return error.AccessDenied;
+    const shell_modes = terminal.getModes(tty) catch |err| return mapTerminalError(err);
+    errdefer terminal.setModes(tty, shell_modes) catch {};
+    if (system.job_terminal_modes.get(group)) |job_modes|
+        terminal.setModes(tty, job_modes) catch |err| return mapTerminalError(err);
+    terminal.setForegroundGroup(tty, pgid) catch |err| return mapTerminalError(err);
+
+    const token: Host.TerminalLease = @enumFromInt(system.next_terminal_lease);
+    system.next_terminal_lease +%= 1;
+    if (system.next_terminal_lease == 0) system.next_terminal_lease = 1;
+    system.terminal_lease = .{
+        .token = token,
+        .tty = tty,
+        .group = group,
+        .previous_group = @intCast(previous),
+        .shell_modes = shell_modes,
+    };
+    return token;
+}
+
+fn releaseTerminal(userdata: ?*anyopaque, token: Host.TerminalLease) Host.Error!void {
+    const system: *System = @ptrCast(@alignCast(userdata.?));
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.Unsupported;
+    const lease = &(system.terminal_lease orelse return error.InvalidArguments);
+    if (lease.token != token) return error.InvalidArguments;
+    if (!lease.foreground_restored) {
+        // Completed groups have no future resume, so keep no stale mode entry.
+        if (system.ownsProcessGroup(lease.group)) {
+            if (terminal.getModes(lease.tty)) |job_modes| {
+                system.job_terminal_modes.putAssumeCapacity(lease.group, job_modes);
+            } else |_| {}
+        }
+        const previous: std.posix.pid_t = @intCast(lease.previous_group);
+        terminal.setForegroundGroup(lease.tty, previous) catch |err| return mapTerminalError(err);
+        lease.foreground_restored = true;
+    }
+    terminal.setModes(lease.tty, lease.shell_modes) catch |err| return mapTerminalError(err);
+    lease.tty.close(system.io);
+    system.terminal_lease = null;
+}
+
+fn mapTerminalError(err: terminal.Error) Host.Error {
+    return switch (err) {
+        error.NotATerminal => error.Unsupported,
+        error.PermissionDenied => error.AccessDenied,
+        error.InvalidGroup => error.InvalidArguments,
+        error.Unexpected => error.Unexpected,
+    };
+}
+
 fn signalPosix(record: *ChildRecord, requested: Host.Signal) Host.Error!void {
     const pid = record.child.id orelse return error.InvalidArguments;
     const native: std.posix.SIG = switch (requested) {
@@ -784,6 +977,11 @@ fn ownsProcessGroup(system: *System, group: CommandPlan.ProcessGroup) bool {
         }
     }
     return false;
+}
+
+fn discardTerminalModesIfUnowned(system: *System, maybe_group: ?CommandPlan.ProcessGroup) void {
+    const group = maybe_group orelse return;
+    if (!system.ownsProcessGroup(group)) _ = system.job_terminal_modes.remove(group);
 }
 
 fn nextProcess(system: *System) Host.Process {
@@ -1002,6 +1200,13 @@ test "system host owns foreground processes until wait" {
     try std.testing.expectEqual(@as(usize, 1), system.children.count());
     try std.testing.expectEqual(@as(?CommandPlan.ProcessGroup, null), spawned.process_group);
     try std.testing.expectEqual(.not_requested, spawned.sandbox_coverage);
+    try std.testing.expect(spawned.process_id != null);
+    if (builtin.os.tag != .windows) {
+        try std.testing.expectEqual(
+            @as(u32, @intCast(system.children.get(spawned.process).?.child.id.?)),
+            @intFromEnum(spawned.process_id.?),
+        );
+    }
 
     try std.testing.expectEqualDeep(
         Host.Termination{ .exited = 23 },
@@ -1073,6 +1278,51 @@ test "system host keeps a stopped POSIX child until it resumes and exits" {
     );
 }
 
+test "system host waits for the stopped child among several owned processes" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    var system: System = .{ .gpa = std.testing.allocator, .io = std.testing.io };
+    defer system.deinit();
+    const system_host = system.host();
+    const input = try system_host.createPipe();
+    defer system_host.closeResource(input.read_end);
+    defer system_host.closeResource(input.write_end);
+
+    const blocked = (try system_host.spawn(.{
+        .executable = "/bin/sh",
+        .argv = &.{ "shell-spelling", "-c", "read value; exit 0" },
+        .file_actions = &.{.{ .use_resource = .{
+            .resource = input.read_end,
+            .target = .stdin,
+        } }},
+    })).spawned;
+    system_host.closeResource(input.read_end);
+    const stopping = (try system_host.spawn(.{
+        .executable = "/bin/sh",
+        .argv = &.{ "shell-spelling", "-c", "kill -STOP $$; exit 0" },
+    })).spawned;
+
+    try std.testing.expectError(error.InvalidArguments, system_host.waitAny(&.{}));
+    try std.testing.expectError(
+        error.InvalidArguments,
+        system_host.waitAny(&.{ blocked.process, @enumFromInt(std.math.maxInt(u32)) }),
+    );
+    try std.testing.expectEqualDeep(Host.ProcessEvent{
+        .process = stopping.process,
+        .termination = .{ .stopped = @intFromEnum(std.posix.SIG.STOP) },
+    }, try system_host.waitAny(&.{ blocked.process, stopping.process }));
+    try system_host.signal(stopping.process, .cont);
+    system_host.closeResource(input.write_end);
+    try std.testing.expectEqualDeep(
+        Host.Termination{ .exited = 0 },
+        try system_host.wait(stopping.process),
+    );
+    try std.testing.expectEqualDeep(
+        Host.Termination{ .exited = 0 },
+        try system_host.wait(blocked.process),
+    );
+}
+
 test "system host creates a POSIX process group" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
 
@@ -1092,6 +1342,11 @@ test "system host creates a POSIX process group" {
         } }},
         .process_group = .create,
     })).spawned;
+    try system.job_terminal_modes.put(
+        std.testing.allocator,
+        spawned.process_group.?,
+        std.mem.zeroes(TerminalModes),
+    );
     try std.testing.expectEqual(
         @as(u32, @intCast(system.children.get(spawned.process).?.child.id.?)),
         @intFromEnum(spawned.process_group.?),
@@ -1105,9 +1360,39 @@ test "system host creates a POSIX process group" {
         Host.Termination{ .exited = 0 },
         try system_host.wait(joined.process),
     );
+    try std.testing.expect(system.job_terminal_modes.contains(spawned.process_group.?));
+    try system_host.signalGroup(spawned.process_group.?, .stop);
+    try std.testing.expectEqualDeep(
+        Host.Termination{ .stopped = @intFromEnum(std.posix.SIG.STOP) },
+        try system_host.waitEvent(spawned.process),
+    );
+    try std.testing.expectEqual(@as(usize, 1), system.children.count());
+    try system_host.signalGroup(spawned.process_group.?, .cont);
     system_host.closeResource(input.write_end);
     _ = try system_host.wait(spawned.process);
+    try std.testing.expect(!system.job_terminal_modes.contains(spawned.process_group.?));
+    try std.testing.expectError(
+        error.InvalidArguments,
+        system_host.signalGroup(spawned.process_group.?, .stop),
+    );
     try std.testing.expectError(error.InvalidArguments, system_host.spawn(join_plan));
+}
+
+test "system host requires an owned group for terminal handoff" {
+    var system: System = .{ .gpa = std.testing.allocator, .io = std.testing.io };
+    defer system.deinit();
+    const system_host = system.host();
+    const unknown: CommandPlan.ProcessGroup = @enumFromInt(424242);
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        try std.testing.expectError(error.Unsupported, system_host.acquireTerminal(unknown));
+        return;
+    }
+    try std.testing.expect(system_host.capabilities().terminal_control);
+    try std.testing.expectError(error.InvalidArguments, system_host.acquireTerminal(unknown));
+    try std.testing.expectError(
+        error.InvalidArguments,
+        system_host.releaseTerminal(@enumFromInt(1)),
+    );
 }
 
 test "system host reports missing executables" {
