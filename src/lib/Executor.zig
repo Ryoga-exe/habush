@@ -32,7 +32,7 @@ default_search_path: []const []const u8,
 invocation_name: []const u8,
 shell_process_id: ?runtime.ProcessId,
 positional_parameters: []const []const u8,
-positional_parameters_override: ?[]const []const u8,
+positional_parameters_override: ?*[]const []const u8,
 variables: ?*VariableStore,
 runtime_state: ?*runtime.State,
 io: runtime.Io,
@@ -156,6 +156,7 @@ const PreparedPipelineStage = struct {
     variables: ?VariableStore = null,
     context: ?ExecutionContext = null,
     jobs: ?runtime.Jobs = null,
+    positional_parameters: []const []const u8 = &.{},
 
     fn finishJobs(stage: *PreparedPipelineStage, cancel_io: ?std.Io) void {
         const jobs = if (stage.jobs) |*owned| owned else return;
@@ -190,6 +191,7 @@ const PreparedPipelineStage = struct {
             result.io = context.io;
         }
         result.jobs = if (stage.jobs) |*jobs| jobs else null;
+        result.positional_parameters_override = &stage.positional_parameters;
         result.prepared_simple = if (stage.plan) |plan| switch (plan) {
             .simple => |simple| simple,
             .definition, .compound => null,
@@ -312,6 +314,8 @@ fn executeFunctionDefinition(executor: Executor, hir: Hir, index: Hir.Inst.Index
 fn executeSubshell(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
     const group = hir.groupedCommand(index);
     var subshell_executor = executor;
+    var positional_parameters = executor.positionalParameters();
+    subshell_executor.positional_parameters_override = &positional_parameters;
     var jobs: runtime.Jobs = .{ .gpa = executor.gpa };
     defer jobs.deinit();
     defer jobs.cancelAll();
@@ -385,9 +389,13 @@ fn executeForClause(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!R
 
     var expanded_words: std.ArrayList([]const u8) = .empty;
     var expansion_failure: Expander.Failure = undefined;
-    const values = if (clause.implicit_positional_parameters)
-        scoped_executor.positionalParameters()
-    else values: {
+    const values = if (clause.implicit_positional_parameters) values: {
+        const parameters = scoped_executor.positionalParameters();
+        const copy = try allocator.alloc([]const u8, parameters.len);
+        for (parameters, copy) |parameter, *destination|
+            destination.* = try allocator.dupe(u8, parameter);
+        break :values copy;
+    } else values: {
         const expander = scoped_executor.wordExpander(allocator, null, &expansion_failure);
         for (clause.words) |word| {
             const expanded = expander.expandArgument(hir, word) catch |err| switch (err) {
@@ -641,6 +649,7 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
 
     const prepared = try allocator.alloc(PreparedPipelineStage, stages.items.len);
     for (prepared, stages.items) |*stage, stage_index| stage.* = .{ .index = stage_index };
+    for (prepared) |*stage| stage.positional_parameters = executor.positionalParameters();
     var prepared_owned = true;
     defer if (prepared_owned) for (prepared) |*stage| stage.deinit();
     var writer_mutex: std.Io.Mutex = .init;
@@ -1752,6 +1761,7 @@ fn executeBuiltin(
         .host = executor.host,
         .execution_context = executor.context,
         .runtime_state = executor.runtime_state,
+        .positional_parameters = executor.positional_parameters_override,
         .jobs = executor.jobs,
         .variable_overrides = command_variables,
         .io = executor.io,
@@ -1778,7 +1788,8 @@ fn executeFunction(executor: Executor, argv: []const []const u8) Error!Result {
     // Function HIR can originate from an earlier input, whose source is not
     // retained. Do not attach those offsets to the invoking input's diagnostics.
     function_executor.diagnostic_locations = false;
-    function_executor.positional_parameters_override = argv[1..];
+    var positional_parameters = argv[1..];
+    function_executor.positional_parameters_override = &positional_parameters;
     function_executor.loop_depth = 0;
     function_executor.function_depth += 1;
     var result = try function_executor.executeInstruction(definition.hir, definition.body);
@@ -1865,7 +1876,7 @@ fn commandSearchPath(
 }
 
 fn positionalParameters(executor: Executor) []const []const u8 {
-    if (executor.positional_parameters_override) |parameters| return parameters;
+    if (executor.positional_parameters_override) |parameters| return parameters.*;
     if (executor.runtime_state) |state| return state.positionalParameters();
     return executor.positional_parameters;
 }

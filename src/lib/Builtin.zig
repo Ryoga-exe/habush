@@ -26,6 +26,7 @@ pub const Tag = enum {
     fg,
     bg,
     @"return",
+    shift,
     @"export",
     unset,
 };
@@ -48,6 +49,9 @@ pub const Result = struct {
 pub const Context = struct {
     host: ?Host = null,
     runtime_state: ?*runtime.State = null,
+    /// Function-local positional parameters, borrowed for this call. A null
+    /// pointer selects the persistent parameters in `runtime_state`.
+    positional_parameters: ?*[]const []const u8 = null,
     jobs: ?*runtime.Jobs = null,
     execution_context: ExecutionContext.Ref = .{ .view = .{} },
     variable_overrides: ?*const VariableStore = null,
@@ -78,6 +82,7 @@ const definitions = std.StaticStringMap(Builtin).initComptime(.{
     .{ "fg", Builtin{ .tag = .fg } },
     .{ "bg", Builtin{ .tag = .bg } },
     .{ "return", Builtin{ .tag = .@"return", .special = true, .pipeline_support = .no_stdin } },
+    .{ "shift", Builtin{ .tag = .shift, .special = true, .pipeline_support = .no_stdin } },
     .{ "export", Builtin{ .tag = .@"export", .special = true, .pipeline_support = .no_stdin } },
     .{ "unset", Builtin{ .tag = .unset, .special = true, .pipeline_support = .no_stdin } },
 });
@@ -106,6 +111,7 @@ pub fn run(builtin: Builtin, context: Context, argv: []const []const u8) Error!R
         .fg => runJobControl(context, argv, true),
         .bg => runJobControl(context, argv, false),
         .@"return" => runReturn(context, argv),
+        .shift => runShift(context, argv),
         .@"export" => runExport(context, argv),
         .unset => runUnset(context, argv),
     };
@@ -176,6 +182,36 @@ fn runReturn(context: Context, argv: []const []const u8) Error!Result {
     };
     const status: runtime.ExitStatus = @truncate(@as(u64, @bitCast(value)));
     return .{ .status = status, .control_flow = .@"return" };
+}
+
+fn runShift(context: Context, argv: []const []const u8) Error!Result {
+    if (argv.len > 2) return commandFailure(context, argv[0], .too_many_arguments);
+    const count = if (argv.len == 1) 1 else count: {
+        const operand = argv[1];
+        if (operand.len == 0)
+            return commandFailure(context, argv[0], .{ .numeric_argument_required = operand });
+        for (operand) |byte| {
+            if (!std.ascii.isDigit(byte))
+                return commandFailure(context, argv[0], .{ .numeric_argument_required = operand });
+        }
+        break :count std.fmt.parseUnsigned(usize, operand, 10) catch
+            return commandFailure(context, argv[0], .shift_count_out_of_range);
+    };
+    const parameters = if (context.positional_parameters) |local|
+        local.*
+    else if (context.runtime_state) |state|
+        state.positionalParameters()
+    else
+        return error.RuntimeStateUnavailable;
+    if (count > parameters.len) return commandFailure(context, argv[0], .shift_count_out_of_range);
+    if (count == 0) return .{ .status = 0 };
+
+    if (context.positional_parameters) |local| {
+        local.* = parameters[count..];
+    } else {
+        try context.runtime_state.?.setPositionalParameters(parameters[count..]);
+    }
+    return .{ .status = 0 };
 }
 
 fn runCd(context: Context, argv: []const []const u8) Error!Result {
@@ -614,6 +650,38 @@ test "runs status-only core builtins" {
     try std.testing.expectEqual(@as(u8, 0), (try lookup(":").?.run(.{}, &.{":"})).status);
     try std.testing.expectEqual(@as(u8, 0), (try lookup("true").?.run(.{}, &.{"true"})).status);
     try std.testing.expectEqual(@as(u8, 1), (try lookup("false").?.run(.{}, &.{"false"})).status);
+}
+
+test "shift updates positional parameters and leaves failures unchanged" {
+    var state = try runtime.State.init(std.testing.allocator, .{
+        .invocation_name = "script",
+        .positional_parameters = &.{ "one", "two", "three" },
+    });
+    defer state.deinit();
+    var diagnostics: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer diagnostics.deinit();
+    const context: Context = .{ .runtime_state = &state, .io = .{ .stderr = &diagnostics.writer } };
+    const builtin = lookup("shift").?;
+    try std.testing.expect(builtin.special);
+    try std.testing.expect(builtin.supportsPipeline());
+
+    try std.testing.expectEqual(@as(u8, 0), (try builtin.run(context, &.{"shift"})).status);
+    try std.testing.expectEqualDeep(@as([]const []const u8, &.{ "two", "three" }), state.positionalParameters());
+    try std.testing.expectEqualStrings("script", state.invocationName());
+    try std.testing.expectEqual(@as(u8, 0), (try builtin.run(context, &.{ "shift", "0" })).status);
+    try std.testing.expectEqual(@as(u8, 1), (try builtin.run(context, &.{ "shift", "3" })).status);
+    try std.testing.expectEqual(@as(u8, 2), (try builtin.run(context, &.{ "shift", "-1" })).status);
+    try std.testing.expectEqual(@as(u8, 2), (try builtin.run(context, &.{ "shift", "1", "2" })).status);
+    try std.testing.expectEqualDeep(@as([]const []const u8, &.{ "two", "three" }), state.positionalParameters());
+
+    var local: []const []const u8 = &.{ "local", "tail" };
+    var function_context = context;
+    function_context.positional_parameters = &local;
+    try std.testing.expectEqual(@as(u8, 0), (try builtin.run(function_context, &.{"shift"})).status);
+    try std.testing.expectEqualDeep(@as([]const []const u8, &.{"tail"}), local);
+    try std.testing.expectEqual(@as(usize, 2), state.positionalParameters().len);
+    try std.testing.expectEqual(@as(u8, 0), (try builtin.run(context, &.{ "shift", "2" })).status);
+    try std.testing.expectEqual(@as(usize, 0), state.positionalParameters().len);
 }
 
 test "read splits IFS fields and assigns the remaining input to the last name" {
