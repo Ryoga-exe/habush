@@ -10,6 +10,62 @@ const Hir = @import("Hir.zig");
 const SandboxPolicy = @import("SandboxPolicy.zig");
 const Session = @import("Session.zig");
 
+test "background jobs retain process state until wait consumes the result" {
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    fake.termination = .{ .exited = 23 };
+    var session = try Session.init(std.testing.allocator, fake.host(), .{
+        .resolver = CommandResolver.preResolved(),
+    });
+    defer session.deinit();
+    var launched = try session.evaluate("/bin/tool &", .{});
+    defer launched.deinit(session.allocator());
+    try std.testing.expectEqual(@as(u8, 0), launched.executed.status);
+    try std.testing.expectEqual(@as(usize, 0), fake.wait_calls.items.len);
+    try std.testing.expectEqual(@as(usize, 1), session.jobs.entries.items.len);
+
+    var waited = try session.evaluate("saved=$!; wait $saved", .{});
+    defer waited.deinit(session.allocator());
+    try std.testing.expectEqualStrings("1", session.variable("saved").?);
+    try std.testing.expectEqual(@as(u8, 23), waited.executed.status);
+    try std.testing.expectEqual(@as(usize, 0), session.jobs.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), fake.wait_calls.items.len);
+}
+
+test "background pipelines preserve the final stage result and use isolated input" {
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    fake.termination = .{ .exited = 29 };
+    var session = try Session.init(std.testing.allocator, fake.host(), .{
+        .resolver = CommandResolver.preResolved(),
+    });
+    defer session.deinit();
+    var launched = try session.evaluate("/bin/first | /bin/last &", .{});
+    defer launched.deinit(session.allocator());
+    try std.testing.expectEqual(@as(u8, 0), launched.executed.status);
+    try std.testing.expectEqual(@as(usize, 0), fake.wait_calls.items.len);
+    try std.testing.expectEqual(@as(usize, 1), fake.create_input_calls.items.len);
+    var waited = try session.evaluate("wait %1", .{});
+    defer waited.deinit(session.allocator());
+    try std.testing.expectEqual(@as(u8, 29), waited.executed.status);
+    try std.testing.expectEqual(@as(usize, 2), fake.wait_calls.items.len);
+}
+
+test "background submission and waiting handle every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, submitBackgroundWithAllocator, .{});
+}
+
+fn submitBackgroundWithAllocator(gpa: std.mem.Allocator) !void {
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var session = try Session.init(gpa, fake.host(), .{ .resolver = CommandResolver.preResolved() });
+    defer session.deinit();
+    var result = try session.evaluate("/bin/first | /bin/last & wait $!", .{});
+    defer result.deinit(gpa);
+    try std.testing.expectEqual(@as(u8, 0), result.executed.status);
+    try std.testing.expectEqual(@as(usize, 0), session.jobs.entries.items.len);
+}
+
 test "session executes with its runtime configuration" {
     var fake_host = FakeHost.init(std.testing.allocator);
     defer fake_host.deinit();

@@ -8,12 +8,15 @@ const std = @import("std");
 const CommandPlan = @import("CommandPlan.zig");
 const Host = @import("Host.zig");
 const SandboxPolicy = @import("SandboxPolicy.zig");
+const ProcessId = @import("runtime/types.zig").ProcessId;
 const Pipeline = @This();
 
 gpa: std.mem.Allocator,
 host: Host,
 pipes: []PipeState,
 processes: []ProcessRecord,
+create_group: bool = false,
+process_group: ?CommandPlan.ProcessGroup = null,
 
 pub const Error = Host.Error || Host.SpawnError;
 
@@ -40,6 +43,8 @@ pub const StartResult = union(enum) {
     started: Pipeline,
     failed: RunResult.Failure,
 };
+
+pub const StartOptions = struct { process_group: bool = false };
 
 pub const RunResult = union(enum) {
     completed: []StageResult,
@@ -71,6 +76,7 @@ const ProcessRecord = struct {
     termination: ?Host.Termination = null,
     stopped: ?u32 = null,
     sandbox_coverage: SandboxPolicy.Coverage = .not_requested,
+    process_id: ?ProcessId = null,
 
     fn observe(record: *ProcessRecord, termination: Host.Termination) void {
         if (termination == .stopped) {
@@ -126,6 +132,14 @@ pub fn stageCount(pipeline: *const Pipeline) usize {
     return pipeline.processes.len;
 }
 
+pub fn coverage(pipeline: *const Pipeline, index: usize) SandboxPolicy.Coverage {
+    return pipeline.processes[index].sandbox_coverage;
+}
+
+pub fn processId(pipeline: *const Pipeline, index: usize) ?ProcessId {
+    return pipeline.processes[index].process_id;
+}
+
 /// Records only a successfully spawned process. Each stage can spawn once;
 /// failed attempts may be retried while their pipe endpoints remain open.
 pub fn spawn(
@@ -136,12 +150,19 @@ pub fn spawn(
     std.debug.assert(index < pipeline.processes.len);
     const record = &pipeline.processes[index];
     if (record.spawned) return error.InvalidArguments;
-    const outcome = try pipeline.host.spawn(plan);
+    var effective_plan = plan;
+    if (pipeline.create_group) {
+        if (plan.process_group != .inherit) return error.InvalidArguments;
+        effective_plan.process_group = if (pipeline.process_group) |group| .{ .join = group } else .create;
+    }
+    const outcome = try pipeline.host.spawn(effective_plan);
     switch (outcome) {
         .spawned => |result| {
             record.spawned = true;
             record.result = result;
             record.sandbox_coverage = result.sandbox_coverage;
+            record.process_id = result.process_id;
+            if (pipeline.create_group) pipeline.process_group = result.process_group;
         },
         .failed => {},
     }
@@ -173,11 +194,15 @@ pub fn status(pipeline: *const Pipeline, index: usize) StageStatus {
 
 pub fn state(pipeline: *const Pipeline) State {
     var running = false;
+    var stopped = false;
     for (pipeline.processes) |record| {
-        if (record.stopped != null) return .stopped;
+        if (record.stopped != null) {
+            stopped = true;
+            continue;
+        }
         if (record.termination == null) running = true;
     }
-    return if (running) .running else .completed;
+    return if (running) .running else if (stopped) .stopped else .completed;
 }
 
 /// Observes each live process without waiting for it to finish. Unsupported
@@ -195,6 +220,14 @@ pub fn poll(pipeline: *Pipeline) Host.Error!State {
 /// A partial delivery cannot be rolled back; remaining stages are attempted
 /// even if an earlier request fails.
 pub fn signal(pipeline: *Pipeline, request: Host.Signal) Host.Error!void {
+    if (pipeline.process_group) |group| {
+        if (pipeline.state() == .completed) return;
+        try pipeline.host.signalGroup(group, request);
+        if (request == .cont) for (pipeline.processes) |*record| {
+            record.stopped = null;
+        };
+        return;
+    }
     var failure: ?Host.Error = null;
     for (pipeline.processes) |*record| {
         const spawned = record.result orelse continue;
@@ -210,8 +243,33 @@ pub fn signal(pipeline: *Pipeline, request: Host.Signal) Host.Error!void {
 pub fn waitAll(pipeline: *Pipeline) Host.Error!State {
     if (pipeline.state() == .stopped) return .stopped;
     for (0..pipeline.processes.len) |index| {
-        if (try pipeline.wait(index)) |termination| {
-            if (termination == .stopped) return .stopped;
+        if (pipeline.processes[index].stopped != null) continue;
+        _ = try pipeline.wait(index);
+    }
+    return pipeline.state();
+}
+
+/// Waits for completion or a stop notification, retaining every live handle.
+pub fn waitEvents(pipeline: *Pipeline) Host.Error!State {
+    const processes = try pipeline.gpa.alloc(Host.Process, pipeline.stageCount());
+    defer pipeline.gpa.free(processes);
+    while (pipeline.state() == .running) {
+        var count: usize = 0;
+        for (pipeline.processes) |record| {
+            if (record.stopped != null) continue;
+            if (record.result) |spawned| {
+                processes[count] = spawned.process;
+                count += 1;
+            }
+        }
+        if (count == 0) break;
+        const event = try pipeline.host.waitAny(processes[0..count]);
+        for (pipeline.processes) |*record| {
+            const spawned = record.result orelse continue;
+            if (spawned.process == event.process) {
+                record.observe(event.termination);
+                break;
+            }
         }
     }
     return pipeline.state();
@@ -295,10 +353,21 @@ pub fn start(
     host: Host,
     plans: []const CommandPlan,
 ) Error!StartResult {
+    return startWithOptions(gpa, host, plans, .{});
+}
+
+pub fn startWithOptions(
+    gpa: std.mem.Allocator,
+    host: Host,
+    plans: []const CommandPlan,
+    options: StartOptions,
+) Error!StartResult {
     // Plans are already concrete: reject malformed input before creating
     // resources or launching any of the neighbouring commands.
     for (plans) |plan| try plan.validate();
+    if (options.process_group and !host.capabilities().process_groups) return error.Unsupported;
     var pipeline = try Pipeline.init(gpa, host, plans.len);
+    pipeline.create_group = options.process_group;
     var transferred = false;
     defer if (!transferred) {
         pipeline.signal(.kill) catch {};

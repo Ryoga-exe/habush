@@ -20,6 +20,8 @@ pub const Context = struct {
     overrides: ?*const VariableStore = null,
     invocation_name: ?[]const u8 = null,
     shell_process_id: ?runtime_types.ProcessId = null,
+    /// Borrowed decimal native process identifier of the last background job.
+    background_process_id: ?[]const u8 = null,
     positional_parameters: []const []const u8 = &.{},
     last_status: runtime_types.ExitStatus = 0,
     failure: ?*Failure = null,
@@ -584,7 +586,11 @@ fn appendParameter(
         }
         return;
     }
-    if (std.mem.eql(u8, name, "-") or std.mem.eql(u8, name, "!")) return;
+    if (std.mem.eql(u8, name, "!")) {
+        if (expander.context.background_process_id) |id| try bytes.appendSlice(expander.allocator, id);
+        return;
+    }
+    if (std.mem.eql(u8, name, "-")) return;
     if (isDecimal(name)) {
         const position = std.fmt.parseUnsigned(usize, name, 10) catch return;
         if (position == 0) {
@@ -643,7 +649,7 @@ fn selectParameterExpansion(
 fn conditionalParameterValue(expander: Expander, parameter: []const u8) Error!?[]const u8 {
     if (VariableStore.isValidName(parameter)) return expander.context.variable(parameter);
     if (std.mem.eql(u8, parameter, "-")) return "";
-    if (std.mem.eql(u8, parameter, "!")) return null;
+    if (std.mem.eql(u8, parameter, "!")) return expander.context.background_process_id;
     if (!isDecimal(parameter)) return error.ParameterExpansionUnsupported;
 
     const position = std.fmt.parseUnsigned(usize, parameter, 10) catch return null;

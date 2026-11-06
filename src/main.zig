@@ -71,6 +71,7 @@ pub fn main(init: std.process.Init) !habush.runtime.ExitStatus {
     defer system_host.deinit();
     var system_resolver = habush.CommandResolver.System.init(io, resolver_options);
     var session = try habush.Session.init(gpa, system_host.host(), .{
+        .job_control = interactive and system_host.host().capabilities().terminal_control,
         .resolver = system_resolver.resolver(),
         .invocation_name = invocation_name,
         .shell_process_id = platform.processId(),

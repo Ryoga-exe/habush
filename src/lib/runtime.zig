@@ -6,6 +6,7 @@ const types = @import("runtime/types.zig");
 pub const Diagnostic = @import("runtime/Diagnostic.zig");
 pub const ExitStatus = types.ExitStatus;
 pub const Io = @import("runtime/Io.zig");
+pub const Jobs = @import("runtime/Jobs.zig");
 pub const ProcessId = types.ProcessId;
 pub const State = @import("runtime/State.zig");
 

@@ -19,12 +19,15 @@ host: Host,
 resolver: ?CommandResolver,
 context: ExecutionContext,
 state: runtime.State,
+jobs: runtime.Jobs,
 last_result: Executor.Result = .{
     .status = 0,
     .sandbox_coverage = .not_requested,
 },
 
 pub const Options = struct {
+    /// Enables explicit controlling-terminal handoff for external foreground jobs.
+    job_control: bool = false,
     resolver: ?CommandResolver = null,
     context: ExecutionContext.View = .{},
     invocation_name: []const u8 = "habush",
@@ -66,6 +69,7 @@ pub fn init(
         .host = host,
         .resolver = options.resolver,
         .context = context,
+        .jobs = .{ .gpa = gpa, .terminal_control = options.job_control },
         .state = try runtime.State.init(gpa, .{
             .invocation_name = options.invocation_name,
             .shell_process_id = options.shell_process_id,
@@ -77,6 +81,10 @@ pub fn init(
 }
 
 pub fn deinit(session: *Session) void {
+    // A session owns its background work. Shutdown explicitly terminates it
+    // before the normal resource-owning destructors wait and release handles.
+    session.jobs.cancelAll();
+    session.jobs.deinit();
     session.state.deinit();
     session.context.deinit();
     session.* = undefined;
@@ -87,13 +95,16 @@ pub fn allocator(session: Session) std.mem.Allocator {
 }
 
 pub fn execute(session: *Session, hir: Hir) Executor.Error!Executor.Result {
-    const result = try Executor.initWithState(
+    var executor = Executor.initWithState(
         session.host,
         session.resolver,
         &session.state,
         &session.context,
         session.last_result.status,
-    ).execute(hir);
+    );
+    executor.jobs = &session.jobs;
+    executor.job_control = session.jobs.terminal_control;
+    const result = try executor.execute(hir);
     session.last_result = result;
     return result;
 }
