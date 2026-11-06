@@ -9,6 +9,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const habush_exec = b.addModule("habush-exec", .{
+        .root_source_file = b.path("src/lib/exec.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const exe = b.addExecutable(.{
         .name = "habush",
         .root_module = b.createModule(.{
@@ -32,6 +37,24 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
 
+    const pipeline_example = b.addExecutable(.{
+        .name = "run-pipeline",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/run_pipeline.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    pipeline_example.root_module.addImport("habush-exec", habush_exec);
+    const run_pipeline_step = b.step("run-pipeline", "Run the structured pipeline example");
+    const run_pipeline_cmd = b.addRunArtifact(pipeline_example);
+    run_pipeline_step.dependOn(&run_pipeline_cmd.step);
+    if (b.args) |args| run_pipeline_cmd.addArgs(args);
+
+    const check_step = b.step("check", "Compile the CLI and structured pipeline example");
+    check_step.dependOn(&exe.step);
+    check_step.dependOn(&pipeline_example.step);
+
     const lib_tests = b.addTest(.{
         .root_module = habush,
     });
@@ -40,6 +63,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&exe.step);
+    test_step.dependOn(&pipeline_example.step);
 
     const command_control_test = b.addRunArtifact(exe);
     command_control_test.setName("test cli exit control flow");

@@ -10,7 +10,6 @@ stdin: *Io.Reader,
 stderr: *Io.Writer,
 session: *habush.Session,
 interactive: bool,
-last_status: habush.runtime.ExitStatus = 0,
 input_line: usize = 0,
 
 pub fn run(self: *Shell) !habush.runtime.ExitStatus {
@@ -19,12 +18,12 @@ pub fn run(self: *Shell) !habush.runtime.ExitStatus {
 
 fn runInput(self: *Shell, source_name: ?[]const u8) !habush.runtime.ExitStatus {
     while (true) {
-        var input = try self.readCommand() orelse return self.last_status;
+        var input = try self.readCommand() orelse return self.session.lastResult().status;
         defer input.deinit(self.allocator);
 
         if (input.incomplete_here_document) {
             try self.stderr.writeAll("habush: incomplete here-document\n");
-            self.last_status = 2;
+            self.session.rejectInput();
             continue;
         }
         if (std.mem.trim(u8, input.source, &std.ascii.whitespace).len == 0) {
@@ -38,7 +37,7 @@ fn runInput(self: *Shell, source_name: ?[]const u8) !habush.runtime.ExitStatus {
             input.source_line,
         )) {
             .none => continue,
-            .exit => return self.last_status,
+            .exit => return self.session.lastResult().status,
             .@"return", .@"break", .@"continue" => unreachable,
         }
     }
@@ -55,7 +54,8 @@ pub fn runSource(
     source: [:0]const u8,
     source_name: ?[]const u8,
 ) !habush.runtime.ExitStatus {
-    if (std.mem.trim(u8, source, &std.ascii.whitespace).len == 0) return 0;
+    if (std.mem.trim(u8, source, &std.ascii.whitespace).len == 0)
+        return self.session.lastResult().status;
     var reader: Io.Reader = .fixed(source);
     const previous_stdin = self.stdin;
     const previous_interactive = self.interactive;
@@ -290,60 +290,37 @@ fn handleInput(
     source_name: ?[]const u8,
     source_line: usize,
 ) !habush.runtime.ControlFlow {
-    var arena = std.heap.ArenaAllocator.init(self.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    var tree = try habush.Ast.parseWithOptions(allocator, source, .{
+    var evaluation = try self.session.evaluate(source, .{
         .collected_here_documents = collected_here_documents,
     });
-    defer tree.deinit(allocator);
-    if (tree.errors.len != 0) {
-        for (tree.errors) |parse_error| {
-            const location = tree.tokenLocation(0, parse_error.token);
-            try self.stderr.writeAll("habush: ");
-            if (source_name) |name| try self.stderr.print("{s}:", .{name});
-            try self.stderr.print("{d}:{d}: ", .{
-                source_line + location.line + 1,
-                location.column + 1,
-            });
-            try tree.renderError(parse_error, self.stderr);
-            try self.stderr.writeByte('\n');
-        }
-        self.last_status = 2;
-        return .none;
-    }
-    switch (tree.status) {
-        .complete => {},
-        .incomplete => {
-            try self.stderr.writeAll("habush: incomplete input\n");
-            self.last_status = 2;
+    defer evaluation.deinit(self.session.allocator());
+    switch (evaluation) {
+        .syntax => |tree| {
+            if (tree.errors.len != 0) {
+                for (tree.errors) |parse_error| {
+                    const location = tree.tokenLocation(0, parse_error.token);
+                    try self.stderr.writeAll("habush: ");
+                    if (source_name) |name| try self.stderr.print("{s}:", .{name});
+                    try self.stderr.print("{d}:{d}: ", .{
+                        source_line + location.line + 1,
+                        location.column + 1,
+                    });
+                    try tree.renderError(parse_error, self.stderr);
+                    try self.stderr.writeByte('\n');
+                }
+            } else if (tree.status == .incomplete) {
+                try self.stderr.writeAll("habush: incomplete input\n");
+            }
             return .none;
         },
-    }
-
-    var hir = try habush.AstGen.generate(allocator, tree);
-    defer hir.deinit(allocator);
-    const result = self.session.executeWithOptions(hir, .{
-        .last_status = self.last_status,
-    }) catch |err| switch (err) {
-        error.UnsupportedInstruction,
-        error.ParameterAssignmentUnavailable,
-        error.PathnameExpansionUnsupported,
-        error.TildeExpansionUnsupported,
-        error.ParameterExpansionUnsupported,
-        => {
+        .unsupported => |err| {
             try self.stderr.print("habush: unsupported runtime feature: {s}\n", .{
                 @errorName(err),
             });
-            self.last_status = 2;
             return .none;
         },
-        else => |other| return other,
-    };
-    self.last_status = result.status;
-
-    return result.control_flow;
+        .executed => |result| return result.control_flow,
+    }
 }
 
 fn readLineAlloc(reader: *Io.Reader, allocator: std.mem.Allocator) !?[:0]u8 {

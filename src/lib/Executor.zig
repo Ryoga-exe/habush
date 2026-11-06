@@ -16,23 +16,24 @@ const Builtin = @import("Builtin.zig");
 const CommandPlan = @import("CommandPlan.zig");
 const CommandResolver = @import("CommandResolver.zig");
 const Executor = @This();
+const ExecutionContext = @import("ExecutionContext.zig");
 const Expander = @import("Expander.zig");
 const Hir = @import("Hir.zig");
 const Host = @import("Host.zig");
+const Pipeline = @import("Pipeline.zig");
 const runtime = @import("runtime.zig");
 const SandboxPolicy = @import("SandboxPolicy.zig");
 const VariableStore = @import("VariableStore.zig");
 
 gpa: std.mem.Allocator,
 host: Host,
-sandbox: CommandPlan.Sandbox,
+context: ExecutionContext.Ref,
 resolver: ?CommandResolver,
-search_path: []const []const u8,
+default_search_path: []const []const u8,
 invocation_name: []const u8,
 shell_process_id: ?runtime.ProcessId,
 positional_parameters: []const []const u8,
 positional_parameters_override: ?[]const []const u8,
-cwd: ?[]const u8,
 variables: ?*VariableStore,
 runtime_state: ?*runtime.State,
 io: runtime.Io,
@@ -57,17 +58,16 @@ pub const Error = Builtin.Error || Host.Error || Expander.Error || CommandResolv
 };
 
 pub const Options = struct {
-    sandbox: CommandPlan.Sandbox = .inherit,
+    context: ExecutionContext.View = .{},
     resolver: ?CommandResolver = null,
-    search_path: []const []const u8 = &.{},
+    /// Used only when neither the command bindings nor shell variables set PATH.
+    default_search_path: []const []const u8 = &.{},
     invocation_name: []const u8 = "habush",
     shell_process_id: ?runtime.ProcessId = null,
     positional_parameters: []const []const u8 = &.{},
-    cwd: ?[]const u8 = null,
     /// Complete shell variable state. When present, exported bindings become
     /// an exact replacement environment; `null` preserves host inheritance.
     variables: ?*VariableStore = null,
-    io: runtime.Io = .{},
     /// Status visible to a command such as `exit` when no operand is given.
     last_status: runtime.ExitStatus = 0,
 };
@@ -83,13 +83,8 @@ const PipelineStage = struct {
     input: ?CommandPlan.Resource,
     output: ?CommandPlan.Resource,
     pipe_stderr: bool,
-    spawned: *?Host.SpawnResult,
-};
-
-const PipelinePipe = struct {
-    endpoints: Host.Pipe,
-    read_open: bool = true,
-    write_open: bool = true,
+    pipeline: *Pipeline,
+    index: usize,
 };
 
 const PipelineStageKind = enum {
@@ -141,16 +136,19 @@ const PreparedPipelineStage = struct {
     plan: ?PipelineStagePlan = null,
     state: ?runtime.State = null,
     variables: ?VariableStore = null,
+    context: ?ExecutionContext = null,
 
     fn deinit(stage: *PreparedPipelineStage) void {
         if (stage.state) |*state| state.deinit();
         if (stage.variables) |*variables| variables.deinit();
+        if (stage.context) |*context| context.deinit();
     }
 
     fn executor(stage: *PreparedPipelineStage, base: Executor) Executor {
         var result = base;
         if (stage.state) |*state| result.runtime_state = state;
         if (stage.variables) |*variables| result.variables = variables;
+        if (stage.context) |*context| result.context = .{ .mutable = context };
         result.prepared_simple = if (stage.plan) |plan| switch (plan) {
             .simple => |simple| simple,
             .definition, .compound => null,
@@ -167,17 +165,16 @@ pub fn initWithOptions(gpa: std.mem.Allocator, host: Host, options: Options) Exe
     return .{
         .gpa = gpa,
         .host = host,
-        .sandbox = options.sandbox,
+        .context = .{ .view = options.context },
         .resolver = options.resolver,
-        .search_path = options.search_path,
+        .default_search_path = options.default_search_path,
         .invocation_name = options.invocation_name,
         .shell_process_id = options.shell_process_id,
         .positional_parameters = options.positional_parameters,
         .positional_parameters_override = null,
-        .cwd = options.cwd,
         .variables = options.variables,
         .runtime_state = null,
-        .io = options.io,
+        .io = options.context.io,
         .scoped_file_actions = &.{},
         .pipeline_stage = null,
         .prepared_simple = null,
@@ -191,23 +188,22 @@ pub fn initWithState(
     host: Host,
     resolver: ?CommandResolver,
     state: *runtime.State,
-    io: runtime.Io,
+    context: *ExecutionContext,
     last_status: runtime.ExitStatus,
 ) Executor {
     return .{
         .gpa = state.allocator(),
         .host = host,
-        .sandbox = .inherit,
+        .context = .{ .mutable = context },
         .resolver = resolver,
-        .search_path = &.{},
+        .default_search_path = &.{},
         .invocation_name = "",
         .shell_process_id = null,
         .positional_parameters = &.{},
         .positional_parameters_override = null,
-        .cwd = null,
         .variables = null,
         .runtime_state = state,
-        .io = io,
+        .io = context.io,
         .scoped_file_actions = &.{},
         .pipeline_stage = null,
         .prepared_simple = null,
@@ -253,6 +249,18 @@ fn executeFunctionDefinition(executor: Executor, hir: Hir, index: Hir.Inst.Index
 fn executeSubshell(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
     const group = hir.groupedCommand(index);
     var subshell_executor = executor;
+    var context_copy = try executor.context.clone(executor.gpa);
+    defer context_copy.deinit();
+    subshell_executor.context = .{ .mutable = &context_copy };
+    var state_copy = if (executor.runtime_state) |state| try state.clone() else null;
+    defer if (state_copy) |*state| state.deinit();
+    if (state_copy) |*state| subshell_executor.runtime_state = state;
+    var variables_copy = if (executor.variables) |variables|
+        try variables.clone(executor.gpa)
+    else
+        null;
+    defer if (variables_copy) |*variables| variables.deinit();
+    if (variables_copy) |*variables| subshell_executor.variables = variables;
     var arena = std.heap.ArenaAllocator.init(executor.gpa);
     defer arena.deinit();
     var scope = switch (try subshell_executor.beginHirRedirections(
@@ -266,18 +274,6 @@ fn executeSubshell(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
     defer scope.deinit();
     subshell_executor = scope.executor;
     subshell_executor.loop_depth = 0;
-    if (executor.runtime_state) |state| {
-        var state_copy = try state.clone();
-        defer state_copy.deinit();
-        subshell_executor.runtime_state = &state_copy;
-        return subshell_executor.executeSubshellBody(hir, group.body);
-    }
-    if (executor.variables) |variables| {
-        var variables_copy = try variables.clone(executor.gpa);
-        defer variables_copy.deinit();
-        subshell_executor.variables = &variables_copy;
-        return subshell_executor.executeSubshellBody(hir, group.body);
-    }
     return subshell_executor.executeSubshellBody(hir, group.body);
 }
 
@@ -581,6 +577,7 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
     defer for (prepared) |*stage| stage.deinit();
     var in_process_count: usize = 0;
     for (prepared) |*stage| {
+        stage.context = try executor.context.clone(executor.gpa);
         if (executor.runtime_state) |state| stage.state = try state.clone();
         if (executor.variables) |variables| stage.variables = try variables.clone(executor.gpa);
         const stage_executor = stage.executor(executor);
@@ -596,28 +593,13 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
     // two such stages require a concurrent runtime scheduler.
     if (in_process_count > 1) return error.UnsupportedInstruction;
 
-    const pipes = try allocator.alloc(PipelinePipe, pipe_stderr.items.len);
-    var pipe_count: usize = 0;
-    const spawned = try allocator.alloc(?Host.SpawnResult, stages.items.len);
-    @memset(spawned, null);
-    defer {
-        closePipes(executor.host, pipes[0..pipe_count]);
-        for (spawned) |process| {
-            if (process) |value| _ = executor.host.wait(value.process) catch {};
-        }
-    }
-
-    for (pipes) |*pipeline_pipe| {
-        pipeline_pipe.* = .{
-            .endpoints = executor.host.createPipe() catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.ResourceUnavailable => return executor.pipelineFailure(.resource_unavailable),
-                error.Unsupported => return executor.pipelineFailure(.unsupported),
-                else => |other| return other,
-            },
-        };
-        pipe_count += 1;
-    }
+    var pipeline = Pipeline.init(allocator, executor.host, stages.items.len) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.ResourceUnavailable => return executor.pipelineFailure(.resource_unavailable),
+        error.Unsupported => return executor.pipelineFailure(.unsupported),
+        else => |other| return other,
+    };
+    defer pipeline.deinit();
 
     var result: Result = .{ .status = 0, .sandbox_coverage = .not_requested };
     const phase_count: usize = if (in_process_count == 0) 1 else 2;
@@ -633,12 +615,14 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
             }
 
             var stage_executor = prepared[stage_index].executor(executor);
+            const connections = pipeline.stage(stage_index);
             stage_executor.pipeline_stage = .{
-                .input = if (stage_index == 0) null else pipes[stage_index - 1].endpoints.read_end,
-                .output = if (stage_index == pipes.len) null else pipes[stage_index].endpoints.write_end,
+                .input = connections.input,
+                .output = connections.output,
                 .pipe_stderr = stage_index < pipe_stderr.items.len and
                     pipe_stderr.items[stage_index],
-                .spawned = &spawned[stage_index],
+                .pipeline = &pipeline,
+                .index = stage_index,
             };
             var stage_result = stage_executor.executeInstruction(hir, prepared[stage_index].index) catch |err| switch (err) {
                 // A non-final in-process stage observes a closed pipeline as a
@@ -657,15 +641,12 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
                 result.sandbox_coverage,
                 stage_result.sandbox_coverage,
             );
-            if (stage_index != 0) closePipeRead(executor.host, &pipes[stage_index - 1]);
-            if (stage_index != pipes.len) closePipeWrite(executor.host, &pipes[stage_index]);
+            pipeline.closeStage(stage_index);
         }
     }
 
-    for (spawned, 0..) |process, stage_index| {
-        if (process) |value| {
-            const termination = try executor.host.wait(value.process);
-            spawned[stage_index] = null;
+    for (0..stages.items.len) |stage_index| {
+        if (try pipeline.wait(stage_index)) |termination| {
             const status = try terminationStatus(termination);
             if (stage_index + 1 == stages.items.len) result.status = status;
         }
@@ -739,27 +720,6 @@ fn collectPipeline(
         },
         else => stages.append(allocator, index),
     };
-}
-
-fn closePipes(host: Host, pipes: []PipelinePipe) void {
-    var index = pipes.len;
-    while (index != 0) {
-        index -= 1;
-        closePipeWrite(host, &pipes[index]);
-        closePipeRead(host, &pipes[index]);
-    }
-}
-
-fn closePipeRead(host: Host, pipeline_pipe: *PipelinePipe) void {
-    if (!pipeline_pipe.read_open) return;
-    host.closeResource(pipeline_pipe.endpoints.read_end);
-    pipeline_pipe.read_open = false;
-}
-
-fn closePipeWrite(host: Host, pipeline_pipe: *PipelinePipe) void {
-    if (!pipeline_pipe.write_open) return;
-    host.closeResource(pipeline_pipe.endpoints.write_end);
-    pipeline_pipe.write_open = false;
 }
 
 fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
@@ -924,7 +884,7 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
     const resolver = executor.resolver orelse return error.CommandResolutionUnavailable;
     const executable = (resolver.resolve(allocator, .{
         .name = argv.items[0],
-        .search_path = executor.commandSearchPath(),
+        .search_path = try executor.commandSearchPath(allocator, &command_variables),
         .cwd = executor.workingDirectory(),
     }) catch |err| switch (err) {
         error.AccessDenied => return executor.commandFailure(
@@ -950,14 +910,18 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
             .duplicate = .{ .source = .stdout, .target = .stderr },
         });
     }
-    const spawn_outcome = executor.host.spawn(.{
+    const plan: CommandPlan = .{
         .executable = executable,
         .argv = argv.items,
         .environment = environment,
         .cwd = if (executor.workingDirectory()) |cwd| .{ .path = cwd } else .inherit,
         .file_actions = effective_file_actions.items,
         .sandbox = executor.activeSandbox(),
-    }) catch |err| switch (err) {
+    };
+    const spawn_outcome = (if (executor.pipeline_stage) |stage|
+        stage.pipeline.spawn(stage.index, plan)
+    else
+        executor.host.spawn(plan)) catch |err| switch (err) {
         error.OutOfMemory, error.InvalidArguments, error.Unexpected => return err,
     };
     const spawned = switch (spawn_outcome) {
@@ -968,9 +932,7 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
             failure,
         ),
     };
-    if (executor.pipeline_stage) |stage| {
-        std.debug.assert(stage.spawned.* == null);
-        stage.spawned.* = spawned;
+    if (executor.pipeline_stage != null) {
         return .{
             .status = 0,
             .sandbox_coverage = spawned.sandbox_coverage,
@@ -1388,6 +1350,7 @@ fn executeBuiltin(
     }
     const result = try builtin.run(.{
         .host = executor.host,
+        .execution_context = executor.context,
         .runtime_state = executor.runtime_state,
         .variable_overrides = command_variables,
         .io = executor.io,
@@ -1462,8 +1425,7 @@ fn parameterExpansionFailure(
 }
 
 fn workingDirectory(executor: Executor) ?[]const u8 {
-    if (executor.runtime_state) |state| return state.workingDirectory();
-    return executor.cwd;
+    return executor.context.get().cwd;
 }
 
 fn invocationName(executor: Executor) []const u8 {
@@ -1476,9 +1438,25 @@ fn shellProcessId(executor: Executor) ?runtime.ProcessId {
     return executor.shell_process_id;
 }
 
-fn commandSearchPath(executor: Executor) []const []const u8 {
-    if (executor.runtime_state) |state| return state.commandSearchPath();
-    return executor.search_path;
+fn commandSearchPath(
+    executor: Executor,
+    allocator: std.mem.Allocator,
+    overrides: *const VariableStore,
+) std.mem.Allocator.Error![]const []const u8 {
+    const path = overrides.get("PATH") orelse path: {
+        if (executor.variableStore()) |variables|
+            if (variables.get("PATH")) |value| break :path value;
+        return if (executor.runtime_state) |state|
+            state.defaultSearchPath()
+        else
+            executor.default_search_path;
+    };
+
+    var entries: std.ArrayList([]const u8) = .empty;
+    errdefer entries.deinit(allocator);
+    var iterator = std.mem.splitScalar(u8, path, std.fs.path.delimiter);
+    while (iterator.next()) |entry| try entries.append(allocator, entry);
+    return entries.toOwnedSlice(allocator);
 }
 
 fn positionalParameters(executor: Executor) []const []const u8 {
@@ -1488,8 +1466,7 @@ fn positionalParameters(executor: Executor) []const []const u8 {
 }
 
 fn activeSandbox(executor: Executor) CommandPlan.Sandbox {
-    if (executor.runtime_state) |state| return state.activeSandbox();
-    return executor.sandbox;
+    return executor.context.get().sandbox;
 }
 
 fn commandFailure(

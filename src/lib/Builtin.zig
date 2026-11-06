@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const Builtin = @This();
+const ExecutionContext = @import("ExecutionContext.zig");
 const Host = @import("Host.zig");
 const runtime = @import("runtime.zig");
 const VariableStore = @import("VariableStore.zig");
@@ -39,6 +40,7 @@ pub const Result = struct {
 pub const Context = struct {
     host: ?Host = null,
     runtime_state: ?*runtime.State = null,
+    execution_context: ExecutionContext.Ref = .{ .view = .{} },
     variable_overrides: ?*const VariableStore = null,
     io: runtime.Io = .{},
     last_status: runtime.ExitStatus = 0,
@@ -49,6 +51,7 @@ pub const Context = struct {
 pub const Error = std.mem.Allocator.Error || std.Io.Writer.Error || error{
     HostUnavailable,
     RuntimeStateUnavailable,
+    ExecutionContextUnavailable,
 };
 
 const definitions = std.StaticStringMap(Builtin).initComptime(.{
@@ -158,6 +161,10 @@ fn runReturn(context: Context, argv: []const []const u8) Error!Result {
 
 fn runCd(context: Context, argv: []const []const u8) Error!Result {
     const state = context.runtime_state orelse return error.RuntimeStateUnavailable;
+    const execution_context = switch (context.execution_context) {
+        .mutable => |value| value,
+        .view => return error.ExecutionContextUnavailable,
+    };
     const host = context.host orelse return error.HostUnavailable;
     var operands = argv[1..];
     var write_directory = false;
@@ -179,7 +186,7 @@ fn runCd(context: Context, argv: []const []const u8) Error!Result {
         variable(context, "HOME") orelse
             return commandFailure(context, argv[0], .{ .variable_not_set = "HOME" });
     const resolved = host.resolveWorkingDirectory(state.allocator(), .{
-        .current = state.workingDirectory(),
+        .current = execution_context.workingDirectory(),
         .path = path,
     }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -190,7 +197,7 @@ fn runCd(context: Context, argv: []const []const u8) Error!Result {
         ),
     };
     defer state.allocator().free(resolved);
-    try state.changeWorkingDirectory(resolved);
+    try state.changeWorkingDirectory(execution_context, resolved);
     if (write_directory) {
         if (context.io.stdout) |stdout| {
             try stdout.writeAll(resolved);
@@ -208,7 +215,6 @@ fn variable(context: Context, name: []const u8) ?[]const u8 {
 }
 
 fn runPwd(context: Context, argv: []const []const u8) Error!Result {
-    const state = context.runtime_state orelse return error.RuntimeStateUnavailable;
     var operands = argv[1..];
     if (operands.len != 0 and std.mem.eql(u8, operands[0], "--")) operands = operands[1..];
     if (operands.len != 0) {
@@ -219,7 +225,7 @@ fn runPwd(context: Context, argv: []const []const u8) Error!Result {
         return commandFailure(context, argv[0], kind);
     }
 
-    const cwd = state.workingDirectory() orelse
+    const cwd = context.execution_context.get().cwd orelse
         return commandFailure(context, argv[0], .working_directory_unavailable);
     if (context.io.stdout) |stdout| {
         try stdout.writeAll(cwd);
@@ -590,16 +596,19 @@ test "cd resolves and persists the working directory" {
     var fake = FakeHost.init(std.testing.allocator);
     defer fake.deinit();
     fake.working_directory_result = "/workspace/project";
-    var state = try runtime.State.init(std.testing.allocator, .{ .cwd = "/workspace" });
+    var state = try runtime.State.init(std.testing.allocator, .{});
     defer state.deinit();
+    var execution_context = try ExecutionContext.init(std.testing.allocator, .{ .cwd = "/workspace" });
+    defer execution_context.deinit();
 
     const result = try lookup("cd").?.run(.{
         .host = fake.host(),
         .runtime_state = &state,
+        .execution_context = .{ .mutable = &execution_context },
     }, &.{ "cd", "project" });
 
     try std.testing.expectEqual(@as(u8, 0), result.status);
-    try std.testing.expectEqualStrings("/workspace/project", state.workingDirectory().?);
+    try std.testing.expectEqualStrings("/workspace/project", execution_context.workingDirectory().?);
     const request = fake.resolve_working_directory_calls.items[0];
     try std.testing.expectEqualStrings("/workspace", request.current.?);
     try std.testing.expectEqualStrings("project", request.path);
@@ -614,6 +623,8 @@ test "cd uses command-local HOME without persisting it" {
         .variables = &.{.{ .name = "HOME", .value = "/home/user" }},
     });
     defer state.deinit();
+    var execution_context = try ExecutionContext.init(std.testing.allocator, .{});
+    defer execution_context.deinit();
     var overrides = VariableStore.init(std.testing.allocator);
     defer overrides.deinit();
     try overrides.set("HOME", "/temporary");
@@ -621,11 +632,12 @@ test "cd uses command-local HOME without persisting it" {
     const result = try lookup("cd").?.run(.{
         .host = fake.host(),
         .runtime_state = &state,
+        .execution_context = .{ .mutable = &execution_context },
         .variable_overrides = &overrides,
     }, &.{"cd"});
 
     try std.testing.expectEqual(@as(u8, 0), result.status);
-    try std.testing.expectEqualStrings("/temporary", state.workingDirectory().?);
+    try std.testing.expectEqualStrings("/temporary", execution_context.workingDirectory().?);
     try std.testing.expectEqualStrings("/home/user", state.variable("HOME").?);
     try std.testing.expectEqualStrings(
         "/temporary",
@@ -639,24 +651,26 @@ test "cd updates directory variables and dash uses OLDPWD" {
     defer fake.deinit();
     fake.working_directory_result = "/previous";
     var state = try runtime.State.init(std.testing.allocator, .{
-        .cwd = "/current",
         .variables = &.{
             .{ .name = "PWD", .value = "/current", .exported = true },
             .{ .name = "OLDPWD", .value = "/previous", .exported = true },
         },
     });
     defer state.deinit();
+    var execution_context = try ExecutionContext.init(std.testing.allocator, .{ .cwd = "/current" });
+    defer execution_context.deinit();
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
 
     const result = try lookup("cd").?.run(.{
         .host = fake.host(),
         .runtime_state = &state,
+        .execution_context = .{ .mutable = &execution_context },
         .io = .{ .stdout = &output.writer },
     }, &.{ "cd", "-" });
 
     try std.testing.expectEqual(@as(u8, 0), result.status);
-    try std.testing.expectEqualStrings("/previous", state.workingDirectory().?);
+    try std.testing.expectEqualStrings("/previous", execution_context.workingDirectory().?);
     try std.testing.expectEqualStrings("/previous", state.variable("PWD").?);
     try std.testing.expectEqualStrings("/current", state.variable("OLDPWD").?);
     try std.testing.expect(state.isVariableExported("PWD"));
@@ -675,11 +689,14 @@ test "cd reports usage and host failures as command status" {
     fake.resolve_working_directory_error = error.AccessDenied;
     var state = try runtime.State.init(std.testing.allocator, .{});
     defer state.deinit();
+    var execution_context = try ExecutionContext.init(std.testing.allocator, .{});
+    defer execution_context.deinit();
     var diagnostics: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer diagnostics.deinit();
     const context: Context = .{
         .host = fake.host(),
         .runtime_state = &state,
+        .execution_context = .{ .mutable = &execution_context },
         .io = .{ .stderr = &diagnostics.writer },
     };
 
@@ -704,14 +721,14 @@ test "cd reports usage and host failures as command status" {
 }
 
 test "pwd writes the logical working directory" {
-    var state = try runtime.State.init(std.testing.allocator, .{ .cwd = "/workspace/project" });
-    defer state.deinit();
+    var execution_context = try ExecutionContext.init(std.testing.allocator, .{ .cwd = "/workspace/project" });
+    defer execution_context.deinit();
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
     var diagnostics: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer diagnostics.deinit();
     const context: Context = .{
-        .runtime_state = &state,
+        .execution_context = .{ .view = execution_context.view() },
         .io = .{
             .stdout = &output.writer,
             .stderr = &diagnostics.writer,
@@ -735,7 +752,7 @@ test "pwd writes the logical working directory" {
     var failing_diagnostics: std.Io.Writer = .fixed(&buffer);
 
     try std.testing.expectError(error.WriteFailed, lookup("pwd").?.run(.{
-        .runtime_state = &state,
+        .execution_context = .{ .view = execution_context.view() },
         .io = .{ .stderr = &failing_diagnostics },
     }, &.{ "pwd", "-P" }));
 }
@@ -753,12 +770,15 @@ fn runCdWithAllocator(gpa: std.mem.Allocator) !void {
     var fake = FakeHost.init(gpa);
     defer fake.deinit();
     fake.working_directory_result = "/workspace/project";
-    var state = try runtime.State.init(gpa, .{ .cwd = "/workspace" });
+    var state = try runtime.State.init(gpa, .{});
     defer state.deinit();
+    var execution_context = try ExecutionContext.init(gpa, .{ .cwd = "/workspace" });
+    defer execution_context.deinit();
 
     _ = try lookup("cd").?.run(.{
         .host = fake.host(),
         .runtime_state = &state,
+        .execution_context = .{ .mutable = &execution_context },
     }, &.{ "cd", "project" });
 }
 
