@@ -22,6 +22,9 @@ pub const Part = struct {
         braced_parameter,
         double_quoted_parameter,
         double_quoted_braced_parameter,
+        command_substitution,
+        double_quoted_command_substitution,
+        arithmetic_substitution,
     };
 };
 
@@ -107,6 +110,7 @@ pub const Incomplete = struct {
         single_quote,
         double_quote,
         parameter_brace,
+        command_substitution,
     };
 };
 
@@ -115,6 +119,105 @@ pub const Status = union(enum) {
     complete,
     incomplete: Incomplete,
 };
+
+/// Returns the closing parenthesis of a `$(...)` beginning at `start`.
+/// Quotes, comments and nested substitutions belong to the inner command,
+/// independently of the quoting around the outer shell word.
+pub fn commandSubstitutionEnd(source: []const u8, start: usize) ?usize {
+    return substitutionEnd(source, start, 0);
+}
+
+fn substitutionEnd(source: []const u8, start: usize, nesting: usize) ?usize {
+    if (nesting == 128) return null;
+    var index = start + 2;
+    var parentheses: usize = 1;
+    var word_start = true;
+    while (index < source.len) {
+        switch (source[index]) {
+            '\\' => {
+                if (index + 1 == source.len) return null;
+                index += 2;
+                word_start = false;
+                continue;
+            },
+            '\'', '"' => |quote| {
+                index = (quotedEnd(source, index, quote, nesting + 1) orelse return null) + 1;
+                word_start = false;
+                continue;
+            },
+            '$' => if (index + 1 < source.len) {
+                if (source[index + 1] == '(') {
+                    index = (substitutionEnd(source, index, nesting + 1) orelse return null) + 1;
+                    word_start = false;
+                    continue;
+                }
+                if (source[index + 1] == '{') {
+                    index = (parameterBraceEnd(source, index, nesting + 1) orelse return null) + 1;
+                    word_start = false;
+                    continue;
+                }
+            },
+            '(' => parentheses += 1,
+            ')' => {
+                parentheses -= 1;
+                if (parentheses == 0) return index;
+            },
+            '#' => if (word_start) {
+                index = std.mem.indexOfScalarPos(u8, source, index, '\n') orelse return null;
+                word_start = true;
+                continue;
+            },
+            else => {},
+        }
+        word_start = std.mem.indexOfScalar(u8, " \t\r\n;|&()<>", source[index]) != null;
+        index += 1;
+    }
+    return null;
+}
+
+fn quotedEnd(source: []const u8, start: usize, quote: u8, nesting: usize) ?usize {
+    var index = start + 1;
+    while (index < source.len) {
+        if (source[index] == quote) return index;
+        if (quote == '"') {
+            if (source[index] == '\\' and index + 1 < source.len) {
+                index += 2;
+                continue;
+            }
+            if (source[index] == '$' and index + 1 < source.len and source[index + 1] == '(') {
+                index = (substitutionEnd(source, index, nesting + 1) orelse return null) + 1;
+                continue;
+            }
+            if (source[index] == '$' and index + 1 < source.len and source[index + 1] == '{') {
+                index = (parameterBraceEnd(source, index, nesting + 1) orelse return null) + 1;
+                continue;
+            }
+        }
+        index += 1;
+    }
+    return null;
+}
+
+fn parameterBraceEnd(source: []const u8, start: usize, nesting: usize) ?usize {
+    if (nesting == 128) return null;
+    var index = start + 2;
+    while (index < source.len) {
+        switch (source[index]) {
+            '}' => return index,
+            '\\' => index += @min(@as(usize, 2), source.len - index),
+            '\'', '"' => |quote| index = (quotedEnd(source, index, quote, nesting + 1) orelse return null) + 1,
+            '$' => {
+                if (index + 1 < source.len and source[index + 1] == '(') {
+                    index = (substitutionEnd(source, index, nesting + 1) orelse return null) + 1;
+                } else if (index + 1 < source.len and source[index + 1] == '{') {
+                    index = (parameterBraceEnd(source, index, nesting + 1) orelse return null) + 1;
+                } else index += 1;
+            },
+            else => index += 1,
+        }
+    }
+    return null;
+}
 
 pub const Iterator = struct {
     source: []const u8,
@@ -321,6 +424,22 @@ pub const Iterator = struct {
         const dollar = iterator.index;
         if (iterator.index + 1 == iterator.source.len) return null;
 
+        if (iterator.source[iterator.index + 1] == '(') {
+            const end = commandSubstitutionEnd(iterator.source, iterator.index) orelse {
+                iterator.setIncomplete(.command_substitution, dollar);
+                return null;
+            };
+            const content_start = iterator.index + 2;
+            const tag: Part.Tag = if (content_start < iterator.source.len and iterator.source[content_start] == '(')
+                .arithmetic_substitution
+            else if (parameter_tag == .double_quoted_parameter)
+                .double_quoted_command_substitution
+            else
+                .command_substitution;
+            iterator.index = end + 1;
+            return iterator.part(tag, content_start, end);
+        }
+
         if (iterator.source[iterator.index + 1] == '{') {
             const content_start = iterator.index + 2;
             iterator.index = content_start;
@@ -328,6 +447,13 @@ pub const Iterator = struct {
             while (iterator.index < iterator.source.len) {
                 switch (iterator.source[iterator.index]) {
                     '$' => {
+                        if (iterator.index + 1 < iterator.source.len and iterator.source[iterator.index + 1] == '(') {
+                            iterator.index = (commandSubstitutionEnd(iterator.source, iterator.index) orelse {
+                                iterator.setIncomplete(.command_substitution, iterator.index);
+                                return null;
+                            }) + 1;
+                            continue;
+                        }
                         if (iterator.index + 1 < iterator.source.len and
                             iterator.source[iterator.index + 1] == '{')
                         {

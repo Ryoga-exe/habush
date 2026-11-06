@@ -78,6 +78,9 @@ const Writer = struct {
             .braced_parameter,
             .double_quoted_parameter,
             .double_quoted_braced_parameter,
+            .command_substitution,
+            .double_quoted_command_substitution,
+            .arithmetic_substitution,
             => try writer.writeString(stream, writer.code.wordPart(index)),
         }
         try stream.writeByte(')');
@@ -226,6 +229,9 @@ const Writer = struct {
             .braced_parameter,
             .double_quoted_parameter,
             .double_quoted_braced_parameter,
+            .command_substitution,
+            .double_quoted_command_substitution,
+            .arithmetic_substitution,
             => return,
             .negated_pipeline => writer.code.instructionData(index).un.src_start,
             .list,

@@ -358,6 +358,9 @@ pub const Inst = struct {
         braced_parameter,
         double_quoted_parameter,
         double_quoted_braced_parameter,
+        command_substitution,
+        double_quoted_command_substitution,
+        arithmetic_substitution,
 
         pub fn isWordPart(tag: Tag) bool {
             return switch (tag) {
@@ -370,6 +373,9 @@ pub const Inst = struct {
                 .braced_parameter,
                 .double_quoted_parameter,
                 .double_quoted_braced_parameter,
+                .command_substitution,
+                .double_quoted_command_substitution,
+                .arithmetic_substitution,
                 => true,
                 else => false,
             };

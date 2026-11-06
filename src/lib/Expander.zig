@@ -280,6 +280,7 @@ fn appendArgumentPart(
             bytes,
             current_field_active,
         ),
+        .command_substitution, .double_quoted_command_substitution, .arithmetic_substitution => return error.ParameterExpansionUnsupported,
     }
 }
 
@@ -445,6 +446,7 @@ fn appendAssignmentPart(
             value,
             true,
         ),
+        .command_substitution, .double_quoted_command_substitution, .arithmetic_substitution => return error.ParameterExpansionUnsupported,
     }
 }
 
@@ -827,6 +829,9 @@ fn hirPartTag(tag: Hir.Inst.Tag) Word.Part.Tag {
         .braced_parameter => .braced_parameter,
         .double_quoted_parameter => .double_quoted_parameter,
         .double_quoted_braced_parameter => .double_quoted_braced_parameter,
+        .command_substitution => .command_substitution,
+        .double_quoted_command_substitution => .double_quoted_command_substitution,
+        .arithmetic_substitution => .arithmetic_substitution,
         else => unreachable,
     };
 }

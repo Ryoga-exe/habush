@@ -2,6 +2,7 @@
 //! Based on  https://codeberg.org/ziglang/zig/src/branch/master/lib/std/zig/tokenizer.zig
 
 const std = @import("std");
+const Word = @import("word.zig");
 
 pub const Token = struct {
     tag: Tag,
@@ -58,6 +59,7 @@ pub const Token = struct {
         unterminated_double_quote,
         unterminated_escape,
         unterminated_parameter_expansion,
+        unterminated_command_substitution,
 
         newline,
 
@@ -100,6 +102,7 @@ pub const Token = struct {
             .unterminated_double_quote,
             .unterminated_escape,
             .unterminated_parameter_expansion,
+            .unterminated_command_substitution,
             .newline,
             => null,
 
@@ -154,6 +157,7 @@ pub const Token = struct {
             .unterminated_double_quote => "UNTERMINATED (\")",
             .unterminated_escape => "UNTERMINATED (\\)",
             .unterminated_parameter_expansion => "UNTERMINATED (${...})",
+            .unterminated_command_substitution => "UNTERMINATED ($(...))",
             .newline => "newline",
             else => unreachable,
         };
@@ -340,8 +344,18 @@ pub const Tokenizer = struct {
                         self.index += 2;
                         continue :state .parameter_expansion;
                     }
-                    self.index += 1;
-                    continue :state .word;
+                    if (self.buffer[self.index + 1] == '(') {
+                        if (Word.commandSubstitutionEnd(self.buffer, self.index)) |end| {
+                            self.index = end + 1;
+                            continue :state .word;
+                        }
+                        result.tag = .unterminated_command_substitution;
+                        result.loc.start = self.index;
+                        self.index = self.buffer.len;
+                    } else {
+                        self.index += 1;
+                        continue :state .word;
+                    }
                 },
                 else => {
                     result.tag = .word;
@@ -432,8 +446,18 @@ pub const Tokenizer = struct {
                         self.index += 2;
                         continue :state .parameter_expansion;
                     }
-                    self.index += 1;
-                    continue :state .double_quote;
+                    if (self.buffer[self.index + 1] == '(') {
+                        if (Word.commandSubstitutionEnd(self.buffer, self.index)) |end| {
+                            self.index = end + 1;
+                            continue :state .double_quote;
+                        }
+                        result.tag = .unterminated_command_substitution;
+                        result.loc.start = self.index;
+                        self.index = self.buffer.len;
+                    } else {
+                        self.index += 1;
+                        continue :state .double_quote;
+                    }
                 },
                 else => {
                     self.index += 1;
@@ -487,13 +511,23 @@ pub const Tokenizer = struct {
                     result.loc.start = parameter_start;
                 },
                 '$' => {
-                    if (self.buffer[self.index + 1] == '{') {
-                        parameter_depth += 1;
-                        self.index += 2;
+                    if (self.buffer[self.index + 1] == '(') {
+                        if (Word.commandSubstitutionEnd(self.buffer, self.index)) |end| {
+                            self.index = end + 1;
+                            continue :state .parameter_expansion;
+                        }
+                        result.tag = .unterminated_command_substitution;
+                        result.loc.start = self.index;
+                        self.index = self.buffer.len;
                     } else {
-                        self.index += 1;
+                        if (self.buffer[self.index + 1] == '{') {
+                            parameter_depth += 1;
+                            self.index += 2;
+                        } else {
+                            self.index += 1;
+                        }
+                        continue :state .parameter_expansion;
                     }
-                    continue :state .parameter_expansion;
                 },
                 '}' => {
                     self.index += 1;
@@ -687,6 +721,12 @@ test "words, digits and operators" {
         .newline,
         .eof,
     });
+}
+
+test "command substitutions retain inner quotes operators and newlines" {
+    try testTokenize("echo pre$(printf '%s' \"$(echo nested)\")post \"$(echo ')')\" ${unset:-$(echo '}')}", &.{ .word, .word, .word, .word, .eof });
+    try testTokenize("echo $(echo one # ignored )\necho two)", &.{ .word, .word, .eof });
+    try testTokenize("echo \"$(echo", &.{ .word, .unterminated_command_substitution, .eof });
 }
 
 test "comments end at LF or CRLF and preserve newline locations" {
