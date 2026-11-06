@@ -1,14 +1,15 @@
 //! Native `Host` implementation backed by Zig's cross-platform standard APIs.
 //!
 //! The backend owns child processes and standard-stream resources, exposes
-//! process events, and leases foreground terminals on POSIX systems. FIFO
-//! actions can run in a trusted command worker. Arbitrary file descriptors
-//! and sandbox restrictions remain unsupported boundaries.
+//! process events, and leases foreground terminals on POSIX systems. Native
+//! restrictions use an explicitly configured backend and trusted worker;
+//! arbitrary file descriptors remain an unsupported boundary.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const CommandPlan = @import("../CommandPlan.zig");
 const Host = @import("../Host.zig");
+const SandboxBackend = @import("../SandboxBackend.zig");
 const command_worker = @import("../worker.zig");
 const runtime_types = @import("../runtime/types.zig");
 const append_file = @import("System/append_file.zig");
@@ -30,7 +31,9 @@ io: std.Io,
 /// Parent process environment used as the base for `.overlay` plans.
 /// The caller retains ownership and must keep it alive while this host is used.
 environ_map: ?*const std.process.Environ.Map = null,
-/// Borrowed trusted executable implementing the command worker entry point.
+/// Explicit opt-in process restriction adapter. The worker path is borrowed
+/// and must name this application's trusted sandbox worker entry point.
+sandbox_backend: ?SandboxBackend = null,
 worker_executable: ?[]const u8 = null,
 children: std.AutoHashMapUnmanaged(Host.Process, ChildRecord) = .empty,
 resources: std.AutoHashMapUnmanaged(CommandPlan.Resource, *FileResource) = .empty,
@@ -211,7 +214,11 @@ fn createPipe(userdata: ?*anyopaque) Host.Error!Host.Pipe {
 
 fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.SpawnError!Host.SpawnOutcome {
     const system: *System = @ptrCast(@alignCast(userdata.?));
-    if (plan.sandbox != .inherit) return .{ .failed = .unsupported };
+    if (plan.sandbox == .restrict) {
+        const backend = system.sandbox_backend orelse return .{ .failed = .sandbox_unavailable };
+        const worker_executable = system.worker_executable orelse return .{ .failed = .sandbox_unavailable };
+        return backend.launch(system.gpa, system.io, system.host(), worker_executable, plan);
+    }
     // FIFO opens can wait for another stage. Defer those actions to a fresh
     // worker so the parent can finish launching its peers. Ordinary file opens
     // retain their existing structured failures and source-order behavior.
@@ -1497,7 +1504,7 @@ test "system host rejects process features before spawning" {
         );
     }
     try std.testing.expectEqualDeep(
-        Host.SpawnOutcome{ .failed = .unsupported },
+        Host.SpawnOutcome{ .failed = .sandbox_unavailable },
         try system_host.spawn(.{
             .executable = executable,
             .argv = argv,
