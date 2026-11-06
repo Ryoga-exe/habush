@@ -2,7 +2,7 @@
 //!
 //! This stage performs current-user tilde expansion, parameter expansion,
 //! field splitting, and quote removal. Pathname expansion, named-user tilde
-//! expansion, and parameter transformations such as `${#name}` remain
+//! expansion, and pattern-based parameter transformations remain
 //! explicit unsupported boundaries.
 
 const std = @import("std");
@@ -321,6 +321,13 @@ fn appendBracedArgumentParameter(
 ) Error!void {
     const expansion = Word.ParameterExpansion.parse(source) orelse
         return error.ParameterExpansionUnsupported;
+    if (expansion.operator == .length) {
+        var buffer: [32]u8 = undefined;
+        const value = std.fmt.bufPrint(&buffer, "{d}", .{
+            try expander.parameterLength(expansion.parameter),
+        }) catch unreachable;
+        return expander.appendScalarArgument(value, quoted, fields, bytes, current_field_active);
+    }
     if (expansion.operator == null)
         return expander.appendArgumentParameter(
             expansion.parameter,
@@ -449,6 +456,13 @@ fn appendBracedAssignmentParameter(
 ) Error!void {
     const expansion = Word.ParameterExpansion.parse(source) orelse
         return error.ParameterExpansionUnsupported;
+    if (expansion.operator == .length) {
+        var buffer: [32]u8 = undefined;
+        const value = std.fmt.bufPrint(&buffer, "{d}", .{
+            try expander.parameterLength(expansion.parameter),
+        }) catch unreachable;
+        return bytes.appendSlice(expander.allocator, value);
+    }
     if (expansion.operator == null)
         return expander.appendParameter(bytes, expansion.parameter);
     switch (try expander.selectParameterExpansion(expansion)) {
@@ -617,12 +631,24 @@ const ParameterSelection = union(enum) {
     empty,
 };
 
+/// Valid UTF-8 values count Unicode scalar values, independently of the host
+/// locale. Non-UTF-8 shell values retain byte-oriented length semantics.
+fn parameterLength(expander: Expander, parameter: []const u8) Error!usize {
+    if (std.mem.eql(u8, parameter, "@") or std.mem.eql(u8, parameter, "*"))
+        return expander.context.positional_parameters.len;
+    var value: std.ArrayList(u8) = .empty;
+    defer value.deinit(expander.allocator);
+    try expander.appendParameter(&value, parameter);
+    return std.unicode.utf8CountCodepoints(value.items) catch value.items.len;
+}
+
 fn selectParameterExpansion(
     expander: Expander,
     expansion: Word.ParameterExpansion,
 ) Error!ParameterSelection {
     const value = try expander.conditionalParameterValue(expansion.parameter);
     return switch (expansion.operator.?) {
+        .length => unreachable,
         .default_if_unset => if (value) |set| .{ .value = set } else .{ .word = expansion.word },
         .default_if_unset_or_null => if (value) |set|
             if (set.len == 0) .{ .word = expansion.word } else .{ .value = set }

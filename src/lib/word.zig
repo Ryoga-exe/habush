@@ -31,6 +31,7 @@ pub const ParameterExpansion = struct {
     word: []const u8 = "",
 
     pub const Operator = enum {
+        length,
         default_if_unset,
         default_if_unset_or_null,
         assign_if_unset,
@@ -42,6 +43,14 @@ pub const ParameterExpansion = struct {
     };
 
     pub fn parse(source: []const u8) ?ParameterExpansion {
+        if (source.len > 1 and source[0] == '#') {
+            if (parameterEnd(source[1..])) |end| {
+                if (end == source.len - 1) return .{
+                    .parameter = source[1..],
+                    .operator = .length,
+                };
+            }
+        }
         const parameter_end = parameterEnd(source) orelse return null;
         if (parameter_end == source.len) {
             return .{ .parameter = source };
@@ -497,6 +506,11 @@ test "parses braced parameter expansion operators" {
     try std.testing.expectEqualStrings("10", plain.parameter);
     try std.testing.expectEqual(null, plain.operator);
     try std.testing.expectEqualStrings("", plain.word);
+
+    const length = ParameterExpansion.parse("#name").?;
+    try std.testing.expectEqualStrings("name", length.parameter);
+    try std.testing.expectEqual(ParameterExpansion.Operator.length, length.operator.?);
+    try std.testing.expectEqual(null, ParameterExpansion.parse("#").?.operator);
 
     try std.testing.expect(ParameterExpansion.parse("") == null);
     try std.testing.expect(ParameterExpansion.parse("name:word") == null);
