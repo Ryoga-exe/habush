@@ -9,6 +9,42 @@ const types = @import("types.zig");
 
 subject: Subject,
 kind: Kind,
+source: ?Source = null,
+
+/// Byte offsets in the source used to generate the executing HIR. `end` is
+/// exclusive when known; a missing end identifies a point, not a guessed range.
+/// Stored function bodies currently omit this field because their source is
+/// independent of the input that invoked them.
+pub const Source = struct {
+    start: u32,
+    end: ?u32 = null,
+};
+
+/// Receives a borrowed diagnostic synchronously. Copy any data retained after
+/// the callback returns. The callback must not reenter or mutate its Session.
+/// Low-level concurrent Executors may invoke it from multiple tasks; use
+/// Serialized or provide equivalent synchronization for shared callback state.
+pub const Sink = struct {
+    userdata: ?*anyopaque = null,
+    report: *const fn (?*anyopaque, Diagnostic) void,
+
+    pub const Serialized = struct {
+        target: Sink,
+        io: std.Io,
+        mutex: std.Io.Mutex = .init,
+
+        pub fn sink(self: *Serialized) Sink {
+            return .{ .userdata = self, .report = dispatch };
+        }
+
+        fn dispatch(userdata: ?*anyopaque, diagnostic: Diagnostic) void {
+            const self: *Serialized = @ptrCast(@alignCast(userdata.?));
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            self.target.report(self.target.userdata, diagnostic);
+        }
+    };
+};
 
 pub const Subject = union(enum) {
     shell,
