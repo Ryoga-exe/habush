@@ -43,13 +43,24 @@ pub const EvaluateOptions = struct {
 };
 
 pub const EvaluateError = Ast.ParseError || AstGen.Error || Executor.Error;
+pub const InitError = VariableStore.Error || Host.Error;
 
 pub fn init(
     gpa: std.mem.Allocator,
     host: Host,
     options: Options,
-) VariableStore.Error!Session {
-    var context = try ExecutionContext.init(gpa, options.context);
+) InitError!Session {
+    var initial_context = options.context;
+    var resolved_cwd: ?[]u8 = null;
+    defer if (resolved_cwd) |cwd| gpa.free(cwd);
+    if (initial_context.cwd == null or !std.fs.path.isAbsolute(initial_context.cwd.?)) {
+        resolved_cwd = try host.resolveWorkingDirectory(gpa, .{
+            .current = null,
+            .path = initial_context.cwd orelse ".",
+        });
+        initial_context.cwd = resolved_cwd.?;
+    }
+    var context = try ExecutionContext.init(gpa, initial_context);
     errdefer context.deinit();
     return .{
         .host = host,

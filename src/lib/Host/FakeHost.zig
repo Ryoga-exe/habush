@@ -24,6 +24,7 @@ spawn_failure_after: usize = 0,
 wait_error: ?Host.Error = null,
 resolve_working_directory_error: ?Host.Error = null,
 working_directory_result: ?[]const u8 = null,
+initial_working_directory: []const u8 = "/",
 open_file_failure: ?Host.FileActionFailure.Reason = null,
 open_file_failure_after: usize = 0,
 create_input_error: ?Host.Error = null,
@@ -233,7 +234,10 @@ fn resolveWorkingDirectory(
 ) Host.Error![]u8 {
     const fake: *FakeHost = @ptrCast(@alignCast(userdata.?));
     if (fake.resolve_working_directory_error) |err| return err;
-    const result = fake.working_directory_result orelse return error.Unsupported;
+    const result = if (request.current == null and std.mem.eql(u8, request.path, "."))
+        fake.initial_working_directory
+    else
+        fake.working_directory_result orelse return error.Unsupported;
 
     const record_allocator = fake.arena.allocator();
     try fake.resolve_working_directory_calls.append(record_allocator, .{

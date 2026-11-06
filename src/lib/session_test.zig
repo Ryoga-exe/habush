@@ -49,6 +49,67 @@ test "session executes with its runtime configuration" {
     try std.testing.expectEqualStrings("/work", fake_host.spawn_calls.items[0].cwd.path);
 }
 
+test "session snapshots the host directory and accepts an explicit absolute directory" {
+    var fake_host = FakeHost.init(std.testing.allocator);
+    defer fake_host.deinit();
+    var fake_resolver = FakeResolver.init(std.testing.allocator);
+    defer fake_resolver.deinit();
+    fake_resolver.result = "/bin/tool";
+    var initial = [_]u8{ '/', 'f', 'i', 'r', 's', 't' };
+    fake_host.initial_working_directory = &initial;
+
+    var session = try Session.init(std.testing.allocator, fake_host.host(), .{
+        .resolver = fake_resolver.resolver(),
+    });
+    defer session.deinit();
+    try std.testing.expectEqual(@as(usize, 1), fake_host.resolve_working_directory_calls.items.len);
+    try std.testing.expect(fake_host.resolve_working_directory_calls.items[0].current == null);
+    try std.testing.expectEqualStrings(".", fake_host.resolve_working_directory_calls.items[0].path);
+    initial[1] = 'x';
+    fake_host.initial_working_directory = "/later";
+
+    var hir = try generate("tool");
+    defer hir.deinit(std.testing.allocator);
+    _ = try session.execute(hir);
+    try std.testing.expectEqualStrings("/first", session.workingDirectory().?);
+    try std.testing.expectEqualStrings("/first", fake_resolver.calls.items[0].cwd.?);
+    try std.testing.expectEqualStrings("/first", fake_host.spawn_calls.items[0].cwd.path);
+
+    fake_host.resolve_working_directory_error = error.AccessDenied;
+    var explicit = try Session.init(std.testing.allocator, fake_host.host(), .{
+        .context = .{ .cwd = "/chosen" },
+    });
+    defer explicit.deinit();
+    try std.testing.expectEqualStrings("/chosen", explicit.workingDirectory().?);
+    try std.testing.expectEqual(@as(usize, 1), fake_host.resolve_working_directory_calls.items.len);
+}
+
+test "session resolves relative initial directory and propagates bootstrap failures" {
+    var fake_host = FakeHost.init(std.testing.allocator);
+    defer fake_host.deinit();
+    fake_host.working_directory_result = "/root/project";
+
+    var session = try Session.init(std.testing.allocator, fake_host.host(), .{
+        .context = .{ .cwd = "project" },
+    });
+    defer session.deinit();
+    try std.testing.expectEqualStrings("/root/project", session.workingDirectory().?);
+    try std.testing.expectEqual(@as(usize, 1), fake_host.resolve_working_directory_calls.items.len);
+    const request = fake_host.resolve_working_directory_calls.items[0];
+    try std.testing.expect(request.current == null);
+    try std.testing.expectEqualStrings("project", request.path);
+    fake_host.working_directory_result = "/changed";
+    try std.testing.expectEqualStrings("/root/project", session.workingDirectory().?);
+
+    var failing_host = FakeHost.init(std.testing.allocator);
+    defer failing_host.deinit();
+    failing_host.resolve_working_directory_error = error.AccessDenied;
+    try std.testing.expectError(
+        error.AccessDenied,
+        Session.init(std.testing.allocator, failing_host.host(), .{}),
+    );
+}
+
 test "sessions keep working directory and output independent" {
     var fake_host = FakeHost.init(std.testing.allocator);
     defer fake_host.deinit();

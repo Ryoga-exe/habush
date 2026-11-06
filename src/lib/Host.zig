@@ -165,7 +165,9 @@ pub fn resourceWriter(host: Host, resource: CommandPlan.Resource) ?*std.Io.Write
 }
 
 /// Resolves and validates a directory using the host platform's path rules.
-/// The returned path is owned by `allocator`.
+/// The returned path is absolute in the host's namespace and owned by
+/// `allocator`. A null current directory captures the host's current base at
+/// this call; callers that need a stable session base must retain the result.
 pub fn resolveWorkingDirectory(
     host: Host,
     allocator: std.mem.Allocator,
