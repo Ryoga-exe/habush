@@ -58,7 +58,9 @@ pub const EvaluateOptions = struct {
     source_revision: ?u64 = null,
     /// Physical line preceding the parser-input unit (zero based).
     source_line_offset: usize = 0,
-    source_base_offset: u32 = 0,
+    source_base_offset: ?u32 = 0,
+    original_source: ?[:0]const u8 = null,
+    source_mappings: []const Hir.Source.Mapping = &.{},
 };
 
 pub const EvaluationId = evaluation.Id;
@@ -211,6 +213,8 @@ fn evaluateInput(
         .line_offset = options.source_line_offset,
         .base_offset = options.source_base_offset,
     });
+    if (options.original_source) |original|
+        try hir.source.?.setInputMapping(gpa, original, options.source_mappings);
     if (hir.root() == null) {
         session.last_result = .{
             .status = session.last_result.status,
