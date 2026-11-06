@@ -113,7 +113,7 @@ pub fn expandArgument(
         const tag = hir.instructionTag(part);
         const value = hir.wordPart(part);
         var located = expander;
-        located.context.substitution_origin = commandSubstitutionOrigin(hir, part);
+        located.context.substitution_origin = wordPartOrigin(hir, part);
         try located.appendArgumentPart(
             hirPartTag(tag),
             value,
@@ -147,7 +147,7 @@ pub fn expandAssignment(
         const tag = hir.instructionTag(part);
         const value = hir.wordPart(part);
         var located = expander;
-        located.context.substitution_origin = commandSubstitutionOrigin(hir, part);
+        located.context.substitution_origin = wordPartOrigin(hir, part);
         try located.appendAssignmentPart(
             hirPartTag(tag),
             value,
@@ -161,8 +161,8 @@ pub fn expandAssignment(
 /// Expands a here-document body without field splitting, pathname expansion,
 /// or quote removal. Quotes are ordinary bytes in a here-document; only
 /// parameter expansion and the restricted here-document backslash rules are
-/// applied here. Command and arithmetic substitutions remain unsupported by
-/// the language frontend.
+/// applied here. Command substitutions share the current input and capture
+/// their output; arithmetic substitution remains unsupported.
 pub fn expandHereDocument(parent: Expander, source: []const u8) Error![]const u8 {
     var expander = parent;
     var local_status: ?runtime_types.ExitStatus = null;
@@ -404,6 +404,7 @@ fn appendBracedArgumentParameter(
             bytes,
             current_field_active,
         );
+    const replacement_expander = expander.forSubslice(source, expansion.word);
     switch (try expander.selectParameterExpansion(expansion)) {
         .value => |value| return expander.appendScalarArgument(
             value,
@@ -420,7 +421,7 @@ fn appendBracedArgumentParameter(
                 current_field_active.* = true;
                 return;
             }
-            try expander.appendExpansionWord(
+            try replacement_expander.appendExpansionWord(
                 replacement,
                 quoted,
                 fields,
@@ -429,7 +430,7 @@ fn appendBracedArgumentParameter(
             );
         },
         .assign => |replacement| {
-            const assigned = try expander.assignParameter(
+            const assigned = try replacement_expander.assignParameter(
                 expansion.parameter,
                 replacement,
                 quoted,
@@ -443,7 +444,7 @@ fn appendBracedArgumentParameter(
                 current_field_active,
             );
         },
-        .fail => try expander.failParameter(expansion, quoted),
+        .fail => try replacement_expander.failParameter(expansion, quoted),
     }
 }
 
@@ -474,7 +475,8 @@ fn appendExpansionWord(
     var iterator = Word.Iterator.initExpansionWord(source, 0, force_quoted);
     var part_index: usize = 0;
     while (iterator.next()) |part| : (part_index += 1) {
-        try expander.appendArgumentPart(
+        const located = expander.forRange(part.start, part.end);
+        try located.appendArgumentPart(
             part.tag,
             source[part.start..part.end],
             part_index == 0,
@@ -539,14 +541,15 @@ fn appendBracedAssignmentParameter(
     }
     if (expansion.operator == null)
         return expander.appendParameter(bytes, expansion.parameter);
+    const replacement_expander = expander.forSubslice(source, expansion.word);
     switch (try expander.selectParameterExpansion(expansion)) {
         .value => |value| try bytes.appendSlice(expander.allocator, value),
         .empty => {},
         .word => |replacement| {
-            try expander.appendExpansionWordScalar(bytes, replacement, quoted);
+            try replacement_expander.appendExpansionWordScalar(bytes, replacement, quoted);
         },
         .assign => |replacement| {
-            const assigned = try expander.assignParameter(
+            const assigned = try replacement_expander.assignParameter(
                 expansion.parameter,
                 replacement,
                 quoted,
@@ -554,7 +557,7 @@ fn appendBracedAssignmentParameter(
             defer expander.allocator.free(assigned);
             try bytes.appendSlice(expander.allocator, assigned);
         },
-        .fail => try expander.failParameter(expansion, quoted),
+        .fail => try replacement_expander.failParameter(expansion, quoted),
     }
 }
 
@@ -567,7 +570,8 @@ fn appendExpansionWordScalar(
     var iterator = Word.Iterator.initExpansionWord(source, 0, quoted);
     var part_index: usize = 0;
     while (iterator.next()) |part| : (part_index += 1) {
-        try expander.appendAssignmentPart(
+        const located = expander.forRange(part.start, part.end);
+        try located.appendAssignmentPart(
             part.tag,
             source[part.start..part.end],
             part_index == 0,
@@ -590,15 +594,32 @@ fn lastStatus(expander: Expander) runtime_types.ExitStatus {
     return expander.context.last_status;
 }
 
-fn commandSubstitutionOrigin(hir: Hir, part: Hir.Inst.Index) ?Source.Location {
+fn wordPartOrigin(hir: Hir, part: Hir.Inst.Index) ?Source.Location {
     switch (hir.instructionTag(part)) {
-        .command_substitution, .double_quoted_command_substitution => {},
+        .command_substitution, .double_quoted_command_substitution, .braced_parameter, .double_quoted_braced_parameter => {},
         else => return null,
     }
     const origin = hir.sourceView() orelse return null;
     const start = hir.instructionData(part).pl.src_start;
     const end = std.math.cast(u32, @as(usize, start) + hir.wordPart(part).len) orelse return null;
     return .{ .start = start, .end = end, .origin = origin };
+}
+
+fn forSubslice(expander: Expander, source: []const u8, slice: []const u8) Expander {
+    const start = @intFromPtr(slice.ptr) - @intFromPtr(source.ptr);
+    return expander.forRange(start, start + slice.len);
+}
+
+fn forRange(expander: Expander, start: usize, end: usize) Expander {
+    var located = expander;
+    located.context.substitution_origin = if (expander.context.substitution_origin) |location| origin: {
+        const parent_end = location.end orelse break :origin null;
+        const absolute_start = std.math.add(u32, location.start, std.math.cast(u32, start) orelse break :origin null) catch break :origin null;
+        const absolute_end = std.math.add(u32, location.start, std.math.cast(u32, end) orelse break :origin null) catch break :origin null;
+        if (absolute_start > absolute_end or absolute_end > parent_end) break :origin null;
+        break :origin .{ .start = absolute_start, .end = absolute_end, .origin = location.origin };
+    } else null;
+    return located;
 }
 
 fn assignParameter(

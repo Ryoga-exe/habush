@@ -264,6 +264,64 @@ test "nested substitution diagnostics map through raw CRLF here-document sources
     try std.testing.expect(capture.source.?.absoluteRange() == null);
 }
 
+test "parameter replacement substitutions retain their static source origins" {
+    const Filter = struct {
+        fn report(userdata: ?*anyopaque, diagnostic: Diagnostic) void {
+            if (diagnostic.kind == .command_not_found)
+                DiagnosticCapture.report(userdata, diagnostic);
+        }
+    };
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var resolver = FakeResolver.init(std.testing.allocator);
+    defer resolver.deinit();
+    var capture: DiagnosticCapture = .{};
+    defer capture.deinit();
+    var session = try Session.init(std.testing.allocator, fake.host(), .{
+        .resolver = resolver.resolver(),
+        .context = .{ .io = .{
+            .diagnostic_sink = .{ .userdata = &capture, .report = Filter.report },
+        } },
+    });
+    defer session.deinit();
+    const scripts = [_][:0]const u8{
+        ": ${fallback:-$(missing)}",
+        ": \"${fallback:-$(missing)}\"",
+        "assigned=\"${fallback:=$(missing)}\"",
+        ": \"${fallback:?$(missing)}\"",
+        ": \"${fallback:-${also:-$(missing)}}\"",
+        "value=$(: <<EOF\r\nlong body\r\nEOF\r\n: \"${fallback:-$(missing)}\")",
+    };
+    for (scripts, 0..) |script, index| {
+        const before = capture.count;
+        var result = try session.evaluate(script, .{
+            .source_name = "parameters.hb",
+            .source_base_offset = 500,
+            .source_line_offset = 12,
+            .source_revision = 42,
+        });
+        result.deinit(session.allocator());
+        try std.testing.expectEqual(before + 1, capture.count);
+        const expected = std.mem.indexOf(u8, script, "missing").?;
+        const location = capture.source.?;
+        const origin = capture.origin.?.view();
+        try std.testing.expectEqualStrings("missing", location.originalSlice().?);
+        try std.testing.expectEqualStrings("parameters.hb", origin.name.?);
+        try std.testing.expectEqual(@as(?u64, index + 1), origin.id);
+        try std.testing.expectEqual(@as(?u64, 42), origin.revision);
+        try std.testing.expectEqual(@as(u32, @intCast(500 + expected)), location.absoluteRange().?.start);
+        try std.testing.expectEqual(
+            12 + std.mem.count(u8, script[0..expected], "\n"),
+            origin.line_offset + std.mem.count(u8, origin.text[0..location.start], "\n"),
+        );
+    }
+    try session.setVariable("literal", "$(missing)");
+    const before = capture.count;
+    var literal = try session.evaluate(": \"${fallback:-$literal}\"", .{});
+    defer literal.deinit(session.allocator());
+    try std.testing.expectEqual(before, capture.count);
+}
+
 test "background jobs retain process state until wait consumes the result" {
     var fake = FakeHost.init(std.testing.allocator);
     defer fake.deinit();

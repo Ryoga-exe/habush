@@ -440,7 +440,7 @@ fn word(astgen: *AstGen, node: Ast.Node.Index) Error!Hir.Inst.Index {
                 inline else => |tag| @field(Hir.Inst.Tag, @tagName(tag)),
             },
             .data = switch (part.tag) {
-                .command_substitution, .double_quoted_command_substitution => .{ .pl = .{
+                .command_substitution, .double_quoted_command_substitution, .braced_parameter, .double_quoted_braced_parameter => .{ .pl = .{
                     .src_start = part.start,
                     .payload_index = try astgen.addExtra(value),
                 } },

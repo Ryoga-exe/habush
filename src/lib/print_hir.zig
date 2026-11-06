@@ -226,9 +226,7 @@ const Writer = struct {
             .double_quoted,
             .double_quoted_escaped,
             .parameter,
-            .braced_parameter,
             .double_quoted_parameter,
-            .double_quoted_braced_parameter,
             .arithmetic_substitution,
             => return,
             .negated_pipeline => writer.code.instructionData(index).un.src_start,
@@ -247,6 +245,8 @@ const Writer = struct {
             .function_definition,
             .command_substitution,
             .double_quoted_command_substitution,
+            .braced_parameter,
+            .double_quoted_braced_parameter,
             => writer.code.instructionData(index).pl.src_start,
         };
         try stream.print(" src:{d}", .{start});

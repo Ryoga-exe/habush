@@ -242,7 +242,7 @@ pub fn wordParts(hir: Hir, index: Inst.Index) []const Inst.Index {
 pub fn wordPart(hir: Hir, index: Inst.Index) []const u8 {
     std.debug.assert(hir.instructionTag(index).isWordPart());
     switch (hir.instructionTag(index)) {
-        .command_substitution, .double_quoted_command_substitution => return hir.extraData(String, hir.instructionData(index).pl.payload_index).data.get(hir),
+        .command_substitution, .double_quoted_command_substitution, .braced_parameter, .double_quoted_braced_parameter => return hir.extraData(String, hir.instructionData(index).pl.payload_index).data.get(hir),
         else => {},
     }
     return hir.instructionData(index).str.get(hir);
@@ -359,8 +359,10 @@ pub const Inst = struct {
         double_quoted,
         double_quoted_escaped,
         parameter,
+        /// `data.pl`: source offset of the brace contents and a `String` payload.
         braced_parameter,
         double_quoted_parameter,
+        /// `data.pl`: source offset of the brace contents and a `String` payload.
         double_quoted_braced_parameter,
         /// `data.pl`: source offset of the inner body and a `String` payload.
         command_substitution,
