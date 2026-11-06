@@ -3,6 +3,11 @@
 //! A policy can only reduce the authority inherited from its parent domain.
 //! A host may use one backend, combine multiple mechanisms, or reject a
 //! policy it cannot enforce. Backend-specific concepts do not belong here.
+//!
+//! A CommandPlan applies this request to a new external process subtree. A
+//! Session's default request does not constrain its parent evaluator or jobs
+//! already running. Whole-source restrictions require a fresh evaluator
+//! process launched inside the selected backend's domain.
 
 const std = @import("std");
 const SandboxPolicy = @This();
