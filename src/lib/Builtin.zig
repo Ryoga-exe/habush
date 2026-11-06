@@ -21,6 +21,10 @@ pub const Tag = enum {
     exit,
     pwd,
     read,
+    jobs,
+    wait,
+    fg,
+    bg,
     @"return",
     @"export",
     unset,
@@ -44,6 +48,7 @@ pub const Result = struct {
 pub const Context = struct {
     host: ?Host = null,
     runtime_state: ?*runtime.State = null,
+    jobs: ?*runtime.Jobs = null,
     execution_context: ExecutionContext.Ref = .{ .view = .{} },
     variable_overrides: ?*const VariableStore = null,
     io: runtime.Io = .{},
@@ -52,7 +57,7 @@ pub const Context = struct {
     function_depth: u32 = 0,
 };
 
-pub const Error = std.mem.Allocator.Error || std.Io.Writer.Error || error{
+pub const Error = std.mem.Allocator.Error || std.Io.Writer.Error || Host.Error || error{
     HostUnavailable,
     RuntimeStateUnavailable,
     ExecutionContextUnavailable,
@@ -68,6 +73,10 @@ const definitions = std.StaticStringMap(Builtin).initComptime(.{
     .{ "exit", Builtin{ .tag = .exit, .special = true, .pipeline_support = .no_stdin } },
     .{ "pwd", Builtin{ .tag = .pwd, .pipeline_support = .no_stdin } },
     .{ "read", Builtin{ .tag = .read, .pipeline_support = .reads_stdin } },
+    .{ "jobs", Builtin{ .tag = .jobs, .pipeline_support = .no_stdin } },
+    .{ "wait", Builtin{ .tag = .wait } },
+    .{ "fg", Builtin{ .tag = .fg } },
+    .{ "bg", Builtin{ .tag = .bg } },
     .{ "return", Builtin{ .tag = .@"return", .special = true, .pipeline_support = .no_stdin } },
     .{ "export", Builtin{ .tag = .@"export", .special = true, .pipeline_support = .no_stdin } },
     .{ "unset", Builtin{ .tag = .unset, .special = true, .pipeline_support = .no_stdin } },
@@ -92,6 +101,10 @@ pub fn run(builtin: Builtin, context: Context, argv: []const []const u8) Error!R
         .exit => runExit(context, argv),
         .pwd => runPwd(context, argv),
         .read => runRead(context, argv),
+        .jobs => runJobs(context, argv),
+        .wait => runWait(context, argv),
+        .fg => runJobControl(context, argv, true),
+        .bg => runJobControl(context, argv, false),
         .@"return" => runReturn(context, argv),
         .@"export" => runExport(context, argv),
         .unset => runUnset(context, argv),
@@ -298,6 +311,64 @@ fn runRead(context: Context, argv: []const []const u8) Error!Result {
     // can invalidate the borrowed separator value.
     for (names, values.items) |name, value| try setVariable(state, name, value);
     return .{ .status = if (complete) 0 else 1 };
+}
+
+fn runJobs(context: Context, argv: []const []const u8) Error!Result {
+    if (argv.len != 1) return commandFailure(context, argv[0], .too_many_arguments);
+    const jobs = context.jobs orelse return .{ .status = 0 };
+    try jobs.poll();
+    if (context.io.stdout) |writer| {
+        for (jobs.entries.items) |*entry| {
+            try writer.print("[{d}] {s}\t{s}\n", .{
+                @intFromEnum(entry.id),
+                switch (entry.pipeline.state()) {
+                    .running => "Running",
+                    .stopped => "Stopped",
+                    .completed => "Done",
+                },
+                entry.title,
+            });
+        }
+    }
+    return .{ .status = 0 };
+}
+
+fn runJobControl(context: Context, argv: []const []const u8, foreground: bool) Error!Result {
+    if (argv.len > 2) return commandFailure(context, argv[0], .too_many_arguments);
+    const jobs = context.jobs orelse return commandFailure(context, argv[0], .job_control_unavailable);
+    const id = (if (argv.len == 1) jobs.latest() else jobs.resolve(argv[1])) orelse
+        return commandFailure(context, argv[0], .{ .no_such_job = if (argv.len == 1) "current" else argv[1] });
+    const status: runtime.ExitStatus = if (foreground)
+        (jobs.foreground(id) catch |err| switch (err) {
+            error.Unsupported, error.ResourceUnavailable, error.AccessDenied => return commandFailure(context, argv[0], .job_control_unavailable),
+            else => return err,
+        }) orelse 127
+    else blk: {
+        _ = jobs.signal(id, .cont) catch |err| switch (err) {
+            error.Unsupported, error.AccessDenied => return commandFailure(context, argv[0], .job_control_unavailable),
+            else => return err,
+        };
+        break :blk 0;
+    };
+    return .{ .status = status };
+}
+
+fn runWait(context: Context, argv: []const []const u8) Error!Result {
+    const jobs = context.jobs orelse return .{ .status = if (argv.len == 1) 0 else 127 };
+    if (argv.len == 1) return .{ .status = try jobs.waitAll() };
+    var status: runtime.ExitStatus = 0;
+    for (argv[1..]) |operand| {
+        const id = jobs.resolve(operand) orelse {
+            try context.io.reportDiagnostic(.{ .subject = .{ .command = argv[0] }, .kind = .{ .no_such_job = operand } });
+            status = 127;
+            continue;
+        };
+        status = (try jobs.wait(id)) orelse missing: {
+            try context.io.reportDiagnostic(.{ .subject = .{ .command = argv[0] }, .kind = .{ .no_such_job = operand } });
+            break :missing 127;
+        };
+    }
+    return .{ .status = status };
 }
 
 const ReadInput = struct {

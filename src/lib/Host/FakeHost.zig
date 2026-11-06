@@ -66,6 +66,7 @@ pub fn host(fake: *FakeHost) Host {
 const vtable: Host.VTable = .{
     .spawn = spawn,
     .wait = wait,
+    .wait_any = waitAny,
     .try_wait = tryWait,
     .signal = signal,
     .open_file = openFile,
@@ -173,6 +174,7 @@ fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.SpawnError!Host.SpawnOut
     };
     return .{ .spawned = .{
         .process = process,
+        .process_id = @enumFromInt(@intFromEnum(process)),
         .process_group = process_group,
         .sandbox_coverage = sandbox_coverage,
     } };
@@ -242,6 +244,11 @@ fn wait(userdata: ?*anyopaque, process: Host.Process) Host.Error!Host.Terminatio
     if (fake.wait_error) |err| return err;
     try fake.wait_calls.append(fake.arena.allocator(), process);
     return fake.termination;
+}
+
+fn waitAny(userdata: ?*anyopaque, processes: []const Host.Process) Host.Error!Host.ProcessEvent {
+    if (processes.len == 0) return error.InvalidArguments;
+    return .{ .process = processes[0], .termination = try wait(userdata, processes[0]) };
 }
 
 fn tryWait(userdata: ?*anyopaque, process: Host.Process) Host.Error!?Host.Termination {

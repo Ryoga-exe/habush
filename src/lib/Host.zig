@@ -19,8 +19,13 @@ pub const VTable = struct {
     capabilities: Capabilities = .{},
     spawn: *const fn (?*anyopaque, CommandPlan) SpawnError!SpawnOutcome,
     wait: *const fn (?*anyopaque, Process) Error!Termination,
+    wait_event: ?*const fn (?*anyopaque, Process) Error!Termination = null,
+    wait_any: ?*const fn (?*anyopaque, []const Process) Error!ProcessEvent = null,
     try_wait: ?*const fn (?*anyopaque, Process) Error!?Termination = null,
     signal: ?*const fn (?*anyopaque, Process, Signal) Error!void = null,
+    signal_group: ?*const fn (?*anyopaque, CommandPlan.ProcessGroup, Signal) Error!void = null,
+    acquire_terminal: ?*const fn (?*anyopaque, CommandPlan.ProcessGroup) Error!TerminalLease = null,
+    release_terminal: ?*const fn (?*anyopaque, TerminalLease) Error!void = null,
     open_file: *const fn (
         ?*anyopaque,
         CommandPlan.WorkingDirectory,
@@ -73,6 +78,11 @@ pub const Process = enum(u32) {
     _,
 };
 
+/// Opaque claim on the host's controlling terminal. Release exactly once.
+pub const TerminalLease = enum(u32) {
+    _,
+};
+
 pub const Signal = enum {
     interrupt,
     terminate,
@@ -96,6 +106,9 @@ pub fn capabilities(host: Host) Capabilities {
 
 pub const SpawnResult = struct {
     process: Process,
+    /// Numeric OS PID for shell variables and wait-by-PID. Unlike `process`,
+    /// this identifier is observable and must not be used as an ownership key.
+    process_id: ?runtime_types.ProcessId = null,
     /// Populated when this spawn created or joined a process group.
     process_group: ?CommandPlan.ProcessGroup = null,
     sandbox_coverage: SandboxPolicy.Coverage,
@@ -147,6 +160,11 @@ pub const Termination = union(enum) {
     unknown: u32,
 };
 
+pub const ProcessEvent = struct {
+    process: Process,
+    termination: Termination,
+};
+
 pub fn spawn(host: Host, plan: CommandPlan) SpawnError!SpawnOutcome {
     plan.validate() catch return error.InvalidArguments;
     return host.vtable.spawn(host.userdata, plan);
@@ -154,6 +172,26 @@ pub fn spawn(host: Host, plan: CommandPlan) SpawnError!SpawnOutcome {
 
 pub fn wait(host: Host, process: Process) Error!Termination {
     return host.vtable.wait(host.userdata, process);
+}
+
+/// Blocks until the process exits, is signaled, or stops. Hosts without a
+/// separate stop-aware implementation retain the terminal-only wait behavior.
+pub fn waitEvent(host: Host, process: Process) Error!Termination {
+    const callback = host.vtable.wait_event orelse host.vtable.wait;
+    return callback(host.userdata, process);
+}
+
+/// Blocks until any specified process exits or stops. Each handle must be
+/// owned by this host; an empty set is invalid. A backend with no wait-any
+/// callback can still serve a single process through waitEvent.
+pub fn waitAny(host: Host, processes: []const Process) Error!ProcessEvent {
+    if (processes.len == 0) return error.InvalidArguments;
+    if (host.vtable.wait_any) |callback| return callback(host.userdata, processes);
+    if (processes.len == 1) return .{
+        .process = processes[0],
+        .termination = try host.waitEvent(processes[0]),
+    };
+    return error.Unsupported;
 }
 
 /// Polls one host-owned process without blocking. A stopped notification does
@@ -167,6 +205,26 @@ pub fn tryWait(host: Host, process: Process) Error!?Termination {
 pub fn signal(host: Host, process: Process, requested: Signal) Error!void {
     const callback = host.vtable.signal orelse return error.Unsupported;
     return callback(host.userdata, process, requested);
+}
+
+/// Sends a signal to an owned process group, including every current member.
+pub fn signalGroup(host: Host, group: CommandPlan.ProcessGroup, requested: Signal) Error!void {
+    const callback = host.vtable.signal_group orelse return error.Unsupported;
+    return callback(host.userdata, group, requested);
+}
+
+/// Explicitly transfers the controlling terminal to an owned process group.
+/// The caller must release the returned lease, including on command failure.
+pub fn acquireTerminal(host: Host, group: CommandPlan.ProcessGroup) Error!TerminalLease {
+    const callback = host.vtable.acquire_terminal orelse return error.Unsupported;
+    return callback(host.userdata, group);
+}
+
+/// Restores the terminal's previous foreground process group. A failed
+/// release leaves the lease active so the caller can retry or deinit the host.
+pub fn releaseTerminal(host: Host, lease: TerminalLease) Error!void {
+    const callback = host.vtable.release_terminal orelse return error.Unsupported;
+    return callback(host.userdata, lease);
 }
 
 /// Opens a file once for a shell redirection scope. The returned resource may

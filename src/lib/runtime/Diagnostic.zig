@@ -37,6 +37,8 @@ pub const Kind = union(enum) {
     working_directory_unavailable,
     function_call_depth_exceeded,
     command_not_found,
+    no_such_job: []const u8,
+    job_control_unavailable,
     cannot_execute: CannotExecuteReason,
 };
 
@@ -93,8 +95,9 @@ pub fn status(diagnostic: Diagnostic) types.ExitStatus {
         .cannot_change_directory,
         .working_directory_unavailable,
         .function_call_depth_exceeded,
+        .job_control_unavailable,
         => 1,
-        .command_not_found => 127,
+        .command_not_found, .no_such_job => 127,
         .cannot_execute => 126,
     };
 }
@@ -160,6 +163,8 @@ pub fn render(
         .working_directory_unavailable => try writer.writeAll("working directory unavailable"),
         .function_call_depth_exceeded => try writer.writeAll("maximum function call depth exceeded"),
         .command_not_found => try writer.writeAll("command not found"),
+        .no_such_job => |job| try writer.print("no such job: {s}", .{job}),
+        .job_control_unavailable => try writer.writeAll("job control unavailable"),
         .cannot_execute => |reason| switch (reason) {
             .access_denied => try writer.writeAll("permission denied"),
             .invalid_executable => try writer.writeAll("invalid executable"),

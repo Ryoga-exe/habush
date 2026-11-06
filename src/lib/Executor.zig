@@ -41,6 +41,9 @@ scoped_file_actions: []const CommandPlan.FileAction,
 pipeline_stage: ?PipelineStage,
 prepared_simple: ?PreparedSimpleCommand,
 last_status: runtime.ExitStatus,
+jobs: ?*runtime.Jobs = null,
+background: bool = false,
+job_control: bool = false,
 loop_depth: u32,
 function_depth: u32,
 
@@ -137,8 +140,13 @@ const PreparedPipelineStage = struct {
     state: ?runtime.State = null,
     variables: ?VariableStore = null,
     context: ?ExecutionContext = null,
+    jobs: ?runtime.Jobs = null,
 
     fn deinit(stage: *PreparedPipelineStage) void {
+        if (stage.jobs) |*jobs| {
+            jobs.cancelAll();
+            jobs.deinit();
+        }
         if (stage.state) |*state| state.deinit();
         if (stage.variables) |*variables| variables.deinit();
         if (stage.context) |*context| context.deinit();
@@ -149,6 +157,7 @@ const PreparedPipelineStage = struct {
         if (stage.state) |*state| result.runtime_state = state;
         if (stage.variables) |*variables| result.variables = variables;
         if (stage.context) |*context| result.context = .{ .mutable = context };
+        result.jobs = if (stage.jobs) |*jobs| jobs else null;
         result.prepared_simple = if (stage.plan) |plan| switch (plan) {
             .simple => |simple| simple,
             .definition, .compound => null,
@@ -223,6 +232,13 @@ pub fn execute(executor: Executor, hir: Hir) Error!Result {
 }
 
 fn executeInstruction(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
+    if (executor.background) {
+        if (executor.jobs == null) return error.UnsupportedInstruction;
+        switch (hir.instructionTag(index)) {
+            .simple_command, .pipe, .pipe_and => {},
+            else => return error.UnsupportedInstruction,
+        }
+    }
     return switch (hir.instructionTag(index)) {
         .list => executor.executeList(hir, index),
         .and_if, .or_if => executor.executeAndOr(hir, index),
@@ -249,6 +265,10 @@ fn executeFunctionDefinition(executor: Executor, hir: Hir, index: Hir.Inst.Index
 fn executeSubshell(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
     const group = hir.groupedCommand(index);
     var subshell_executor = executor;
+    var jobs: runtime.Jobs = .{ .gpa = executor.gpa };
+    defer jobs.deinit();
+    defer jobs.cancelAll();
+    subshell_executor.jobs = &jobs;
     var context_copy = try executor.context.clone(executor.gpa);
     defer context_copy.deinit();
     subshell_executor.context = .{ .mutable = &context_copy };
@@ -385,9 +405,9 @@ fn executeList(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result
     var last_status = executor.last_status;
     for (0..hir.listItemCount(index)) |item_index| {
         const item = hir.listItem(index, item_index);
-        if (item.separator == .background) return error.UnsupportedInstruction;
         var command_executor = executor;
         command_executor.last_status = last_status;
+        command_executor.background = item.separator == .background;
         const command_result = try command_executor.executeInstruction(hir, item.command);
         result.status = command_result.status;
         result.sandbox_coverage = combineSandboxCoverage(
@@ -576,7 +596,9 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
     for (prepared, stages.items) |*stage, stage_index| stage.* = .{ .index = stage_index };
     defer for (prepared) |*stage| stage.deinit();
     var in_process_count: usize = 0;
+    var upstream_builtin = false;
     for (prepared) |*stage| {
+        stage.jobs = .{ .gpa = executor.gpa };
         stage.context = try executor.context.clone(executor.gpa);
         if (executor.runtime_state) |state| stage.state = try state.clone();
         if (executor.variables) |variables| stage.variables = try variables.clone(executor.gpa);
@@ -587,19 +609,26 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
         };
         stage.plan = plan;
         if (plan.kind() == .in_process) in_process_count += 1;
+        if (plan.kind() == .in_process and upstream_builtin) return error.UnsupportedInstruction;
+        if (plan.kind() == .builtin) upstream_builtin = true;
+        if (executor.background and plan.kind() != .external) return error.UnsupportedInstruction;
     }
     // A general in-process stage may read from its pipeline input. External
     // neighbours are launched first so one such stage can run synchronously;
     // two such stages require a concurrent runtime scheduler.
     if (in_process_count > 1) return error.UnsupportedInstruction;
 
-    var pipeline = Pipeline.init(allocator, executor.host, stages.items.len) catch |err| switch (err) {
+    var pipeline = Pipeline.init(executor.gpa, executor.host, stages.items.len) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.ResourceUnavailable => return executor.pipelineFailure(.resource_unavailable),
         error.Unsupported => return executor.pipelineFailure(.unsupported),
         else => |other| return other,
     };
-    defer pipeline.deinit();
+    var transferred = false;
+    defer if (!transferred) pipeline.deinit();
+    const foreground_job = !executor.background and in_process_count == 0 and !upstream_builtin and
+        executor.jobs != null and executor.jobs.?.terminal_control;
+    pipeline.create_group = (executor.background or foreground_job) and executor.host.capabilities().process_groups;
 
     var result: Result = .{ .status = 0, .sandbox_coverage = .not_requested };
     const phase_count: usize = if (in_process_count == 0) 1 else 2;
@@ -642,7 +671,22 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
                 stage_result.sandbox_coverage,
             );
             pipeline.closeStage(stage_index);
+            if (executor.background and pipeline.status(stage_index) == .pending) {
+                pipeline.signal(.kill) catch {};
+                return stage_result;
+            }
         }
+    }
+
+    if (executor.background or foreground_job) {
+        const jobs = executor.jobs orelse return error.UnsupportedInstruction;
+        const id = jobs.add(pipeline, "pipeline", .{ .background = executor.background }) catch |err| {
+            pipeline.signal(.kill) catch {};
+            return err;
+        };
+        transferred = true;
+        result.status = if (executor.background) 0 else (try jobs.foreground(id)).?;
+        return result;
     }
 
     for (0..stages.items.len) |stage_index| {
@@ -830,6 +874,7 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
         executor.resolveCommand(argv.items[0]);
     switch (command) {
         .builtin => |candidate| {
+            if (executor.background) return error.UnsupportedInstruction;
             if (executor.pipeline_stage != null and !candidate.supportsPipeline())
                 return error.UnsupportedInstruction;
             var scope = switch (try executor.beginSimpleCommandRedirections(
@@ -849,6 +894,7 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
             );
         },
         .function => {
+            if (executor.background) return error.UnsupportedInstruction;
             if (has_assignments) {
                 const mutable_variables = variables orelse unreachable;
                 try applyAssignments(mutable_variables, &command_variables);
@@ -895,6 +941,18 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
     }) orelse return executor.commandFailure(argv.items[0], .command_not_found);
 
     var effective_file_actions: std.ArrayList(CommandPlan.FileAction) = .empty;
+    if (executor.background and !executor.job_control and
+        (executor.pipeline_stage == null or executor.pipeline_stage.?.input == null))
+    {
+        const input = try executor.host.createInput(&.{});
+        redirect_resources.append(allocator, input) catch |err| {
+            executor.host.closeResource(input);
+            return err;
+        };
+        try effective_file_actions.append(allocator, .{
+            .use_resource = .{ .resource = input, .target = .stdin },
+        });
+    }
     try effective_file_actions.appendSlice(allocator, executor.scoped_file_actions);
     if (executor.pipeline_stage) |stage| {
         if (stage.input) |resource| try effective_file_actions.append(allocator, .{
@@ -918,6 +976,33 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
         .file_actions = effective_file_actions.items,
         .sandbox = executor.activeSandbox(),
     };
+    if (executor.pipeline_stage == null and
+        (executor.background or (executor.jobs != null and executor.jobs.?.terminal_control)))
+    {
+        const jobs = executor.jobs orelse return error.UnsupportedInstruction;
+        var started = try Pipeline.startWithOptions(executor.gpa, executor.host, &.{plan}, .{
+            .process_group = executor.host.capabilities().process_groups,
+        });
+        switch (started) {
+            .failed => |failure| return executor.spawnFailure(
+                argv.items[0],
+                effective_file_actions.items,
+                failure.reason,
+            ),
+            .started => |*pipeline| {
+                const id = jobs.add(pipeline.*, argv.items[0], .{ .background = executor.background }) catch |err| {
+                    pipeline.signal(.kill) catch {};
+                    pipeline.deinit();
+                    return err;
+                };
+                const coverage = pipeline.coverage(0);
+                return .{
+                    .status = if (executor.background) 0 else (try jobs.foreground(id)).?,
+                    .sandbox_coverage = coverage,
+                };
+            },
+        }
+    }
     const spawn_outcome = (if (executor.pipeline_stage) |stage|
         stage.pipeline.spawn(stage.index, plan)
     else
@@ -1363,6 +1448,7 @@ fn executeBuiltin(
         .host = executor.host,
         .execution_context = executor.context,
         .runtime_state = executor.runtime_state,
+        .jobs = executor.jobs,
         .variable_overrides = command_variables,
         .io = executor.io,
         .last_status = executor.last_status,
@@ -1410,6 +1496,7 @@ fn wordExpander(
         .positional_parameters = executor.positionalParameters(),
         .invocation_name = executor.invocationName(),
         .shell_process_id = executor.shellProcessId(),
+        .background_process_id = if (executor.jobs) |jobs| jobs.backgroundProcessIdText() else null,
         .last_status = executor.last_status,
         .failure = failure,
     });
