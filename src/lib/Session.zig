@@ -1,12 +1,16 @@
-//! Persistent state for evaluating HIR units.
+//! Persistent state for evaluating shell input and HIR units.
 
 const std = @import("std");
+const Ast = @import("Ast.zig");
+const AstGen = @import("AstGen.zig");
 const CommandPlan = @import("CommandPlan.zig");
 const CommandResolver = @import("CommandResolver.zig");
 const Executor = @import("Executor.zig");
+const Evaluation = @import("evaluation.zig").Result;
 const ExecutionContext = @import("ExecutionContext.zig");
 const Hir = @import("Hir.zig");
 const Host = @import("Host.zig");
+const heredoc = @import("heredoc.zig");
 const runtime = @import("runtime.zig");
 const VariableStore = @import("VariableStore.zig");
 const Session = @This();
@@ -34,11 +38,11 @@ pub const Options = struct {
     variables: []const VariableStore.Binding = &.{},
 };
 
-pub const ExecutionOptions = struct {
-    /// Overrides the previous successful execution status. Frontends use this
-    /// after failures, such as parse errors, that occur outside the runtime.
-    last_status: ?runtime.ExitStatus = null,
+pub const EvaluateOptions = struct {
+    collected_here_documents: []const heredoc.Collected = &.{},
 };
+
+pub const EvaluateError = Ast.ParseError || AstGen.Error || Executor.Error;
 
 pub fn init(
     gpa: std.mem.Allocator,
@@ -67,24 +71,70 @@ pub fn deinit(session: *Session) void {
     session.* = undefined;
 }
 
-pub fn execute(session: *Session, hir: Hir) Executor.Error!Executor.Result {
-    return session.executeWithOptions(hir, .{});
+pub fn allocator(session: Session) std.mem.Allocator {
+    return session.state.allocator();
 }
 
-pub fn executeWithOptions(
-    session: *Session,
-    hir: Hir,
-    options: ExecutionOptions,
-) Executor.Error!Executor.Result {
+pub fn execute(session: *Session, hir: Hir) Executor.Error!Executor.Result {
     const result = try Executor.initWithState(
         session.host,
         session.resolver,
         &session.state,
         &session.context,
-        options.last_status orelse session.last_result.status,
+        session.last_result.status,
     ).execute(hir);
     session.last_result = result;
     return result;
+}
+
+/// Evaluates submitted input. Editor-only analysis should use `Ast.parse`
+/// instead: rejected input here changes the shell's previous exit status.
+/// The caller must deinit the returned value with this session's allocator;
+/// a syntax result borrows `source` and collected here-document bodies.
+pub fn evaluate(
+    session: *Session,
+    source: [:0]const u8,
+    options: EvaluateOptions,
+) EvaluateError!Evaluation {
+    const gpa = session.allocator();
+    var tree = try Ast.parseWithOptions(gpa, source, .{
+        .collected_here_documents = options.collected_here_documents,
+    });
+    if (tree.errors.len != 0 or tree.status != .complete) {
+        session.rejectInput();
+        return .{ .syntax = tree };
+    }
+    defer tree.deinit(gpa);
+
+    var hir = try AstGen.generate(gpa, tree);
+    defer hir.deinit(gpa);
+    if (hir.root() == null) {
+        session.last_result = .{
+            .status = session.last_result.status,
+            .sandbox_coverage = .not_requested,
+        };
+        return .{ .executed = session.last_result };
+    }
+    const result = session.execute(hir) catch |err| switch (err) {
+        error.UnsupportedInstruction,
+        error.ParameterAssignmentUnavailable,
+        error.PathnameExpansionUnsupported,
+        error.TildeExpansionUnsupported,
+        error.ParameterExpansionUnsupported,
+        => {
+            session.rejectInput();
+            return .{ .unsupported = @errorCast(err) };
+        },
+        else => |other| return other,
+    };
+    return .{ .executed = result };
+}
+
+/// Records a submitted-input failure detected by an input adapter, such as
+/// EOF while collecting a here-document. Merely inspecting input is not a
+/// rejection and must not call this operation.
+pub fn rejectInput(session: *Session) void {
+    session.last_result = .{ .status = 2, .sandbox_coverage = .not_requested };
 }
 
 pub fn workingDirectory(session: Session) ?[]const u8 {

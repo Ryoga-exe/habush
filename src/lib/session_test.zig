@@ -138,9 +138,92 @@ test "session carries the previous status into exit" {
     try std.testing.expectEqual(@as(u8, 1), result.status);
     try std.testing.expectEqual(.exit, result.control_flow);
 
-    const overridden = try session.executeWithOptions(exit_hir, .{ .last_status = 2 });
-    try std.testing.expectEqual(@as(u8, 2), overridden.status);
-    try std.testing.expectEqual(.exit, overridden.control_flow);
+    session.rejectInput();
+    const after_rejection = try session.execute(exit_hir);
+    try std.testing.expectEqual(@as(u8, 2), after_rejection.status);
+    try std.testing.expectEqual(.exit, after_rejection.control_flow);
+}
+
+test "source evaluation carries variables and status across inputs" {
+    var fake_host = FakeHost.init(std.testing.allocator);
+    defer fake_host.deinit();
+    var session = try Session.init(std.testing.allocator, fake_host.host(), .{});
+    defer session.deinit();
+
+    var assignment = try session.evaluate("name=remembered", .{});
+    defer assignment.deinit(session.allocator());
+    try std.testing.expectEqual(@as(u8, 0), assignment.executed.status);
+    try std.testing.expectEqualStrings("remembered", session.variable("name").?);
+
+    var failure = try session.evaluate("false", .{});
+    defer failure.deinit(session.allocator());
+    try std.testing.expectEqual(@as(u8, 1), failure.executed.status);
+
+    var empty = try session.evaluate(" # no command\n", .{});
+    defer empty.deinit(session.allocator());
+    try std.testing.expectEqual(@as(u8, 1), empty.executed.status);
+    try std.testing.expectEqual(.none, empty.executed.control_flow);
+
+    var exit_result = try session.evaluate("exit", .{});
+    defer exit_result.deinit(session.allocator());
+    try std.testing.expectEqual(@as(u8, 1), exit_result.executed.status);
+    try std.testing.expectEqual(.exit, exit_result.executed.control_flow);
+    try std.testing.expectEqual(@as(u8, 1), session.lastResult().status);
+    try std.testing.expectEqualStrings("remembered", session.variable("name").?);
+}
+
+test "analysis is pure and rejected syntax borrows its source" {
+    var fake_host = FakeHost.init(std.testing.allocator);
+    defer fake_host.deinit();
+    var session = try Session.init(std.testing.allocator, fake_host.host(), .{
+        .variables = &.{.{ .name = "name", .value = "before" }},
+    });
+    defer session.deinit();
+
+    var inspected = try Ast.parse(std.testing.allocator, "name=after");
+    defer inspected.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("before", session.variable("name").?);
+    try std.testing.expectEqual(@as(u8, 0), session.lastResult().status);
+
+    const source = try std.testing.allocator.dupeZ(u8, "|");
+    defer std.testing.allocator.free(source);
+    {
+        var rejected = try session.evaluate(source, .{});
+        defer rejected.deinit(session.allocator());
+        try std.testing.expect(rejected.syntax.errors.len != 0);
+        try std.testing.expect(rejected.syntax.source.ptr == source.ptr);
+        try std.testing.expectEqual(@as(u8, 2), session.lastResult().status);
+        try std.testing.expectEqualStrings("before", session.variable("name").?);
+    }
+    try std.testing.expectEqualStrings("|", source);
+
+    var incomplete = try session.evaluate("if true; then", .{});
+    defer incomplete.deinit(session.allocator());
+    try std.testing.expect(incomplete.syntax.status == .incomplete);
+    try std.testing.expectEqual(@as(u8, 2), session.lastResult().status);
+}
+
+test "source evaluation handles allocation failures across its outcomes" {
+    for ([_][:0]const u8{ "f() { false; }; f", "|", "/bin/echo *.zig" }) |source| {
+        try std.testing.checkAllAllocationFailures(
+            std.testing.allocator,
+            evaluateWithAllocator,
+            .{source},
+        );
+    }
+}
+
+test "unsupported source evaluation reports a shell status" {
+    var fake_host = FakeHost.init(std.testing.allocator);
+    defer fake_host.deinit();
+    var session = try Session.init(std.testing.allocator, fake_host.host(), .{});
+    defer session.deinit();
+
+    var evaluation = try session.evaluate("/bin/echo *.zig", .{});
+    defer evaluation.deinit(session.allocator());
+    try std.testing.expectEqual(error.PathnameExpansionUnsupported, evaluation.unsupported);
+    try std.testing.expectEqual(@as(u8, 2), session.lastResult().status);
+    try std.testing.expectEqual(@as(usize, 0), fake_host.spawn_calls.items.len);
 }
 
 test "session supplies positional parameters to implicit for loops" {
@@ -655,4 +738,13 @@ fn generate(source: [:0]const u8) !Hir {
     var tree = try Ast.parse(std.testing.allocator, source);
     defer tree.deinit(std.testing.allocator);
     return AstGen.generate(std.testing.allocator, tree);
+}
+
+fn evaluateWithAllocator(gpa: std.mem.Allocator, source: [:0]const u8) !void {
+    var fake_host = FakeHost.init(std.testing.allocator);
+    defer fake_host.deinit();
+    var session = try Session.init(gpa, fake_host.host(), .{});
+    defer session.deinit();
+    var evaluation = try session.evaluate(source, .{});
+    defer evaluation.deinit(gpa);
 }
