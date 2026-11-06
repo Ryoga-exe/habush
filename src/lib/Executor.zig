@@ -773,8 +773,10 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
                 result.sandbox_coverage,
                 stage_result.sandbox_coverage,
             );
+            const unspawned = pipeline.status(stage_index) == .pending;
+            if (unspawned) pipeline.completeUnspawned(stage_index, stage_result.status);
             pipeline.closeStage(stage_index);
-            if (executor.background and pipeline.status(stage_index) == .pending) {
+            if (executor.background and unspawned) {
                 pipeline.signal(.kill) catch {};
                 return stage_result;
             }
@@ -935,6 +937,8 @@ fn executeConcurrentPipeline(
         var stage_result = try stage_executor.executeInstruction(hir, prepared[remaining].index);
         stage_result.control_flow = .none;
         results[remaining] = stage_result;
+        if (pipeline.status(remaining) == .pending)
+            pipeline.completeUnspawned(remaining, stage_result.status);
         pipeline.closeStage(remaining);
     }
 

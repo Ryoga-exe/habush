@@ -227,3 +227,22 @@ test "job status survives polling until wait consumes it" {
     try std.testing.expect((try jobs.wait(id)) == null);
     try std.testing.expectEqual(@as(usize, 0), fake.wait_calls.items.len);
 }
+
+test "foreground jobs consume pipelines containing a stage that never spawned" {
+    const FakeHost = @import("../Host/FakeHost.zig");
+    for ([_]usize{ 0, 1 }) |failed_stage| {
+        var fake = FakeHost.init(std.testing.allocator);
+        defer fake.deinit();
+        var pipeline = try Pipeline.init(std.testing.allocator, fake.host(), 2);
+        var transferred = false;
+        defer if (!transferred) pipeline.deinit();
+        pipeline.completeUnspawned(failed_stage, 127);
+        _ = try pipeline.spawn(1 - failed_stage, .{ .executable = "/child", .argv = &.{"child"} });
+        var jobs: Jobs = .{ .gpa = std.testing.allocator, .terminal_control = true };
+        defer jobs.deinit();
+        const id = try jobs.add(pipeline, "pipeline", .{ .background = false });
+        transferred = true;
+        try std.testing.expectEqual(@as(ExitStatus, if (failed_stage == 1) 127 else 0), (try jobs.foreground(id)).?);
+        try std.testing.expectEqual(@as(usize, 0), jobs.entries.items.len);
+    }
+}

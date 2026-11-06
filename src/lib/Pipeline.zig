@@ -192,6 +192,16 @@ pub fn stageCount(pipeline: *const Pipeline) usize {
     return pipeline.processes.len;
 }
 
+/// Records the final outcome of a stage which did not create a process. The
+/// caller already handled its synchronous diagnostic. It must not remain
+/// pending when this pipeline is transferred to a job or polled for completion.
+pub fn completeUnspawned(pipeline: *Pipeline, index: usize, status_code: u8) void {
+    const record = &pipeline.processes[index];
+    std.debug.assert(!record.spawned and record.result == null and record.termination == null);
+    record.spawned = true;
+    record.termination = .{ .exited = status_code };
+}
+
 pub fn coverage(pipeline: *const Pipeline, index: usize) SandboxPolicy.Coverage {
     return pipeline.processes[index].sandbox_coverage;
 }
