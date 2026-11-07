@@ -33,6 +33,31 @@ test "executes static simple commands through the host" {
     try std.testing.expectEqual(@as(usize, 1), fake.wait_calls.items.len);
 }
 
+test "command substitutions isolate state and control flow while retaining the last status" {
+    var hir = try generate(
+        \\outer=old
+        \\f() { shift; outer=inner; pwd; exit 7; }
+        \\value=$(f one two)
+        \\first_status=$?
+        \\after="$outer:$#"
+        \\final=$(false)
+    );
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var state = try runtime.State.init(std.testing.allocator, .{ .positional_parameters = &.{"parent"} });
+    defer state.deinit();
+    var context = try ExecutionContext.init(std.testing.allocator, .{ .cwd = "/workspace" });
+    defer context.deinit();
+    const result = try Executor.initWithState(fake.host(), null, &state, &context, 0).execute(hir);
+    try std.testing.expectEqual(@as(u8, 1), result.status);
+    try std.testing.expect(result.control_flow.isNone());
+    try std.testing.expectEqualStrings("/workspace", state.variable("value").?);
+    try std.testing.expectEqualStrings("7", state.variable("first_status").?);
+    try std.testing.expectEqualStrings("old:1", state.variable("after").?);
+    try std.testing.expectEqualStrings("", state.variable("final").?);
+}
+
 test "lowers external command file redirects in source order" {
     var hir = try generate("/bin/tool <input >output 2>>error");
     defer hir.deinit(std.testing.allocator);

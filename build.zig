@@ -94,11 +94,12 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_lib_tests.step);
     const terminal_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/terminal/ShellIntegration.zig"),
+            .root_source_file = b.path("src/Shell.zig"),
             .target = target,
             .optimize = optimize,
         }),
     });
+    terminal_tests.root_module.addImport("habush", habush);
     const run_terminal_tests = b.addRunArtifact(terminal_tests);
     test_step.dependOn(&run_terminal_tests.step);
     test_step.dependOn(&exe.step);

@@ -41,6 +41,7 @@ pub fn init(gpa: std.mem.Allocator, inner: BaseHost, io: std.Io) BaseHost.Error!
             .open_file = openFile,
             .create_pipe = createPipe,
             .create_input = createInput,
+            .create_capture = if (inner.vtable.create_capture != null) createCapture else null,
             .close_resource = closeResource,
             .resource_writer = resourceWriter,
             .resource_reader = resourceReader,
@@ -202,6 +203,13 @@ fn createPipe(userdata: ?*anyopaque) BaseHost.Error!BaseHost.Pipe {
     self.mutex.lockUncancelable(self.io);
     defer self.mutex.unlock(self.io);
     return self.inner.createPipe();
+}
+
+fn createCapture(userdata: ?*anyopaque) BaseHost.Error!CommandPlan.Resource {
+    const self = from(userdata);
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    return self.inner.createCapture();
 }
 
 fn createInput(userdata: ?*anyopaque, bytes: []const u8) BaseHost.Error!CommandPlan.Resource {

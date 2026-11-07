@@ -64,11 +64,13 @@ pub const Prepared = struct {
 pub fn prepare(gpa: std.mem.Allocator, plan: CommandPlan) PrepareError!Prepared {
     try plan.validate();
     // A resolved path avoids a second, implicit PATH search in the worker.
-    if (std.mem.indexOfScalar(u8, plan.executable, '/') == null) return error.Unsupported;
+    if (plan.command_failure == null and std.mem.indexOfScalar(u8, plan.executable, '/') == null)
+        return error.Unsupported;
     const split = try splitFileActions(plan.file_actions);
     var arguments: std.ArrayList([]const u8) = .empty;
     defer arguments.deinit(gpa);
     try arguments.append(gpa, version);
+    if (plan.suspend_before_execute) try arguments.append(gpa, "suspend");
     for (split.worker_actions) |action| switch (action) {
         .open => |open| try arguments.appendSlice(gpa, &.{
             "open",                     descriptorText(open.target), @tagName(open.access),
@@ -80,6 +82,8 @@ pub fn prepare(gpa: std.mem.Allocator, plan: CommandPlan) PrepareError!Prepared 
         .close => |descriptor| try arguments.appendSlice(gpa, &.{ "close", descriptorText(descriptor) }),
         .use_resource => unreachable,
     };
+    if (plan.command_failure) |failure|
+        try arguments.appendSlice(gpa, &.{ "fail", @tagName(failure) });
     try arguments.append(gpa, "--");
     try arguments.append(gpa, plan.executable);
     try arguments.appendSlice(gpa, plan.argv[1..]);
@@ -119,12 +123,16 @@ pub fn launch(
     wrapped.executable = worker_executable;
     wrapped.argv = arguments.items;
     wrapped.file_actions = prepared.resource_prefix;
+    wrapped.command_failure = null;
+    wrapped.suspend_before_execute = false;
     return host.spawn(wrapped);
 }
 
 pub const Decoded = struct {
     actions: []CommandPlan.FileAction,
     argv: []const []const u8,
+    command_failure: ?CommandPlan.CommandFailure = null,
+    suspend_before_execute: bool = false,
 
     pub fn deinit(decoded: *Decoded, gpa: std.mem.Allocator) void {
         gpa.free(decoded.actions);
@@ -140,19 +148,31 @@ pub fn parse(gpa: std.mem.Allocator, arguments: []const []const u8) ParseError!D
     var actions: std.ArrayList(CommandPlan.FileAction) = .empty;
     defer actions.deinit(gpa);
     var index: usize = 1;
+    var command_failure: ?CommandPlan.CommandFailure = null;
+    var suspend_before_execute = false;
     while (index < arguments.len) {
         const opcode = arguments[index];
         index += 1;
         if (std.mem.eql(u8, opcode, "--")) {
             if (index == arguments.len or arguments[index].len == 0 or
-                std.mem.indexOfScalar(u8, arguments[index], '/') == null)
+                (command_failure == null and std.mem.indexOfScalar(u8, arguments[index], '/') == null))
                 return error.InvalidArguments;
             return .{
                 .actions = try actions.toOwnedSlice(gpa),
                 .argv = arguments[index..],
+                .command_failure = command_failure,
+                .suspend_before_execute = suspend_before_execute,
             };
         }
-        if (std.mem.eql(u8, opcode, "open")) {
+        if (std.mem.eql(u8, opcode, "suspend")) {
+            if (suspend_before_execute or actions.items.len != 0 or command_failure != null) return error.InvalidArguments;
+            suspend_before_execute = true;
+        } else if (std.mem.eql(u8, opcode, "fail")) {
+            if (command_failure != null or index == arguments.len) return error.InvalidArguments;
+            command_failure = std.meta.stringToEnum(CommandPlan.CommandFailure, arguments[index]) orelse
+                return error.InvalidArguments;
+            index += 1;
+        } else if (std.mem.eql(u8, opcode, "open")) {
             if (arguments.len - index < 4) return error.InvalidArguments;
             const access = std.meta.stringToEnum(CommandPlan.FileAction.Open.Access, arguments[index + 1]) orelse
                 return error.InvalidArguments;
@@ -229,6 +249,16 @@ pub fn run(init: std.process.Init, arguments: []const [:0]const u8) u8 {
         report(init.io, "unsupported platform");
         return 126;
     } else {
+        if (decoded.suspend_before_execute) {
+            // std.process.spawn has already exec'd this fresh worker, so its
+            // parent's exec-error handshake is complete. Unlike stopping a
+            // pre-exec child, this does not block the parent's spawn call.
+            std.posix.kill(std.posix.system.getpid(), .STOP) catch |err| {
+                if (reporter) |channel| channel.send(.unsupported);
+                report(init.io, @errorName(err));
+                return 126;
+            };
+        }
         for (decoded.actions, 0..) |action, index| applyAction(init.io, action) catch |err| {
             if (reporter) |channel| channel.send(.{ .file_action = .{
                 .action_index = @intCast(index),
@@ -237,6 +267,15 @@ pub fn run(init: std.process.Init, arguments: []const [:0]const u8) u8 {
             reportActionFailure(init.io, index, err);
             return 126;
         };
+        if (decoded.command_failure) |failure| {
+            const reason: Host.SpawnFailure = switch (failure) {
+                .command_not_found => .command_not_found,
+                .access_denied => .access_denied,
+            };
+            if (reporter) |channel| channel.send(reason);
+            report(init.io, @tagName(failure));
+            return if (failure == .command_not_found) 127 else 126;
+        }
         const err = std.process.replace(init.io, .{
             .argv = decoded.argv,
             .environ_map = init.environ_map,
@@ -395,6 +434,23 @@ fn report(io: std.Io, message: []const u8) void {
 fn reportActionFailure(io: std.Io, index: usize, err: anyerror) void {
     var stderr = std.Io.File.stderr().writerStreaming(io, &.{});
     stderr.interface.print("habush: worker: file action {d}: {s}\n", .{ index, @errorName(err) }) catch {};
+}
+
+test "startup suspension is parsed before every file action" {
+    var prepared = try prepare(std.testing.allocator, .{
+        .executable = "/bin/cat",
+        .argv = &.{"/bin/cat"},
+        .suspend_before_execute = true,
+        .file_actions = &.{.{ .close = .stdin }},
+    });
+    defer prepared.deinit(std.testing.allocator);
+    var decoded = try parse(std.testing.allocator, prepared.arguments);
+    defer decoded.deinit(std.testing.allocator);
+    try std.testing.expect(decoded.suspend_before_execute);
+    try std.testing.expectEqual(@as(usize, 1), decoded.actions.len);
+    try std.testing.expectError(error.InvalidArguments, parse(std.testing.allocator, &.{
+        "1", "close", "0", "suspend", "--", "/bin/cat",
+    }));
 }
 
 test "worker protocol preserves ordered actions and literal argv without environment" {

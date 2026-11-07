@@ -130,12 +130,21 @@ pub fn main(init: std.process.Init) !habush.runtime.ExitStatus {
         init.environ_map.get("COMPUTERNAME") orelse ""
     else
         std.posix.gethostname(&hostname_buffer) catch "";
+    const editor_setting = init.environ_map.get("HABUSH_LINE_EDIT") orelse "auto";
+    const editor_terminal = if (init.environ_map.get("TERM")) |term|
+        term.len != 0 and !std.mem.eql(u8, term, "dumb")
+    else
+        false;
     var shell: Shell = .{
         .allocator = gpa,
         .stdin = stdin,
         .stderr = stderr,
         .session = &session,
         .interactive = interactive,
+        .io = io,
+        .line_edit = interactive and builtin.os.tag != .windows and
+            !std.mem.eql(u8, editor_setting, "off") and
+            (editor_terminal or std.mem.eql(u8, editor_setting, "on")),
         .integration = if (integration_enabled) .{
             .writer = stderr,
             .hostname = hostname,

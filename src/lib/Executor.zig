@@ -17,12 +17,16 @@ const ConcurrentWriter = @import("concurrent/Writer.zig");
 const Executor = @This();
 const ExecutionContext = @import("ExecutionContext.zig");
 const Expander = @import("Expander.zig");
+const Ast = @import("Ast.zig");
+const AstGen = @import("AstGen.zig");
+const SourceInput = @import("SourceInput.zig");
 const Hir = @import("Hir.zig");
 const Host = @import("Host.zig");
 const Pipeline = @import("Pipeline.zig");
 const runtime = @import("runtime.zig");
 const SandboxPolicy = @import("SandboxPolicy.zig");
 const VariableStore = @import("VariableStore.zig");
+const Tokenizer = @import("tokenizer.zig").Tokenizer;
 
 gpa: std.mem.Allocator,
 host: Host,
@@ -45,7 +49,6 @@ background: bool = false,
 job_control: bool = false,
 concurrent_pipeline: ?ConcurrentPipeline = null,
 cancel_io: ?std.Io = null,
-diagnostic_locations: bool = true,
 loop_depth: u32,
 function_depth: u32,
 
@@ -109,12 +112,14 @@ const PipelineStageKind = enum {
 };
 
 const CommandSelection = union(enum) {
+    empty,
     external,
     builtin: Builtin,
     function,
 
     fn pipelineStageKind(command: CommandSelection) PipelineStageKind {
         return switch (command) {
+            .empty => .builtin,
             .external => .external,
             .builtin => |builtin| if (builtin.pipeline_support == .reads_stdin) .in_process else .builtin,
             .function => .in_process,
@@ -125,6 +130,7 @@ const CommandSelection = union(enum) {
 const PreparedSimpleCommand = struct {
     argv: []const []const u8,
     command: CommandSelection,
+    substitution_status: ?runtime.ExitStatus = null,
 };
 
 const PipelineStagePlan = union(enum) {
@@ -273,13 +279,7 @@ pub fn execute(executor: Executor, hir: Hir) Error!Result {
 
 fn executeInstruction(parent: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
     var executor = parent;
-    executor.io.diagnostic_source = if (executor.diagnostic_locations and hir.instructionTag(index) == .simple_command) blk: {
-        for (hir.simpleCommandParts(index)) |part| {
-            if (hir.instructionTag(part) == .word)
-                break :blk .{ .start = hir.instructionData(part).pl.src_start };
-        }
-        break :blk .{ .start = hir.instructionData(index).pl.src_start };
-    } else null;
+    executor.io.diagnostic_source = instructionSource(hir, index);
     if (executor.cancel_io) |io| try io.checkCancel();
     if (executor.background) {
         if (executor.jobs == null) return error.UnsupportedInstruction;
@@ -316,7 +316,7 @@ fn executeSubshell(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
     var subshell_executor = executor;
     var positional_parameters = executor.positionalParameters();
     subshell_executor.positional_parameters_override = &positional_parameters;
-    var jobs: runtime.Jobs = .{ .gpa = executor.gpa };
+    var jobs: runtime.Jobs = .{ .gpa = executor.gpa, .diagnostic_io = executor.io };
     defer jobs.deinit();
     defer jobs.cancelAll();
     subshell_executor.jobs = &jobs;
@@ -660,7 +660,7 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
         if (executor.concurrent_pipeline) |config|
             stage.arena = std.heap.ArenaAllocator.init(config.allocator);
         const stage_allocator = stage.allocator(executor.gpa);
-        stage.jobs = .{ .gpa = stage_allocator };
+        stage.jobs = .{ .gpa = stage_allocator, .diagnostic_io = executor.io };
         stage.context = try executor.context.clone(stage_allocator);
         // A surrounding compound redirection changes the current executor's
         // streams without replacing the session's context. Stage snapshots
@@ -726,6 +726,7 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
     const foreground_job = !executor.background and in_process_count == 0 and !upstream_builtin and
         executor.jobs != null and executor.jobs.?.terminal_control;
     pipeline.create_group = (executor.background or foreground_job) and executor.host.capabilities().process_groups;
+    pipeline.suspend_on_start = foreground_job and executor.host.capabilities().suspend_before_execute;
 
     if (executor.concurrent_pipeline) |config| {
         if (non_external_count > 1) return executor.executeConcurrentPipeline(
@@ -779,8 +780,10 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
                 result.sandbox_coverage,
                 stage_result.sandbox_coverage,
             );
+            const unspawned = pipeline.status(stage_index) == .pending;
+            if (unspawned) pipeline.completeUnspawned(stage_index, stage_result.status);
             pipeline.closeStage(stage_index);
-            if (executor.background and pipeline.status(stage_index) == .pending) {
+            if (executor.background and unspawned) {
                 pipeline.signal(.kill) catch {};
                 return stage_result;
             }
@@ -800,6 +803,8 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
 
     for (0..stages.items.len) |stage_index| {
         if (try pipeline.wait(stage_index)) |termination| {
+            if (pipeline.takeStartupFailure(stage_index)) |failure|
+                try executor.io.reportStartupFailure(failure.context, failure.reason);
             const status = try terminationStatus(termination);
             if (stage_index + 1 == stages.items.len) result.status = status;
         }
@@ -868,6 +873,7 @@ fn executeConcurrentPipeline(
         if (stage.plan.?.kind() != .external) task_count += 1;
         switch (stage.plan.?) {
             .simple => |simple| switch (simple.command) {
+                .empty => {},
                 .external, .function => requires_signals = true,
                 .builtin => {},
             },
@@ -939,6 +945,8 @@ fn executeConcurrentPipeline(
         var stage_result = try stage_executor.executeInstruction(hir, prepared[remaining].index);
         stage_result.control_flow = .none;
         results[remaining] = stage_result;
+        if (pipeline.status(remaining) == .pending)
+            pipeline.completeUnspawned(remaining, stage_result.status);
         pipeline.closeStage(remaining);
     }
 
@@ -976,6 +984,8 @@ fn executeConcurrentPipeline(
             return err;
         };
         if (termination) |value| {
+            if (pipeline.takeStartupFailure(stage_index)) |failure|
+                try executor.io.reportStartupFailure(failure.context, failure.reason);
             if (stage_index + 1 == prepared.len)
                 result.status = try terminationStatus(value);
         }
@@ -984,11 +994,13 @@ fn executeConcurrentPipeline(
 }
 
 fn preparePipelineStage(
-    executor: Executor,
+    parent: Executor,
     hir: Hir,
     index: Hir.Inst.Index,
     allocator: std.mem.Allocator,
 ) Error!PipelineStagePreparation {
+    var executor = parent;
+    executor.io.diagnostic_source = instructionSource(hir, index);
     if (hir.instructionTag(index) != .simple_command) return switch (hir.instructionTag(index)) {
         .subshell,
         .brace_group,
@@ -1001,8 +1013,35 @@ fn preparePipelineStage(
         else => error.UnsupportedInstruction,
     };
 
+    // Substitutions may read this stage's stdin or wait for peer stages. They
+    // must execute after pipeline startup, with this stage's stream bindings.
+    for (hir.simpleCommandParts(index)) |part| {
+        const value = switch (hir.instructionTag(part)) {
+            .word => part,
+            .assignment => hir.assignment(part).value,
+            .redirect => hir.redirect(part).target,
+            else => continue,
+        };
+        for (hir.wordParts(value)) |word_part| switch (hir.instructionTag(word_part)) {
+            .command_substitution, .double_quoted_command_substitution => return .{ .ready = .compound },
+            .braced_parameter, .double_quoted_braced_parameter => {
+                if (std.mem.indexOf(u8, hir.wordPart(word_part), "$(") != null)
+                    return .{ .ready = .compound };
+            },
+            else => {},
+        };
+        if (hir.instructionTag(part) == .redirect) {
+            if (hir.redirect(part).here_document.unwrap()) |document| {
+                const body = hir.hereDocument(document);
+                if (body.expand_body and body.body != null and std.mem.indexOf(u8, body.body.?, "$(") != null)
+                    return .{ .ready = .compound };
+            }
+        }
+    }
     var expansion_failure: Expander.Failure = undefined;
-    const expander = executor.wordExpander(allocator, null, &expansion_failure);
+    var substitution_status: ?runtime.ExitStatus = null;
+    var expander = executor.wordExpander(allocator, null, &expansion_failure);
+    expander.context.substitution_status = &substitution_status;
     var argv: std.ArrayList([]const u8) = .empty;
     for (hir.simpleCommandParts(index)) |part| switch (hir.instructionTag(part)) {
         .assignment, .redirect => {},
@@ -1018,10 +1057,13 @@ fn preparePipelineStage(
         },
         else => return error.UnsupportedInstruction,
     };
-    if (argv.items.len == 0) return error.UnsupportedInstruction;
     const expanded_argv = try argv.toOwnedSlice(allocator);
-    const command = executor.resolveCommand(expanded_argv[0]);
-    return .{ .ready = .{ .simple = .{ .argv = expanded_argv, .command = command } } };
+    const command: CommandSelection = if (expanded_argv.len == 0) .empty else executor.resolveCommand(expanded_argv[0]);
+    return .{ .ready = .{ .simple = .{
+        .argv = expanded_argv,
+        .command = command,
+        .substitution_status = substitution_status,
+    } } };
 }
 
 fn resolveCommand(executor: Executor, name: []const u8) CommandSelection {
@@ -1055,9 +1097,22 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
     var arena = std.heap.ArenaAllocator.init(executor.gpa);
     defer arena.deinit();
     const allocator = arena.allocator();
+    if (executor.pipeline_stage != null and executor.prepared_simple == null) {
+        var resources: std.ArrayList(CommandPlan.Resource) = .empty;
+        defer closeRedirectResources(executor.host, &resources);
+        var scope = switch (try executor.beginSimpleCommandRedirections(&.{}, &resources, allocator)) {
+            .ready => |ready| ready,
+            .failed => |failure| return failure,
+        };
+        defer scope.deinit();
+        scope.executor.pipeline_stage = null;
+        return scope.executor.executeSimpleCommand(hir, index);
+    }
     const variables = executor.variableStore();
     var expansion_failure: Expander.Failure = undefined;
-    const expander = executor.wordExpander(allocator, null, &expansion_failure);
+    var substitution_status: ?runtime.ExitStatus = if (executor.prepared_simple) |prepared| prepared.substitution_status else null;
+    var expander = executor.wordExpander(allocator, null, &expansion_failure);
+    expander.context.substitution_status = &substitution_status;
 
     var argv: std.ArrayList([]const u8) = .empty;
     if (executor.prepared_simple) |prepared| try argv.appendSlice(allocator, prepared.argv);
@@ -1102,7 +1157,6 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
         )) |failure| return failure;
     }
     if (argv.items.len == 0) {
-        if (executor.pipeline_stage != null) return error.UnsupportedInstruction;
         var scope = switch (try executor.beginRedirections(
             file_actions.items,
             &redirect_resources,
@@ -1113,7 +1167,7 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
         };
         defer scope.deinit();
         if (!has_assignments) return if (has_words or has_redirects)
-            .{ .status = 0, .sandbox_coverage = .not_requested }
+            .{ .status = substitution_status orelse 0, .sandbox_coverage = .not_requested }
         else
             error.UnsupportedInstruction;
         const mutable_variables = variables orelse return error.VariableStateUnavailable;
@@ -1129,7 +1183,7 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
             };
             try mutable_variables.set(assignment.name, value);
         }
-        return .{ .status = 0, .sandbox_coverage = .not_requested };
+        return .{ .status = substitution_status orelse 0, .sandbox_coverage = .not_requested };
     }
 
     var command_variables = VariableStore.init(allocator);
@@ -1138,11 +1192,12 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
         for (parts) |part| {
             if (hir.instructionTag(part) != .assignment) continue;
             const assignment = hir.assignment(part);
-            const assignment_expander = executor.wordExpander(
+            var assignment_expander = executor.wordExpander(
                 allocator,
                 &command_variables,
                 &expansion_failure,
             );
+            assignment_expander.context.substitution_status = &substitution_status;
             const value = assignment_expander.expandAssignment(hir, assignment.value) catch |err| switch (err) {
                 error.ParameterExpansionFailed => return executor.parameterExpansionFailure(
                     allocator,
@@ -1158,6 +1213,7 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
     else
         executor.resolveCommand(argv.items[0]);
     switch (command) {
+        .empty => unreachable,
         .builtin => |candidate| {
             if (executor.background) return error.UnsupportedInstruction;
             if (executor.pipeline_stage != null and !candidate.supportsPipeline())
@@ -1213,17 +1269,21 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
     );
 
     const resolver = executor.resolver orelse return error.CommandResolutionUnavailable;
+    var command_failure: ?CommandPlan.CommandFailure = null;
     const executable = (resolver.resolve(allocator, .{
         .name = argv.items[0],
         .search_path = try executor.commandSearchPath(allocator, &command_variables),
         .cwd = executor.workingDirectory(),
     }) catch |err| switch (err) {
-        error.AccessDenied => return executor.commandFailure(
-            argv.items[0],
-            .{ .cannot_execute = .access_denied },
-        ),
+        error.AccessDenied => denied: {
+            command_failure = .access_denied;
+            break :denied null;
+        },
         error.OutOfMemory, error.Unexpected => return err,
-    }) orelse return executor.commandFailure(argv.items[0], .command_not_found);
+    }) orelse unresolved: {
+        if (command_failure == null) command_failure = .command_not_found;
+        break :unresolved argv.items[0];
+    };
 
     var effective_file_actions: std.ArrayList(CommandPlan.FileAction) = .empty;
     if (executor.background and !executor.job_control and
@@ -1262,6 +1322,7 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
         .cwd = if (executor.workingDirectory()) |cwd| .{ .path = cwd } else .inherit,
         .file_actions = effective_file_actions.items,
         .sandbox = executor.activeSandbox(),
+        .command_failure = command_failure,
     };
     if (executor.pipeline_stage == null and
         (executor.background or (executor.jobs != null and executor.jobs.?.terminal_control)))
@@ -1269,6 +1330,9 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
         const jobs = executor.jobs orelse return error.UnsupportedInstruction;
         var started = try Pipeline.startWithOptions(executor.gpa, executor.host, &.{plan}, .{
             .process_group = executor.host.capabilities().process_groups,
+            .suspend_on_start = !executor.background and jobs.terminal_control and
+                executor.host.capabilities().suspend_before_execute,
+            .origins = &.{executor.io.diagnostic_source},
         });
         switch (started) {
             .failed => |failure| return executor.spawnFailure(
@@ -1291,7 +1355,7 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
         }
     }
     const spawn_outcome = (if (executor.pipeline_stage) |stage|
-        stage.pipeline.spawn(stage.index, plan)
+        stage.pipeline.spawnWithOrigin(stage.index, plan, executor.io.diagnostic_source)
     else
         executor.host.spawn(plan)) catch |err| switch (err) {
         error.OutOfMemory, error.InvalidArguments, error.Unexpected => return err,
@@ -1326,6 +1390,11 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
         _ = executor.host.wait(spawned.process) catch {};
         return err;
     };
+    if (termination == .spawn_failed) try executor.io.reportStartupFailure(.{
+        .command = argv.items[0],
+        .file_actions = effective_file_actions.items,
+        .source = executor.io.diagnostic_source,
+    }, termination.spawn_failed);
     return .{
         .status = try terminationStatus(termination),
         .sandbox_coverage = spawned.sandbox_coverage,
@@ -1386,7 +1455,7 @@ fn beginHirRedirections(
 }
 
 fn appendRedirectActions(
-    executor: Executor,
+    parent: Executor,
     hir: Hir,
     redirect_index: Hir.Inst.Index,
     allocator: std.mem.Allocator,
@@ -1395,7 +1464,9 @@ fn appendRedirectActions(
     actions: *std.ArrayList(CommandPlan.FileAction),
     resources: *std.ArrayList(CommandPlan.Resource),
 ) Error!?Result {
+    var executor = parent;
     const redirect = hir.redirect(redirect_index);
+    executor.io.diagnostic_source = instructionSource(hir, redirect.target);
     const target = if (redirect.io_number) |io_number| target: {
         const descriptor = CommandPlan.FileDescriptor.parse(io_number) orelse
             return try executor.redirectFailure(.{ .invalid_file_descriptor = io_number });
@@ -1785,9 +1856,6 @@ fn executeFunction(executor: Executor, argv: []const []const u8) Error!Result {
     defer definition.deinit(executor.gpa);
 
     var function_executor = executor;
-    // Function HIR can originate from an earlier input, whose source is not
-    // retained. Do not attach those offsets to the invoking input's diagnostics.
-    function_executor.diagnostic_locations = false;
     var positional_parameters = argv[1..];
     function_executor.positional_parameters_override = &positional_parameters;
     function_executor.loop_depth = 0;
@@ -1803,7 +1871,7 @@ fn variableStore(executor: Executor) ?*VariableStore {
 }
 
 fn wordExpander(
-    executor: Executor,
+    executor: *const Executor,
     allocator: std.mem.Allocator,
     overrides: ?*const VariableStore,
     failure: *Expander.Failure,
@@ -1817,7 +1885,132 @@ fn wordExpander(
         .background_process_id = if (executor.jobs) |jobs| jobs.backgroundProcessIdText() else null,
         .last_status = executor.last_status,
         .failure = failure,
+        .command_substitution = .{
+            .userdata = executor,
+            .run = runCommandSubstitution,
+        },
     });
+}
+
+fn runCommandSubstitution(
+    userdata: *const anyopaque,
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    location: ?@import("Source.zig").Location,
+    overrides: ?*const VariableStore,
+    last_status: runtime.ExitStatus,
+) Expander.Error!Expander.CommandSubstitution.Result {
+    const parent: *const Executor = @ptrCast(@alignCast(userdata));
+    // A context restriction governs external children, not this evaluator.
+    // Restricting the whole shell process permits these operations inside its
+    // domain; a child-only request cannot confine temporary capture or builtins.
+    if (parent.activeSandbox() != .inherit) return error.SandboxUnavailable;
+    var input = SourceInput.collect(allocator, source) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.CommandSubstitutionFailed,
+    };
+    defer input.deinit(allocator);
+    var tree = Ast.parseWithOptions(allocator, input.source, .{ .collected_here_documents = input.here_documents }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.CommandSubstitutionFailed,
+    };
+    defer tree.deinit(allocator);
+    if (tree.errors.len != 0 or tree.status != .complete) return error.CommandSubstitutionFailed;
+    var hir = AstGen.generate(allocator, tree) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.CommandSubstitutionFailed,
+    };
+    defer hir.deinit(allocator);
+    try hir.source.?.setInputMapping(allocator, input.original_source, input.mappings);
+    if (location) |span| {
+        if (span.origin) |origin| {
+            if (span.originalSlice()) |raw| {
+                const mappings = try Hir.Source.composeMappings(allocator, input.mappings, span);
+                defer allocator.free(mappings);
+                try hir.source.?.setInputMapping(allocator, raw, mappings);
+            }
+            var inner = origin;
+            const raw_range = span.originalRange();
+            inner.base_offset = if (origin.base_offset) |base|
+                if (raw_range) |range| std.math.add(u32, base, range.start) catch null else null
+            else
+                null;
+            inner.line_offset += if (raw_range) |range|
+                std.mem.count(u8, origin.originalBytes()[0..range.start], "\n")
+            else
+                std.mem.count(u8, origin.text[0..span.start], "\n");
+            try hir.source.?.setOrigin(allocator, inner);
+        }
+    }
+
+    const capture = try parent.host.createCapture();
+    defer parent.host.closeResource(capture);
+    const output = parent.host.resourceWriter(capture) orelse return error.CommandSubstitutionUnavailable;
+    var nested = parent.*;
+    nested.last_status = last_status;
+    var state = if (parent.runtime_state) |state| try state.cloneWithAllocator(allocator) else null;
+    defer if (state) |*owned| owned.deinit();
+    if (state) |*owned| nested.runtime_state = owned;
+    var variables = if (parent.variables) |variables|
+        try variables.clone(allocator)
+    else if (parent.runtime_state == null)
+        VariableStore.init(allocator)
+    else
+        null;
+    defer if (variables) |*owned| owned.deinit();
+    if (variables) |*owned| nested.variables = owned;
+    if (overrides) |bindings| {
+        const destination = nested.variableStore() orelse return error.VariableStateUnavailable;
+        try applyAssignments(destination, bindings);
+        var iterator = bindings.iterator();
+        while (iterator.next()) |binding| try destination.setExported(binding.name, true);
+    }
+    var context = try parent.context.clone(allocator);
+    defer context.deinit();
+    nested.context = .{ .mutable = &context };
+    nested.io = parent.io;
+    nested.io.stdout = output;
+    nested.io.diagnostic_source = null;
+    context.io = nested.io;
+    nested.gpa = allocator;
+    nested.background = false;
+    nested.job_control = false;
+    nested.pipeline_stage = null;
+    nested.prepared_simple = null;
+    nested.loop_depth = 0;
+    var parameters = parent.positionalParameters();
+    nested.positional_parameters_override = &parameters;
+    var actions: std.ArrayList(CommandPlan.FileAction) = .empty;
+    defer actions.deinit(allocator);
+    try actions.appendSlice(allocator, parent.scoped_file_actions);
+    try actions.append(allocator, .{ .use_resource = .{ .resource = capture, .target = .stdout } });
+    nested.scoped_file_actions = actions.items;
+    var jobs: runtime.Jobs = .{
+        .gpa = allocator,
+        .diagnostic_io = nested.io,
+        .last_background_process_id = if (parent.jobs) |jobs| jobs.last_background_process_id else null,
+    };
+    defer finishSubstitutionJobs(parent.*, &jobs);
+    nested.jobs = &jobs;
+    const result = try nested.execute(hir);
+    finishSubstitutionJobs(parent.*, &jobs);
+    jobs = .{ .gpa = allocator, .diagnostic_io = nested.io };
+    try output.flush();
+    const reader = parent.host.resourceReader(capture) orelse return error.CommandSubstitutionUnavailable;
+    const bytes = reader.allocRemaining(allocator, .unlimited) catch |err| switch (err) {
+        error.StreamTooLong => return error.ResourceUnavailable,
+        else => |other| return other,
+    };
+    return .{ .output = bytes, .status = result.status };
+}
+
+fn finishSubstitutionJobs(executor: Executor, jobs: *runtime.Jobs) void {
+    const previous = if (executor.cancel_io) |io| io.swapCancelProtection(.blocked) else null;
+    defer {
+        if (previous) |value| _ = executor.cancel_io.?.swapCancelProtection(value);
+    }
+    jobs.cancelAll();
+    jobs.deinit();
 }
 
 fn parameterExpansionFailure(
@@ -1898,6 +2091,42 @@ fn commandFailure(
     return .{
         .status = diagnostic.status(),
         .sandbox_coverage = .not_requested,
+    };
+}
+
+fn instructionSource(hir: Hir, index: Hir.Inst.Index) ?runtime.Diagnostic.Source {
+    const location_index = if (hir.instructionTag(index) == .simple_command) command: {
+        for (hir.simpleCommandParts(index)) |part|
+            if (hir.instructionTag(part) == .word) break :command part;
+        break :command index;
+    } else index;
+    const start = switch (hir.instructionTag(location_index)) {
+        .simple_command,
+        .word,
+        .assignment,
+        .redirect,
+        .list,
+        .here_document,
+        .subshell,
+        .brace_group,
+        .if_clause,
+        .while_clause,
+        .until_clause,
+        .for_clause,
+        .function_definition,
+        => hir.instructionData(location_index).pl.src_start,
+        .negated_pipeline => hir.instructionData(location_index).un.src_start,
+        .pipe, .pipe_and, .and_if, .or_if => return instructionSource(hir, hir.instructionData(location_index).bin.lhs),
+        else => return null,
+    };
+    const origin = hir.sourceView() orelse return .{ .start = start };
+    if (start >= origin.text.len) return .{ .start = start, .origin = origin };
+    var tokenizer = Tokenizer.init(origin.text[start.. :0]);
+    const token = tokenizer.next();
+    return .{
+        .start = start,
+        .end = std.math.cast(u32, @as(usize, start) + token.loc.end),
+        .origin = origin,
     };
 }
 

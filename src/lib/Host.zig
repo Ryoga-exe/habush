@@ -33,6 +33,7 @@ pub const VTable = struct {
     ) SpawnError!OpenFileOutcome,
     create_pipe: *const fn (?*anyopaque) Error!Pipe,
     create_input: *const fn (?*anyopaque, []const u8) Error!CommandPlan.Resource,
+    create_capture: ?*const fn (?*anyopaque) Error!CommandPlan.Resource = null,
     close_resource: *const fn (?*anyopaque, CommandPlan.Resource) void,
     resource_writer: *const fn (?*anyopaque, CommandPlan.Resource) ?*std.Io.Writer,
     resource_reader: ?*const fn (?*anyopaque, CommandPlan.Resource) ?*std.Io.Reader = null,
@@ -97,6 +98,8 @@ pub const Signal = enum {
 pub const Capabilities = struct {
     process_groups: bool = false,
     terminal_control: bool = false,
+    /// A fresh worker can stop before target execution and terminal IO.
+    suspend_before_execute: bool = false,
     poll: bool = false,
     signals: bool = false,
     /// openFile may run concurrently with other Host operations. The host
@@ -178,6 +181,8 @@ pub const ProcessEvent = struct {
 
 pub fn spawn(host: Host, plan: CommandPlan) SpawnError!SpawnOutcome {
     plan.validate() catch return error.InvalidArguments;
+    if (plan.suspend_before_execute and !host.capabilities().suspend_before_execute)
+        return .{ .failed = .unsupported };
     return host.vtable.spawn(host.userdata, plan);
 }
 
@@ -278,6 +283,16 @@ pub fn resourceWriter(host: Host, resource: CommandPlan.Resource) ?*std.Io.Write
 pub fn resourceReader(host: Host, resource: CommandPlan.Resource) ?*std.Io.Reader {
     const callback = host.vtable.resource_reader orelse return null;
     return callback(host.userdata, resource);
+}
+
+/// Creates a host-owned output capture. Write through resourceWriter or an
+/// inherited child stdout, then flush and finish all writers before requesting
+/// resourceReader. Its reader starts at offset zero independently of the write
+/// position. The host may spool to storage instead of a bounded pipe; callers
+/// decide how much data to retain while reading. Close with closeResource.
+pub fn createCapture(host: Host) Error!CommandPlan.Resource {
+    const callback = host.vtable.create_capture orelse return error.Unsupported;
+    return callback(host.userdata);
 }
 
 /// Resolves and validates a directory using the host platform's path rules.

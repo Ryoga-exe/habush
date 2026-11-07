@@ -58,11 +58,13 @@ fn finish(astgen: *AstGen) Error!Hir {
     errdefer astgen.gpa.free(string_bytes);
     const extra = try astgen.extra.toOwnedSlice(astgen.gpa);
     errdefer astgen.gpa.free(extra);
+    const source = try Hir.Source.init(astgen.gpa, .{ .text = astgen.tree.source });
 
     return .{
         .instructions = instructions,
         .string_bytes = string_bytes,
         .extra = extra,
+        .source = source,
     };
 }
 
@@ -437,7 +439,13 @@ fn word(astgen: *AstGen, node: Ast.Node.Index) Error!Hir.Inst.Index {
             .tag = switch (part.tag) {
                 inline else => |tag| @field(Hir.Inst.Tag, @tagName(tag)),
             },
-            .data = .{ .str = value },
+            .data = switch (part.tag) {
+                .command_substitution, .double_quoted_command_substitution, .braced_parameter, .double_quoted_braced_parameter => .{ .pl = .{
+                    .src_start = part.start,
+                    .payload_index = try astgen.addExtra(value),
+                } },
+                else => .{ .str = value },
+            },
         });
         try astgen.scratch.append(astgen.gpa, @intFromEnum(instruction));
     }

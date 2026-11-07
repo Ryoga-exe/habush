@@ -56,6 +56,7 @@ const FileResource = struct {
     writer: ?std.Io.File.Writer,
     readable: bool = false,
     reader: ?std.Io.File.Reader = null,
+    positional_read: bool = false,
     // `read` uses takeByte, so a one-byte buffer does not read past the
     // consumed byte before a child inherits the descriptor. Other Reader
     // operations can still read ahead and need shared input ownership.
@@ -181,6 +182,7 @@ const vtable: Host.VTable = .{
     .capabilities = .{
         .process_groups = builtin.os.tag != .windows and builtin.os.tag != .wasi,
         .terminal_control = builtin.os.tag != .windows and builtin.os.tag != .wasi,
+        .suspend_before_execute = builtin.os.tag != .windows and builtin.os.tag != .wasi,
         .poll = builtin.os.tag != .wasi,
         .signals = builtin.os.tag != .wasi,
         .parallel_open_file = true,
@@ -197,6 +199,7 @@ const vtable: Host.VTable = .{
     .open_file = openFile,
     .create_pipe = createPipe,
     .create_input = createInput,
+    .create_capture = createCapture,
     .close_resource = closeResource,
     .resource_writer = resourceWriter,
     .resource_reader = resourceReader,
@@ -241,6 +244,17 @@ fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.SpawnError!Host.SpawnOut
         const worker_executable = system.worker_executable orelse return .{ .failed = .sandbox_unavailable };
         return backend.launch(system.gpa, system.io, system.workerHost(), worker_executable, plan);
     }
+    if (plan.suspend_before_execute) {
+        if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return .{ .failed = .unsupported };
+        const worker_executable = system.worker_executable orelse return .{ .failed = .unsupported };
+        return command_worker.launch(system.gpa, system.workerHost(), worker_executable, plan) catch |err| switch (err) {
+            error.Unsupported => if (firstFifoAction(system, plan) == null)
+                system.launchPreboundWorker(worker_executable, plan)
+            else
+                .{ .failed = .unsupported },
+            else => |other| return other,
+        };
+    }
     // FIFO opens can wait for another stage. Defer those actions to a fresh
     // worker so the parent can finish launching its peers. Ordinary file opens
     // retain their existing structured failures and source-order behavior.
@@ -254,6 +268,30 @@ fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.SpawnError!Host.SpawnOut
         return fileActionFailure(action_index, .unsupported);
     }
     return system.spawnNative(plan, false);
+}
+
+/// Ordinary interleaved resource actions already work through native stdio
+/// preparation. Preserve their order instead of making interactive execution
+/// less capable. Blocking FIFO and restricted opens never enter this fallback.
+fn launchPreboundWorker(system: *System, executable: []const u8, plan: CommandPlan) Host.SpawnError!Host.SpawnOutcome {
+    std.debug.assert(plan.sandbox == .inherit);
+    var target = plan;
+    target.file_actions = &.{};
+    var prepared = command_worker.prepare(system.gpa, target) catch |err| switch (err) {
+        error.Unsupported => return .{ .failed = .unsupported },
+        else => |other| return other,
+    };
+    defer prepared.deinit(system.gpa);
+    var arguments: std.ArrayList([]const u8) = .empty;
+    defer arguments.deinit(system.gpa);
+    try arguments.appendSlice(system.gpa, &.{ executable, command_worker.argument });
+    try arguments.appendSlice(system.gpa, prepared.arguments);
+    var wrapped = plan;
+    wrapped.executable = executable;
+    wrapped.argv = arguments.items;
+    wrapped.command_failure = null;
+    wrapped.suspend_before_execute = false;
+    return system.workerHost().spawn(wrapped);
 }
 
 fn spawnWorker(userdata: ?*anyopaque, plan: CommandPlan) Host.SpawnError!Host.SpawnOutcome {
@@ -356,6 +394,11 @@ fn spawnNative(system: *System, plan: CommandPlan, bootstrap_worker: bool) Host.
             },
         }
     }
+
+    if (plan.command_failure) |failure| return .{ .failed = switch (failure) {
+        .command_not_found => .command_not_found,
+        .access_denied => .access_denied,
+    } };
 
     var child_io = [_]std.process.SpawnOptions.StdIo{
         spawnStdio(bindings[0], .stdin),
@@ -545,6 +588,17 @@ fn registerResource(system: *System, initial: FileResource) std.mem.Allocator.Er
     return resource;
 }
 
+fn createCapture(userdata: ?*anyopaque) Host.Error!CommandPlan.Resource {
+    const system: *System = @ptrCast(@alignCast(userdata.?));
+    const resource = try createInput(userdata, &.{});
+    system.resource_mutex.lockUncancelable(system.io);
+    defer system.resource_mutex.unlock(system.io);
+    const data = system.resources.get(resource).?;
+    data.writer = data.file().writerStreaming(system.io, &.{});
+    data.positional_read = true;
+    return resource;
+}
+
 fn createInput(userdata: ?*anyopaque, bytes: []const u8) Host.Error!CommandPlan.Resource {
     const system: *System = @ptrCast(@alignCast(userdata.?));
     const permissions: std.Io.File.Permissions = switch (builtin.os.tag) {
@@ -656,8 +710,10 @@ fn resourceReader(userdata: ?*anyopaque, resource: CommandPlan.Resource) ?*std.I
     defer system.resource_mutex.unlock(system.io);
     const data = system.resources.get(resource) orelse return null;
     if (!data.readable) return null;
-    if (data.reader == null)
-        data.reader = data.file().readerStreaming(system.io, &data.read_buffer);
+    if (data.reader == null) data.reader = if (data.positional_read)
+        data.file().reader(system.io, &data.read_buffer)
+    else
+        data.file().readerStreaming(system.io, &data.read_buffer);
     const reader = &(data.reader orelse return null);
     return &reader.interface;
 }
@@ -1769,6 +1825,29 @@ test "system host provides seekable input resources to child processes" {
     try std.testing.expectEqualStrings("ere-document contents\n", output);
 }
 
+test "capture reads from zero after both parent and child output exceed a pipe buffer" {
+    var system: System = .{ .gpa = std.testing.allocator, .io = std.testing.io };
+    defer system.deinit();
+    const system_host = system.host();
+    const capture = try system_host.createCapture();
+    defer system_host.closeResource(capture);
+    const writer = system_host.resourceWriter(capture).?;
+    const bytes = try std.testing.allocator.alloc(u8, 256 * 1024);
+    defer std.testing.allocator.free(bytes);
+    @memset(bytes, 'a');
+    try writer.writeAll(bytes);
+    try writer.flush();
+    var plan = outputCommand("tail");
+    plan.file_actions = &.{.{ .use_resource = .{ .resource = capture, .target = .stdout } }};
+    try expectExitStatus(system_host, plan, 0);
+    const reader = system_host.resourceReader(capture).?;
+    var actual: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer actual.deinit();
+    _ = try reader.streamRemaining(&actual.writer);
+    try std.testing.expectEqualSlices(u8, bytes, actual.written()[0..bytes.len]);
+    try std.testing.expectEqualStrings(if (builtin.os.tag == .windows) "tail\r\n" else "tail", actual.written()[bytes.len..]);
+}
+
 test "system host creates and closes pipeline resources" {
     var system: System = .{ .gpa = std.testing.allocator, .io = std.testing.io };
     defer system.deinit();
@@ -1784,6 +1863,37 @@ test "system host creates and closes pipeline resources" {
     system_host.closeResource(pipeline_pipe.write_end);
     system_host.closeResource(pipeline_pipe.read_end);
     try std.testing.expectEqual(@as(usize, 0), system.resources.count());
+}
+
+test "known lookup failures preserve ordered redirect effects and errors" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var directory_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const directory_len = try temporary.dir.realPath(std.testing.io, &directory_buffer);
+    var system: System = .{ .gpa = std.testing.allocator, .io = std.testing.io };
+    defer system.deinit();
+    var plan: CommandPlan = .{
+        .executable = "missing",
+        .argv = &.{"missing"},
+        .cwd = .{ .path = directory_buffer[0..directory_len] },
+        .command_failure = .command_not_found,
+        .file_actions = &.{
+            .{ .open = .{ .path = "first", .target = .stdout, .access = .write, .disposition = .create_or_truncate } },
+            .{ .open = .{ .path = "second", .target = .stdout, .access = .write, .disposition = .create_or_truncate } },
+        },
+    };
+    try std.testing.expectEqualDeep(Host.SpawnOutcome{ .failed = .command_not_found }, try system.host().spawn(plan));
+    for ([_][]const u8{ "first", "second" }) |path| {
+        const stat = try temporary.dir.statFile(std.testing.io, path, .{});
+        try std.testing.expectEqual(@as(u64, 0), stat.size);
+    }
+    plan.file_actions = &.{
+        .{ .open = .{ .path = "absent/output", .target = .stdout, .access = .write, .disposition = .create_or_truncate } },
+        .{ .open = .{ .path = "never", .target = .stdout, .access = .write, .disposition = .create_or_truncate } },
+    };
+    try std.testing.expectEqualDeep(Host.SpawnOutcome{ .failed = .{ .file_action = .{ .action_index = 0, .reason = .not_found } } }, try system.host().spawn(plan));
+    try std.testing.expectError(error.FileNotFound, temporary.dir.statFile(std.testing.io, "never", .{}));
+    try std.testing.expectEqual(@as(usize, 0), system.children.count());
 }
 
 test "system host duplicates redirected standard streams" {
@@ -2006,4 +2116,16 @@ test "malformed worker report still consumes the terminal process handle" {
     try std.testing.expectEqualDeep(Host.Termination{ .unknown = 0 }, termination);
     try std.testing.expect(!system.children.contains(process));
     try std.testing.expectError(error.InvalidArguments, system.host().tryWait(process));
+}
+
+test "startup suspension without a worker is rejected before creating children" {
+    var system: System = .{ .gpa = std.testing.allocator, .io = std.testing.io };
+    defer system.deinit();
+    const outcome = try system.host().spawn(.{
+        .executable = "/bin/cat",
+        .argv = &.{"/bin/cat"},
+        .suspend_before_execute = true,
+    });
+    try std.testing.expectEqualDeep(Host.SpawnOutcome{ .failed = .unsupported }, outcome);
+    try std.testing.expectEqual(@as(usize, 0), system.children.count());
 }

@@ -54,6 +54,13 @@ pub const Options = struct {
 
 pub const EvaluateOptions = struct {
     collected_here_documents: []const heredoc.Collected = &.{},
+    source_name: ?[]const u8 = null,
+    source_revision: ?u64 = null,
+    /// Physical line preceding the parser-input unit (zero based).
+    source_line_offset: usize = 0,
+    source_base_offset: ?u32 = 0,
+    original_source: ?[:0]const u8 = null,
+    source_mappings: []const Hir.Source.Mapping = &.{},
 };
 
 pub const EvaluationId = evaluation.Id;
@@ -87,7 +94,7 @@ pub fn init(
         .host = host,
         .resolver = options.resolver,
         .context = context,
-        .jobs = .{ .gpa = gpa, .terminal_control = options.job_control },
+        .jobs = .{ .gpa = gpa, .terminal_control = options.job_control, .diagnostic_io = context.io },
         .concurrent_pipeline = options.concurrent_pipeline,
         .observer = options.observer,
         .state = try runtime.State.init(gpa, .{
@@ -132,6 +139,9 @@ pub fn execute(session: *Session, hir: Hir) Executor.Error!Executor.Result {
             executor.io.diagnostic_sink = serialized_sink.sink();
         }
     }
+    const previous_job_io = session.jobs.diagnostic_io;
+    session.jobs.diagnostic_io = executor.io;
+    defer session.jobs.diagnostic_io = previous_job_io;
     const result = try executor.execute(hir);
     session.last_result = result;
     return result;
@@ -159,7 +169,7 @@ pub fn evaluate(
         .source = source,
         .cwd = session.workingDirectory(),
     } });
-    const result = session.evaluateInput(source, options) catch |err| {
+    const result = session.evaluateInput(source, options, id) catch |err| {
         if (observer) |sink| sink.notify(sink.userdata, .{ .finished = .{
             .id = id,
             .outcome = .{ .failed = err },
@@ -181,6 +191,7 @@ fn evaluateInput(
     session: *Session,
     source: [:0]const u8,
     options: EvaluateOptions,
+    id: EvaluationId,
 ) EvaluateError!Evaluation {
     const gpa = session.allocator();
     var tree = try Ast.parseWithOptions(gpa, source, .{
@@ -194,6 +205,16 @@ fn evaluateInput(
 
     var hir = try AstGen.generate(gpa, tree);
     defer hir.deinit(gpa);
+    if (hir.source) |*origin| try origin.setOrigin(gpa, .{
+        .text = source,
+        .name = options.source_name,
+        .id = @intFromEnum(id),
+        .revision = options.source_revision,
+        .line_offset = options.source_line_offset,
+        .base_offset = options.source_base_offset,
+    });
+    if (options.original_source) |original|
+        try hir.source.?.setInputMapping(gpa, original, options.source_mappings);
     if (hir.root() == null) {
         session.last_result = .{
             .status = session.last_result.status,
@@ -221,6 +242,12 @@ fn evaluateInput(
 /// rejection and must not call this operation.
 pub fn rejectInput(session: *Session) void {
     session.last_result = .{ .status = 2, .sandbox_coverage = .not_requested };
+}
+
+/// Records an input-adapter cancellation before evaluation begins. This does
+/// not submit input or emit an evaluation lifecycle pair.
+pub fn interruptInput(session: *Session) void {
+    session.last_result = .{ .status = 130, .sandbox_coverage = .not_requested };
 }
 
 pub fn workingDirectory(session: Session) ?[]const u8 {

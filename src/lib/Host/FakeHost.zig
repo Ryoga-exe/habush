@@ -20,6 +20,7 @@ resource_reader_override: ?*std.Io.Reader = null,
 next_process: u32 = 1,
 next_process_group: u32 = 1,
 next_resource: u32 = 1,
+captures: std.AutoHashMapUnmanaged(CommandPlan.Resource, *Capture) = .empty,
 termination: Host.Termination = .{ .exited = 0 },
 spawn_error: ?Host.SpawnError = null,
 spawn_failure: ?Host.SpawnFailure = null,
@@ -42,6 +43,11 @@ pub const OpenFileCall = struct {
 };
 
 pub const SignalCall = struct { process: Host.Process, signal: Host.Signal };
+
+const Capture = struct {
+    output: std.Io.Writer.Allocating,
+    reader: ?std.Io.Reader = null,
+};
 
 pub fn init(gpa: std.mem.Allocator) FakeHost {
     return .{
@@ -72,6 +78,7 @@ const vtable: Host.VTable = .{
     .open_file = openFile,
     .create_pipe = createPipe,
     .create_input = createInput,
+    .create_capture = createCapture,
     .close_resource = closeResource,
     .resource_writer = resourceWriter,
     .resource_reader = resourceReader,
@@ -86,6 +93,17 @@ fn createPipe(userdata: ?*anyopaque) Host.Error!Host.Pipe {
     const write_end: CommandPlan.Resource = @enumFromInt(fake.next_resource);
     fake.next_resource +%= 1;
     return .{ .read_end = read_end, .write_end = write_end };
+}
+
+fn createCapture(userdata: ?*anyopaque) Host.Error!CommandPlan.Resource {
+    const fake: *FakeHost = @ptrCast(@alignCast(userdata.?));
+    const allocator = fake.arena.allocator();
+    const capture = try allocator.create(Capture);
+    capture.* = .{ .output = .init(allocator) };
+    const resource: CommandPlan.Resource = @enumFromInt(fake.next_resource);
+    fake.next_resource +%= 1;
+    try fake.captures.put(allocator, resource, capture);
+    return resource;
 }
 
 fn createInput(userdata: ?*anyopaque, bytes: []const u8) Host.Error!CommandPlan.Resource {
@@ -129,12 +147,13 @@ fn openFile(
 
 fn closeResource(userdata: ?*anyopaque, resource: CommandPlan.Resource) void {
     const fake: *FakeHost = @ptrCast(@alignCast(userdata.?));
-    _ = resource;
     fake.closed_resource_count += 1;
+    _ = fake.captures.remove(resource);
 }
 
 fn resourceWriter(userdata: ?*anyopaque, resource: CommandPlan.Resource) ?*std.Io.Writer {
     const fake: *FakeHost = @ptrCast(@alignCast(userdata.?));
+    if (fake.captures.get(resource)) |capture| return &capture.output.writer;
     if (@intFromEnum(resource) == 0 or @intFromEnum(resource) >= fake.next_resource) return null;
     if (fake.resource_writer_override) |writer| return writer;
     return &fake.redirected_output.writer;
@@ -142,6 +161,10 @@ fn resourceWriter(userdata: ?*anyopaque, resource: CommandPlan.Resource) ?*std.I
 
 fn resourceReader(userdata: ?*anyopaque, resource: CommandPlan.Resource) ?*std.Io.Reader {
     const fake: *FakeHost = @ptrCast(@alignCast(userdata.?));
+    if (fake.captures.get(resource)) |capture| {
+        if (capture.reader == null) capture.reader = .fixed(capture.output.written());
+        return &capture.reader.?;
+    }
     if (@intFromEnum(resource) == 0 or @intFromEnum(resource) >= fake.next_resource) return null;
     return fake.resource_reader_override;
 }
@@ -149,6 +172,24 @@ fn resourceReader(userdata: ?*anyopaque, resource: CommandPlan.Resource) ?*std.I
 fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.SpawnError!Host.SpawnOutcome {
     const fake: *FakeHost = @ptrCast(@alignCast(userdata.?));
     if (fake.spawn_error) |err| return err;
+    if (plan.command_failure) |failure| {
+        for (plan.file_actions, 0..) |action, action_index| {
+            if (action == .open) {
+                const opened = try openFile(userdata, plan.cwd, action.open);
+                switch (opened) {
+                    .failed => |reason| return .{ .failed = .{ .file_action = .{
+                        .action_index = @intCast(action_index),
+                        .reason = reason,
+                    } } },
+                    .opened => |resource| closeResource(userdata, resource),
+                }
+            }
+        }
+        return .{ .failed = switch (failure) {
+            .command_not_found => .command_not_found,
+            .access_denied => .access_denied,
+        } };
+    }
     if (fake.spawn_failure) |failure| {
         if (fake.spawn_calls.items.len >= fake.spawn_failure_after)
             return .{ .failed = failure };
@@ -210,7 +251,9 @@ fn clonePlan(allocator: std.mem.Allocator, plan: CommandPlan) !CommandPlan {
         },
         .file_actions = actions,
         .process_group = plan.process_group,
+        .suspend_before_execute = plan.suspend_before_execute,
         .sandbox = try plan.sandbox.clone(allocator),
+        .command_failure = plan.command_failure,
     };
 }
 

@@ -10,6 +10,7 @@ const Hir = @import("Hir.zig");
 const SandboxPolicy = @import("SandboxPolicy.zig");
 const Session = @import("Session.zig");
 const Diagnostic = @import("runtime/Diagnostic.zig");
+const Source = @import("Source.zig");
 
 test "evaluation events pair outcomes and reject callback reentry" {
     const Capture = struct {
@@ -86,40 +87,66 @@ test "evaluation events pair outcomes and reject callback reentry" {
     try std.testing.expectEqual(@as(u8, 7), capture.records[3].status.?);
     try std.testing.expectEqual(error.Unexpected, capture.failure.?);
 
+    session.interruptInput();
+    try std.testing.expectEqual(@as(u8, 130), session.lastResult().status);
+    try std.testing.expectEqual(@as(usize, 10), capture.count);
+
     session.next_evaluation_id = std.math.maxInt(u64);
     try std.testing.expectError(error.EvaluationIdExhausted, session.evaluate("true", .{}));
     try std.testing.expectEqual(@as(usize, 10), capture.count);
 }
 
-test "session delivers borrowed structured diagnostics with original command offsets" {
-    const Capture = struct {
-        count: usize = 0,
-        source: ?Diagnostic.Source = null,
-        command: [32]u8 = undefined,
-        command_len: usize = 0,
+const DiagnosticCapture = struct {
+    count: usize = 0,
+    source: ?Diagnostic.Source = null,
+    origin: ?Source = null,
+    subject: [128]u8 = undefined,
+    subject_len: usize = 0,
+    kind: std.meta.Tag(Diagnostic.Kind) = .command_not_found,
+    worker_reported: bool = false,
 
-        fn report(userdata: ?*anyopaque, diagnostic: Diagnostic) void {
-            const self: *@This() = @ptrCast(@alignCast(userdata.?));
-            self.count += 1;
-            self.source = diagnostic.source;
-            const command = diagnostic.subject.command;
-            @memcpy(self.command[0..command.len], command);
-            self.command_len = command.len;
+    fn deinit(self: *DiagnosticCapture) void {
+        if (self.origin) |*origin| origin.deinit(std.testing.allocator);
+    }
+
+    fn report(userdata: ?*anyopaque, diagnostic: Diagnostic) void {
+        const self: *DiagnosticCapture = @ptrCast(@alignCast(userdata.?));
+        self.count += 1;
+        if (self.origin) |*origin| origin.deinit(std.testing.allocator);
+        self.origin = null;
+        self.source = diagnostic.source;
+        if (self.source) |*location| {
+            if (location.origin) |origin| {
+                self.origin = Source.init(std.testing.allocator, origin) catch unreachable;
+                location.origin = self.origin.?.view();
+            }
         }
-    };
+        const subject = switch (diagnostic.subject) {
+            .shell => "",
+            .command, .path => |value| value,
+        };
+        @memcpy(self.subject[0..subject.len], subject);
+        self.subject_len = subject.len;
+        self.kind = diagnostic.kind;
+        self.worker_reported = diagnostic.worker_reported;
+    }
+};
+
+test "diagnostics retain exact ranges and the source of stored function bodies" {
     var fake = FakeHost.init(std.testing.allocator);
     defer fake.deinit();
     var resolver = FakeResolver.init(std.testing.allocator);
     defer resolver.deinit();
     resolver.result = null;
-    var capture: Capture = .{};
+    var capture: DiagnosticCapture = .{};
+    defer capture.deinit();
     var stderr: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer stderr.deinit();
     var session = try Session.init(std.testing.allocator, fake.host(), .{
         .resolver = resolver.resolver(),
         .context = .{ .io = .{
             .stderr = &stderr.writer,
-            .diagnostic_sink = .{ .userdata = &capture, .report = Capture.report },
+            .diagnostic_sink = .{ .userdata = &capture, .report = DiagnosticCapture.report },
         } },
     });
     defer session.deinit();
@@ -128,16 +155,171 @@ test "session delivers borrowed structured diagnostics with original command off
     try std.testing.expectEqual(@as(u8, 127), result.executed.status);
     try std.testing.expectEqual(@as(usize, 1), capture.count);
     try std.testing.expectEqual(@as(u32, 26), capture.source.?.start);
-    try std.testing.expect(capture.source.?.end == null);
-    try std.testing.expectEqualStrings("missing", capture.command[0..capture.command_len]);
+    try std.testing.expectEqualStrings("\"$command_name\"", capture.source.?.slice().?);
+    try std.testing.expectEqualStrings("missing", capture.subject[0..capture.subject_len]);
     try std.testing.expectEqualStrings("", stderr.written());
 
-    var definition = try session.evaluate("f() { missing; }", .{});
-    defer definition.deinit(session.allocator());
-    var invocation = try session.evaluate("f", .{});
+    const input = try std.testing.allocator.dupeZ(u8, "f() { missing; }");
+    var definition = try session.evaluate(input, .{
+        .source_name = "definitions.hb",
+        .source_revision = 9,
+        .source_line_offset = 20,
+    });
+    definition.deinit(session.allocator());
+    @memset(input, 'x');
+    std.testing.allocator.free(input);
+    var invocation = try session.evaluate("f", .{ .source_name = "invocation.hb" });
     defer invocation.deinit(session.allocator());
     try std.testing.expectEqual(@as(usize, 2), capture.count);
-    try std.testing.expect(capture.source == null);
+    try std.testing.expectEqualStrings("missing", capture.source.?.slice().?);
+    try std.testing.expectEqualStrings("definitions.hb", capture.origin.?.name.?);
+    try std.testing.expectEqual(@as(?u64, 9), capture.origin.?.revision);
+    try std.testing.expectEqual(@as(?u64, 2), capture.origin.?.id);
+    try std.testing.expectEqual(@as(usize, 20), capture.origin.?.line_offset);
+
+    var pipeline = try session.evaluate("f | true", .{ .source_name = "pipeline.hb" });
+    defer pipeline.deinit(session.allocator());
+    try std.testing.expectEqual(@as(usize, 3), capture.count);
+    try std.testing.expectEqualStrings("missing", capture.source.?.slice().?);
+    try std.testing.expectEqualStrings("definitions.hb", capture.origin.?.name.?);
+}
+
+test "delayed worker diagnostics preserve background command and path attribution" {
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    fake.termination = .{ .spawn_failed = .{ .file_action = .{ .action_index = 1, .reason = .access_denied } } };
+    var capture: DiagnosticCapture = .{};
+    defer capture.deinit();
+    var stderr: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer stderr.deinit();
+    var session = try Session.init(std.testing.allocator, fake.host(), .{
+        .resolver = CommandResolver.preResolved(),
+        .context = .{ .io = .{
+            .stderr = &stderr.writer,
+            .diagnostic_sink = .{ .userdata = &capture, .report = DiagnosticCapture.report },
+        } },
+    });
+    defer session.deinit();
+    const input = try std.testing.allocator.dupeZ(u8, "/bin/tool > denied &");
+    var launched = try session.evaluate(input, .{ .source_name = "submitted.hb" });
+    launched.deinit(session.allocator());
+    @memset(input, 'x');
+    std.testing.allocator.free(input);
+    try std.testing.expectEqual(@as(usize, 0), capture.count);
+    var waited = try session.evaluate("wait $!", .{ .source_name = "later.hb" });
+    defer waited.deinit(session.allocator());
+    try std.testing.expectEqual(@as(u8, 1), waited.executed.status);
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqualStrings("denied", capture.subject[0..capture.subject_len]);
+    try std.testing.expectEqualStrings("/bin/tool", capture.source.?.slice().?);
+    try std.testing.expectEqualStrings("submitted.hb", capture.origin.?.name.?);
+    try std.testing.expectEqual(@as(?u64, 1), capture.origin.?.id);
+    try std.testing.expect(capture.worker_reported);
+    try std.testing.expectEqualStrings("", stderr.written());
+    try session.jobs.poll();
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+}
+
+test "nested substitution diagnostics map through raw CRLF here-document sources" {
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var resolver = FakeResolver.init(std.testing.allocator);
+    defer resolver.deinit();
+    var capture: DiagnosticCapture = .{};
+    defer capture.deinit();
+    var session = try Session.init(std.testing.allocator, fake.host(), .{
+        .resolver = resolver.resolver(),
+        .context = .{ .io = .{
+            .diagnostic_sink = .{ .userdata = &capture, .report = DiagnosticCapture.report },
+        } },
+    });
+    defer session.deinit();
+    const scripts = [_][:0]const u8{
+        "value=$(missing)",
+        "value=$(inner=$(missing))",
+        "value=$(cat <<EOF\r\nlong body\r\nEOF\r\nmissing)",
+        "value=$(cat <<EOF\r\nlong body\r\nEOF\r\ninner=$(missing))",
+    };
+    for (scripts, 0..) |script, index| {
+        var result = try session.evaluate(script, .{
+            .source_name = "nested.hb",
+            .source_base_offset = 200,
+            .source_line_offset = 4,
+            .source_revision = 12,
+        });
+        defer result.deinit(session.allocator());
+        const expected = std.mem.indexOf(u8, script, "missing").?;
+        const source = capture.source.?;
+        const origin = capture.origin.?.view();
+        try std.testing.expectEqualStrings("missing", source.originalSlice().?);
+        try std.testing.expectEqualStrings("nested.hb", origin.name.?);
+        try std.testing.expectEqual(@as(?u64, index + 1), origin.id);
+        try std.testing.expectEqual(@as(?u64, 12), origin.revision);
+        try std.testing.expectEqual(@as(u32, @intCast(200 + expected)), source.absoluteRange().?.start);
+        const actual_line = origin.line_offset + std.mem.count(u8, origin.text[0..source.start], "\n");
+        try std.testing.expectEqual(4 + std.mem.count(u8, script[0..expected], "\n"), actual_line);
+    }
+    var unknown = try session.evaluate("value=$(missing)", .{ .source_base_offset = null });
+    defer unknown.deinit(session.allocator());
+    try std.testing.expect(capture.source.?.absoluteRange() == null);
+}
+
+test "parameter replacement substitutions retain their static source origins" {
+    const Filter = struct {
+        fn report(userdata: ?*anyopaque, diagnostic: Diagnostic) void {
+            if (diagnostic.kind == .command_not_found)
+                DiagnosticCapture.report(userdata, diagnostic);
+        }
+    };
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var resolver = FakeResolver.init(std.testing.allocator);
+    defer resolver.deinit();
+    var capture: DiagnosticCapture = .{};
+    defer capture.deinit();
+    var session = try Session.init(std.testing.allocator, fake.host(), .{
+        .resolver = resolver.resolver(),
+        .context = .{ .io = .{
+            .diagnostic_sink = .{ .userdata = &capture, .report = Filter.report },
+        } },
+    });
+    defer session.deinit();
+    const scripts = [_][:0]const u8{
+        ": ${fallback:-$(missing)}",
+        ": \"${fallback:-$(missing)}\"",
+        "assigned=\"${fallback:=$(missing)}\"",
+        ": \"${fallback:?$(missing)}\"",
+        ": \"${fallback:-${also:-$(missing)}}\"",
+        "value=$(: <<EOF\r\nlong body\r\nEOF\r\n: \"${fallback:-$(missing)}\")",
+    };
+    for (scripts, 0..) |script, index| {
+        const before = capture.count;
+        var result = try session.evaluate(script, .{
+            .source_name = "parameters.hb",
+            .source_base_offset = 500,
+            .source_line_offset = 12,
+            .source_revision = 42,
+        });
+        result.deinit(session.allocator());
+        try std.testing.expectEqual(before + 1, capture.count);
+        const expected = std.mem.indexOf(u8, script, "missing").?;
+        const location = capture.source.?;
+        const origin = capture.origin.?.view();
+        try std.testing.expectEqualStrings("missing", location.originalSlice().?);
+        try std.testing.expectEqualStrings("parameters.hb", origin.name.?);
+        try std.testing.expectEqual(@as(?u64, index + 1), origin.id);
+        try std.testing.expectEqual(@as(?u64, 42), origin.revision);
+        try std.testing.expectEqual(@as(u32, @intCast(500 + expected)), location.absoluteRange().?.start);
+        try std.testing.expectEqual(
+            12 + std.mem.count(u8, script[0..expected], "\n"),
+            origin.line_offset + std.mem.count(u8, origin.text[0..location.start], "\n"),
+        );
+    }
+    try session.setVariable("literal", "$(missing)");
+    const before = capture.count;
+    var literal = try session.evaluate(": \"${fallback:-$literal}\"", .{});
+    defer literal.deinit(session.allocator());
+    try std.testing.expectEqual(before, capture.count);
 }
 
 test "background jobs retain process state until wait consumes the result" {

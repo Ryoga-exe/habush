@@ -1,6 +1,7 @@
 //! In-progress parser state. Converted to an `Ast` after parsing.
 
 const std = @import("std");
+const SourceInput = @import("SourceInput.zig");
 const Allocator = std.mem.Allocator;
 const Ast = @import("Ast.zig");
 const Node = Ast.Node;
@@ -123,6 +124,7 @@ pub fn parseWithOptions(
             .unterminated_double_quote,
             .unterminated_escape,
             .unterminated_parameter_expansion,
+            .unterminated_command_substitution,
             => status = .{ .incomplete = .{ .lexical = token_index } },
             else => {},
         }
@@ -1072,6 +1074,10 @@ fn parseWordParts(
     source: []const u8,
     source_start: Ast.ByteOffset,
 ) Ast.ParseError!Ast.WordPartRange {
+    if (!try parser.validateWordSubstitutions(source)) try parser.warn(.{
+        .tag = .invalid_command_substitution,
+        .token = parser.tok_i - 1,
+    });
     const part_start = std.math.cast(u32, parser.word_parts.len) orelse
         return error.SourceTooLarge;
     var iterator = word.Iterator.init(source, source_start);
@@ -1086,6 +1092,28 @@ fn parseWordParts(
         .start = @enumFromInt(part_start),
         .end = @enumFromInt(part_end),
     };
+}
+
+fn validateWordSubstitutions(parser: *Parse, source: []const u8) Ast.ParseError!bool {
+    var iterator = word.Iterator.init(source, 0);
+    while (iterator.next()) |part| switch (part.tag) {
+        .command_substitution, .double_quoted_command_substitution => {
+            var input = SourceInput.collect(parser.gpa, source[part.start..part.end]) catch |err| switch (err) {
+                error.UnterminatedHereDocument => return false,
+                else => |other| return other,
+            };
+            defer input.deinit(parser.gpa);
+            var inner = try Ast.parseWithOptions(parser.gpa, input.source, .{ .collected_here_documents = input.here_documents });
+            defer inner.deinit(parser.gpa);
+            if (inner.status != .complete or inner.errors.len != 0) return false;
+        },
+        .braced_parameter, .double_quoted_braced_parameter => {
+            const expansion = word.ParameterExpansion.parse(source[part.start..part.end]) orelse continue;
+            if (expansion.word.len != 0 and !try parser.validateWordSubstitutions(expansion.word)) return false;
+        },
+        else => {},
+    };
+    return true;
 }
 
 fn parseRedirect(parser: *Parse) Ast.ParseError!Node.Index {

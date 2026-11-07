@@ -89,4 +89,5 @@ test "prompt and command boundaries carry status without capturing output" {
 
 test {
     _ = @import("osc.zig");
+    _ = @import("render.zig");
 }

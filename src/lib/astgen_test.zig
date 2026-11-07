@@ -14,6 +14,26 @@ test "generates empty input" {
     try std.testing.expect(hir.root() == null);
 }
 
+test "command substitution word parts own nested source and quoting" {
+    var tree = try Ast.parse(std.testing.allocator, "echo pre$(printf '%s' \"$(echo nested)\")post \"$(echo ')')\" $((1 + 2))");
+    defer tree.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+    try std.testing.expect(tree.status == .complete);
+    var hir = try AstGen.generate(std.testing.allocator, tree);
+    defer hir.deinit(std.testing.allocator);
+    const parts = hir.simpleCommandParts(firstCommand(hir));
+    const unquoted = hir.wordParts(parts[1]);
+    try std.testing.expectEqual(@as(usize, 3), unquoted.len);
+    try std.testing.expectEqual(Hir.Inst.Tag.command_substitution, hir.instructionTag(unquoted[1]));
+    try std.testing.expectEqualStrings("printf '%s' \"$(echo nested)\"", hir.wordPart(unquoted[1]));
+    try std.testing.expectEqual(Hir.Inst.Tag.double_quoted_command_substitution, hir.instructionTag(hir.wordParts(parts[2])[0]));
+    try std.testing.expectEqual(Hir.Inst.Tag.arithmetic_substitution, hir.instructionTag(hir.wordParts(parts[3])[0]));
+
+    var incomplete = try Ast.parse(std.testing.allocator, "echo $(echo nested");
+    defer incomplete.deinit(std.testing.allocator);
+    try std.testing.expect(incomplete.status == .incomplete);
+}
+
 test "generates a simple command while preserving part order" {
     const source = "A=one >out echo \"$name\" 2>>log";
     var tree = try Ast.parse(std.testing.allocator, source);

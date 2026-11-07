@@ -7,6 +7,8 @@ pub const AstGen = @import("AstGen.zig");
 pub const Builtin = @import("Builtin.zig");
 pub const CommandPlan = @import("CommandPlan.zig");
 pub const CommandResolver = @import("CommandResolver.zig");
+pub const Completion = @import("Completion.zig");
+pub const edit = @import("edit.zig");
 pub const concurrent = @import("concurrent.zig");
 pub const Executor = @import("Executor.zig");
 pub const Evaluation = @import("evaluation.zig").Result;
@@ -23,6 +25,7 @@ pub const runtime = @import("runtime.zig");
 pub const SandboxPolicy = @import("SandboxPolicy.zig");
 pub const SandboxBackend = @import("SandboxBackend.zig");
 pub const Session = @import("Session.zig");
+pub const Source = @import("Source.zig");
 pub const VariableStore = @import("VariableStore.zig");
 
 test {

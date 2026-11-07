@@ -22,3 +22,18 @@ extern "kernel32" fn SetConsoleCtrlHandler(
     handler: ?*const fn (windows.DWORD) callconv(.winapi) windows.BOOL,
     add: windows.BOOL,
 ) callconv(.winapi) windows.BOOL;
+
+/// The initial editor uses POSIX terminal modes. Windows keeps cooked input.
+pub const LineInput = struct {
+    pub fn init() error{}!?LineInput {
+        return null;
+    }
+    pub fn restore(_: *LineInput) error{}!void {}
+    pub fn deinit(_: *LineInput) void {}
+    pub fn ready(_: LineInput, _: i32) bool {
+        return false;
+    }
+    pub fn columns(_: LineInput) usize {
+        return 80;
+    }
+};

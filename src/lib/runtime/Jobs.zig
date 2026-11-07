@@ -5,6 +5,7 @@ const std = @import("std");
 const Host = @import("../Host.zig");
 const Pipeline = @import("../Pipeline.zig");
 const ExitStatus = @import("types.zig").ExitStatus;
+const Io = @import("Io.zig");
 const Jobs = @This();
 
 gpa: std.mem.Allocator,
@@ -13,6 +14,7 @@ next_id: u32 = 1,
 terminal_control: bool = false,
 last_background_process_id: ?@import("types.zig").ProcessId = null,
 process_id_buffer: [10]u8 = undefined,
+diagnostic_io: Io = .{},
 
 pub const Id = enum(u32) { _ };
 pub const Options = struct { negated: bool = false, background: bool = true };
@@ -122,12 +124,16 @@ pub fn latest(jobs: *Jobs) ?Id {
 }
 
 pub fn poll(jobs: *Jobs) Host.Error!void {
-    for (jobs.entries.items) |*entry| _ = try entry.pipeline.poll();
+    for (jobs.entries.items) |*entry| {
+        _ = try entry.pipeline.poll();
+        try jobs.reportFailures(&entry.pipeline);
+    }
 }
 
 pub fn wait(jobs: *Jobs, id: Id) Host.Error!?ExitStatus {
     const entry = jobs.get(id) orelse return null;
     _ = try entry.pipeline.waitEvents();
+    try jobs.reportFailures(&entry.pipeline);
     const status = entry.exitStatus() orelse return error.Unexpected;
     if (entry.pipeline.state() == .completed) jobs.remove(id);
     return status;
@@ -154,6 +160,13 @@ pub fn foreground(jobs: *Jobs, id: Id) Host.Error!?ExitStatus {
     var lease: ?Host.TerminalLease = null;
     const host = entry.pipeline.host;
     defer if (lease) |token| host.releaseTerminal(token) catch {};
+    if (entry.pipeline.suspend_on_start) {
+        // Every worker stops before the target can read the TTY. Observe the
+        // startup barrier before handing over the terminal and resuming the
+        // group; no reader can race into SIGTTIN before this point.
+        _ = try entry.pipeline.waitEvents();
+        entry.pipeline.suspend_on_start = false;
+    }
     _ = try entry.pipeline.poll();
     if (entry.pipeline.state() != .completed) {
         if (jobs.terminal_control) {
@@ -180,9 +193,17 @@ pub fn foreground(jobs: *Jobs, id: Id) Host.Error!?ExitStatus {
         try host.releaseTerminal(token);
         lease = null;
     }
+    try jobs.reportFailures(&entry.pipeline);
     const result = entry.exitStatus() orelse return error.Unexpected;
     if (entry.pipeline.state() == .completed) jobs.remove(id);
     return result;
+}
+
+fn reportFailures(jobs: Jobs, pipeline: *Pipeline) Host.Error!void {
+    for (0..pipeline.stageCount()) |index| {
+        if (pipeline.takeStartupFailure(index)) |failure|
+            try jobs.diagnostic_io.reportStartupFailure(failure.context, failure.reason);
+    }
 }
 
 fn remove(jobs: *Jobs, id: Id) void {
@@ -212,4 +233,23 @@ test "job status survives polling until wait consumes it" {
     try std.testing.expectEqual(@as(?ExitStatus, 29), try jobs.wait(id));
     try std.testing.expect((try jobs.wait(id)) == null);
     try std.testing.expectEqual(@as(usize, 0), fake.wait_calls.items.len);
+}
+
+test "foreground jobs consume pipelines containing a stage that never spawned" {
+    const FakeHost = @import("../Host/FakeHost.zig");
+    for ([_]usize{ 0, 1 }) |failed_stage| {
+        var fake = FakeHost.init(std.testing.allocator);
+        defer fake.deinit();
+        var pipeline = try Pipeline.init(std.testing.allocator, fake.host(), 2);
+        var transferred = false;
+        defer if (!transferred) pipeline.deinit();
+        pipeline.completeUnspawned(failed_stage, 127);
+        _ = try pipeline.spawn(1 - failed_stage, .{ .executable = "/child", .argv = &.{"child"} });
+        var jobs: Jobs = .{ .gpa = std.testing.allocator, .terminal_control = true };
+        defer jobs.deinit();
+        const id = try jobs.add(pipeline, "pipeline", .{ .background = false });
+        transferred = true;
+        try std.testing.expectEqual(@as(ExitStatus, if (failed_stage == 1) 127 else 0), (try jobs.foreground(id)).?);
+        try std.testing.expectEqual(@as(usize, 0), jobs.entries.items.len);
+    }
 }

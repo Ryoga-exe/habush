@@ -194,6 +194,7 @@ pub const Error = struct {
 
     pub const Tag = enum {
         invalid_token,
+        invalid_command_substitution,
         unexpected_token,
         expected_token,
         expected_command,
@@ -299,6 +300,7 @@ pub fn renderError(tree: *const Ast, parse_error: Error, writer: *Writer) Writer
     const found = Token.symbol(tree.tokenTag(parse_error.token));
     return switch (parse_error.tag) {
         .invalid_token => writer.print("invalid token '{s}'", .{tree.tokenSlice(parse_error.token)}),
+        .invalid_command_substitution => writer.writeAll("invalid command substitution syntax"),
         .unexpected_token => writer.print("unexpected token '{s}'", .{found}),
         .expected_token => writer.print("expected '{s}', found '{s}'", .{
             Token.symbol(parse_error.extra.expected_tag),

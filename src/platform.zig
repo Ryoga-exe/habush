@@ -16,6 +16,7 @@ const implementation = switch (builtin.os.tag) {
 };
 
 pub const installInteractiveInterruptHandler = implementation.installInteractiveInterruptHandler;
+pub const LineInput = implementation.LineInput;
 pub fn processId() ProcessId {
     return @enumFromInt(implementation.processId());
 }

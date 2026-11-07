@@ -6,19 +6,17 @@
 const std = @import("std");
 const Diagnostic = @This();
 const types = @import("types.zig");
+const Host = @import("../Host.zig");
+const Pipeline = @import("../Pipeline.zig");
 
 subject: Subject,
 kind: Kind,
 source: ?Source = null,
+/// The fresh worker already attempted its legacy stderr presentation. A sink
+/// still receives this diagnostic, while the default parent renderer skips it.
+worker_reported: bool = false,
 
-/// Byte offsets in the source used to generate the executing HIR. `end` is
-/// exclusive when known; a missing end identifies a point, not a guessed range.
-/// Stored function bodies currently omit this field because their source is
-/// independent of the input that invoked them.
-pub const Source = struct {
-    start: u32,
-    end: ?u32 = null,
-};
+pub const Source = @import("../Source.zig").Location;
 
 /// Receives a borrowed diagnostic synchronously. Copy any data retained after
 /// the callback returns. The callback must not reenter or mutate its Session.
@@ -109,6 +107,45 @@ pub const CannotCreatePipelineReason = enum {
 pub const RenderOptions = struct {
     program_name: ?[]const u8 = null,
 };
+
+pub fn fromStartupFailure(context: Pipeline.FailureContext, failure: Host.SpawnFailure) error{Unexpected}!Diagnostic {
+    var diagnostic: Diagnostic = .{
+        .subject = .{ .command = context.command },
+        .kind = .command_not_found,
+        .source = context.source,
+        .worker_reported = true,
+    };
+    diagnostic.kind = switch (failure) {
+        .command_not_found => .command_not_found,
+        .access_denied => .{ .cannot_execute = .access_denied },
+        .invalid_executable => .{ .cannot_execute = .invalid_executable },
+        .resource_unavailable => .{ .cannot_execute = .resource_unavailable },
+        .sandbox_unavailable => .{ .cannot_execute = .sandbox_unavailable },
+        .unsupported => .{ .cannot_execute = .unsupported },
+        .file_action => |file_action| action: {
+            if (file_action.action_index >= context.file_actions.len) return error.Unexpected;
+            switch (context.file_actions[file_action.action_index]) {
+                .open => |open| {
+                    diagnostic.subject = .{ .path = open.path };
+                    break :action .{ .cannot_open = switch (file_action.reason) {
+                        .not_found => .not_found,
+                        .access_denied => .access_denied,
+                        .invalid_path => .invalid_path,
+                        .path_already_exists => .path_already_exists,
+                        .resource_unavailable => .resource_unavailable,
+                        .unsupported => .unsupported,
+                    } };
+                },
+                .duplicate, .close, .use_resource => break :action switch (file_action.reason) {
+                    .resource_unavailable => .{ .cannot_execute = .resource_unavailable },
+                    .unsupported => .{ .cannot_execute = .unsupported },
+                    else => return error.Unexpected,
+                },
+            }
+        },
+    };
+    return diagnostic;
+}
 
 pub fn status(diagnostic: Diagnostic) types.ExitStatus {
     return switch (diagnostic.kind) {
