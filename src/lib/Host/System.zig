@@ -408,6 +408,8 @@ fn spawnNative(system: *System, plan: CommandPlan, bootstrap_worker: bool) Host.
                     return fileActionFailure(action_index, .unsupported);
                 const target = stdioIndex(duplicate.target) orelse
                     return fileActionFailure(action_index, .unsupported);
+                if (bindings[source] == .close)
+                    return fileActionFailure(action_index, .bad_file_descriptor);
                 bindings[target] = bindings[source];
             },
             .close => |descriptor| {
@@ -1951,6 +1953,32 @@ test "known lookup failures preserve ordered redirect effects and errors" {
     };
     try std.testing.expectEqualDeep(Host.SpawnOutcome{ .failed = .{ .file_action = .{ .action_index = 0, .reason = .not_found } } }, try system.host().spawn(plan));
     try std.testing.expectError(error.FileNotFound, temporary.dir.statFile(std.testing.io, "never", .{}));
+    try std.testing.expectEqual(@as(usize, 0), system.children.count());
+}
+
+test "system host rejects a closed duplicate source before spawning" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const len = try temporary.dir.realPath(std.testing.io, &buffer);
+    var system: System = .{ .gpa = std.testing.allocator, .io = std.testing.io };
+    defer system.deinit();
+    const result = try system.host().spawn(.{
+        .executable = "/bin/touch",
+        .argv = &.{ "/bin/touch", "marker" },
+        .cwd = .{ .path = buffer[0..len] },
+        .file_actions = &.{
+            .{ .open = .{ .path = "first", .target = .stdout, .access = .write, .disposition = .create_or_truncate } },
+            .{ .close = .stdout },
+            .{ .duplicate = .{ .source = .stdout, .target = .stderr } },
+        },
+    });
+    try std.testing.expectEqualDeep(Host.SpawnOutcome{ .failed = .{ .file_action = .{
+        .action_index = 2,
+        .reason = .bad_file_descriptor,
+    } } }, result);
+    _ = try temporary.dir.statFile(std.testing.io, "first", .{});
+    try std.testing.expectError(error.FileNotFound, temporary.dir.statFile(std.testing.io, "marker", .{}));
     try std.testing.expectEqual(@as(usize, 0), system.children.count());
 }
 

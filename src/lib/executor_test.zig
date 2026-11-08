@@ -1360,7 +1360,7 @@ test "builtin redirections replace runtime output only for the command scope" {
 }
 
 test "read uses redirected input only within its command scope" {
-    var hir = try generate("read FIRST <input; read SECOND");
+    var hir = try generate("read FIRST 1<>input 0<&1; read SECOND");
     defer hir.deinit(std.testing.allocator);
     var fake = FakeHost.init(std.testing.allocator);
     defer fake.deinit();
@@ -1448,6 +1448,29 @@ test "failed scoped redirections prevent command side effects" {
     try std.testing.expectEqualStrings("original", variables.get("persisted").?);
     try std.testing.expectEqualStrings("missing: no such file or directory\n", diagnostics.written());
     try std.testing.expectEqual(@as(usize, 0), fake.closed_resource_count);
+}
+
+test "copying a closed stream stops builtin and compound side effects" {
+    for ([_][:0]const u8{ "pwd >first 1>&- 2>&1", "{ persisted=changed; } >first 1>&- 1>&1" }) |source| {
+        var hir = try generate(source);
+        defer hir.deinit(std.testing.allocator);
+        var fake = FakeHost.init(std.testing.allocator);
+        defer fake.deinit();
+        var variables = VariableStore.init(std.testing.allocator);
+        defer variables.deinit();
+        try variables.set("persisted", "original");
+        var diagnostics: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer diagnostics.deinit();
+        const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+            .variables = &variables,
+            .context = .{ .io = .{ .stderr = &diagnostics.writer } },
+        }).execute(hir);
+        try std.testing.expectEqual(@as(u8, 1), result.status);
+        try std.testing.expectEqualStrings("original", variables.get("persisted").?);
+        try std.testing.expectEqualStrings("bad file descriptor: 1\n", diagnostics.written());
+        try std.testing.expectEqual(@as(usize, 1), fake.open_file_calls.items.len);
+        try std.testing.expectEqual(@as(usize, 1), fake.closed_resource_count);
+    }
 }
 
 test "later scoped redirection failure closes earlier resources" {

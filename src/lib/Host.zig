@@ -168,6 +168,7 @@ pub const FileActionFailure = struct {
         access_denied,
         invalid_path,
         path_already_exists,
+        bad_file_descriptor,
         resource_unavailable,
         unsupported,
     };

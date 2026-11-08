@@ -249,6 +249,7 @@ fn encode(failure: Host.SpawnFailure) [packet_len]u8 {
             .path_already_exists => 4,
             .resource_unavailable => 5,
             .unsupported => 6,
+            .bad_file_descriptor => 7,
         };
         std.mem.writeInt(u32, packet[8..12], failure.file_action.action_index, .little);
     }
@@ -273,6 +274,7 @@ fn decode(packet: *const [packet_len]u8) Error!Host.SpawnFailure {
             4 => .path_already_exists,
             5 => .resource_unavailable,
             6 => .unsupported,
+            7 => .bad_file_descriptor,
             else => return error.Unexpected,
         } } },
         else => error.Unexpected,

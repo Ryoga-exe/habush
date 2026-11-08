@@ -41,6 +41,7 @@ variables: ?*VariableStore,
 runtime_state: ?*runtime.State,
 io: runtime.Io,
 scoped_file_actions: []const CommandPlan.FileAction,
+stream_bindings: ?[3]StreamBinding = null,
 pipeline_stage: ?PipelineStage,
 prepared_simple: ?PreparedSimpleCommand,
 last_status: runtime.ExitStatus,
@@ -53,6 +54,12 @@ loop_depth: u32,
 function_depth: u32,
 
 const max_function_depth = 64;
+
+const StreamBinding = struct {
+    reader: ?*std.Io.Reader = null,
+    writer: ?*std.Io.Writer = null,
+    closed: bool = false,
+};
 
 /// Failures that prevent the runtime from producing a shell-visible `Result`.
 /// Expected command failures are reported through `Result.status` and, when
@@ -1615,6 +1622,11 @@ fn beginRedirections(
             return .{ .failed = try executor.redirectFailure(.{ .cannot_execute = .sandbox_unavailable }) };
     };
     var scoped_executor = executor;
+    var bindings = executor.stream_bindings orelse [3]StreamBinding{
+        .{ .reader = executor.io.stdin },
+        .{ .writer = executor.io.stdout },
+        .{ .writer = executor.io.stderr },
+    };
     var resources = owned_resources.*;
     owned_resources.* = .empty;
     var retain_resources = false;
@@ -1628,70 +1640,66 @@ fn beginRedirections(
     var scoped_actions: std.ArrayList(CommandPlan.FileAction) = .empty;
     try scoped_actions.appendSlice(allocator, executor.scoped_file_actions);
 
-    for (actions) |action| switch (action) {
-        .open => |open| {
-            _ = standardStreamIndex(open.target) orelse
-                return error.UnsupportedInstruction;
-            try resources.ensureUnusedCapacity(allocator, 1);
-            try scoped_actions.ensureUnusedCapacity(allocator, 1);
-            const outcome = try executor.host.openFile(
-                if (executor.workingDirectory()) |cwd| .{ .path = cwd } else .inherit,
-                open,
-            );
-            const resource = switch (outcome) {
-                .opened => |resource| resource,
-                .failed => |reason| return .{ .failed = try scoped_executor.fileOpenFailure(
-                    open.path,
-                    reason,
-                ) },
-            };
-            resources.appendAssumeCapacity(resource);
-            scoped_actions.appendAssumeCapacity(.{ .use_resource = .{
-                .resource = resource,
-                .target = open.target,
-            } });
-            if (open.target == .stdin) {
-                scoped_executor.io.stdin = executor.host.resourceReader(resource);
-            } else {
-                scoped_executor.setRuntimeWriter(
-                    open.target,
-                    executor.host.resourceWriter(resource),
+    for (actions) |action| {
+        switch (action) {
+            .open => |open| {
+                const target = standardStreamIndex(open.target) orelse
+                    return error.UnsupportedInstruction;
+                try resources.ensureUnusedCapacity(allocator, 1);
+                try scoped_actions.ensureUnusedCapacity(allocator, 1);
+                const outcome = try executor.host.openFile(
+                    if (executor.workingDirectory()) |cwd| .{ .path = cwd } else .inherit,
+                    open,
                 );
-            }
-        },
-        .duplicate => |duplicate| {
-            _ = standardStreamIndex(duplicate.source) orelse
-                return error.UnsupportedInstruction;
-            _ = standardStreamIndex(duplicate.target) orelse
-                return error.UnsupportedInstruction;
-            const writer = scoped_executor.runtimeWriter(duplicate.source);
-            scoped_executor.setRuntimeWriter(duplicate.target, writer);
-            if (duplicate.target == .stdin)
-                scoped_executor.io.stdin = if (duplicate.source == .stdin) scoped_executor.io.stdin else null;
-            try scoped_actions.append(allocator, action);
-        },
-        .close => |descriptor| {
-            _ = standardStreamIndex(descriptor) orelse
-                return error.UnsupportedInstruction;
-            scoped_executor.setRuntimeWriter(descriptor, null);
-            if (descriptor == .stdin) scoped_executor.io.stdin = null;
-            try scoped_actions.append(allocator, action);
-        },
-        .use_resource => |use| {
-            _ = standardStreamIndex(use.target) orelse
-                return error.UnsupportedInstruction;
-            if (use.target == .stdin) {
-                scoped_executor.io.stdin = executor.host.resourceReader(use.resource);
-            } else {
-                scoped_executor.setRuntimeWriter(
-                    use.target,
-                    executor.host.resourceWriter(use.resource),
-                );
-            }
-            try scoped_actions.append(allocator, action);
-        },
-    };
+                const resource = switch (outcome) {
+                    .opened => |resource| resource,
+                    .failed => |reason| return .{ .failed = try scoped_executor.fileOpenFailure(
+                        open.path,
+                        reason,
+                    ) },
+                };
+                resources.appendAssumeCapacity(resource);
+                scoped_actions.appendAssumeCapacity(.{ .use_resource = .{
+                    .resource = resource,
+                    .target = open.target,
+                } });
+                bindings[target] = .{
+                    .reader = executor.host.resourceReader(resource),
+                    .writer = executor.host.resourceWriter(resource),
+                };
+            },
+            .duplicate => |duplicate| {
+                const source = standardStreamIndex(duplicate.source) orelse
+                    return error.UnsupportedInstruction;
+                const target = standardStreamIndex(duplicate.target) orelse
+                    return error.UnsupportedInstruction;
+                if (bindings[source].closed)
+                    return .{ .failed = try scoped_executor.redirectFailure(.{ .bad_file_descriptor = duplicate.source }) };
+                bindings[target] = bindings[source];
+                try scoped_actions.append(allocator, action);
+            },
+            .close => |descriptor| {
+                const target = standardStreamIndex(descriptor) orelse
+                    return error.UnsupportedInstruction;
+                bindings[target] = .{ .closed = true };
+                try scoped_actions.append(allocator, action);
+            },
+            .use_resource => |use| {
+                const target = standardStreamIndex(use.target) orelse
+                    return error.UnsupportedInstruction;
+                bindings[target] = .{
+                    .reader = executor.host.resourceReader(use.resource),
+                    .writer = executor.host.resourceWriter(use.resource),
+                };
+                try scoped_actions.append(allocator, action);
+            },
+        }
+        scoped_executor.io.stdin = bindings[0].reader;
+        scoped_executor.io.stdout = bindings[1].writer;
+        scoped_executor.io.stderr = bindings[2].writer;
+    }
 
+    scoped_executor.stream_bindings = bindings;
     scoped_executor.scoped_file_actions = scoped_actions.items;
     retain_resources = true;
     return .{ .ready = .{
@@ -1734,26 +1742,6 @@ fn closeRedirectResources(
         host.closeResource(resources.items[index]);
     }
     resources.* = .empty;
-}
-
-fn runtimeWriter(executor: Executor, descriptor: CommandPlan.FileDescriptor) ?*std.Io.Writer {
-    return switch (descriptor) {
-        .stdout => executor.io.stdout,
-        .stderr => executor.io.stderr,
-        else => null,
-    };
-}
-
-fn setRuntimeWriter(
-    executor: *Executor,
-    descriptor: CommandPlan.FileDescriptor,
-    writer: ?*std.Io.Writer,
-) void {
-    switch (descriptor) {
-        .stdout => executor.io.stdout = writer,
-        .stderr => executor.io.stderr = writer,
-        else => {},
-    }
 }
 
 fn standardStreamIndex(descriptor: CommandPlan.FileDescriptor) ?usize {
@@ -2215,6 +2203,10 @@ fn spawnFailure(
             return switch (action) {
                 .open => |open| executor.fileOpenFailure(open.path, file_action.reason),
                 .duplicate, .close, .use_resource => switch (file_action.reason) {
+                    .bad_file_descriptor => if (action == .duplicate)
+                        executor.redirectFailure(.{ .bad_file_descriptor = action.duplicate.source })
+                    else
+                        error.Unexpected,
                     .resource_unavailable => executor.commandFailure(
                         command,
                         .{ .cannot_execute = .resource_unavailable },
@@ -2244,6 +2236,7 @@ fn fileOpenFailure(
             .path_already_exists => .path_already_exists,
             .resource_unavailable => .resource_unavailable,
             .unsupported => .unsupported,
+            .bad_file_descriptor => unreachable,
         } },
     };
     try executor.io.reportDiagnostic(diagnostic);

@@ -479,6 +479,9 @@ const ReadInput = struct {
 
     fn remainingField(input: ReadInput, cursor: *usize, ifs: []const u8) []const u8 {
         cursor.* = input.skipWhitespace(cursor.*, ifs);
+        var next = cursor.*;
+        const field = input.nextField(&next, ifs);
+        if (next == input.bytes.items.len) return field;
         var end = input.bytes.items.len;
         while (end > cursor.* and input.separator(end - 1, ifs) == .whitespace)
             end -= 1;
@@ -713,6 +716,29 @@ test "read splits IFS fields and assigns the remaining input to the last name" {
         &.{"read"},
     )).status);
     try std.testing.expectEqualStrings("  reply  ", state.variable("REPLY").?);
+}
+
+test "read drops a final IFS delimiter only when no surplus fields remain" {
+    var state = try runtime.State.init(std.testing.allocator, .{});
+    defer state.deinit();
+    try state.setVariable("IFS", ": ");
+    const cases = .{
+        .{ "a:b:\n", "b" },
+        .{ "a:b:  \n", "b" },
+        .{ "a:b::\n", "b::" },
+        .{ "a:b:c:\n", "b:c:" },
+        .{ "a::\n", "" },
+        .{ "a:b\\:\n", "b:" },
+    };
+    inline for (cases) |case| {
+        var input: std.Io.Reader = .fixed(case[0]);
+        const result = try lookup("read").?.run(.{
+            .runtime_state = &state,
+            .io = .{ .stdin = &input },
+        }, &.{ "read", "FIRST", "LAST" });
+        try std.testing.expectEqual(@as(u8, 0), result.status);
+        try std.testing.expectEqualStrings(case[1], state.variable("LAST").?);
+    }
 }
 
 test "read preserves variables on an input failure" {
