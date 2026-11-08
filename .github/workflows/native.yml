@@ -33,3 +33,23 @@ jobs:
         run: zig build test-sandbox --summary all
       - if: runner.os == 'Linux'
         run: zig build check -Dtarget=x86_64-freebsd --summary all
+
+  freebsd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc # v1
+        with:
+          release: '14.4'
+          copyback: false
+          prepare: pkg install -y python312 ca_root_nss
+          run: |
+            set -eu
+            zig_dir=$(python3.12 test/setup_zig.py)
+            export PATH="$zig_dir:$PATH"
+            zig build test -j2 --summary all
+            zig build install -j2 --summary all
+            python3.12 test/interactive.py zig-out/bin/habush
