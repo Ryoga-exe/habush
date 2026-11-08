@@ -106,6 +106,27 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&pipeline_example.step);
     test_step.dependOn(&sandbox_example.step);
 
+    switch (target.result.os.tag) {
+        .linux, .macos, .freebsd => {
+            const terminal_probe = b.addExecutable(.{
+                .name = "terminal-test",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("test/terminal.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .link_libc = true,
+                }),
+            });
+            if (target.result.os.tag != .macos)
+                terminal_probe.root_module.linkSystemLibrary("util", .{});
+            const terminal_test = b.addRunArtifact(terminal_probe);
+            terminal_test.addArtifactArg(exe);
+            terminal_test.expectExitCode(0);
+            test_step.dependOn(&terminal_test.step);
+        },
+        else => {},
+    }
+
     const command_control_test = b.addRunArtifact(exe);
     command_control_test.setName("test cli exit control flow");
     command_control_test.addArgs(&.{ "-c", "false; exit; missing" });
