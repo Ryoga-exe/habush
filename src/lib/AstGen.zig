@@ -58,14 +58,15 @@ fn finish(astgen: *AstGen) Error!Hir {
     errdefer astgen.gpa.free(string_bytes);
     const extra = try astgen.extra.toOwnedSlice(astgen.gpa);
     errdefer astgen.gpa.free(extra);
-    const source = try Hir.Source.init(astgen.gpa, .{ .text = astgen.tree.source });
+    var source = try Hir.Source.init(astgen.gpa, .{ .text = astgen.tree.source });
+    errdefer source.deinit(astgen.gpa);
 
-    return .{
+    return Hir.initShared(astgen.gpa, .{
         .instructions = instructions,
         .string_bytes = string_bytes,
         .extra = extra,
         .source = source,
-    };
+    });
 }
 
 fn list(astgen: *AstGen, node: Ast.Node.Index) Error!Hir.Inst.Index {

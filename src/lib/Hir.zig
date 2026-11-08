@@ -17,6 +17,12 @@ string_bytes: []u8,
 extra: []u32,
 /// Original parser-input bytes and origin, owned independently of the AST.
 source: ?Source = null,
+shared: ?*Shared = null,
+
+const Shared = struct {
+    references: std.atomic.Value(usize) = .init(1),
+    gpa: Allocator,
+};
 
 pub const ByteOffset = u32;
 
@@ -60,11 +66,41 @@ fn ExtraData(comptime T: type) type {
 }
 
 pub fn deinit(hir: *Hir, gpa: Allocator) void {
+    if (hir.shared) |shared| {
+        std.debug.assert(shared.gpa.ptr == gpa.ptr and shared.gpa.vtable == gpa.vtable);
+        if (shared.references.fetchSub(1, .acq_rel) != 1) {
+            hir.* = undefined;
+            return;
+        }
+        gpa.destroy(shared);
+    }
     hir.instructions.deinit(gpa);
     gpa.free(hir.string_bytes);
     gpa.free(hir.extra);
     if (hir.source) |*source| source.deinit(gpa);
     hir.* = undefined;
+}
+
+/// Transfers the buffers on success. Shared units are immutable after retention.
+pub fn initShared(gpa: Allocator, owned: Hir) Allocator.Error!Hir {
+    std.debug.assert(owned.shared == null);
+    const shared = try gpa.create(Shared);
+    shared.* = .{ .gpa = gpa };
+    var hir = owned;
+    hir.shared = shared;
+    return hir;
+}
+
+/// Shares an immutable unit within its allocator; other allocators get an
+/// independent copy so their lifetime never depends on the original arena.
+pub fn retain(hir: Hir, gpa: Allocator) Allocator.Error!Hir {
+    if (hir.shared) |shared| {
+        if (shared.gpa.ptr == gpa.ptr and shared.gpa.vtable == gpa.vtable) {
+            _ = shared.references.fetchAdd(1, .monotonic);
+            return hir;
+        }
+    }
+    return hir.clone(gpa);
 }
 
 pub fn clone(hir: Hir, gpa: Allocator) Allocator.Error!Hir {
@@ -77,13 +113,15 @@ pub fn clone(hir: Hir, gpa: Allocator) Allocator.Error!Hir {
     errdefer gpa.free(string_bytes);
     var source = if (hir.source) |value| try value.clone(gpa) else null;
     errdefer if (source) |*value| value.deinit(gpa);
+    const extra = try gpa.dupe(u32, hir.extra);
+    errdefer gpa.free(extra);
 
-    return .{
+    return initShared(gpa, .{
         .instructions = instructions,
         .string_bytes = string_bytes,
-        .extra = try gpa.dupe(u32, hir.extra),
+        .extra = extra,
         .source = source,
-    };
+    });
 }
 
 pub fn sourceView(hir: Hir) ?Source.View {
@@ -91,6 +129,16 @@ pub fn sourceView(hir: Hir) ?Source.View {
 }
 
 pub fn setSource(hir: *Hir, gpa: Allocator, source: Source.View) Allocator.Error!void {
+    if (hir.shared) |shared| {
+        if (shared.references.load(.acquire) != 1) {
+            var copy = try hir.clone(gpa);
+            errdefer copy.deinit(gpa);
+            try copy.setSource(gpa, source);
+            hir.deinit(gpa);
+            hir.* = copy;
+            return;
+        }
+    }
     const copy = try Source.init(gpa, source);
     if (hir.source) |*previous| previous.deinit(gpa);
     hir.source = copy;
