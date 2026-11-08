@@ -2034,6 +2034,36 @@ test "break outside a loop reports a command failure" {
     try std.testing.expectEqualStrings("break: not in a loop\n", diagnostics.written());
 }
 
+test "function prefix bindings are exported temporarily while unrelated changes persist" {
+    var hir = try generate(
+        \\f() { seen="$name:$new:$visible"; /bin/env; unset name visible; new=changed; other=kept; }
+        \\name=temporary new=added visible=temporary f
+    );
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var state = try runtime.State.init(std.testing.allocator, .{ .variables = &.{
+        .{ .name = "name", .value = "original" },
+        .{ .name = "visible", .value = "exported", .exported = true },
+    } });
+    defer state.deinit();
+    var context = try ExecutionContext.init(std.testing.allocator, .{});
+    defer context.deinit();
+    _ = try Executor.initWithState(fake.host(), CommandResolver.preResolved(), &state, &context, 0).execute(hir);
+    try std.testing.expectEqualStrings("temporary:added:temporary", state.variable("seen").?);
+    try std.testing.expectEqualStrings("kept", state.variable("other").?);
+    try std.testing.expectEqualStrings("original", state.variable("name").?);
+    try std.testing.expect(!state.variableStore().isExported("name"));
+    try std.testing.expectEqualStrings("exported", state.variable("visible").?);
+    try std.testing.expect(state.variableStore().isExported("visible"));
+    try std.testing.expect(state.variable("new") == null);
+    const environment = fake.spawn_calls.items[0].environment.replace;
+    try std.testing.expectEqual(@as(usize, 3), environment.len);
+    for (environment) |binding| {
+        try std.testing.expectEqualStrings(if (std.mem.eql(u8, binding.name, "new")) "added" else "temporary", binding.value);
+    }
+}
+
 test "special builtin assignments persist in session state" {
     var hir = try generate("name=temporary next=\"$name value\" :");
     defer hir.deinit(std.testing.allocator);

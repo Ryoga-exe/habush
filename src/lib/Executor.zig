@@ -202,6 +202,14 @@ const PreparedPipelineStage = struct {
         if (stage.context) |*context| {
             result.context = .{ .mutable = context };
             result.io = context.io;
+            if (result.stream_bindings) |*bindings| {
+                for (bindings) |*binding| {
+                    if (binding.writer != null and binding.writer == base.io.stdout)
+                        binding.writer = context.io.stdout
+                    else if (binding.writer != null and binding.writer == base.io.stderr)
+                        binding.writer = context.io.stderr;
+                }
+            }
         }
         result.jobs = if (stage.jobs) |*jobs| jobs else null;
         result.positional_parameters_override = &stage.positional_parameters;
@@ -288,6 +296,9 @@ fn executeInstruction(parent: Executor, hir: Hir, index: Hir.Inst.Index) Error!R
     var executor = parent;
     executor.io.diagnostic_source = instructionSource(hir, index);
     if (executor.cancel_io) |io| try io.checkCancel();
+    if (executor.host.capabilities().poll) {
+        if (executor.jobs) |jobs| try jobs.poll();
+    }
     if (executor.background) {
         if (executor.jobs == null) return error.UnsupportedInstruction;
         switch (hir.instructionTag(index)) {
@@ -1258,10 +1269,6 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
         },
         .function => {
             if (executor.background) return error.UnsupportedInstruction;
-            if (has_assignments) {
-                const mutable_variables = variables orelse unreachable;
-                try applyAssignments(mutable_variables, &command_variables);
-            }
             var scope = switch (try executor.beginSimpleCommandRedirections(
                 file_actions.items,
                 &redirect_resources,
@@ -1276,7 +1283,7 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
             // not additional top-level pipeline stages.
             scope.executor.pipeline_stage = null;
             scope.executor.prepared_simple = null;
-            return scope.executor.executeFunction(argv.items);
+            return scope.executor.executeFunction(argv.items, &command_variables);
         },
         .external => {},
     }
@@ -1627,6 +1634,9 @@ fn beginRedirections(
         .{ .writer = executor.io.stdout },
         .{ .writer = executor.io.stderr },
     };
+    bindings[0].reader = executor.io.stdin;
+    bindings[1].writer = executor.io.stdout;
+    bindings[2].writer = executor.io.stderr;
     var resources = owned_resources.*;
     owned_resources.* = .empty;
     var retain_resources = false;
@@ -1850,7 +1860,7 @@ fn executeBuiltin(
     };
 }
 
-fn executeFunction(executor: Executor, argv: []const []const u8) Error!Result {
+fn executeFunction(executor: Executor, argv: []const []const u8, assignments: *const VariableStore) Error!Result {
     if (executor.function_depth == max_function_depth)
         return executor.commandFailure(argv[0], .function_call_depth_exceeded);
 
@@ -1858,14 +1868,37 @@ fn executeFunction(executor: Executor, argv: []const []const u8) Error!Result {
     var definition = (try state.cloneFunction(argv[0], executor.gpa)) orelse unreachable;
     defer definition.deinit(executor.gpa);
 
+    const variables = state.variableStore();
+    var saved = VariableStore.init(variables.gpa);
+    defer saved.deinit();
+    var iterator = assignments.iterator();
+    while (iterator.next()) |binding| {
+        if (variables.get(binding.name)) |value| {
+            try saved.set(binding.name, value);
+            try saved.setExported(binding.name, variables.isExported(binding.name));
+        }
+    }
+
+    var result = executor.callFunction(definition, argv, assignments) catch |err| {
+        try variables.restoreBindings(&saved, assignments);
+        return err;
+    };
+    try variables.restoreBindings(&saved, assignments);
+    if (result.control_flow == .@"return") result.control_flow = .none;
+    return result;
+}
+
+fn callFunction(executor: Executor, definition: @import("FunctionStore.zig").Definition, argv: []const []const u8, assignments: *const VariableStore) Error!Result {
+    const variables = executor.variableStore().?;
+    try applyAssignments(variables, assignments);
+    var iterator = assignments.iterator();
+    while (iterator.next()) |binding| try variables.setExported(binding.name, true);
     var function_executor = executor;
     var positional_parameters = argv[1..];
     function_executor.positional_parameters_override = &positional_parameters;
     function_executor.loop_depth = 0;
     function_executor.function_depth += 1;
-    var result = try function_executor.executeInstruction(definition.hir, definition.body);
-    if (result.control_flow == .@"return") result.control_flow = .none;
-    return result;
+    return function_executor.executeInstruction(definition.hir, definition.body);
 }
 
 fn variableStore(executor: Executor) ?*VariableStore {
@@ -1976,6 +2009,10 @@ fn runCommandSubstitution(
     nested.context = .{ .mutable = &context };
     nested.io = parent.io;
     nested.io.stdout = output;
+    if (nested.stream_bindings) |*bindings| bindings[1] = .{
+        .reader = parent.host.resourceReader(capture),
+        .writer = output,
+    };
     nested.io.diagnostic_source = null;
     context.io = nested.io;
     nested.gpa = allocator;

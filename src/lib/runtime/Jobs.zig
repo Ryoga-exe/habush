@@ -135,11 +135,25 @@ pub fn poll(jobs: *Jobs) Host.Error!void {
 
 pub fn wait(jobs: *Jobs, id: Id) Host.Error!?ExitStatus {
     const entry = jobs.get(id) orelse return null;
-    _ = try entry.pipeline.waitEvents();
+    try jobs.waitEntry(entry);
     try jobs.reportFailures(&entry.pipeline);
     const status = entry.exitStatus() orelse return error.Unexpected;
     if (entry.pipeline.state() == .completed) jobs.remove(id);
     return status;
+}
+
+fn waitEntry(jobs: *Jobs, entry: *Entry) Host.Error!void {
+    if (entry.pipeline.host.capabilities().poll) {
+        if (jobs.cancel_io) |io| {
+            while (entry.pipeline.state() == .running) {
+                try jobs.poll();
+                if (entry.pipeline.state() == .running)
+                    try io.sleep(.fromMilliseconds(2), .awake);
+            }
+            return;
+        }
+    }
+    _ = try entry.pipeline.waitEvents();
 }
 
 pub fn waitAll(jobs: *Jobs) Host.Error!ExitStatus {
@@ -179,7 +193,7 @@ pub fn foreground(jobs: *Jobs, id: Id) Host.Error!?ExitStatus {
         // Every worker stops before the target can read the TTY. Observe the
         // startup barrier before handing over the terminal and resuming the
         // group; no reader can race into SIGTTIN before this point.
-        _ = try entry.pipeline.waitEvents();
+        try jobs.waitEntry(entry);
         entry.pipeline.suspend_on_start = false;
     }
     _ = try entry.pipeline.poll();
@@ -202,7 +216,7 @@ pub fn foreground(jobs: *Jobs, id: Id) Host.Error!?ExitStatus {
                 break;
             }
         }
-        _ = try entry.pipeline.waitEvents();
+        try jobs.waitEntry(entry);
     }
     if (lease) |token| {
         try host.releaseTerminal(token);

@@ -36,7 +36,7 @@ pub fn run(self: *Shell) !habush.runtime.ExitStatus {
 fn runInput(self: *Shell, source_name: ?[]const u8) !habush.runtime.ExitStatus {
     while (true) {
         self.interrupt_generation = interrupt.snapshot();
-        var input = (self.withInterrupt(?CommandInput, readCommand, .{self}, discardInput) catch |err| switch (err) {
+        var input = (self.withInterrupt(?CommandInput, readCommand, .{self}, discardInput, true) catch |err| switch (err) {
             error.InputInterrupted, error.Canceled => {
                 self.session.interruptInput();
                 if (err == error.Canceled) try self.stderr.writeByte('\n');
@@ -490,7 +490,7 @@ fn handleInput(
 }
 
 fn evaluate(self: *Shell, source: [:0]const u8, options: habush.Session.EvaluateOptions) !habush.Evaluation {
-    return self.withInterrupt(habush.Evaluation, habush.Session.evaluate, .{ self.session, source, options }, discardEvaluation);
+    return self.withInterrupt(habush.Evaluation, habush.Session.evaluate, .{ self.session, source, options }, discardEvaluation, false);
 }
 
 fn discardInput(self: *Shell, value: ?CommandInput) void {
@@ -511,14 +511,16 @@ fn withInterrupt(
     comptime operation: anytype,
     args: std.meta.ArgsTuple(@TypeOf(operation)),
     comptime discard: fn (*Shell, T) void,
+    poll_background: bool,
 ) !T {
-    if (!self.interruptible) return @call(.auto, operation, args);
+    if (!self.interruptible and !poll_background) return @call(.auto, operation, args);
     const io = self.io orelse return @call(.auto, operation, args);
     const Result = union(enum) {
         completed: @typeInfo(@TypeOf(operation)).@"fn".return_type.?,
         interrupted: std.Io.Cancelable!void,
+        poll_failed: habush.Host.Error!void,
     };
-    var storage: [2]Result = undefined;
+    var storage: [3]Result = undefined;
     var pending: std.Io.Select(Result) = .init(io, &storage);
     defer while (pending.cancel()) |result| {
         if (result == .completed) {
@@ -526,11 +528,27 @@ fn withInterrupt(
         }
     };
     try pending.concurrent(.completed, operation, args);
-    try pending.concurrent(.interrupted, interrupt.wait, .{ io, self.interrupt_generation });
+    if (self.interruptible)
+        try pending.concurrent(.interrupted, interrupt.wait, .{ io, self.interrupt_generation });
+    if (poll_background and self.session.host.capabilities().poll)
+        try pending.concurrent(.poll_failed, pollJobs, .{self});
     return switch (try pending.await()) {
         .completed => |result| result,
         .interrupted => error.Canceled,
+        .poll_failed => |result| {
+            try result;
+            unreachable;
+        },
     };
+}
+
+// Only input waiting runs beside this task; evaluation owns the table itself.
+fn pollJobs(self: *Shell) habush.Host.Error!void {
+    const io = self.io.?;
+    while (true) {
+        try io.sleep(.fromMilliseconds(20), .awake);
+        try self.session.jobs.poll();
+    }
 }
 
 fn readLineAlloc(reader: *Io.Reader, allocator: std.mem.Allocator, ending: *LineEnding) !?[:0]u8 {
