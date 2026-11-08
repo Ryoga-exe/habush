@@ -4,6 +4,7 @@ const AstGen = @import("AstGen.zig");
 const Expander = @import("Expander.zig");
 const Hir = @import("Hir.zig");
 const VariableStore = @import("VariableStore.zig");
+const FakeHost = @import("Host/FakeHost.zig");
 
 test "expands and joins static argument parts" {
     var hir = try generate("command pre\"mid\"'post'\\ end \"\" \\* '*' \"*\"");
@@ -32,6 +33,59 @@ test "classifies unsupported argument expansions" {
     try expectExpansionError("command ${name%pattern}", error.ParameterExpansionUnsupported);
     try expectExpansionError("command *.zig", error.PathnameExpansionUnsupported);
     try expectExpansionError("command ~other/work", error.TildeExpansionUnsupported);
+}
+
+test "pathname expansion preserves quote provenance field splitting and path components" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exercisePathnames, .{});
+}
+
+fn exercisePathnames(gpa: std.mem.Allocator) !void {
+    var hir = try generate("command * \"*.txt\" \\*.txt prefix\"*\"* $value \"$value\" ${missing:-\"*.txt\"} ${assigned:=\"*.txt\"} $assigned */*.txt no-match* .?* [.]secret */ ~/*.txt ${words:=\"a b\"}");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    fake.directories = &.{
+        .{ .path = ".", .names = &.{ "b.txt", "a.txt", ".secret", "star*.txt", "sub", "prefix*one", "prefix-two" } },
+        .{ .path = "sub/", .names = &.{ "c.txt", ".hidden.txt" } },
+        .{ .path = "star*/", .names = &.{"home.txt"} },
+    };
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+    try variables.set("value", "*.txt sub/*.txt");
+    try variables.set("HOME", "star*");
+    const expander = Expander.initWithContext(gpa, .{
+        .variables = &variables,
+        .pathname_host = fake.host(),
+        .pathname_cwd = "/workspace",
+    });
+    const expected = [_][]const []const u8{
+        &.{ "a.txt", "b.txt", "prefix*one", "prefix-two", "star*.txt", "sub" },
+        &.{"*.txt"},
+        &.{"*.txt"},
+        &.{"prefix*one"},
+        &.{ "a.txt", "b.txt", "star*.txt", "sub/c.txt" },
+        &.{"*.txt sub/*.txt"},
+        &.{"*.txt"},
+        &.{"*.txt"},
+        &.{ "a.txt", "b.txt", "star*.txt" },
+        &.{"sub/c.txt"},
+        &.{"no-match*"},
+        &.{".secret"},
+        &.{"[.]secret"},
+        &.{"sub/"},
+        &.{"star*/home.txt"},
+        &.{"a b"},
+    };
+    for (firstCommandParts(hir)[1..], expected) |part, fields| {
+        const actual = try expander.expandArgument(hir, part);
+        defer {
+            for (actual) |field| gpa.free(field);
+            gpa.free(actual);
+        }
+        try std.testing.expectEqualDeep(fields, actual);
+    }
+    for (fake.directory_calls.items) |call|
+        try std.testing.expectEqualStrings("/workspace", call.cwd.path);
 }
 
 test "parameter lengths count Unicode scalars and preserve scalar expansion rules" {

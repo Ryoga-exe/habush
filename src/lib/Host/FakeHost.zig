@@ -36,6 +36,8 @@ open_file_failure: ?Host.FileActionFailure.Reason = null,
 open_file_failure_after: usize = 0,
 create_input_error: ?Host.Error = null,
 sandbox_coverage: ?SandboxPolicy.Coverage = null,
+directories: []const struct { path: []const u8, names: []const []const u8 } = &.{},
+directory_calls: std.ArrayList(struct { cwd: CommandPlan.WorkingDirectory, path: []const u8 }) = .empty,
 
 pub const OpenFileCall = struct {
     cwd: CommandPlan.WorkingDirectory,
@@ -83,7 +85,35 @@ const vtable: Host.VTable = .{
     .resource_writer = resourceWriter,
     .resource_reader = resourceReader,
     .resolve_working_directory = resolveWorkingDirectory,
+    .read_directory = readDirectory,
 };
+
+fn readDirectory(userdata: ?*anyopaque, gpa: std.mem.Allocator, cwd: CommandPlan.WorkingDirectory, path: []const u8) Host.Error!?Host.Directory {
+    const fake: *FakeHost = @ptrCast(@alignCast(userdata.?));
+    const arena = fake.arena.allocator();
+    try fake.directory_calls.append(arena, .{
+        .cwd = switch (cwd) {
+            .inherit => .inherit,
+            .path => |value| .{ .path = try arena.dupe(u8, value) },
+        },
+        .path = try arena.dupe(u8, path),
+    });
+    for (fake.directories) |directory| {
+        if (!std.mem.eql(u8, path, directory.path)) continue;
+        const names = try gpa.alloc([]const u8, directory.names.len);
+        var count: usize = 0;
+        errdefer {
+            for (names[0..count]) |name| gpa.free(name);
+            gpa.free(names);
+        }
+        for (directory.names, names) |name, *copy| {
+            copy.* = try gpa.dupe(u8, name);
+            count += 1;
+        }
+        return .{ .names = names };
+    }
+    return null;
+}
 
 fn createPipe(userdata: ?*anyopaque) Host.Error!Host.Pipe {
     const fake: *FakeHost = @ptrCast(@alignCast(userdata.?));

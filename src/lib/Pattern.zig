@@ -10,6 +10,7 @@ bytes: []const u8,
 quoted: []const bool = &.{},
 
 pub fn hasMeta(pattern: Pattern) bool {
+    std.debug.assert(pattern.quoted.len == 0 or pattern.quoted.len == pattern.bytes.len);
     for (pattern.bytes, 0..) |byte, index| {
         if (pattern.isQuoted(index)) continue;
         if (byte == '*' or byte == '?') return true;
@@ -90,11 +91,17 @@ fn bracket(pattern: Pattern, start: usize, point: u32) ?Bracket {
         if (pattern.bytes[index] == '[' and !pattern.isQuoted(index) and
             index + 1 < pattern.bytes.len and pattern.bytes[index + 1] == ':' and !pattern.isQuoted(index + 1))
         {
-            const end = std.mem.indexOfPos(u8, pattern.bytes, index + 2, ":]") orelse return null;
-            const class = classes.get(pattern.bytes[index + 2 .. end]) orelse return null;
-            matched = matched or class.matches(point);
-            index = end + 2;
-            continue;
+            var end = index + 2;
+            while (end + 1 < pattern.bytes.len) : (end += 1) {
+                if (pattern.bytes[end] == ':' and pattern.bytes[end + 1] == ']' and
+                    !pattern.isQuoted(end) and !pattern.isQuoted(end + 1)) break;
+            }
+            if (end + 1 < pattern.bytes.len) {
+                const class = classes.get(pattern.bytes[index + 2 .. end]) orelse return null;
+                matched = matched or class.matches(point);
+                index = end + 2;
+                continue;
+            }
         }
         const low = character(pattern.bytes, index);
         index += low.len;
@@ -176,4 +183,8 @@ test "shell patterns match scalar characters ranges classes and complete values"
     try std.testing.expect(quoted.matches("*日"));
     try std.testing.expect(!quoted.matches("other"));
     try std.testing.expect(!(Pattern{ .bytes = "[" }).hasMeta());
+    try std.testing.expect(!(Pattern{
+        .bytes = "[[:digit:]]",
+        .quoted = &.{ false, false, false, false, false, false, false, false, true, false, false },
+    }).matches("3"));
 }
