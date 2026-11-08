@@ -163,6 +163,7 @@ pub fn main(init: std.process.Init) !habush.runtime.ExitStatus {
         .stderr = stderr,
         .session = &session,
         .interactive = interactive,
+        .interruptible = interactive,
         .io = io,
         .line_edit = config.lineEditEnabled(interactive, init.environ_map.get("TERM")),
         .completion_limits = config.completion_limits,
