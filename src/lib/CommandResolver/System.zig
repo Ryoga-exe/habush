@@ -123,17 +123,18 @@ const CandidateStatus = enum {
 
 fn checkCandidate(system: *System, candidate: []const u8) CommandResolver.Error!CandidateStatus {
     const dir = std.Io.Dir.cwd();
+    // access reports long components that Zig 0.16's Linux stat treats as bugs.
+    dir.access(system.io, candidate, .{ .execute = true }) catch |err| return switch (err) {
+        error.FileNotFound, error.NameTooLong, error.BadPathName, error.SymLinkLoop => .missing,
+        error.AccessDenied, error.PermissionDenied => .denied,
+        else => error.Unexpected,
+    };
     const stat = dir.statFile(system.io, candidate, .{}) catch |err| return switch (err) {
         error.FileNotFound, error.NotDir, error.NameTooLong, error.BadPathName, error.SymLinkLoop => .missing,
         error.AccessDenied, error.PermissionDenied => .denied,
         else => error.Unexpected,
     };
     if (stat.kind != .file) return .missing;
-    dir.access(system.io, candidate, .{ .execute = true }) catch |err| return switch (err) {
-        error.FileNotFound, error.NameTooLong, error.BadPathName, error.SymLinkLoop => .missing,
-        error.AccessDenied, error.PermissionDenied => .denied,
-        else => error.Unexpected,
-    };
     return .executable;
 }
 
