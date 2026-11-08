@@ -17,6 +17,7 @@ session: *habush.Session,
 interactive: bool,
 io: ?std.Io = null,
 line_edit: bool = false,
+completion_limits: habush.Completion.Provider.Limits = .{},
 integration: ?ShellIntegration = null,
 input_line: usize = 0,
 /// Known only for a fixed script/command source buffer.
@@ -395,6 +396,7 @@ fn readInputLine(self: *Shell, prompt: []const u8, prefix: []const u8, allow_com
             .prompt = prompt,
             .prefix = prefix,
             .allow_completion = allow_completion,
+            .completion_limits = self.completion_limits,
         }).read() catch |err| switch (err) {
             error.EditorUnavailable => try readLineAlloc(self.stdin, self.allocator, &self.last_line_ending),
             error.EndOfStream => null,

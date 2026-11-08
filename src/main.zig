@@ -165,6 +165,7 @@ pub fn main(init: std.process.Init) !habush.runtime.ExitStatus {
         .interactive = interactive,
         .io = io,
         .line_edit = config.lineEditEnabled(interactive, init.environ_map.get("TERM")),
+        .completion_limits = config.completion_limits,
         .integration = if (integration_enabled) .{
             .writer = stderr,
             .hostname = hostname,

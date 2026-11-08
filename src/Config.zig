@@ -8,6 +8,9 @@ version: u32 = 1,
 line_edit: Mode = .auto,
 shell_integration: Mode = .auto,
 load_rc: bool = true,
+/// Shared by native providers and future adapters; guest execution budgets
+/// remain the plugin host's responsibility.
+completion_limits: @import("habush").Completion.Provider.Limits = .{},
 
 pub const Mode = enum { auto, on, off };
 pub const max_file_bytes = 64 * 1024;
@@ -128,6 +131,8 @@ test "typed JSON and environment overrides reject invalid or ambiguous settings"
     const config = try parse(std.testing.allocator, "{\"line_edit\":\"off\",\"load_rc\":false}");
     try std.testing.expectEqual(Mode.off, config.line_edit);
     try std.testing.expect(!config.load_rc);
+    const bounded = try parse(std.testing.allocator, "{\"completion_limits\":{\"candidates\":8,\"bytes\":4096,\"scanned\":256}}");
+    try std.testing.expectEqual(@as(usize, 8), bounded.completion_limits.candidates);
     try std.testing.expectError(error.UnknownField, parse(std.testing.allocator, "{\"line_edti\":\"off\"}"));
     try std.testing.expectError(error.DuplicateField, parse(std.testing.allocator, "{\"load_rc\":true,\"load_rc\":false}"));
     try std.testing.expectError(error.UnsupportedConfigVersion, parse(std.testing.allocator, "{\"version\":2}"));

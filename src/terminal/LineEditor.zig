@@ -15,6 +15,7 @@ session: *habush.Session,
 prompt: []const u8,
 prefix: []const u8,
 allow_completion: bool = true,
+completion_limits: habush.Completion.Provider.Limits = .{},
 
 const max_input_bytes = 64 * 1024;
 
@@ -179,7 +180,7 @@ fn complete(editor: LineEditor, buffer: *habush.edit.Buffer) !bool {
     var result = try habush.Completion.Provider.collect(editor.gpa, .{
         .context = context,
         .prefix = prefix,
-    }, &.{native.provider()}, .{});
+    }, &.{native.provider()}, editor.completion_limits);
     defer result.deinit(editor.gpa);
     if (result.unique() == null) {
         if (result.candidates.len == 0) return false;
