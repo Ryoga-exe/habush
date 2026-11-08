@@ -15,6 +15,9 @@ stdin: *Io.Reader,
 stderr: *Io.Writer,
 session: *habush.Session,
 interactive: bool,
+/// Allows an interactive caller's startup source to remain cancellable while
+/// runSource suppresses prompts, editing, and shell-integration messages.
+interruptible: bool = false,
 io: ?std.Io = null,
 line_edit: bool = false,
 integration: ?ShellIntegration = null,
@@ -31,9 +34,10 @@ pub fn run(self: *Shell) !habush.runtime.ExitStatus {
 fn runInput(self: *Shell, source_name: ?[]const u8) !habush.runtime.ExitStatus {
     while (true) {
         self.interrupt_generation = interrupt.snapshot();
-        var input = (self.readCommand() catch |err| switch (err) {
-            error.InputInterrupted => {
+        var input = (self.withInterrupt(?CommandInput, readCommand, .{self}, discardInput) catch |err| switch (err) {
+            error.InputInterrupted, error.Canceled => {
                 self.session.interruptInput();
+                if (err == error.Canceled) try self.stderr.writeByte('\n');
                 continue;
             },
             else => return err,
@@ -489,28 +493,45 @@ fn handleInput(
 }
 
 fn evaluate(self: *Shell, source: [:0]const u8, options: habush.Session.EvaluateOptions) !habush.Evaluation {
-    if (!self.interactive) return self.session.evaluate(source, options);
-    const io = self.io orelse return self.session.evaluate(source, options);
+    return self.withInterrupt(habush.Evaluation, habush.Session.evaluate, .{ self.session, source, options }, discardEvaluation);
+}
+
+fn discardInput(self: *Shell, value: ?CommandInput) void {
+    var owned = value orelse return;
+    owned.deinit(self.allocator);
+}
+
+fn discardEvaluation(self: *Shell, value: habush.Evaluation) void {
+    var owned = value;
+    owned.deinit(self.session.allocator());
+}
+
+/// Both tasks are joined before the caller touches the reader/session again.
+/// A completed operation may own a result even when the interrupt wins.
+fn withInterrupt(
+    self: *Shell,
+    comptime T: type,
+    comptime operation: anytype,
+    args: std.meta.ArgsTuple(@TypeOf(operation)),
+    comptime discard: fn (*Shell, T) void,
+) !T {
+    if (!self.interruptible) return @call(.auto, operation, args);
+    const io = self.io orelse return @call(.auto, operation, args);
     const Result = union(enum) {
-        evaluated: habush.Session.EvaluateError!habush.Evaluation,
+        completed: @typeInfo(@TypeOf(operation)).@"fn".return_type.?,
         interrupted: std.Io.Cancelable!void,
     };
     var storage: [2]Result = undefined;
     var pending: std.Io.Select(Result) = .init(io, &storage);
     defer while (pending.cancel()) |result| {
-        // Evaluation can finish while an interrupt wins the race. Syntax
-        // results own an AST even when the caller will discard that result.
-        if (result == .evaluated) {
-            if (result.evaluated) |value| {
-                var owned = value;
-                owned.deinit(self.session.allocator());
-            } else |_| {}
+        if (result == .completed) {
+            if (result.completed) |value| discard(self, value) else |_| {}
         }
     };
-    try pending.concurrent(.evaluated, habush.Session.evaluate, .{ self.session, source, options });
+    try pending.concurrent(.completed, operation, args);
     try pending.concurrent(.interrupted, interrupt.wait, .{ io, self.interrupt_generation });
     return switch (try pending.await()) {
-        .evaluated => |result| result,
+        .completed => |result| result,
         .interrupted => error.Canceled,
     };
 }
@@ -594,4 +615,46 @@ test "script diagnostics retain raw CRLF here-document and final-line byte range
     try std.testing.expectEqualDeep(habush.Source.Range{ .start = @intCast(nested), .end = @intCast(nested + "missing_nested".len) }, capture.ranges[1].?);
     try std.testing.expectEqualDeep(habush.Source.Range{ .start = @intCast(last), .end = @intCast(script.len) }, capture.ranges[2].?);
     try std.testing.expectEqualStrings("", stderr.written());
+}
+
+test "startup source stays interruptible without interactive presentation" {
+    const Notify = struct {
+        io: std.Io,
+        started: std.Io.Event = .unset,
+
+        fn observe(userdata: ?*anyopaque, event: habush.Session.Event) void {
+            const notify: *@This() = @ptrCast(@alignCast(userdata.?));
+            if (event == .started) notify.started.set(notify.io);
+        }
+
+        fn run(notify: *@This()) std.Io.Cancelable!void {
+            try notify.started.wait(notify.io);
+            interrupt.notify();
+        }
+    };
+    var system: habush.Host.System = .{ .gpa = std.testing.allocator, .io = std.testing.io };
+    defer system.deinit();
+    var notify: Notify = .{ .io = std.testing.io };
+    var session = try habush.Session.init(std.testing.allocator, system.host(), .{
+        .cancel_io = std.testing.io,
+        .observer = .{ .userdata = &notify, .notify = Notify.observe },
+    });
+    defer session.deinit();
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var reader: Io.Reader = .fixed("");
+    var shell: Shell = .{
+        .allocator = std.testing.allocator,
+        .stdin = &reader,
+        .stderr = &output.writer,
+        .session = &session,
+        .interactive = true,
+        .interruptible = true,
+        .io = std.testing.io,
+    };
+    var notifier = try std.testing.io.concurrent(Notify.run, .{&notify});
+    defer notifier.cancel(std.testing.io) catch {};
+    try std.testing.expectEqual(@as(u8, 130), try shell.runSource("while true; do :; done\n", "rc"));
+    try std.testing.expect(shell.interactive);
+    try std.testing.expectEqualStrings("\n", output.written());
 }

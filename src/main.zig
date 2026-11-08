@@ -142,6 +142,7 @@ pub fn main(init: std.process.Init) !habush.runtime.ExitStatus {
         .stderr = stderr,
         .session = &session,
         .interactive = interactive,
+        .interruptible = interactive,
         .io = io,
         .line_edit = interactive and builtin.os.tag != .windows and
             !std.mem.eql(u8, editor_setting, "off") and
