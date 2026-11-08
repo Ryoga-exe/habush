@@ -1039,6 +1039,43 @@ test "multiple general in-process pipeline stages remain unsupported" {
     try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
 }
 
+test "cancellation between pipeline stages kills and reaps already spawned children" {
+    const CancelAfterSpawn = struct {
+        fake: *FakeHost,
+        protection: std.Io.CancelProtection = .unblocked,
+
+        fn checkCancel(userdata: ?*anyopaque) std.Io.Cancelable!void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            if (self.protection == .unblocked and self.fake.spawn_calls.items.len != 0)
+                return error.Canceled;
+        }
+
+        fn swapProtection(userdata: ?*anyopaque, protection: std.Io.CancelProtection) std.Io.CancelProtection {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            const previous = self.protection;
+            self.protection = protection;
+            return previous;
+        }
+    };
+    var hir = try generate("/bin/source | /bin/sink");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var cancellation: CancelAfterSpawn = .{ .fake = &fake };
+    var io_vtable = std.testing.io.vtable.*;
+    io_vtable.checkCancel = CancelAfterSpawn.checkCancel;
+    io_vtable.swapCancelProtection = CancelAfterSpawn.swapProtection;
+    var executor = preResolvedExecutor(std.testing.allocator, fake.host());
+    executor.cancel_io = .{ .userdata = &cancellation, .vtable = &io_vtable };
+
+    try std.testing.expectError(error.Canceled, executor.execute(hir));
+    try std.testing.expectEqual(@as(usize, 1), fake.spawn_calls.items.len);
+    try std.testing.expectEqual(@as(usize, 1), fake.signal_calls.items.len);
+    try std.testing.expectEqual(@import("Host.zig").Signal.kill, fake.signal_calls.items[0].signal);
+    try expectPipelineResourcesReleased(&fake);
+    try std.testing.expectEqual(std.Io.CancelProtection.unblocked, cancellation.protection);
+}
+
 test "concurrent stage failure kills external peers and closes pipes" {
     var hir = try generate("/bin/source | true | pwd");
     defer hir.deinit(std.testing.allocator);
