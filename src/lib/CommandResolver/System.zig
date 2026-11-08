@@ -92,22 +92,14 @@ fn tryCandidate(
     name: []const u8,
     denied: *bool,
 ) CommandResolver.Error!?[]u8 {
-    var parts: [3][]const u8 = undefined;
-    var len: usize = 0;
-    if (cwd) |path| {
-        parts[len] = path;
-        len += 1;
-    }
-    if (directory) |path| {
-        if (path.len != 0) {
-            parts[len] = path;
-            len += 1;
-        }
-    }
-    parts[len] = name;
-    len += 1;
-
-    const candidate = try std.fs.path.resolve(allocator, parts[0..len]);
+    const base = directory orelse "";
+    // Keep .. for the filesystem to resolve after following symbolic links.
+    const candidate = if (std.fs.path.isAbsolute(name))
+        try allocator.dupe(u8, name)
+    else if (std.fs.path.isAbsolute(base))
+        try std.fs.path.join(allocator, &.{ base, name })
+    else
+        try std.fs.path.join(allocator, &.{ cwd orelse ".", base, name });
     errdefer allocator.free(candidate);
     switch (try system.checkCandidate(candidate)) {
         .executable => return candidate,
@@ -132,13 +124,13 @@ const CandidateStatus = enum {
 fn checkCandidate(system: *System, candidate: []const u8) CommandResolver.Error!CandidateStatus {
     const dir = std.Io.Dir.cwd();
     const stat = dir.statFile(system.io, candidate, .{}) catch |err| return switch (err) {
-        error.FileNotFound, error.NotDir => .missing,
+        error.FileNotFound, error.NotDir, error.NameTooLong, error.BadPathName, error.SymLinkLoop => .missing,
         error.AccessDenied, error.PermissionDenied => .denied,
         else => error.Unexpected,
     };
     if (stat.kind != .file) return .missing;
     dir.access(system.io, candidate, .{ .execute = true }) catch |err| return switch (err) {
-        error.FileNotFound => .missing,
+        error.FileNotFound, error.NameTooLong, error.BadPathName, error.SymLinkLoop => .missing,
         error.AccessDenied, error.PermissionDenied => .denied,
         else => error.Unexpected,
     };
@@ -180,7 +172,9 @@ test "system resolver handles search paths, explicit paths, and missing commands
         .cwd = directory,
     })).?;
     defer std.testing.allocator.free(explicit);
-    try std.testing.expectEqualStrings(expected, explicit);
+    const expected_explicit = try std.fs.path.join(std.testing.allocator, &.{ directory, ".", "tool" });
+    defer std.testing.allocator.free(expected_explicit);
+    try std.testing.expectEqualStrings(expected_explicit, explicit);
     try std.testing.expect(try resolver_value.resolve(std.testing.allocator, .{
         .name = "missing",
         .search_path = &.{directory},
@@ -210,6 +204,37 @@ test "system resolver tries configured executable extensions" {
     defer std.testing.allocator.free(executable);
 
     try std.testing.expectEqualStrings("tool.test-exe", std.fs.path.basename(executable));
+}
+
+test "system resolver preserves symlink traversal for explicit paths and PATH entries" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "work", "real", "real/sub" }) |path|
+        try tmp.dir.createDir(std.testing.io, path, .default_dir);
+    for ([_][]const u8{ "work/tool", "real/tool" }) |path| {
+        const file = try tmp.dir.createFile(std.testing.io, path, .{ .permissions = .executable_file });
+        file.close(std.testing.io);
+    }
+    try tmp.dir.symLink(std.testing.io, "../real/sub", "work/link", .{ .is_directory = true });
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root = buffer[0..try tmp.dir.realPath(std.testing.io, &buffer)];
+    const cwd = try std.fs.path.join(std.testing.allocator, &.{ root, "work" });
+    defer std.testing.allocator.free(cwd);
+    const absolute = try std.fs.path.join(std.testing.allocator, &.{ cwd, "link", "..", "tool" });
+    defer std.testing.allocator.free(absolute);
+    const search = std.fs.path.dirname(absolute).?;
+    var system = System.init(std.testing.io, .{});
+    for ([_]CommandResolver.Request{
+        .{ .name = "link/../tool", .search_path = &.{}, .cwd = cwd },
+        .{ .name = absolute, .search_path = &.{}, .cwd = "/wrong" },
+        .{ .name = "tool", .search_path = &.{"link/.."}, .cwd = cwd },
+        .{ .name = "tool", .search_path = &.{search}, .cwd = "/wrong" },
+    }) |request| {
+        const result = (try system.resolver().resolve(std.testing.allocator, request)).?;
+        defer std.testing.allocator.free(result);
+        try std.testing.expectEqualStrings(absolute, result);
+    }
 }
 
 test "system resolver handles every allocation failure" {

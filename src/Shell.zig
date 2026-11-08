@@ -54,6 +54,7 @@ fn runInput(self: *Shell, source_name: ?[]const u8) !habush.runtime.ExitStatus {
             self.session.rejectInput();
             command_open = false;
             try self.endCommand(2);
+            if (!self.interactive) return 2;
             continue;
         }
         if (std.mem.trim(u8, input.source, &std.ascii.whitespace).len == 0) {
@@ -366,7 +367,7 @@ fn readHereDocument(
         try pending.writer.writeAll(stripped);
         try pending.writer.writeByte('\n');
 
-        const continued = metadata.expand_body and hasLineContinuation(stripped);
+        const continued = metadata.expand_body and habush.heredoc.hasLineContinuation(stripped);
         try delimiter_candidate.writer.writeAll(
             if (continued) stripped[0 .. stripped.len - 1] else stripped,
         );
@@ -378,14 +379,6 @@ fn readHereDocument(
         pending.clearRetainingCapacity();
         delimiter_candidate.clearRetainingCapacity();
     }
-}
-
-fn hasLineContinuation(line: []const u8) bool {
-    var backslash_count: usize = 0;
-    var index = line.len;
-    while (index != 0 and line[index - 1] == '\\') : (index -= 1)
-        backslash_count += 1;
-    return backslash_count % 2 == 1;
 }
 
 fn readInputLine(self: *Shell, prompt: []const u8, prefix: []const u8, allow_completion: bool) !?[:0]u8 {
@@ -484,7 +477,7 @@ fn handleInput(
             } else if (tree.status == .incomplete) {
                 try self.stderr.writeAll("habush: incomplete input\n");
             }
-            return .none;
+            return if (self.interactive) .none else .exit;
         },
         .unsupported => |err| {
             try self.stderr.print("habush: unsupported runtime feature: {s}\n", .{

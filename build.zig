@@ -111,6 +111,18 @@ pub fn build(b: *std.Build) void {
     command_control_test.addArgs(&.{ "-c", "false; exit; missing" });
     expectCliResult(command_control_test, test_step, 1, "", "");
 
+    const syntax_stop_test = b.addRunArtifact(exe);
+    syntax_stop_test.setName("test cli syntax error stops remaining source");
+    syntax_stop_test.addArgs(&.{ "-c", ")\nexit 23" });
+    expectCliResult(syntax_stop_test, test_step, 2, "", "habush: 1:1: expected command, found ')'\n");
+
+    const long_name = b.allocator.alloc(u8, 256) catch @panic("out of memory");
+    @memset(long_name, 'x');
+    const long_command_test = b.addRunArtifact(exe);
+    long_command_test.setName("test cli survives an overlong command name");
+    long_command_test.addArgs(&.{ "-c", b.fmt("{s}\nexit 23", .{long_name}) });
+    expectCliResult(long_command_test, test_step, 23, "", b.fmt("habush: {s}: command not found\n", .{long_name}));
+
     const stream_test = b.addRunArtifact(exe);
     stream_test.setName("test cli standard input");
     stream_test.setStdIn(.{ .bytes = "true\nexit 9\n" });
