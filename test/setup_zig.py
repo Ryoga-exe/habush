@@ -10,7 +10,7 @@ import urllib.request
 import zipfile
 
 version = "0.16.0"
-arch = {"AMD64": "x86_64", "arm64": "aarch64"}.get(platform.machine(), platform.machine())
+arch = {"amd64": "x86_64", "arm64": "aarch64"}.get(platform.machine().lower(), platform.machine())
 system = {"Darwin": "macos", "Windows": "windows", "FreeBSD": "freebsd"}.get(
     platform.system(), platform.system().lower())
 with urllib.request.urlopen("https://ziglang.org/download/index.json") as response:
