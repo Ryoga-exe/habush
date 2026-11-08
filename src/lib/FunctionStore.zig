@@ -58,6 +58,11 @@ pub fn contains(functions: FunctionStore, name: []const u8) bool {
     return functions.map.contains(name);
 }
 
+/// Borrows names until the next definition change or deinit.
+pub fn names(functions: FunctionStore) []const []const u8 {
+    return functions.map.keys();
+}
+
 /// Returns an owned snapshot that remains valid if the stored definition is
 /// replaced while its body is executing.
 pub fn cloneDefinition(

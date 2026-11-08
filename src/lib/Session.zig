@@ -274,6 +274,16 @@ pub fn variable(session: Session, name: []const u8) ?[]const u8 {
     return session.state.variable(name);
 }
 
+/// Borrowed views for adapters; do not retain across session mutation/evaluation.
+pub fn functionNames(session: Session) []const []const u8 {
+    return session.state.functions.names();
+}
+
+/// Used only if PATH is unset, like command execution.
+pub fn defaultSearchPath(session: Session) []const []const u8 {
+    return session.state.defaultSearchPath();
+}
+
 pub fn setVariable(session: *Session, name: []const u8, value: []const u8) VariableStore.Error!void {
     return session.state.setVariable(name, value);
 }
