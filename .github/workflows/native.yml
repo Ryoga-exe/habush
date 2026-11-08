@@ -1,0 +1,46 @@
+name: Native platforms
+
+on:
+  push:
+    branches: [main, 'feat/**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: '0.16.0'
+      - run: zig build test --summary all
+      - if: runner.os == 'macOS'
+        run: zig build test-sandbox --summary all
+
+  freebsd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: vmactions/freebsd-vm@v1
+        with:
+          release: '14.4'
+          copyback: false
+          prepare: pkg install -y zig
+          run: |
+            set -eu
+            test "$(zig version)" = 0.16.0
+            zig build test -j2 --summary all

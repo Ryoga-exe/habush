@@ -94,7 +94,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_lib_tests.step);
     const terminal_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/Shell.zig"),
+            .root_source_file = b.path("src/app_test.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -106,10 +106,43 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&pipeline_example.step);
     test_step.dependOn(&sandbox_example.step);
 
+    switch (target.result.os.tag) {
+        .linux, .macos, .freebsd => {
+            const terminal_probe = b.addExecutable(.{
+                .name = "terminal-test",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("test/terminal.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .link_libc = true,
+                }),
+            });
+            if (target.result.os.tag != .macos)
+                terminal_probe.root_module.linkSystemLibrary("util", .{});
+            const terminal_test = b.addRunArtifact(terminal_probe);
+            terminal_test.addArtifactArg(exe);
+            terminal_test.expectExitCode(0);
+            test_step.dependOn(&terminal_test.step);
+        },
+        else => {},
+    }
+
     const command_control_test = b.addRunArtifact(exe);
     command_control_test.setName("test cli exit control flow");
     command_control_test.addArgs(&.{ "-c", "false; exit; missing" });
     expectCliResult(command_control_test, test_step, 1, "", "");
+
+    const syntax_stop_test = b.addRunArtifact(exe);
+    syntax_stop_test.setName("test cli syntax error stops remaining source");
+    syntax_stop_test.addArgs(&.{ "-c", ")\nexit 23" });
+    expectCliResult(syntax_stop_test, test_step, 2, "", "habush: 1:1: expected command, found ')'\n");
+
+    const long_name = b.allocator.alloc(u8, 256) catch @panic("out of memory");
+    @memset(long_name, 'x');
+    const long_command_test = b.addRunArtifact(exe);
+    long_command_test.setName("test cli survives an overlong command name");
+    long_command_test.addArgs(&.{ "-c", b.fmt("{s}\nexit 23", .{long_name}) });
+    expectCliResult(long_command_test, test_step, 23, "", b.fmt("habush: {s}: command not found\n", .{long_name}));
 
     const stream_test = b.addRunArtifact(exe);
     stream_test.setName("test cli standard input");
@@ -288,7 +321,7 @@ pub fn build(b: *std.Build) void {
         test_step,
         2,
         "",
-        "habush: usage: habush [-c command | script [argument ...]]\n",
+        "habush: usage: habush [--config path | --no-config] [--no-rc] [-c command | script [argument ...]]\n",
     );
 }
 

@@ -41,6 +41,7 @@ variables: ?*VariableStore,
 runtime_state: ?*runtime.State,
 io: runtime.Io,
 scoped_file_actions: []const CommandPlan.FileAction,
+stream_bindings: ?[3]StreamBinding = null,
 pipeline_stage: ?PipelineStage,
 prepared_simple: ?PreparedSimpleCommand,
 last_status: runtime.ExitStatus,
@@ -53,6 +54,12 @@ loop_depth: u32,
 function_depth: u32,
 
 const max_function_depth = 64;
+
+const StreamBinding = struct {
+    reader: ?*std.Io.Reader = null,
+    writer: ?*std.Io.Writer = null,
+    closed: bool = false,
+};
 
 /// Failures that prevent the runtime from producing a shell-visible `Result`.
 /// Expected command failures are reported through `Result.status` and, when
@@ -195,6 +202,14 @@ const PreparedPipelineStage = struct {
         if (stage.context) |*context| {
             result.context = .{ .mutable = context };
             result.io = context.io;
+            if (result.stream_bindings) |*bindings| {
+                for (bindings) |*binding| {
+                    if (binding.writer != null and binding.writer == base.io.stdout)
+                        binding.writer = context.io.stdout
+                    else if (binding.writer != null and binding.writer == base.io.stderr)
+                        binding.writer = context.io.stderr;
+                }
+            }
         }
         result.jobs = if (stage.jobs) |*jobs| jobs else null;
         result.positional_parameters_override = &stage.positional_parameters;
@@ -281,6 +296,9 @@ fn executeInstruction(parent: Executor, hir: Hir, index: Hir.Inst.Index) Error!R
     var executor = parent;
     executor.io.diagnostic_source = instructionSource(hir, index);
     if (executor.cancel_io) |io| try io.checkCancel();
+    if (executor.host.capabilities().poll) {
+        if (executor.jobs) |jobs| try jobs.poll();
+    }
     if (executor.background) {
         if (executor.jobs == null) return error.UnsupportedInstruction;
         switch (hir.instructionTag(index)) {
@@ -316,9 +334,12 @@ fn executeSubshell(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
     var subshell_executor = executor;
     var positional_parameters = executor.positionalParameters();
     subshell_executor.positional_parameters_override = &positional_parameters;
-    var jobs: runtime.Jobs = .{ .gpa = executor.gpa, .diagnostic_io = executor.io };
-    defer jobs.deinit();
-    defer jobs.cancelAll();
+    var jobs: runtime.Jobs = .{
+        .gpa = executor.gpa,
+        .diagnostic_io = executor.io,
+        .cancel_io = executor.cancel_io,
+    };
+    defer finishScopeJobs(executor, &jobs);
     subshell_executor.jobs = &jobs;
     var context_copy = try executor.context.clone(executor.gpa);
     defer context_copy.deinit();
@@ -660,7 +681,11 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
         if (executor.concurrent_pipeline) |config|
             stage.arena = std.heap.ArenaAllocator.init(config.allocator);
         const stage_allocator = stage.allocator(executor.gpa);
-        stage.jobs = .{ .gpa = stage_allocator, .diagnostic_io = executor.io };
+        stage.jobs = .{
+            .gpa = stage_allocator,
+            .diagnostic_io = executor.io,
+            .cancel_io = executor.cancel_io,
+        };
         stage.context = try executor.context.clone(stage_allocator);
         // A surrounding compound redirection changes the current executor's
         // streams without replacing the session's context. Stage snapshots
@@ -706,6 +731,7 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
         else => |other| return other,
     };
     var transferred = false;
+    var failed = false;
     defer {
         // This pipeline can itself be a stage of a canceled outer pipeline.
         // Its children and stage-local jobs must still be killed and reaped.
@@ -717,6 +743,9 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
             if (previous_protection) |previous|
                 _ = executor.cancel_io.?.swapCancelProtection(previous);
         }
+        // A failed evaluation may leave children running, or stopped at the
+        // startup gate. Waiting alone cannot release either kind of child.
+        if (!transferred and failed) pipeline.signal(.kill) catch {};
         // Stage-local jobs can inherit an outer pipe end. Terminate them
         // before waiting for the outer pipeline to drain.
         for (prepared) |*stage| stage.deinit();
@@ -737,6 +766,9 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
             config,
         );
     }
+    // Concurrent execution already terminates peers before canceling and
+    // joining its stage tasks. This path still owns sequential stage startup.
+    errdefer failed = true;
 
     var result: Result = .{ .status = 0, .sandbox_coverage = .not_requested };
     const phase_count: usize = if (in_process_count == 0) 1 else 2;
@@ -840,6 +872,7 @@ const ConcurrentStageTask = struct {
             .index = stage_index,
         };
         stage_executor.cancel_io = task.io;
+        task.stage.jobs.?.cancel_io = task.io;
         const executed = stage_executor.executeInstruction(task.hir, task.stage.index);
         task.stage.finishJobs(task.io);
         if (executed) |completed| {
@@ -1236,10 +1269,6 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
         },
         .function => {
             if (executor.background) return error.UnsupportedInstruction;
-            if (has_assignments) {
-                const mutable_variables = variables orelse unreachable;
-                try applyAssignments(mutable_variables, &command_variables);
-            }
             var scope = switch (try executor.beginSimpleCommandRedirections(
                 file_actions.items,
                 &redirect_resources,
@@ -1254,7 +1283,7 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
             // not additional top-level pipeline stages.
             scope.executor.pipeline_stage = null;
             scope.executor.prepared_simple = null;
-            return scope.executor.executeFunction(argv.items);
+            return scope.executor.executeFunction(argv.items, &command_variables);
         },
         .external => {},
     }
@@ -1600,6 +1629,14 @@ fn beginRedirections(
             return .{ .failed = try executor.redirectFailure(.{ .cannot_execute = .sandbox_unavailable }) };
     };
     var scoped_executor = executor;
+    var bindings = executor.stream_bindings orelse [3]StreamBinding{
+        .{ .reader = executor.io.stdin },
+        .{ .writer = executor.io.stdout },
+        .{ .writer = executor.io.stderr },
+    };
+    bindings[0].reader = executor.io.stdin;
+    bindings[1].writer = executor.io.stdout;
+    bindings[2].writer = executor.io.stderr;
     var resources = owned_resources.*;
     owned_resources.* = .empty;
     var retain_resources = false;
@@ -1613,70 +1650,66 @@ fn beginRedirections(
     var scoped_actions: std.ArrayList(CommandPlan.FileAction) = .empty;
     try scoped_actions.appendSlice(allocator, executor.scoped_file_actions);
 
-    for (actions) |action| switch (action) {
-        .open => |open| {
-            _ = standardStreamIndex(open.target) orelse
-                return error.UnsupportedInstruction;
-            try resources.ensureUnusedCapacity(allocator, 1);
-            try scoped_actions.ensureUnusedCapacity(allocator, 1);
-            const outcome = try executor.host.openFile(
-                if (executor.workingDirectory()) |cwd| .{ .path = cwd } else .inherit,
-                open,
-            );
-            const resource = switch (outcome) {
-                .opened => |resource| resource,
-                .failed => |reason| return .{ .failed = try scoped_executor.fileOpenFailure(
-                    open.path,
-                    reason,
-                ) },
-            };
-            resources.appendAssumeCapacity(resource);
-            scoped_actions.appendAssumeCapacity(.{ .use_resource = .{
-                .resource = resource,
-                .target = open.target,
-            } });
-            if (open.target == .stdin) {
-                scoped_executor.io.stdin = executor.host.resourceReader(resource);
-            } else {
-                scoped_executor.setRuntimeWriter(
-                    open.target,
-                    executor.host.resourceWriter(resource),
+    for (actions) |action| {
+        switch (action) {
+            .open => |open| {
+                const target = standardStreamIndex(open.target) orelse
+                    return error.UnsupportedInstruction;
+                try resources.ensureUnusedCapacity(allocator, 1);
+                try scoped_actions.ensureUnusedCapacity(allocator, 1);
+                const outcome = try executor.host.openFile(
+                    if (executor.workingDirectory()) |cwd| .{ .path = cwd } else .inherit,
+                    open,
                 );
-            }
-        },
-        .duplicate => |duplicate| {
-            _ = standardStreamIndex(duplicate.source) orelse
-                return error.UnsupportedInstruction;
-            _ = standardStreamIndex(duplicate.target) orelse
-                return error.UnsupportedInstruction;
-            const writer = scoped_executor.runtimeWriter(duplicate.source);
-            scoped_executor.setRuntimeWriter(duplicate.target, writer);
-            if (duplicate.target == .stdin)
-                scoped_executor.io.stdin = if (duplicate.source == .stdin) scoped_executor.io.stdin else null;
-            try scoped_actions.append(allocator, action);
-        },
-        .close => |descriptor| {
-            _ = standardStreamIndex(descriptor) orelse
-                return error.UnsupportedInstruction;
-            scoped_executor.setRuntimeWriter(descriptor, null);
-            if (descriptor == .stdin) scoped_executor.io.stdin = null;
-            try scoped_actions.append(allocator, action);
-        },
-        .use_resource => |use| {
-            _ = standardStreamIndex(use.target) orelse
-                return error.UnsupportedInstruction;
-            if (use.target == .stdin) {
-                scoped_executor.io.stdin = executor.host.resourceReader(use.resource);
-            } else {
-                scoped_executor.setRuntimeWriter(
-                    use.target,
-                    executor.host.resourceWriter(use.resource),
-                );
-            }
-            try scoped_actions.append(allocator, action);
-        },
-    };
+                const resource = switch (outcome) {
+                    .opened => |resource| resource,
+                    .failed => |reason| return .{ .failed = try scoped_executor.fileOpenFailure(
+                        open.path,
+                        reason,
+                    ) },
+                };
+                resources.appendAssumeCapacity(resource);
+                scoped_actions.appendAssumeCapacity(.{ .use_resource = .{
+                    .resource = resource,
+                    .target = open.target,
+                } });
+                bindings[target] = .{
+                    .reader = executor.host.resourceReader(resource),
+                    .writer = executor.host.resourceWriter(resource),
+                };
+            },
+            .duplicate => |duplicate| {
+                const source = standardStreamIndex(duplicate.source) orelse
+                    return error.UnsupportedInstruction;
+                const target = standardStreamIndex(duplicate.target) orelse
+                    return error.UnsupportedInstruction;
+                if (bindings[source].closed)
+                    return .{ .failed = try scoped_executor.redirectFailure(.{ .bad_file_descriptor = duplicate.source }) };
+                bindings[target] = bindings[source];
+                try scoped_actions.append(allocator, action);
+            },
+            .close => |descriptor| {
+                const target = standardStreamIndex(descriptor) orelse
+                    return error.UnsupportedInstruction;
+                bindings[target] = .{ .closed = true };
+                try scoped_actions.append(allocator, action);
+            },
+            .use_resource => |use| {
+                const target = standardStreamIndex(use.target) orelse
+                    return error.UnsupportedInstruction;
+                bindings[target] = .{
+                    .reader = executor.host.resourceReader(use.resource),
+                    .writer = executor.host.resourceWriter(use.resource),
+                };
+                try scoped_actions.append(allocator, action);
+            },
+        }
+        scoped_executor.io.stdin = bindings[0].reader;
+        scoped_executor.io.stdout = bindings[1].writer;
+        scoped_executor.io.stderr = bindings[2].writer;
+    }
 
+    scoped_executor.stream_bindings = bindings;
     scoped_executor.scoped_file_actions = scoped_actions.items;
     retain_resources = true;
     return .{ .ready = .{
@@ -1719,26 +1752,6 @@ fn closeRedirectResources(
         host.closeResource(resources.items[index]);
     }
     resources.* = .empty;
-}
-
-fn runtimeWriter(executor: Executor, descriptor: CommandPlan.FileDescriptor) ?*std.Io.Writer {
-    return switch (descriptor) {
-        .stdout => executor.io.stdout,
-        .stderr => executor.io.stderr,
-        else => null,
-    };
-}
-
-fn setRuntimeWriter(
-    executor: *Executor,
-    descriptor: CommandPlan.FileDescriptor,
-    writer: ?*std.Io.Writer,
-) void {
-    switch (descriptor) {
-        .stdout => executor.io.stdout = writer,
-        .stderr => executor.io.stderr = writer,
-        else => {},
-    }
 }
 
 fn standardStreamIndex(descriptor: CommandPlan.FileDescriptor) ?usize {
@@ -1847,7 +1860,7 @@ fn executeBuiltin(
     };
 }
 
-fn executeFunction(executor: Executor, argv: []const []const u8) Error!Result {
+fn executeFunction(executor: Executor, argv: []const []const u8, assignments: *const VariableStore) Error!Result {
     if (executor.function_depth == max_function_depth)
         return executor.commandFailure(argv[0], .function_call_depth_exceeded);
 
@@ -1855,14 +1868,37 @@ fn executeFunction(executor: Executor, argv: []const []const u8) Error!Result {
     var definition = (try state.cloneFunction(argv[0], executor.gpa)) orelse unreachable;
     defer definition.deinit(executor.gpa);
 
+    const variables = state.variableStore();
+    var saved = VariableStore.init(variables.gpa);
+    defer saved.deinit();
+    var iterator = assignments.iterator();
+    while (iterator.next()) |binding| {
+        if (variables.get(binding.name)) |value| {
+            try saved.set(binding.name, value);
+            try saved.setExported(binding.name, variables.isExported(binding.name));
+        }
+    }
+
+    var result = executor.callFunction(definition, argv, assignments) catch |err| {
+        try variables.restoreBindings(&saved, assignments);
+        return err;
+    };
+    try variables.restoreBindings(&saved, assignments);
+    if (result.control_flow == .@"return") result.control_flow = .none;
+    return result;
+}
+
+fn callFunction(executor: Executor, definition: @import("FunctionStore.zig").Definition, argv: []const []const u8, assignments: *const VariableStore) Error!Result {
+    const variables = executor.variableStore().?;
+    try applyAssignments(variables, assignments);
+    var iterator = assignments.iterator();
+    while (iterator.next()) |binding| try variables.setExported(binding.name, true);
     var function_executor = executor;
     var positional_parameters = argv[1..];
     function_executor.positional_parameters_override = &positional_parameters;
     function_executor.loop_depth = 0;
     function_executor.function_depth += 1;
-    var result = try function_executor.executeInstruction(definition.hir, definition.body);
-    if (result.control_flow == .@"return") result.control_flow = .none;
-    return result;
+    return function_executor.executeInstruction(definition.hir, definition.body);
 }
 
 fn variableStore(executor: Executor) ?*VariableStore {
@@ -1885,6 +1921,9 @@ fn wordExpander(
         .background_process_id = if (executor.jobs) |jobs| jobs.backgroundProcessIdText() else null,
         .last_status = executor.last_status,
         .failure = failure,
+        .pathname_host = executor.host,
+        .pathname_cwd = executor.workingDirectory(),
+        .pathname_restricted = executor.activeSandbox() != .inherit,
         .command_substitution = .{
             .userdata = executor,
             .run = runCommandSubstitution,
@@ -1970,6 +2009,10 @@ fn runCommandSubstitution(
     nested.context = .{ .mutable = &context };
     nested.io = parent.io;
     nested.io.stdout = output;
+    if (nested.stream_bindings) |*bindings| bindings[1] = .{
+        .reader = parent.host.resourceReader(capture),
+        .writer = output,
+    };
     nested.io.diagnostic_source = null;
     context.io = nested.io;
     nested.gpa = allocator;
@@ -1988,13 +2031,14 @@ fn runCommandSubstitution(
     var jobs: runtime.Jobs = .{
         .gpa = allocator,
         .diagnostic_io = nested.io,
+        .cancel_io = nested.cancel_io,
         .last_background_process_id = if (parent.jobs) |jobs| jobs.last_background_process_id else null,
     };
-    defer finishSubstitutionJobs(parent.*, &jobs);
+    defer finishScopeJobs(parent.*, &jobs);
     nested.jobs = &jobs;
     const result = try nested.execute(hir);
-    finishSubstitutionJobs(parent.*, &jobs);
-    jobs = .{ .gpa = allocator, .diagnostic_io = nested.io };
+    finishScopeJobs(parent.*, &jobs);
+    jobs = .{ .gpa = allocator, .diagnostic_io = nested.io, .cancel_io = nested.cancel_io };
     try output.flush();
     const reader = parent.host.resourceReader(capture) orelse return error.CommandSubstitutionUnavailable;
     const bytes = reader.allocRemaining(allocator, .unlimited) catch |err| switch (err) {
@@ -2004,7 +2048,7 @@ fn runCommandSubstitution(
     return .{ .output = bytes, .status = result.status };
 }
 
-fn finishSubstitutionJobs(executor: Executor, jobs: *runtime.Jobs) void {
+fn finishScopeJobs(executor: Executor, jobs: *runtime.Jobs) void {
     const previous = if (executor.cancel_io) |io| io.swapCancelProtection(.blocked) else null;
     defer {
         if (previous) |value| _ = executor.cancel_io.?.swapCancelProtection(value);
@@ -2196,6 +2240,10 @@ fn spawnFailure(
             return switch (action) {
                 .open => |open| executor.fileOpenFailure(open.path, file_action.reason),
                 .duplicate, .close, .use_resource => switch (file_action.reason) {
+                    .bad_file_descriptor => if (action == .duplicate)
+                        executor.redirectFailure(.{ .bad_file_descriptor = action.duplicate.source })
+                    else
+                        error.Unexpected,
                     .resource_unavailable => executor.commandFailure(
                         command,
                         .{ .cannot_execute = .resource_unavailable },
@@ -2225,6 +2273,7 @@ fn fileOpenFailure(
             .path_already_exists => .path_already_exists,
             .resource_unavailable => .resource_unavailable,
             .unsupported => .unsupported,
+            .bad_file_descriptor => unreachable,
         } },
     };
     try executor.io.reportDiagnostic(diagnostic);

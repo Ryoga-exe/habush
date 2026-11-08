@@ -24,7 +24,7 @@ pub const Definition = struct {
         gpa: std.mem.Allocator,
     ) std.mem.Allocator.Error!Definition {
         return .{
-            .hir = try definition.hir.clone(gpa),
+            .hir = try definition.hir.retain(gpa),
             .body = definition.body,
         };
     }
@@ -46,16 +46,28 @@ pub fn deinit(functions: *FunctionStore) void {
 pub fn clone(functions: FunctionStore, gpa: std.mem.Allocator) std.mem.Allocator.Error!FunctionStore {
     var copy = FunctionStore.init(gpa);
     errdefer copy.deinit();
-    for (functions.map.keys(), functions.map.values()) |name, definition|
-        copy.set(name, definition.hir, definition.body) catch |err| switch (err) {
+    // A destination allocator owns one copy per source unit, not per function.
+    var units: std.AutoHashMapUnmanaged([*]const Hir.Inst.Tag, Hir) = .empty;
+    defer units.deinit(gpa);
+    for (functions.map.keys(), functions.map.values()) |name, definition| {
+        const key = definition.hir.instructions.items(.tag).ptr;
+        const previous = units.get(key);
+        copy.set(name, previous orelse definition.hir, definition.body) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.InvalidName => unreachable,
         };
+        if (previous == null) try units.put(gpa, key, copy.map.get(name).?.hir);
+    }
     return copy;
 }
 
 pub fn contains(functions: FunctionStore, name: []const u8) bool {
     return functions.map.contains(name);
+}
+
+/// Borrows names until the next definition change or deinit.
+pub fn names(functions: FunctionStore) []const []const u8 {
+    return functions.map.keys();
 }
 
 /// Returns an owned snapshot that remains valid if the stored definition is
@@ -79,7 +91,7 @@ pub fn set(
     if (!VariableStore.isValidName(name)) return error.InvalidName;
 
     var definition = Definition{
-        .hir = try hir.clone(functions.gpa),
+        .hir = try hir.retain(functions.gpa),
         .body = body,
     };
     errdefer definition.deinit(functions.gpa);
@@ -117,6 +129,36 @@ test "function store owns, replaces, and snapshots definitions" {
     try std.testing.expectEqualStrings("second", assignmentValue(replacement));
     try std.testing.expect(functions.contains("build"));
     try std.testing.expect(!(functions.contains("missing")));
+}
+
+test "functions share their immutable unit and clone once into another allocator" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    var tree = try @import("Ast.zig").parse(gpa, "first() { value=one; }; second() { value=two; }");
+    defer tree.deinit(gpa);
+    var hir = try @import("AstGen.zig").generate(gpa, tree);
+    defer hir.deinit(gpa);
+    var functions = FunctionStore.init(gpa);
+    defer functions.deinit();
+    for (0..hir.listItemCount(hir.root().?)) |index| {
+        const function = hir.functionDefinition(hir.listItem(hir.root().?, index).command);
+        try functions.set(function.name, hir, function.body);
+    }
+    try std.testing.expect(functions.map.values()[0].hir.instructions.items(.tag).ptr == hir.instructions.items(.tag).ptr);
+    try std.testing.expect(functions.map.values()[1].hir.instructions.items(.tag).ptr == hir.instructions.items(.tag).ptr);
+    var snapshot = (try functions.cloneDefinition("first", gpa)).?;
+    defer snapshot.deinit(gpa);
+    try std.testing.expect(snapshot.hir.instructions.items(.tag).ptr == hir.instructions.items(.tag).ptr);
+
+    var copy = try functions.clone(std.testing.allocator);
+    defer copy.deinit();
+    try std.testing.expect(copy.map.values()[0].hir.instructions.items(.tag).ptr != hir.instructions.items(.tag).ptr);
+    try std.testing.expect(copy.map.values()[0].hir.instructions.items(.tag).ptr == copy.map.values()[1].hir.instructions.items(.tag).ptr);
+    try hir.setSource(gpa, .{ .text = "changed origin" });
+    try std.testing.expectEqualStrings("first() { value=one; }; second() { value=two; }", snapshot.hir.source.?.text);
+    try std.testing.expectEqualStrings("one", assignmentValue(copy.map.get("first").?));
+    try std.testing.expectEqualStrings("two", assignmentValue(copy.map.get("second").?));
 }
 
 test "function store rejects invalid names" {

@@ -4,6 +4,7 @@ const std = @import("std");
 const habush = @import("habush");
 const ShellIntegration = @import("terminal/ShellIntegration.zig");
 const LineEditor = @import("terminal/LineEditor.zig");
+const interrupt = @import("interrupt.zig");
 const Io = std.Io;
 const Shell = @This();
 
@@ -14,13 +15,19 @@ stdin: *Io.Reader,
 stderr: *Io.Writer,
 session: *habush.Session,
 interactive: bool,
+/// Allows an interactive caller's startup source to remain cancellable while
+/// runSource suppresses prompts, editing, and shell-integration messages.
+interruptible: bool = false,
 io: ?std.Io = null,
 line_edit: bool = false,
+completion_limits: habush.Completion.Provider.Limits = .{},
+resolver_options: habush.CommandResolver.System.Options = .{},
 integration: ?ShellIntegration = null,
 input_line: usize = 0,
 /// Known only for a fixed script/command source buffer.
 input_byte_offset: ?u32 = null,
 last_line_ending: LineEnding = .lf,
+interrupt_generation: u32 = 0,
 
 pub fn run(self: *Shell) !habush.runtime.ExitStatus {
     return self.runInput(null);
@@ -28,9 +35,11 @@ pub fn run(self: *Shell) !habush.runtime.ExitStatus {
 
 fn runInput(self: *Shell, source_name: ?[]const u8) !habush.runtime.ExitStatus {
     while (true) {
-        var input = (self.readCommand() catch |err| switch (err) {
-            error.InputInterrupted => {
+        self.interrupt_generation = interrupt.snapshot();
+        var input = (self.withInterrupt(?CommandInput, readCommand, .{self}, discardInput, true) catch |err| switch (err) {
+            error.InputInterrupted, error.Canceled => {
                 self.session.interruptInput();
+                if (err == error.Canceled) try self.stderr.writeByte('\n');
                 continue;
             },
             else => return err,
@@ -45,6 +54,7 @@ fn runInput(self: *Shell, source_name: ?[]const u8) !habush.runtime.ExitStatus {
             self.session.rejectInput();
             command_open = false;
             try self.endCommand(2);
+            if (!self.interactive) return 2;
             continue;
         }
         if (std.mem.trim(u8, input.source, &std.ascii.whitespace).len == 0) {
@@ -357,7 +367,7 @@ fn readHereDocument(
         try pending.writer.writeAll(stripped);
         try pending.writer.writeByte('\n');
 
-        const continued = metadata.expand_body and hasLineContinuation(stripped);
+        const continued = metadata.expand_body and habush.heredoc.hasLineContinuation(stripped);
         try delimiter_candidate.writer.writeAll(
             if (continued) stripped[0 .. stripped.len - 1] else stripped,
         );
@@ -369,14 +379,6 @@ fn readHereDocument(
         pending.clearRetainingCapacity();
         delimiter_candidate.clearRetainingCapacity();
     }
-}
-
-fn hasLineContinuation(line: []const u8) bool {
-    var backslash_count: usize = 0;
-    var index = line.len;
-    while (index != 0 and line[index - 1] == '\\') : (index -= 1)
-        backslash_count += 1;
-    return backslash_count % 2 == 1;
 }
 
 fn readInputLine(self: *Shell, prompt: []const u8, prefix: []const u8, allow_completion: bool) !?[:0]u8 {
@@ -392,6 +394,8 @@ fn readInputLine(self: *Shell, prompt: []const u8, prefix: []const u8, allow_com
             .prompt = prompt,
             .prefix = prefix,
             .allow_completion = allow_completion,
+            .completion_limits = self.completion_limits,
+            .resolver_options = self.resolver_options,
         }).read() catch |err| switch (err) {
             error.EditorUnavailable => try readLineAlloc(self.stdin, self.allocator, &self.last_line_ending),
             error.EndOfStream => null,
@@ -440,14 +444,21 @@ fn handleInput(
     mappings: []const habush.Source.Mapping,
     source_offset: ?u32,
 ) !habush.runtime.ControlFlow {
-    var evaluation = try self.session.evaluate(source, .{
+    var evaluation = self.evaluate(source, .{
         .collected_here_documents = collected_here_documents,
         .source_name = source_name,
         .source_line_offset = source_line,
         .source_base_offset = source_offset,
         .original_source = original_source,
         .source_mappings = mappings,
-    });
+    }) catch |err| switch (err) {
+        error.Canceled => {
+            self.session.interruptInput();
+            try self.stderr.writeByte('\n');
+            return .none;
+        },
+        else => return err,
+    };
     defer evaluation.deinit(self.session.allocator());
     switch (evaluation) {
         .syntax => |tree| {
@@ -466,7 +477,7 @@ fn handleInput(
             } else if (tree.status == .incomplete) {
                 try self.stderr.writeAll("habush: incomplete input\n");
             }
-            return .none;
+            return if (self.interactive) .none else .exit;
         },
         .unsupported => |err| {
             try self.stderr.print("habush: unsupported runtime feature: {s}\n", .{
@@ -475,6 +486,68 @@ fn handleInput(
             return .none;
         },
         .executed => |result| return result.control_flow,
+    }
+}
+
+fn evaluate(self: *Shell, source: [:0]const u8, options: habush.Session.EvaluateOptions) !habush.Evaluation {
+    return self.withInterrupt(habush.Evaluation, habush.Session.evaluate, .{ self.session, source, options }, discardEvaluation, false);
+}
+
+fn discardInput(self: *Shell, value: ?CommandInput) void {
+    var owned = value orelse return;
+    owned.deinit(self.allocator);
+}
+
+fn discardEvaluation(self: *Shell, value: habush.Evaluation) void {
+    var owned = value;
+    owned.deinit(self.session.allocator());
+}
+
+/// Both tasks are joined before the caller touches the reader/session again.
+/// A completed operation may own a result even when the interrupt wins.
+fn withInterrupt(
+    self: *Shell,
+    comptime T: type,
+    comptime operation: anytype,
+    args: std.meta.ArgsTuple(@TypeOf(operation)),
+    comptime discard: fn (*Shell, T) void,
+    poll_background: bool,
+) !T {
+    if (!self.interruptible and !poll_background) return @call(.auto, operation, args);
+    const io = self.io orelse return @call(.auto, operation, args);
+    const Result = union(enum) {
+        completed: @typeInfo(@TypeOf(operation)).@"fn".return_type.?,
+        interrupted: std.Io.Cancelable!void,
+        poll_failed: habush.Host.Error!void,
+    };
+    var storage: [3]Result = undefined;
+    var pending: std.Io.Select(Result) = .init(io, &storage);
+    defer while (pending.cancel()) |result| {
+        if (result == .completed) {
+            if (result.completed) |value| discard(self, value) else |_| {}
+        }
+    };
+    try pending.concurrent(.completed, operation, args);
+    if (self.interruptible)
+        try pending.concurrent(.interrupted, interrupt.wait, .{ io, self.interrupt_generation });
+    if (poll_background and self.session.host.capabilities().poll)
+        try pending.concurrent(.poll_failed, pollJobs, .{self});
+    return switch (try pending.await()) {
+        .completed => |result| result,
+        .interrupted => error.Canceled,
+        .poll_failed => |result| {
+            try result;
+            unreachable;
+        },
+    };
+}
+
+// Only input waiting runs beside this task; evaluation owns the table itself.
+fn pollJobs(self: *Shell) habush.Host.Error!void {
+    const io = self.io.?;
+    while (true) {
+        try io.sleep(.fromMilliseconds(20), .awake);
+        try self.session.jobs.poll();
     }
 }
 
@@ -557,4 +630,46 @@ test "script diagnostics retain raw CRLF here-document and final-line byte range
     try std.testing.expectEqualDeep(habush.Source.Range{ .start = @intCast(nested), .end = @intCast(nested + "missing_nested".len) }, capture.ranges[1].?);
     try std.testing.expectEqualDeep(habush.Source.Range{ .start = @intCast(last), .end = @intCast(script.len) }, capture.ranges[2].?);
     try std.testing.expectEqualStrings("", stderr.written());
+}
+
+test "startup source stays interruptible without interactive presentation" {
+    const Notify = struct {
+        io: std.Io,
+        started: std.Io.Event = .unset,
+
+        fn observe(userdata: ?*anyopaque, event: habush.Session.Event) void {
+            const notify: *@This() = @ptrCast(@alignCast(userdata.?));
+            if (event == .started) notify.started.set(notify.io);
+        }
+
+        fn run(notify: *@This()) std.Io.Cancelable!void {
+            try notify.started.wait(notify.io);
+            interrupt.notify();
+        }
+    };
+    var system: habush.Host.System = .{ .gpa = std.testing.allocator, .io = std.testing.io };
+    defer system.deinit();
+    var notify: Notify = .{ .io = std.testing.io };
+    var session = try habush.Session.init(std.testing.allocator, system.host(), .{
+        .cancel_io = std.testing.io,
+        .observer = .{ .userdata = &notify, .notify = Notify.observe },
+    });
+    defer session.deinit();
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var reader: Io.Reader = .fixed("");
+    var shell: Shell = .{
+        .allocator = std.testing.allocator,
+        .stdin = &reader,
+        .stderr = &output.writer,
+        .session = &session,
+        .interactive = true,
+        .interruptible = true,
+        .io = std.testing.io,
+    };
+    var notifier = try std.testing.io.concurrent(Notify.run, .{&notify});
+    defer notifier.cancel(std.testing.io) catch {};
+    try std.testing.expectEqual(@as(u8, 130), try shell.runSource("while true; do :; done\n", "rc"));
+    try std.testing.expect(shell.interactive);
+    try std.testing.expectEqualStrings("\n", output.written());
 }

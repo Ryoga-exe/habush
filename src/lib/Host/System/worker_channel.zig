@@ -249,6 +249,7 @@ fn encode(failure: Host.SpawnFailure) [packet_len]u8 {
             .path_already_exists => 4,
             .resource_unavailable => 5,
             .unsupported => 6,
+            .bad_file_descriptor => 7,
         };
         std.mem.writeInt(u32, packet[8..12], failure.file_action.action_index, .little);
     }
@@ -273,6 +274,7 @@ fn decode(packet: *const [packet_len]u8) Error!Host.SpawnFailure {
             4 => .path_already_exists,
             5 => .resource_unavailable,
             6 => .unsupported,
+            7 => .bad_file_descriptor,
             else => return error.Unexpected,
         } } },
         else => error.Unexpected,
@@ -332,9 +334,9 @@ test "worker channel transfers input and preserves file action indexes" {
     const input = try receiveInput(child);
     if (input) |fd| close(fd);
     const reporter: Reporter = .{ .socket = child };
-    reporter.send(.{ .file_action = .{ .action_index = 2, .reason = .access_denied } });
+    reporter.send(.{ .file_action = .{ .action_index = 2, .reason = .bad_file_descriptor } });
     const report = parent.takeReport(3);
-    try std.testing.expectEqualDeep(@as(?Host.SpawnFailure, .{ .file_action = .{ .action_index = 5, .reason = .access_denied } }), try report.read());
+    try std.testing.expectEqualDeep(@as(?Host.SpawnFailure, .{ .file_action = .{ .action_index = 5, .reason = .bad_file_descriptor } }), try report.read());
 }
 
 test "closed input and an empty report preserve native termination" {

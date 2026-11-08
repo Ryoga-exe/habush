@@ -1039,6 +1039,43 @@ test "multiple general in-process pipeline stages remain unsupported" {
     try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
 }
 
+test "cancellation between pipeline stages kills and reaps already spawned children" {
+    const CancelAfterSpawn = struct {
+        fake: *FakeHost,
+        protection: std.Io.CancelProtection = .unblocked,
+
+        fn checkCancel(userdata: ?*anyopaque) std.Io.Cancelable!void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            if (self.protection == .unblocked and self.fake.spawn_calls.items.len != 0)
+                return error.Canceled;
+        }
+
+        fn swapProtection(userdata: ?*anyopaque, protection: std.Io.CancelProtection) std.Io.CancelProtection {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            const previous = self.protection;
+            self.protection = protection;
+            return previous;
+        }
+    };
+    var hir = try generate("/bin/source | /bin/sink");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var cancellation: CancelAfterSpawn = .{ .fake = &fake };
+    var io_vtable = std.testing.io.vtable.*;
+    io_vtable.checkCancel = CancelAfterSpawn.checkCancel;
+    io_vtable.swapCancelProtection = CancelAfterSpawn.swapProtection;
+    var executor = preResolvedExecutor(std.testing.allocator, fake.host());
+    executor.cancel_io = .{ .userdata = &cancellation, .vtable = &io_vtable };
+
+    try std.testing.expectError(error.Canceled, executor.execute(hir));
+    try std.testing.expectEqual(@as(usize, 1), fake.spawn_calls.items.len);
+    try std.testing.expectEqual(@as(usize, 1), fake.signal_calls.items.len);
+    try std.testing.expectEqual(@import("Host.zig").Signal.kill, fake.signal_calls.items[0].signal);
+    try expectPipelineResourcesReleased(&fake);
+    try std.testing.expectEqual(std.Io.CancelProtection.unblocked, cancellation.protection);
+}
+
 test "concurrent stage failure kills external peers and closes pipes" {
     var hir = try generate("/bin/source | true | pwd");
     defer hir.deinit(std.testing.allocator);
@@ -1323,7 +1360,7 @@ test "builtin redirections replace runtime output only for the command scope" {
 }
 
 test "read uses redirected input only within its command scope" {
-    var hir = try generate("read FIRST <input; read SECOND");
+    var hir = try generate("read FIRST 1<>input 0<&1; read SECOND");
     defer hir.deinit(std.testing.allocator);
     var fake = FakeHost.init(std.testing.allocator);
     defer fake.deinit();
@@ -1411,6 +1448,29 @@ test "failed scoped redirections prevent command side effects" {
     try std.testing.expectEqualStrings("original", variables.get("persisted").?);
     try std.testing.expectEqualStrings("missing: no such file or directory\n", diagnostics.written());
     try std.testing.expectEqual(@as(usize, 0), fake.closed_resource_count);
+}
+
+test "copying a closed stream stops builtin and compound side effects" {
+    for ([_][:0]const u8{ "pwd >first 1>&- 2>&1", "{ persisted=changed; } >first 1>&- 1>&1" }) |source| {
+        var hir = try generate(source);
+        defer hir.deinit(std.testing.allocator);
+        var fake = FakeHost.init(std.testing.allocator);
+        defer fake.deinit();
+        var variables = VariableStore.init(std.testing.allocator);
+        defer variables.deinit();
+        try variables.set("persisted", "original");
+        var diagnostics: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer diagnostics.deinit();
+        const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+            .variables = &variables,
+            .context = .{ .io = .{ .stderr = &diagnostics.writer } },
+        }).execute(hir);
+        try std.testing.expectEqual(@as(u8, 1), result.status);
+        try std.testing.expectEqualStrings("original", variables.get("persisted").?);
+        try std.testing.expectEqualStrings("bad file descriptor: 1\n", diagnostics.written());
+        try std.testing.expectEqual(@as(usize, 1), fake.open_file_calls.items.len);
+        try std.testing.expectEqual(@as(usize, 1), fake.closed_resource_count);
+    }
 }
 
 test "later scoped redirection failure closes earlier resources" {
@@ -1974,6 +2034,36 @@ test "break outside a loop reports a command failure" {
     try std.testing.expectEqualStrings("break: not in a loop\n", diagnostics.written());
 }
 
+test "function prefix bindings are exported temporarily while unrelated changes persist" {
+    var hir = try generate(
+        \\f() { seen="$name:$new:$visible"; /bin/env; unset name visible; new=changed; other=kept; }
+        \\name=temporary new=added visible=temporary f
+    );
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var state = try runtime.State.init(std.testing.allocator, .{ .variables = &.{
+        .{ .name = "name", .value = "original" },
+        .{ .name = "visible", .value = "exported", .exported = true },
+    } });
+    defer state.deinit();
+    var context = try ExecutionContext.init(std.testing.allocator, .{});
+    defer context.deinit();
+    _ = try Executor.initWithState(fake.host(), CommandResolver.preResolved(), &state, &context, 0).execute(hir);
+    try std.testing.expectEqualStrings("temporary:added:temporary", state.variable("seen").?);
+    try std.testing.expectEqualStrings("kept", state.variable("other").?);
+    try std.testing.expectEqualStrings("original", state.variable("name").?);
+    try std.testing.expect(!state.variableStore().isExported("name"));
+    try std.testing.expectEqualStrings("exported", state.variable("visible").?);
+    try std.testing.expect(state.variableStore().isExported("visible"));
+    try std.testing.expect(state.variable("new") == null);
+    const environment = fake.spawn_calls.items[0].environment.replace;
+    try std.testing.expectEqual(@as(usize, 3), environment.len);
+    for (environment) |binding| {
+        try std.testing.expectEqualStrings(if (std.mem.eql(u8, binding.name, "new")) "added" else "temporary", binding.value);
+    }
+}
+
 test "special builtin assignments persist in session state" {
     var hir = try generate("name=temporary next=\"$name value\" :");
     defer hir.deinit(std.testing.allocator);
@@ -2192,7 +2282,7 @@ test "parameter expansion failures become shell diagnostics" {
 
 test "unsupported expansions have no host side effects" {
     const cases = [_]struct { [:0]const u8, anyerror }{
-        .{ "/bin/echo *.zig", error.PathnameExpansionUnsupported },
+        .{ "/bin/echo ~other", error.TildeExpansionUnsupported },
     };
     for (cases) |case| {
         var hir = try generate(case[0]);
@@ -2206,6 +2296,24 @@ test "unsupported expansions have no host side effects" {
         );
         try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
     }
+}
+
+test "redirect pathname expansion rejects multiple matches before opening any path" {
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    fake.directories = &.{.{ .path = ".", .names = &.{ "b.txt", "a.txt" } }};
+    const executor = Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .context = .{ .cwd = "/workspace" },
+    });
+    var ambiguous = try generate("true >*.txt");
+    defer ambiguous.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 1), (try executor.execute(ambiguous)).status);
+    try std.testing.expectEqual(@as(usize, 0), fake.open_file_calls.items.len);
+    var single = try generate("true >a*.txt");
+    defer single.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), (try executor.execute(single)).status);
+    try std.testing.expectEqual(@as(usize, 1), fake.open_file_calls.items.len);
+    try std.testing.expectEqualStrings("a.txt", fake.open_file_calls.items[0].open.path);
 }
 
 test "field splitting contributes every expanded command argument" {

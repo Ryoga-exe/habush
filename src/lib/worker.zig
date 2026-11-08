@@ -292,6 +292,7 @@ fn fileActionReason(err: anyerror) Host.FileActionFailure.Reason {
         error.AccessDenied, error.PermissionDenied, error.IsDir => .access_denied,
         error.InvalidName, error.BadPathName, error.NameTooLong => .invalid_path,
         error.PathAlreadyExists => .path_already_exists,
+        error.BadDescriptor => .bad_file_descriptor,
         error.OutOfMemory,
         error.NoDevice,
         error.SystemResources,
@@ -396,15 +397,8 @@ fn clearCloseOnExec(fd: std.posix.fd_t) !void {
 fn duplicateDescriptor(source: std.posix.fd_t, target: std.posix.fd_t) !void {
     // Some Linux dup2(fd, fd) implementations do not validate fd in Release.
     _ = try descriptorFlags(source);
-    while (true) switch (std.posix.errno(std.posix.system.dup2(source, target))) {
-        .SUCCESS => {
-            if (source == target) try clearCloseOnExec(target);
-            return;
-        },
-        .INTR, .BUSY => continue,
-        .BADF => return error.BadDescriptor,
-        else => return error.DuplicateFailed,
-    };
+    std.Io.Threaded.dup2(source, target) catch return error.DuplicateFailed;
+    if (source == target) try clearCloseOnExec(target);
 }
 
 fn openFile(io: std.Io, open: CommandPlan.FileAction.Open) !std.Io.File {

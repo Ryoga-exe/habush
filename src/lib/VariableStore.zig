@@ -126,6 +126,21 @@ pub fn unset(variables: *VariableStore, name: []const u8) bool {
     return true;
 }
 
+/// Restores saved command bindings without copying their owned values.
+/// Names absent from the saved store were unset before the command.
+pub fn restoreBindings(
+    variables: *VariableStore,
+    saved: *VariableStore,
+    assignments: *const VariableStore,
+) std.mem.Allocator.Error!void {
+    std.debug.assert(variables.gpa.ptr == saved.gpa.ptr and variables.gpa.vtable == saved.gpa.vtable);
+    try variables.map.ensureUnusedCapacity(variables.gpa, saved.map.count());
+    for (assignments.map.keys()) |name| _ = variables.unset(name);
+    for (saved.map.keys(), saved.map.values()) |name, value|
+        variables.map.putAssumeCapacityNoClobber(name, value);
+    saved.map.clearRetainingCapacity();
+}
+
 pub fn isValidName(name: []const u8) bool {
     if (name.len == 0 or !isNameStart(name[0])) return false;
     for (name[1..]) |byte| {

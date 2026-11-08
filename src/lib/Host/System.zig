@@ -204,7 +204,42 @@ const vtable: Host.VTable = .{
     .resource_writer = resourceWriter,
     .resource_reader = resourceReader,
     .resolve_working_directory = resolveWorkingDirectory,
+    .read_directory = readDirectory,
 };
+
+fn readDirectory(userdata: ?*anyopaque, gpa: std.mem.Allocator, cwd: CommandPlan.WorkingDirectory, path: []const u8) Host.Error!?Host.Directory {
+    const system: *System = @ptrCast(@alignCast(userdata.?));
+    const resolved = if (std.fs.path.isAbsolute(path))
+        try gpa.dupe(u8, path)
+    else switch (cwd) {
+        .inherit => try gpa.dupe(u8, path),
+        .path => |base| try std.fs.path.join(gpa, &.{ base, path }),
+    };
+    defer gpa.free(resolved);
+    const directory = std.Io.Dir.cwd().openDir(system.io, resolved, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return null,
+        error.AccessDenied, error.PermissionDenied => return error.AccessDenied,
+        error.Canceled => return error.Canceled,
+        else => return error.ResourceUnavailable,
+    };
+    defer directory.close(system.io);
+    var names: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (names.items) |name| gpa.free(name);
+        names.deinit(gpa);
+    }
+    var iterator = directory.iterate();
+    while (iterator.next(system.io) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        error.AccessDenied => return error.AccessDenied,
+        else => return error.Unexpected,
+    }) |entry| {
+        const name = try gpa.dupe(u8, entry.name);
+        errdefer gpa.free(name);
+        try names.append(gpa, name);
+    }
+    return .{ .names = try names.toOwnedSlice(gpa) };
+}
 
 fn createPipe(userdata: ?*anyopaque) Host.Error!Host.Pipe {
     const system: *System = @ptrCast(@alignCast(userdata.?));
@@ -373,6 +408,8 @@ fn spawnNative(system: *System, plan: CommandPlan, bootstrap_worker: bool) Host.
                     return fileActionFailure(action_index, .unsupported);
                 const target = stdioIndex(duplicate.target) orelse
                     return fileActionFailure(action_index, .unsupported);
+                if (bindings[source] == .close)
+                    return fileActionFailure(action_index, .bad_file_descriptor);
                 bindings[target] = bindings[source];
             },
             .close => |descriptor| {
@@ -1318,6 +1355,29 @@ test "system host resolves and validates working directories" {
     try std.testing.expectEqualStrings(expected, resolved);
 }
 
+test "directory snapshots use explicit cwd and own entry names" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.createDir(std.testing.io, "child", .default_dir);
+    for ([_][]const u8{ "child/visible", "child/.hidden", "file" }) |path| {
+        const file = try temporary.dir.createFile(std.testing.io, path, .{});
+        file.close(std.testing.io);
+    }
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const length = try temporary.dir.realPath(std.testing.io, &buffer);
+    var system: System = .{ .gpa = std.testing.allocator, .io = std.testing.io };
+    defer system.deinit();
+    const cwd: CommandPlan.WorkingDirectory = .{ .path = buffer[0..length] };
+    const entries = (try system.host().readDirectory(std.testing.allocator, cwd, "child")).?;
+    defer entries.deinit(std.testing.allocator);
+    try temporary.dir.deleteFile(std.testing.io, "child/visible");
+    try std.testing.expectEqual(@as(usize, 2), entries.names.len);
+    for (entries.names) |name|
+        try std.testing.expect(std.mem.eql(u8, name, "visible") or std.mem.eql(u8, name, ".hidden"));
+    try std.testing.expect((try system.host().readDirectory(std.testing.allocator, cwd, "missing")) == null);
+    try std.testing.expect((try system.host().readDirectory(std.testing.allocator, cwd, "file")) == null);
+}
+
 test "system host accepts absolute directories independently of shell state" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1893,6 +1953,32 @@ test "known lookup failures preserve ordered redirect effects and errors" {
     };
     try std.testing.expectEqualDeep(Host.SpawnOutcome{ .failed = .{ .file_action = .{ .action_index = 0, .reason = .not_found } } }, try system.host().spawn(plan));
     try std.testing.expectError(error.FileNotFound, temporary.dir.statFile(std.testing.io, "never", .{}));
+    try std.testing.expectEqual(@as(usize, 0), system.children.count());
+}
+
+test "system host rejects a closed duplicate source before spawning" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const len = try temporary.dir.realPath(std.testing.io, &buffer);
+    var system: System = .{ .gpa = std.testing.allocator, .io = std.testing.io };
+    defer system.deinit();
+    const result = try system.host().spawn(.{
+        .executable = "/bin/touch",
+        .argv = &.{ "/bin/touch", "marker" },
+        .cwd = .{ .path = buffer[0..len] },
+        .file_actions = &.{
+            .{ .open = .{ .path = "first", .target = .stdout, .access = .write, .disposition = .create_or_truncate } },
+            .{ .close = .stdout },
+            .{ .duplicate = .{ .source = .stdout, .target = .stderr } },
+        },
+    });
+    try std.testing.expectEqualDeep(Host.SpawnOutcome{ .failed = .{ .file_action = .{
+        .action_index = 2,
+        .reason = .bad_file_descriptor,
+    } } }, result);
+    _ = try temporary.dir.statFile(std.testing.io, "first", .{});
+    try std.testing.expectError(error.FileNotFound, temporary.dir.statFile(std.testing.io, "marker", .{}));
     try std.testing.expectEqual(@as(usize, 0), system.children.count());
 }
 

@@ -61,7 +61,7 @@ pub const Context = struct {
     function_depth: u32 = 0,
 };
 
-pub const Error = std.mem.Allocator.Error || std.Io.Writer.Error || Host.Error || error{
+pub const Error = std.mem.Allocator.Error || std.Io.Writer.Error || std.Io.Reader.Error || Host.Error || error{
     HostUnavailable,
     RuntimeStateUnavailable,
     ExecutionContextUnavailable,
@@ -423,10 +423,13 @@ const ReadInput = struct {
         allocator: std.mem.Allocator,
         reader: *std.Io.Reader,
         raw: bool,
-    ) std.mem.Allocator.Error!bool {
+    ) (std.mem.Allocator.Error || std.Io.Reader.Error)!bool {
         var pending_escape = false;
         while (true) {
-            const byte = reader.takeByte() catch break;
+            const byte = reader.takeByte() catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => return err,
+            };
             if (!raw and pending_escape) {
                 pending_escape = false;
                 if (byte == '\n') continue;
@@ -476,6 +479,9 @@ const ReadInput = struct {
 
     fn remainingField(input: ReadInput, cursor: *usize, ifs: []const u8) []const u8 {
         cursor.* = input.skipWhitespace(cursor.*, ifs);
+        var next = cursor.*;
+        const field = input.nextField(&next, ifs);
+        if (next == input.bytes.items.len) return field;
         var end = input.bytes.items.len;
         while (end > cursor.* and input.separator(end - 1, ifs) == .whitespace)
             end -= 1;
@@ -710,6 +716,47 @@ test "read splits IFS fields and assigns the remaining input to the last name" {
         &.{"read"},
     )).status);
     try std.testing.expectEqualStrings("  reply  ", state.variable("REPLY").?);
+}
+
+test "read drops a final IFS delimiter only when no surplus fields remain" {
+    var state = try runtime.State.init(std.testing.allocator, .{});
+    defer state.deinit();
+    try state.setVariable("IFS", ": ");
+    const cases = .{
+        .{ "a:b:\n", "b" },
+        .{ "a:b:  \n", "b" },
+        .{ "a:b::\n", "b::" },
+        .{ "a:b:c:\n", "b:c:" },
+        .{ "a::\n", "" },
+        .{ "a:b\\:\n", "b:" },
+    };
+    inline for (cases) |case| {
+        var input: std.Io.Reader = .fixed(case[0]);
+        const result = try lookup("read").?.run(.{
+            .runtime_state = &state,
+            .io = .{ .stdin = &input },
+        }, &.{ "read", "FIRST", "LAST" });
+        try std.testing.expectEqual(@as(u8, 0), result.status);
+        try std.testing.expectEqualStrings(case[1], state.variable("LAST").?);
+    }
+}
+
+test "read preserves variables on an input failure" {
+    const Failing = struct {
+        fn stream(_: *std.Io.Reader, _: *std.Io.Writer, _: std.Io.Limit) std.Io.Reader.StreamError!usize {
+            return error.ReadFailed;
+        }
+    };
+    var state = try runtime.State.init(std.testing.allocator, .{});
+    defer state.deinit();
+    try state.setVariable("value", "original");
+    var buffer: [1]u8 = undefined;
+    var input: std.Io.Reader = .{ .vtable = &.{ .stream = Failing.stream }, .buffer = &buffer, .seek = 0, .end = 0 };
+    try std.testing.expectError(error.ReadFailed, lookup("read").?.run(.{
+        .runtime_state = &state,
+        .io = .{ .stdin = &input },
+    }, &.{ "read", "value" }));
+    try std.testing.expectEqualStrings("original", state.variable("value").?);
 }
 
 test "read handles escaped separators, raw input, continuation, and partial EOF" {

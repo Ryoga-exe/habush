@@ -63,6 +63,7 @@ pub const Kind = union(enum) {
     parameter_expansion: ParameterExpansion,
     ambiguous_redirect,
     invalid_file_descriptor: []const u8,
+    bad_file_descriptor: @import("../CommandPlan.zig").FileDescriptor,
     unsupported_file_descriptor: []const u8,
     input_resource_unavailable,
     cannot_create_pipeline: CannotCreatePipelineReason,
@@ -134,9 +135,14 @@ pub fn fromStartupFailure(context: Pipeline.FailureContext, failure: Host.SpawnF
                         .path_already_exists => .path_already_exists,
                         .resource_unavailable => .resource_unavailable,
                         .unsupported => .unsupported,
+                        .bad_file_descriptor => return error.Unexpected,
                     } };
                 },
                 .duplicate, .close, .use_resource => break :action switch (file_action.reason) {
+                    .bad_file_descriptor => if (context.file_actions[file_action.action_index] == .duplicate)
+                        .{ .bad_file_descriptor = context.file_actions[file_action.action_index].duplicate.source }
+                    else
+                        return error.Unexpected,
                     .resource_unavailable => .{ .cannot_execute = .resource_unavailable },
                     .unsupported => .{ .cannot_execute = .unsupported },
                     else => return error.Unexpected,
@@ -162,6 +168,7 @@ pub fn status(diagnostic: Diagnostic) types.ExitStatus {
         .parameter_expansion,
         .ambiguous_redirect,
         .invalid_file_descriptor,
+        .bad_file_descriptor,
         .unsupported_file_descriptor,
         .input_resource_unavailable,
         .cannot_create_pipeline,
@@ -213,6 +220,7 @@ pub fn render(
             "invalid file descriptor: {s}",
             .{descriptor},
         ),
+        .bad_file_descriptor => |descriptor| try writer.print("bad file descriptor: {d}", .{@intFromEnum(descriptor)}),
         .unsupported_file_descriptor => |descriptor| try writer.print(
             "unsupported file descriptor: {s}",
             .{descriptor},

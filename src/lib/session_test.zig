@@ -66,7 +66,7 @@ test "evaluation events pair outcomes and reject callback reentry" {
     defer session.deinit();
     capture.session = &session;
 
-    const inputs = [_][:0]const u8{ "exit 7", "# comment", "if", "tool *.txt" };
+    const inputs = [_][:0]const u8{ "exit 7", "# comment", "if", "tool ~other" };
     for (inputs) |input| {
         var result = try session.evaluate(input, .{});
         result.deinit(session.allocator());
@@ -633,7 +633,7 @@ test "analysis is pure and rejected syntax borrows its source" {
 }
 
 test "source evaluation handles allocation failures across its outcomes" {
-    for ([_][:0]const u8{ "f() { false; }; f", "|", "/bin/echo *.zig" }) |source| {
+    for ([_][:0]const u8{ "f() { false; }; f", "|", "/bin/echo ~other" }) |source| {
         try std.testing.checkAllAllocationFailures(
             std.testing.allocator,
             evaluateWithAllocator,
@@ -648,9 +648,9 @@ test "unsupported source evaluation reports a shell status" {
     var session = try Session.init(std.testing.allocator, fake_host.host(), .{});
     defer session.deinit();
 
-    var evaluation = try session.evaluate("/bin/echo *.zig", .{});
+    var evaluation = try session.evaluate("/bin/echo ~other", .{});
     defer evaluation.deinit(session.allocator());
-    try std.testing.expectEqual(error.PathnameExpansionUnsupported, evaluation.unsupported);
+    try std.testing.expectEqual(error.TildeExpansionUnsupported, evaluation.unsupported);
     try std.testing.expectEqual(@as(u8, 2), session.lastResult().status);
     try std.testing.expectEqual(@as(usize, 0), fake_host.spawn_calls.items.len);
 }

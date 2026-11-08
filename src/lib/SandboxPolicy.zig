@@ -106,14 +106,22 @@ pub fn clone(policy: SandboxPolicy, allocator: std.mem.Allocator) !SandboxPolicy
     };
     errdefer copy.deinit(allocator);
 
-    copy.file_system = switch (policy.file_system) {
-        .unrestricted => .unrestricted,
-        .allow => |rules| .{ .allow = try clonePathRules(allocator, rules) },
-    };
-    copy.network = switch (policy.network) {
-        .unrestricted => .unrestricted,
-        .allow => |rules| .{ .allow = try allocator.dupe(NetworkRule, rules) },
-    };
+    // Commit each union only after allocation succeeds: result-location
+    // construction can otherwise publish .allow before its payload exists.
+    switch (policy.file_system) {
+        .unrestricted => {},
+        .allow => |rules| {
+            const owned = try clonePathRules(allocator, rules);
+            copy.file_system = .{ .allow = owned };
+        },
+    }
+    switch (policy.network) {
+        .unrestricted => {},
+        .allow => |rules| {
+            const owned = try allocator.dupe(NetworkRule, rules);
+            copy.network = .{ .allow = owned };
+        },
+    }
     return copy;
 }
 

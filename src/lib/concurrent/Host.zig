@@ -46,8 +46,16 @@ pub fn init(gpa: std.mem.Allocator, inner: BaseHost, io: std.Io) BaseHost.Error!
             .resource_writer = resourceWriter,
             .resource_reader = resourceReader,
             .resolve_working_directory = resolveWorkingDirectory,
+            .read_directory = if (inner.vtable.read_directory != null) readDirectory else null,
         },
     };
+}
+
+fn readDirectory(userdata: ?*anyopaque, gpa: std.mem.Allocator, cwd: CommandPlan.WorkingDirectory, path: []const u8) BaseHost.Error!?BaseHost.Directory {
+    const self = from(userdata);
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    return self.inner.readDirectory(gpa, cwd, path);
 }
 
 /// All process handles created through this adapter must have finished using

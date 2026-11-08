@@ -42,7 +42,26 @@ pub const VTable = struct {
         std.mem.Allocator,
         WorkingDirectoryRequest,
     ) Error![]u8 = null,
+    read_directory: ?*const fn (?*anyopaque, std.mem.Allocator, CommandPlan.WorkingDirectory, []const u8) Error!?Directory = null,
 };
+
+/// An allocator-owned snapshot of native entry names, without shell matching
+/// or sorting. Null from readDirectory means a missing/non-directory path.
+pub const Directory = struct {
+    names: []const []const u8,
+
+    pub fn deinit(directory: Directory, gpa: std.mem.Allocator) void {
+        for (directory.names) |name| gpa.free(name);
+        gpa.free(directory.names);
+    }
+};
+
+pub fn readDirectory(host: Host, gpa: std.mem.Allocator, cwd: CommandPlan.WorkingDirectory, path: []const u8) Error!?Directory {
+    if (std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidArguments;
+    if (cwd == .path and std.mem.indexOfScalar(u8, cwd.path, 0) != null) return error.InvalidArguments;
+    const read = host.vtable.read_directory orelse return error.Unsupported;
+    return read(host.userdata, gpa, cwd, path);
+}
 
 pub const OpenFileOutcome = union(enum) {
     opened: CommandPlan.Resource,
@@ -149,6 +168,7 @@ pub const FileActionFailure = struct {
         access_denied,
         invalid_path,
         path_already_exists,
+        bad_file_descriptor,
         resource_unavailable,
         unsupported,
     };
