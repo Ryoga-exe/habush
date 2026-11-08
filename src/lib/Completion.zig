@@ -4,6 +4,9 @@ const std = @import("std");
 const word_syntax = @import("word.zig");
 const Completion = @This();
 
+pub const Provider = @import("Completion/Provider.zig");
+pub const Native = @import("Completion/Native.zig");
+
 pub const Range = struct { start: usize, end: usize };
 pub const Quote = enum { unquoted, single, double };
 pub const Kind = enum { command, argument, redirection, parameter, comment };
@@ -296,4 +299,8 @@ test "candidate edits are literal and reject stale input" {
     const borrowed = try inspect(&mutable, mutable.len, 1);
     mutable[0] = 'x';
     try std.testing.expectError(error.StaleContext, makeEdit(std.testing.allocator, borrowed, &mutable, 1, "echo"));
+}
+
+test {
+    std.testing.refAllDecls(@This());
 }
