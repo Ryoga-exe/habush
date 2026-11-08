@@ -94,6 +94,7 @@ pub fn main(init: std.process.Init) !habush.runtime.ExitStatus {
     };
     const runtime_host = if (concurrent_host) |*adapter| adapter.host() else system_host.host();
     var session = try habush.Session.init(gpa, runtime_host, .{
+        .cancel_io = io,
         .job_control = interactive and runtime_host.capabilities().terminal_control,
         .concurrent_pipeline = if (concurrent_host != null) .{ .io = io, .allocator = gpa } else null,
         .resolver = concurrent_resolver.resolver(),

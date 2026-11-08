@@ -4,6 +4,7 @@ const std = @import("std");
 const habush = @import("habush");
 const ShellIntegration = @import("terminal/ShellIntegration.zig");
 const LineEditor = @import("terminal/LineEditor.zig");
+const interrupt = @import("interrupt.zig");
 const Io = std.Io;
 const Shell = @This();
 
@@ -21,6 +22,7 @@ input_line: usize = 0,
 /// Known only for a fixed script/command source buffer.
 input_byte_offset: ?u32 = null,
 last_line_ending: LineEnding = .lf,
+interrupt_generation: u32 = 0,
 
 pub fn run(self: *Shell) !habush.runtime.ExitStatus {
     return self.runInput(null);
@@ -28,6 +30,7 @@ pub fn run(self: *Shell) !habush.runtime.ExitStatus {
 
 fn runInput(self: *Shell, source_name: ?[]const u8) !habush.runtime.ExitStatus {
     while (true) {
+        self.interrupt_generation = interrupt.snapshot();
         var input = (self.readCommand() catch |err| switch (err) {
             error.InputInterrupted => {
                 self.session.interruptInput();
@@ -440,14 +443,21 @@ fn handleInput(
     mappings: []const habush.Source.Mapping,
     source_offset: ?u32,
 ) !habush.runtime.ControlFlow {
-    var evaluation = try self.session.evaluate(source, .{
+    var evaluation = self.evaluate(source, .{
         .collected_here_documents = collected_here_documents,
         .source_name = source_name,
         .source_line_offset = source_line,
         .source_base_offset = source_offset,
         .original_source = original_source,
         .source_mappings = mappings,
-    });
+    }) catch |err| switch (err) {
+        error.Canceled => {
+            self.session.interruptInput();
+            try self.stderr.writeByte('\n');
+            return .none;
+        },
+        else => return err,
+    };
     defer evaluation.deinit(self.session.allocator());
     switch (evaluation) {
         .syntax => |tree| {
@@ -476,6 +486,33 @@ fn handleInput(
         },
         .executed => |result| return result.control_flow,
     }
+}
+
+fn evaluate(self: *Shell, source: [:0]const u8, options: habush.Session.EvaluateOptions) !habush.Evaluation {
+    if (!self.interactive) return self.session.evaluate(source, options);
+    const io = self.io orelse return self.session.evaluate(source, options);
+    const Result = union(enum) {
+        evaluated: habush.Session.EvaluateError!habush.Evaluation,
+        interrupted: std.Io.Cancelable!void,
+    };
+    var storage: [2]Result = undefined;
+    var pending: std.Io.Select(Result) = .init(io, &storage);
+    defer while (pending.cancel()) |result| {
+        // Evaluation can finish while an interrupt wins the race. Syntax
+        // results own an AST even when the caller will discard that result.
+        if (result == .evaluated) {
+            if (result.evaluated) |value| {
+                var owned = value;
+                owned.deinit(self.session.allocator());
+            } else |_| {}
+        }
+    };
+    try pending.concurrent(.evaluated, habush.Session.evaluate, .{ self.session, source, options });
+    try pending.concurrent(.interrupted, interrupt.wait, .{ io, self.interrupt_generation });
+    return switch (try pending.await()) {
+        .evaluated => |result| result,
+        .interrupted => error.Canceled,
+    };
 }
 
 fn readLineAlloc(reader: *Io.Reader, allocator: std.mem.Allocator, ending: *LineEnding) !?[:0]u8 {

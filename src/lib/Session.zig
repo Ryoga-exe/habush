@@ -22,6 +22,7 @@ context: ExecutionContext,
 state: runtime.State,
 jobs: runtime.Jobs,
 concurrent_pipeline: ?Executor.ConcurrentPipeline,
+cancel_io: ?std.Io,
 observer: ?Observer,
 next_evaluation_id: u64 = 0,
 evaluating: bool = false,
@@ -31,6 +32,8 @@ last_result: Executor.Result = .{
 },
 
 pub const Options = struct {
+    /// Enables cancellation checkpoints on the current evaluation task.
+    cancel_io: ?std.Io = null,
     /// Synchronous submitted-input observation; borrowed userdata must outlive
     /// this session. The callback cannot reenter or change this session.
     observer: ?Observer = null,
@@ -96,6 +99,7 @@ pub fn init(
         .context = context,
         .jobs = .{ .gpa = gpa, .terminal_control = options.job_control, .diagnostic_io = context.io },
         .concurrent_pipeline = options.concurrent_pipeline,
+        .cancel_io = options.cancel_io,
         .observer = options.observer,
         .state = try runtime.State.init(gpa, .{
             .invocation_name = options.invocation_name,
@@ -132,6 +136,7 @@ pub fn execute(session: *Session, hir: Hir) Executor.Error!Executor.Result {
     executor.jobs = &session.jobs;
     executor.job_control = session.jobs.terminal_control;
     executor.concurrent_pipeline = session.concurrent_pipeline;
+    executor.cancel_io = session.cancel_io;
     var serialized_sink: runtime.Diagnostic.Sink.Serialized = undefined;
     if (executor.io.diagnostic_sink) |sink| {
         if (session.concurrent_pipeline) |config| {
@@ -244,8 +249,8 @@ pub fn rejectInput(session: *Session) void {
     session.last_result = .{ .status = 2, .sandbox_coverage = .not_requested };
 }
 
-/// Records an input-adapter cancellation before evaluation begins. This does
-/// not submit input or emit an evaluation lifecycle pair.
+/// Records an input-adapter interrupt without submitting another evaluation.
+/// Any interrupted evaluation must have finished its cleanup before this call.
 pub fn interruptInput(session: *Session) void {
     session.last_result = .{ .status = 130, .sandbox_coverage = .not_requested };
 }
