@@ -16,7 +16,9 @@ pub fn installInteractiveInterruptHandler() error{}!void {
     posix.sigaction(posix.SIG.INT, &action, null);
 }
 
-fn suppressInteractiveInterrupt(_: posix.SIG) callconv(.c) void {}
+fn suppressInteractiveInterrupt(_: posix.SIG) callconv(.c) void {
+    @import("../interrupt.zig").notify();
+}
 
 /// One input operation owns terminal modes. It restores cooked input before
 /// a builtin or external child can read the shared stdin descriptor.

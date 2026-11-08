@@ -13,6 +13,7 @@ pub fn installInteractiveInterruptHandler() Error!void {
 }
 
 fn consoleCtrlHandler(control_type: windows.DWORD) callconv(.winapi) windows.BOOL {
+    if (control_type == ctrl_c_event) @import("../interrupt.zig").notify();
     return windows.BOOL.fromBool(control_type == ctrl_c_event);
 }
 

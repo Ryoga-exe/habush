@@ -15,6 +15,9 @@ terminal_control: bool = false,
 last_background_process_id: ?@import("types.zig").ProcessId = null,
 process_id_buffer: [10]u8 = undefined,
 diagnostic_io: Io = .{},
+/// The current task's cancellation provider, when the Host can cancel waits.
+/// Cleanup blocks cancellation until the canceled foreground job is reaped.
+cancel_io: ?std.Io = null,
 
 pub const Id = enum(u32) { _ };
 pub const Options = struct { negated: bool = false, background: bool = true };
@@ -155,11 +158,23 @@ pub fn signal(jobs: *Jobs, id: Id, request: Host.Signal) Host.Error!bool {
     return true;
 }
 
+/// A canceled foreground operation terminates and consumes this job. Other
+/// jobs remain owned by the session, including jobs being waited on via wait.
 pub fn foreground(jobs: *Jobs, id: Id) Host.Error!?ExitStatus {
     const entry = jobs.get(id) orelse return null;
     var lease: ?Host.TerminalLease = null;
     const host = entry.pipeline.host;
-    defer if (lease) |token| host.releaseTerminal(token) catch {};
+    var canceled = false;
+    defer {
+        const previous = if (jobs.cancel_io) |io| io.swapCancelProtection(.blocked) else null;
+        defer {
+            if (previous) |protection| _ = jobs.cancel_io.?.swapCancelProtection(protection);
+        }
+        if (canceled) entry.pipeline.signal(.kill) catch {};
+        if (lease) |token| host.releaseTerminal(token) catch {};
+        if (canceled) jobs.remove(id);
+    }
+    errdefer |failure| canceled = failure == error.Canceled;
     if (entry.pipeline.suspend_on_start) {
         // Every worker stops before the target can read the TTY. Observe the
         // startup barrier before handing over the terminal and resuming the
@@ -175,7 +190,7 @@ pub fn foreground(jobs: *Jobs, id: Id) Host.Error!?ExitStatus {
                 // Fast commands can exit between the first poll and tty
                 // handoff. An already completed job needs no terminal claim.
                 if (try entry.pipeline.poll() == .completed) break :retry null;
-                return err;
+                return @as(Host.Error!?ExitStatus, err);
             };
         }
         // A freshly launched reader can have received SIGTTIN before the
@@ -251,5 +266,50 @@ test "foreground jobs consume pipelines containing a stage that never spawned" {
         transferred = true;
         try std.testing.expectEqual(@as(ExitStatus, if (failed_stage == 1) 127 else 0), (try jobs.foreground(id)).?);
         try std.testing.expectEqual(@as(usize, 0), jobs.entries.items.len);
+    }
+}
+
+test "canceled foreground jobs are reaped without consuming other background jobs" {
+    const FakeHost = @import("../Host/FakeHost.zig");
+    const CancelOnce = struct {
+        fn waitAny(userdata: ?*anyopaque, processes: []const Host.Process) Host.Error!Host.ProcessEvent {
+            const fake: *FakeHost = @ptrCast(@alignCast(userdata.?));
+            if (fake.wait_error) |err| {
+                fake.wait_error = null;
+                return err;
+            }
+            return fake.host().waitAny(processes);
+        }
+    };
+    for ([_]bool{ false, true }) |startup_gate| {
+        var fake = FakeHost.init(std.testing.allocator);
+        defer fake.deinit();
+        fake.try_wait_termination = null;
+        var vtable = fake.host().vtable.*;
+        vtable.wait_any = CancelOnce.waitAny;
+        const host: Host = .{ .userdata = &fake, .vtable = &vtable };
+        var jobs: Jobs = .{ .gpa = std.testing.allocator };
+        defer jobs.deinit();
+        const background = (try Pipeline.start(std.testing.allocator, host, &.{.{ .executable = "/background", .argv = &.{"background"} }})).started;
+        const background_id = try jobs.add(background, "background", .{});
+        var foreground_pipeline = (try Pipeline.start(std.testing.allocator, host, &.{.{ .executable = "/foreground", .argv = &.{"foreground"} }})).started;
+        foreground_pipeline.suspend_on_start = startup_gate;
+        const foreground_id = try jobs.add(foreground_pipeline, "foreground", .{});
+        fake.wait_error = error.Canceled;
+
+        try std.testing.expectError(error.Canceled, jobs.foreground(foreground_id));
+        try std.testing.expect(jobs.get(foreground_id) == null);
+        try std.testing.expectEqual(@as(usize, 1), jobs.entries.items.len);
+        try std.testing.expectEqual(Pipeline.State.running, jobs.get(background_id).?.pipeline.state());
+        try std.testing.expectEqual(@as(usize, 1), fake.signal_calls.items.len);
+        try std.testing.expectEqual(Host.Signal.kill, fake.signal_calls.items[0].signal);
+        try std.testing.expectEqual(@as(u32, 2), @intFromEnum(fake.signal_calls.items[0].process));
+        try std.testing.expectEqual(@as(usize, 1), fake.wait_calls.items.len);
+        try std.testing.expectEqual(@as(u32, 2), @intFromEnum(fake.wait_calls.items[0]));
+
+        fake.wait_error = error.Canceled;
+        try std.testing.expectError(error.Canceled, jobs.wait(background_id));
+        try std.testing.expect(jobs.get(background_id) != null);
+        fake.wait_error = null;
     }
 }

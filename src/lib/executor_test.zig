@@ -1039,6 +1039,43 @@ test "multiple general in-process pipeline stages remain unsupported" {
     try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
 }
 
+test "cancellation between pipeline stages kills and reaps already spawned children" {
+    const CancelAfterSpawn = struct {
+        fake: *FakeHost,
+        protection: std.Io.CancelProtection = .unblocked,
+
+        fn checkCancel(userdata: ?*anyopaque) std.Io.Cancelable!void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            if (self.protection == .unblocked and self.fake.spawn_calls.items.len != 0)
+                return error.Canceled;
+        }
+
+        fn swapProtection(userdata: ?*anyopaque, protection: std.Io.CancelProtection) std.Io.CancelProtection {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            const previous = self.protection;
+            self.protection = protection;
+            return previous;
+        }
+    };
+    var hir = try generate("/bin/source | /bin/sink");
+    defer hir.deinit(std.testing.allocator);
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    var cancellation: CancelAfterSpawn = .{ .fake = &fake };
+    var io_vtable = std.testing.io.vtable.*;
+    io_vtable.checkCancel = CancelAfterSpawn.checkCancel;
+    io_vtable.swapCancelProtection = CancelAfterSpawn.swapProtection;
+    var executor = preResolvedExecutor(std.testing.allocator, fake.host());
+    executor.cancel_io = .{ .userdata = &cancellation, .vtable = &io_vtable };
+
+    try std.testing.expectError(error.Canceled, executor.execute(hir));
+    try std.testing.expectEqual(@as(usize, 1), fake.spawn_calls.items.len);
+    try std.testing.expectEqual(@as(usize, 1), fake.signal_calls.items.len);
+    try std.testing.expectEqual(@import("Host.zig").Signal.kill, fake.signal_calls.items[0].signal);
+    try expectPipelineResourcesReleased(&fake);
+    try std.testing.expectEqual(std.Io.CancelProtection.unblocked, cancellation.protection);
+}
+
 test "concurrent stage failure kills external peers and closes pipes" {
     var hir = try generate("/bin/source | true | pwd");
     defer hir.deinit(std.testing.allocator);
@@ -2192,7 +2229,7 @@ test "parameter expansion failures become shell diagnostics" {
 
 test "unsupported expansions have no host side effects" {
     const cases = [_]struct { [:0]const u8, anyerror }{
-        .{ "/bin/echo *.zig", error.PathnameExpansionUnsupported },
+        .{ "/bin/echo ~other", error.TildeExpansionUnsupported },
     };
     for (cases) |case| {
         var hir = try generate(case[0]);
@@ -2206,6 +2243,24 @@ test "unsupported expansions have no host side effects" {
         );
         try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
     }
+}
+
+test "redirect pathname expansion rejects multiple matches before opening any path" {
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    fake.directories = &.{.{ .path = ".", .names = &.{ "b.txt", "a.txt" } }};
+    const executor = Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .context = .{ .cwd = "/workspace" },
+    });
+    var ambiguous = try generate("true >*.txt");
+    defer ambiguous.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 1), (try executor.execute(ambiguous)).status);
+    try std.testing.expectEqual(@as(usize, 0), fake.open_file_calls.items.len);
+    var single = try generate("true >a*.txt");
+    defer single.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), (try executor.execute(single)).status);
+    try std.testing.expectEqual(@as(usize, 1), fake.open_file_calls.items.len);
+    try std.testing.expectEqualStrings("a.txt", fake.open_file_calls.items[0].open.path);
 }
 
 test "field splitting contributes every expanded command argument" {

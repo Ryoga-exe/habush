@@ -15,6 +15,8 @@ session: *habush.Session,
 prompt: []const u8,
 prefix: []const u8,
 allow_completion: bool = true,
+completion_limits: habush.Completion.Provider.Limits = .{},
+resolver_options: habush.CommandResolver.System.Options = .{},
 
 const max_input_bytes = 64 * 1024;
 
@@ -169,62 +171,48 @@ fn complete(editor: LineEditor, buffer: *habush.edit.Buffer) !bool {
         else => return err,
     };
     defer editor.gpa.free(prefix);
-    var candidates: Candidates = .{ .gpa = editor.gpa };
-    defer candidates.deinit();
-    if (context.kind == .command and std.mem.indexOfScalar(u8, prefix, '/') == null) {
-        inline for (std.meta.fields(habush.Builtin.Tag)) |field| {
-            if (std.mem.startsWith(u8, field.name, prefix)) try candidates.add(field.name);
-        }
-    } else if (context.kind == .command or context.kind == .argument or context.kind == .redirection) {
-        const cwd = editor.session.workingDirectory() orelse return false;
-        var directory = std.Io.Dir.openDirAbsolute(editor.io, cwd, .{ .iterate = true }) catch return false;
-        defer directory.close(editor.io);
-        const slash = std.mem.lastIndexOfScalar(u8, prefix, '/');
-        const dirname = if (slash) |index| prefix[0 .. index + 1] else "";
-        const basename = if (slash) |index| prefix[index + 1 ..] else prefix;
-        var child_directory: ?std.Io.Dir = if (dirname.len != 0)
-            directory.openDir(editor.io, dirname, .{ .iterate = true }) catch return false
-        else
-            null;
-        defer if (child_directory) |dir| dir.close(editor.io);
-        var iterator = (child_directory orelse directory).iterate();
-        var scanned: usize = 0;
-        while (scanned < 512) : (scanned += 1) {
-            const entry = (iterator.next(editor.io) catch return false) orelse break;
-            if (!std.mem.startsWith(u8, entry.name, basename)) continue;
-            if (basename.len == 0 and std.mem.startsWith(u8, entry.name, ".")) continue;
-            const value = try std.mem.concat(editor.gpa, u8, &.{ dirname, entry.name, if (entry.kind == .directory) "/" else "" });
-            defer editor.gpa.free(value);
-            try candidates.add(value);
-        }
-        if (scanned == 512) return false;
+    var native: habush.Completion.Native = .{
+        .io = editor.io,
+        .cwd = editor.session.workingDirectory(),
+        .path = editor.session.variable("PATH"),
+        .default_search_path = editor.session.defaultSearchPath(),
+        .function_names = editor.session.functionNames(),
+        .executable_extensions = editor.resolver_options.executable_extensions,
+    };
+    var result = try habush.Completion.Provider.collect(editor.gpa, .{
+        .context = context,
+        .prefix = prefix,
+    }, &.{native.provider()}, editor.completion_limits);
+    defer result.deinit(editor.gpa);
+    if (result.unique() == null) {
+        if (result.candidates.len == 0) return false;
+        try editor.showCandidates(result);
+        return true;
     }
-    const value = candidates.value orelse return false;
-    if (candidates.ambiguous) return false;
-    var edit = habush.Completion.makeEdit(editor.gpa, context, source, buffer.revision, value) catch |err| switch (err) {
+    var edit = result.makeEdit(editor.gpa, 0, source, buffer.revision) catch |err| switch (err) {
         error.StaleContext, error.UnsupportedContext, error.InvalidCandidate => return false,
         else => return err,
     };
     defer edit.deinit(editor.gpa);
+    if (edit.text.len > max_input_bytes -| (buffer.text().len - (edit.range.end - edit.range.start))) return false;
     try buffer.replace(edit.range.start - editor.prefix.len, edit.range.end - editor.prefix.len, edit.text);
     return true;
 }
 
-const Candidates = struct {
-    gpa: std.mem.Allocator,
-    value: ?[]u8 = null,
-    ambiguous: bool = false,
-
-    fn add(candidates: *Candidates, value: []const u8) !void {
-        if (candidates.value) |existing| {
-            if (!std.mem.eql(u8, existing, value)) candidates.ambiguous = true;
-        } else candidates.value = try candidates.gpa.dupe(u8, value);
+fn showCandidates(editor: LineEditor, result: habush.Completion.Provider.Result) !void {
+    const max_rows = 8;
+    try editor.output.writeAll("\r\n");
+    for (result.candidates[0..@min(max_rows, result.candidates.len)]) |candidate| {
+        const label = candidate.label orelse candidate.value;
+        // Labels are data, never terminal sequences. Bound presentation as well
+        // as provider output; insertion always uses the complete original value.
+        try render.writeVisible(editor.output, label[0..@min(label.len, 256)]);
+        if (label.len > 256) try editor.output.writeAll("...");
+        try editor.output.writeAll("\r\n");
     }
-
-    fn deinit(candidates: *Candidates) void {
-        if (candidates.value) |value| candidates.gpa.free(value);
-    }
-};
+    if (result.candidates.len > max_rows) try editor.output.writeAll("... more matches\r\n");
+    if (result.truncated or result.incomplete) try editor.output.writeAll("... partial results\r\n");
+}
 
 fn takeByte(input: *std.Io.Reader) std.Io.Reader.Error!?u8 {
     return input.takeByte() catch |err| switch (err) {
