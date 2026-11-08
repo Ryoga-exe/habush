@@ -187,6 +187,16 @@ test "native completion uses shell cwd and PATH, functions, and literal file val
     var duplicate = try Provider.collect(std.testing.allocator, .{ .context = builtin_context, .prefix = "pw" }, &providers, .{});
     defer duplicate.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("pwd", duplicate.unique().?.value);
+    if (builtin.os.tag == .windows) {
+        var custom = try tmp.dir.createFile(std.testing.io, "bin/habush-custom.HB", .{});
+        custom.close(std.testing.io);
+        native.path = "bin";
+        native.executable_extensions = &.{".HB"};
+        const custom_context = try Completion.inspect("habush-cust", 11, 4);
+        var extensions = try Provider.collect(std.testing.allocator, .{ .context = custom_context, .prefix = "habush-cust" }, &providers, .{});
+        defer extensions.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings("habush-custom.HB", extensions.unique().?.value);
+    }
 }
 
 test "completion preserves relative and absolute symlink parent traversal" {

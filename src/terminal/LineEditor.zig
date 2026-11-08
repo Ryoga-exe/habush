@@ -16,6 +16,7 @@ prompt: []const u8,
 prefix: []const u8,
 allow_completion: bool = true,
 completion_limits: habush.Completion.Provider.Limits = .{},
+resolver_options: habush.CommandResolver.System.Options = .{},
 
 const max_input_bytes = 64 * 1024;
 
@@ -176,6 +177,7 @@ fn complete(editor: LineEditor, buffer: *habush.edit.Buffer) !bool {
         .path = editor.session.variable("PATH"),
         .default_search_path = editor.session.defaultSearchPath(),
         .function_names = editor.session.functionNames(),
+        .executable_extensions = editor.resolver_options.executable_extensions,
     };
     var result = try habush.Completion.Provider.collect(editor.gpa, .{
         .context = context,
