@@ -94,7 +94,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_lib_tests.step);
     const terminal_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/Shell.zig"),
+            .root_source_file = b.path("src/app_test.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -288,7 +288,7 @@ pub fn build(b: *std.Build) void {
         test_step,
         2,
         "",
-        "habush: usage: habush [-c command | script [argument ...]]\n",
+        "habush: usage: habush [--config path | --no-config] [--no-rc] [-c command | script [argument ...]]\n",
     );
 }
 

@@ -5,6 +5,8 @@ const Io = std.Io;
 const platform = @import("platform.zig");
 const Shell = @import("Shell.zig");
 const ShellIntegration = @import("terminal/ShellIntegration.zig");
+const Config = @import("Config.zig");
+const Cli = @import("Cli.zig");
 
 pub fn main(init: std.process.Init) !habush.runtime.ExitStatus {
     const arena = init.arena.allocator();
@@ -31,11 +33,35 @@ pub fn main(init: std.process.Init) !habush.runtime.ExitStatus {
     const args = try init.minimal.args.toSlice(arena);
     if (args.len >= 2 and std.mem.eql(u8, args[1], habush.worker.argument))
         return habush.worker.run(init, args[2..]);
-    const invocation = Invocation.parse(args) orelse {
-        try stderr.print("habush: usage: {s}\n", .{Invocation.usage});
+    const startup = Cli.parse(args) orelse {
+        try stderr.print("habush: usage: {s}\n", .{Cli.usage});
         return 2;
     };
+    const invocation = startup.invocation;
     const interactive = invocation == .stream and try stdin_file.isTty(io) and try stderr_file.isTty(io);
+
+    var paths = try Config.Paths.init(gpa, init.environ_map);
+    defer paths.deinit(gpa);
+    var config: Config = .{};
+    // Ambient application settings and rc are interactive startup behavior.
+    // An explicit --config is still validated for -c and script invocations.
+    if (!startup.no_config and (interactive or startup.config_path != null)) {
+        const config_path = startup.config_path orelse try paths.configFile(arena);
+        if (config_path) |path| {
+            config = Config.read(gpa, io, path) catch |err| loaded: {
+                if (err == error.FileNotFound and startup.config_path == null) break :loaded .{};
+                if (err == error.OutOfMemory) return err;
+                try reportConfigError(stderr, path, err);
+                return 2;
+            };
+        }
+    }
+    if (interactive or startup.config_path != null) {
+        config = config.withEnvironment(init.environ_map) catch |err| {
+            try reportConfigError(stderr, null, err);
+            return 2;
+        };
+    }
 
     if (interactive) try platform.installInteractiveInterruptHandler();
 
@@ -117,7 +143,7 @@ pub fn main(init: std.process.Init) !habush.runtime.ExitStatus {
     // redirected stdout. Explicit opt-in still requires interactive TTYs.
     const integration_enabled = ShellIntegration.enabled(.{
         .interactive_terminal = interactive,
-        .setting = init.environ_map.get("HABUSH_SHELL_INTEGRATION"),
+        .setting = @tagName(config.shell_integration),
         .term = init.environ_map.get("TERM"),
         .term_program = init.environ_map.get("TERM_PROGRAM"),
         .kitty = init.environ_map.get("KITTY_WINDOW_ID") != null,
@@ -130,11 +156,6 @@ pub fn main(init: std.process.Init) !habush.runtime.ExitStatus {
         init.environ_map.get("COMPUTERNAME") orelse ""
     else
         std.posix.gethostname(&hostname_buffer) catch "";
-    const editor_setting = init.environ_map.get("HABUSH_LINE_EDIT") orelse "auto";
-    const editor_terminal = if (init.environ_map.get("TERM")) |term|
-        term.len != 0 and !std.mem.eql(u8, term, "dumb")
-    else
-        false;
     var shell: Shell = .{
         .allocator = gpa,
         .stdin = stdin,
@@ -142,15 +163,34 @@ pub fn main(init: std.process.Init) !habush.runtime.ExitStatus {
         .session = &session,
         .interactive = interactive,
         .io = io,
-        .line_edit = interactive and builtin.os.tag != .windows and
-            !std.mem.eql(u8, editor_setting, "off") and
-            (editor_terminal or std.mem.eql(u8, editor_setting, "on")),
+        .line_edit = config.lineEditEnabled(interactive, init.environ_map.get("TERM")),
         .integration = if (integration_enabled) .{
             .writer = stderr,
             .hostname = hostname,
             .path_style = if (builtin.os.tag == .windows) .windows else .posix,
         } else null,
     };
+
+    if (interactive and !startup.no_config and !startup.no_rc and config.load_rc) {
+        const candidates = [_]?[]const u8{ try paths.rcFile(arena), try paths.legacyRcFile(arena) };
+        for (candidates) |candidate| {
+            const path = candidate orelse continue;
+            const source = Io.Dir.cwd().readFileAllocOptions(io, path, gpa, .limited(Config.max_rc_bytes), .of(u8), 0) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                error.OutOfMemory => return err,
+                else => {
+                    try reportScriptReadError(stderr, path, err);
+                    return 1;
+                },
+            };
+            defer gpa.free(source);
+            const status = try shell.runSource(source, path);
+            if (session.lastResult().control_flow == .exit) return status;
+            // Existing XDG rc takes precedence even when it is empty or fails;
+            // compatibility fallback must never execute a second startup file.
+            break;
+        }
+    }
 
     return switch (invocation) {
         .stream => shell.run(),
@@ -173,29 +213,24 @@ pub fn main(init: std.process.Init) !habush.runtime.ExitStatus {
     };
 }
 
-const Invocation = union(enum) {
-    stream,
-    command: []const u8,
-    script: struct {
-        path: []const u8,
-        arguments: []const [:0]const u8,
-    },
-
-    const usage = "habush [-c command | script [argument ...]]";
-
-    fn parse(args: []const [:0]const u8) ?Invocation {
-        if (args.len <= 1) return .stream;
-        if (args.len == 3 and std.mem.eql(u8, args[1], "-c")) {
-            return .{ .command = args[2] };
-        }
-        if (std.mem.eql(u8, args[1], "--")) {
-            if (args.len == 2) return .stream;
-            return .{ .script = .{ .path = args[2], .arguments = args[3..] } };
-        }
-        if (std.mem.startsWith(u8, args[1], "-")) return null;
-        return .{ .script = .{ .path = args[1], .arguments = args[2..] } };
-    }
-};
+fn reportConfigError(writer: *Io.Writer, path: ?[]const u8, err: anyerror) Io.Writer.Error!void {
+    const message = switch (err) {
+        error.InvalidLineEditSetting => "HABUSH_LINE_EDIT must be auto, on, or off",
+        error.InvalidShellIntegrationSetting => "HABUSH_SHELL_INTEGRATION must be auto, on, or off",
+        error.UnsupportedConfigVersion => "unsupported config version",
+        error.UnknownField => "unknown config field",
+        error.DuplicateField => "duplicate config field",
+        error.InvalidEnumTag => "expected auto, on, or off",
+        error.FileNotFound => "no such file or directory",
+        error.AccessDenied => "permission denied",
+        error.IsDir => "is a directory",
+        error.StreamTooLong => "config file is too large",
+        else => @errorName(err),
+    };
+    try writer.writeAll("habush: configuration: ");
+    if (path) |value| try writer.print("{s}: ", .{value});
+    try writer.print("{s}\n", .{message});
+}
 
 fn argumentSlices(
     allocator: std.mem.Allocator,
