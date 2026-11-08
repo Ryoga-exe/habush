@@ -2192,7 +2192,7 @@ test "parameter expansion failures become shell diagnostics" {
 
 test "unsupported expansions have no host side effects" {
     const cases = [_]struct { [:0]const u8, anyerror }{
-        .{ "/bin/echo *.zig", error.PathnameExpansionUnsupported },
+        .{ "/bin/echo ~other", error.TildeExpansionUnsupported },
     };
     for (cases) |case| {
         var hir = try generate(case[0]);
@@ -2206,6 +2206,24 @@ test "unsupported expansions have no host side effects" {
         );
         try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
     }
+}
+
+test "redirect pathname expansion rejects multiple matches before opening any path" {
+    var fake = FakeHost.init(std.testing.allocator);
+    defer fake.deinit();
+    fake.directories = &.{.{ .path = ".", .names = &.{ "b.txt", "a.txt" } }};
+    const executor = Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+        .context = .{ .cwd = "/workspace" },
+    });
+    var ambiguous = try generate("true >*.txt");
+    defer ambiguous.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 1), (try executor.execute(ambiguous)).status);
+    try std.testing.expectEqual(@as(usize, 0), fake.open_file_calls.items.len);
+    var single = try generate("true >a*.txt");
+    defer single.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), (try executor.execute(single)).status);
+    try std.testing.expectEqual(@as(usize, 1), fake.open_file_calls.items.len);
+    try std.testing.expectEqualStrings("a.txt", fake.open_file_calls.items[0].open.path);
 }
 
 test "field splitting contributes every expanded command argument" {

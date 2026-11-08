@@ -1885,6 +1885,9 @@ fn wordExpander(
         .background_process_id = if (executor.jobs) |jobs| jobs.backgroundProcessIdText() else null,
         .last_status = executor.last_status,
         .failure = failure,
+        .pathname_host = executor.host,
+        .pathname_cwd = executor.workingDirectory(),
+        .pathname_restricted = executor.activeSandbox() != .inherit,
         .command_substitution = .{
             .userdata = executor,
             .run = runCommandSubstitution,

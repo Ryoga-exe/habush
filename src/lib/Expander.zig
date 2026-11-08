@@ -1,9 +1,9 @@
 //! Context-sensitive expansion of HIR words.
 //!
 //! This stage performs current-user tilde expansion, parameter expansion,
-//! field splitting, and quote removal. Pathname expansion, named-user tilde
-//! expansion, and pattern-based parameter transformations remain
-//! explicit unsupported boundaries.
+//! field splitting, quote removal, and pathname expansion through a supplied
+//! Host. Named-user tilde expansion and pattern-based parameter transformations
+//! remain explicit unsupported boundaries.
 
 const std = @import("std");
 const Expander = @This();
@@ -14,9 +14,45 @@ const runtime_types = @import("runtime/types.zig");
 const VariableStore = @import("VariableStore.zig");
 const Word = @import("word.zig");
 const Source = @import("Source.zig");
+const Pattern = @import("Pattern.zig");
+const pathname = @import("pathname.zig");
 
 allocator: std.mem.Allocator,
 context: Context,
+patterns: ?*PatternBuffers = null,
+
+const PatternBuffers = struct {
+    current: std.ArrayList(bool) = .empty,
+    fields: std.ArrayList([]const bool) = .empty,
+
+    fn deinit(buffers: *PatternBuffers, gpa: std.mem.Allocator) void {
+        buffers.current.deinit(gpa);
+        for (buffers.fields.items) |mask| gpa.free(mask);
+        buffers.fields.deinit(gpa);
+    }
+};
+
+const Assigned = struct {
+    bytes: []const u8,
+    quoted: []const bool,
+
+    fn deinit(assigned: Assigned, gpa: std.mem.Allocator) void {
+        gpa.free(assigned.bytes);
+        gpa.free(assigned.quoted);
+    }
+};
+
+fn protect(expander: Expander, count: usize, quoted: bool) std.mem.Allocator.Error!void {
+    if (expander.patterns) |patterns| try patterns.current.appendNTimes(expander.allocator, quoted, count);
+}
+
+fn protectMasked(expander: Expander, count: usize, mask: []const bool, quoted: bool) std.mem.Allocator.Error!void {
+    if (expander.patterns) |patterns| {
+        if (quoted or mask.len == 0) return expander.protect(count, quoted);
+        std.debug.assert(mask.len == count);
+        try patterns.current.appendSlice(expander.allocator, mask);
+    }
+}
 
 pub const Context = struct {
     variables: ?*VariableStore = null,
@@ -32,6 +68,9 @@ pub const Context = struct {
     /// Last completed substitution status in this expansion scope.
     substitution_status: ?*?runtime_types.ExitStatus = null,
     substitution_origin: ?Source.Location = null,
+    pathname_host: ?Host = null,
+    pathname_cwd: ?[]const u8 = null,
+    pathname_restricted: bool = false,
 
     fn variable(context: Context, name: []const u8) ?[]const u8 {
         if (context.overrides) |overrides| {
@@ -99,12 +138,15 @@ pub fn expandArgument(
     word: Hir.Inst.Index,
 ) Error![]const []const u8 {
     var expander = parent;
+    var patterns: PatternBuffers = .{};
+    defer patterns.deinit(expander.allocator);
+    expander.patterns = &patterns;
     var local_status: ?runtime_types.ExitStatus = null;
     if (expander.context.substitution_status == null) expander.context.substitution_status = &local_status;
     var bytes: std.ArrayList(u8) = .empty;
     defer bytes.deinit(expander.allocator);
     var fields: std.ArrayList([]const u8) = .empty;
-    errdefer {
+    defer {
         for (fields.items) |field| expander.allocator.free(field);
         fields.deinit(expander.allocator);
     }
@@ -126,8 +168,38 @@ pub fn expandArgument(
         );
     }
 
-    if (current_field_active) try finishField(expander.allocator, &fields, &bytes);
-    return fields.toOwnedSlice(expander.allocator);
+    if (current_field_active) try expander.finishField(&fields, &bytes);
+    const needs_pathname_expansion = for (fields.items, patterns.fields.items) |field, quoted| {
+        if ((Pattern{ .bytes = field, .quoted = quoted }).hasMeta()) break true;
+    } else false;
+    if (!needs_pathname_expansion) return fields.toOwnedSlice(expander.allocator);
+    var expanded: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (expanded.items) |field| expander.allocator.free(field);
+        expanded.deinit(expander.allocator);
+    }
+    for (fields.items, patterns.fields.items) |field, quoted| {
+        const pattern: Pattern = .{ .bytes = field, .quoted = quoted };
+        if (pattern.hasMeta()) {
+            if (expander.context.pathname_restricted) return error.SandboxUnavailable;
+            const host = expander.context.pathname_host orelse return error.PathnameExpansionUnsupported;
+            if (host.vtable.read_directory == null) return error.PathnameExpansionUnsupported;
+            if (try pathname.expand(expander.allocator, host, if (expander.context.pathname_cwd) |cwd| .{ .path = cwd } else .inherit, pattern)) |paths| {
+                defer expander.allocator.free(paths);
+                expanded.appendSlice(expander.allocator, paths) catch |err| {
+                    for (paths) |path| expander.allocator.free(path);
+                    return err;
+                };
+                continue;
+            }
+        }
+        const copy = try expander.allocator.dupe(u8, field);
+        expanded.append(expander.allocator, copy) catch |err| {
+            expander.allocator.free(copy);
+            return err;
+        };
+    }
+    return expanded.toOwnedSlice(expander.allocator);
 }
 
 /// Expands an assignment value without field splitting or pathname expansion.
@@ -286,8 +358,6 @@ fn appendArgumentPart(
 ) Error!void {
     switch (tag) {
         .literal => {
-            if (!force_quoted and std.mem.indexOfAny(u8, value, "*?[") != null)
-                return error.PathnameExpansionUnsupported;
             if (!force_quoted and is_first and std.mem.startsWith(u8, value, "~")) {
                 try expander.appendTilde(bytes, value);
                 current_field_active.* = true;
@@ -295,6 +365,7 @@ fn appendArgumentPart(
             }
             if (force_quoted or !expansion_word) {
                 try bytes.appendSlice(expander.allocator, value);
+                try expander.protect(value.len, force_quoted);
                 current_field_active.* = true;
             } else {
                 try expander.appendFieldSplit(fields, bytes, current_field_active, value);
@@ -306,6 +377,7 @@ fn appendArgumentPart(
         .double_quoted_escaped,
         => {
             try bytes.appendSlice(expander.allocator, value);
+            try expander.protect(value.len, true);
             current_field_active.* = true;
         },
         .parameter => try expander.appendArgumentParameter(
@@ -368,7 +440,9 @@ fn appendArgumentParameter(
         return;
     }
     if (quoted) {
+        const start = bytes.items.len;
         try expander.appendParameter(bytes, parameter);
+        try expander.protect(bytes.items.len - start, true);
         current_field_active.* = true;
         return;
     }
@@ -435,9 +509,10 @@ fn appendBracedArgumentParameter(
                 replacement,
                 quoted,
             );
-            defer expander.allocator.free(assigned);
-            try expander.appendScalarArgument(
-                assigned,
+            defer assigned.deinit(expander.allocator);
+            try expander.appendScalarArgumentMasked(
+                assigned.bytes,
+                assigned.quoted,
                 quoted,
                 fields,
                 bytes,
@@ -456,11 +531,24 @@ fn appendScalarArgument(
     bytes: *std.ArrayList(u8),
     current_field_active: *bool,
 ) Error!void {
+    return expander.appendScalarArgumentMasked(value, &.{}, quoted, fields, bytes, current_field_active);
+}
+
+fn appendScalarArgumentMasked(
+    expander: Expander,
+    value: []const u8,
+    mask: []const bool,
+    quoted: bool,
+    fields: *std.ArrayList([]const u8),
+    bytes: *std.ArrayList(u8),
+    current_field_active: *bool,
+) Error!void {
     if (quoted) {
         try bytes.appendSlice(expander.allocator, value);
+        try expander.protect(value.len, true);
         current_field_active.* = true;
     } else {
-        try expander.appendFieldSplit(fields, bytes, current_field_active, value);
+        try expander.appendFieldSplitMasked(fields, bytes, current_field_active, value, mask);
     }
 }
 
@@ -502,13 +590,21 @@ fn appendAssignmentPart(
             if (is_first and std.mem.startsWith(u8, value, "~"))
                 return expander.appendTilde(bytes, value);
             try bytes.appendSlice(expander.allocator, value);
+            try expander.protect(value.len, false);
         },
         .escaped,
         .single_quoted,
         .double_quoted,
         .double_quoted_escaped,
-        => try bytes.appendSlice(expander.allocator, value),
-        .parameter, .double_quoted_parameter => try expander.appendParameter(bytes, value),
+        => {
+            try bytes.appendSlice(expander.allocator, value);
+            try expander.protect(value.len, true);
+        },
+        .parameter, .double_quoted_parameter => {
+            const start = bytes.items.len;
+            try expander.appendParameter(bytes, value);
+            try expander.protect(bytes.items.len - start, tag == .double_quoted_parameter);
+        },
         .braced_parameter => try expander.appendBracedAssignmentParameter(bytes, value, false),
         .double_quoted_braced_parameter => try expander.appendBracedAssignmentParameter(
             bytes,
@@ -519,6 +615,7 @@ fn appendAssignmentPart(
             const result = try expander.runCommandSubstitution(value);
             defer expander.allocator.free(result.output);
             try bytes.appendSlice(expander.allocator, std.mem.trimEnd(u8, result.output, "\n"));
+            try expander.protect(std.mem.trimEnd(u8, result.output, "\n").len, tag == .double_quoted_command_substitution);
         },
         .arithmetic_substitution => return error.ParameterExpansionUnsupported,
     }
@@ -537,13 +634,20 @@ fn appendBracedAssignmentParameter(
         const value = std.fmt.bufPrint(&buffer, "{d}", .{
             try expander.parameterLength(expansion.parameter),
         }) catch unreachable;
+        try expander.protect(value.len, quoted);
         return bytes.appendSlice(expander.allocator, value);
     }
-    if (expansion.operator == null)
-        return expander.appendParameter(bytes, expansion.parameter);
+    if (expansion.operator == null) {
+        const start = bytes.items.len;
+        try expander.appendParameter(bytes, expansion.parameter);
+        return expander.protect(bytes.items.len - start, quoted);
+    }
     const replacement_expander = expander.forSubslice(source, expansion.word);
     switch (try expander.selectParameterExpansion(expansion)) {
-        .value => |value| try bytes.appendSlice(expander.allocator, value),
+        .value => |value| {
+            try bytes.appendSlice(expander.allocator, value);
+            try expander.protect(value.len, quoted);
+        },
         .empty => {},
         .word => |replacement| {
             try replacement_expander.appendExpansionWordScalar(bytes, replacement, quoted);
@@ -554,8 +658,9 @@ fn appendBracedAssignmentParameter(
                 replacement,
                 quoted,
             );
-            defer expander.allocator.free(assigned);
-            try bytes.appendSlice(expander.allocator, assigned);
+            defer assigned.deinit(expander.allocator);
+            try bytes.appendSlice(expander.allocator, assigned.bytes);
+            try expander.protectMasked(assigned.bytes.len, assigned.quoted, quoted);
         },
         .fail => try replacement_expander.failParameter(expansion, quoted),
     }
@@ -627,21 +732,27 @@ fn assignParameter(
     parameter: []const u8,
     replacement: []const u8,
     quoted: bool,
-) Error![]u8 {
+) Error!Assigned {
     if (!VariableStore.isValidName(parameter)) return error.ParameterExpansionUnsupported;
     const variables = expander.context.variables orelse
         return error.ParameterAssignmentUnavailable;
 
     var bytes: std.ArrayList(u8) = .empty;
     errdefer bytes.deinit(expander.allocator);
-    try expander.appendExpansionWordScalar(&bytes, replacement, quoted);
+    var patterns: PatternBuffers = .{};
+    defer patterns.deinit(expander.allocator);
+    var collecting = expander;
+    collecting.patterns = &patterns;
+    try collecting.appendExpansionWordScalar(&bytes, replacement, quoted);
     const value = try bytes.toOwnedSlice(expander.allocator);
     errdefer expander.allocator.free(value);
+    const mask = try patterns.current.toOwnedSlice(expander.allocator);
+    errdefer expander.allocator.free(mask);
     variables.set(parameter, value) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidName => unreachable,
     };
-    return value;
+    return .{ .bytes = value, .quoted = mask };
 }
 
 fn failParameter(
@@ -814,7 +925,9 @@ fn appendTilde(
     const home = expander.context.variable("HOME") orelse
         return error.TildeExpansionUnsupported;
     try bytes.appendSlice(expander.allocator, home);
+    try expander.protect(home.len, true);
     try bytes.appendSlice(expander.allocator, value[prefix_end..]);
+    try expander.protect(value.len - prefix_end, false);
 }
 
 fn joinSeparator(expander: Expander) ?u8 {
@@ -829,13 +942,22 @@ fn appendFieldSplit(
     current_field_active: *bool,
     value: []const u8,
 ) Error!void {
-    if (std.mem.indexOfAny(u8, value, "*?[") != null)
-        return error.PathnameExpansionUnsupported;
+    return expander.appendFieldSplitMasked(fields, bytes, current_field_active, value, &.{});
+}
 
+fn appendFieldSplitMasked(
+    expander: Expander,
+    fields: *std.ArrayList([]const u8),
+    bytes: *std.ArrayList(u8),
+    current_field_active: *bool,
+    value: []const u8,
+    mask: []const bool,
+) Error!void {
     const ifs = expander.context.variable("IFS") orelse " \t\n";
     if (ifs.len == 0) {
         if (value.len != 0) {
             try bytes.appendSlice(expander.allocator, value);
+            try expander.protectMasked(value.len, mask, false);
             current_field_active.* = true;
         }
         return;
@@ -843,28 +965,29 @@ fn appendFieldSplit(
 
     var index: usize = 0;
     while (index < value.len) {
-        if (!isIfsByte(ifs, value[index])) {
+        if ((mask.len != 0 and mask[index]) or !isIfsByte(ifs, value[index])) {
             const start = index;
-            while (index < value.len and !isIfsByte(ifs, value[index])) : (index += 1) {}
+            while (index < value.len and ((mask.len != 0 and mask[index]) or !isIfsByte(ifs, value[index]))) : (index += 1) {}
             try bytes.appendSlice(expander.allocator, value[start..index]);
+            try expander.protectMasked(index - start, if (mask.len == 0) &.{} else mask[start..index], false);
             current_field_active.* = true;
             continue;
         }
 
         var non_whitespace_delimiter = !isIfsWhitespace(ifs, value[index]);
         if (!non_whitespace_delimiter) {
-            while (index < value.len and isIfsWhitespace(ifs, value[index])) : (index += 1) {}
-            if (index < value.len and isIfsNonWhitespace(ifs, value[index])) {
+            while (index < value.len and (mask.len == 0 or !mask[index]) and isIfsWhitespace(ifs, value[index])) : (index += 1) {}
+            if (index < value.len and (mask.len == 0 or !mask[index]) and isIfsNonWhitespace(ifs, value[index])) {
                 non_whitespace_delimiter = true;
                 index += 1;
             }
         } else {
             index += 1;
         }
-        while (index < value.len and isIfsWhitespace(ifs, value[index])) : (index += 1) {}
+        while (index < value.len and (mask.len == 0 or !mask[index]) and isIfsWhitespace(ifs, value[index])) : (index += 1) {}
 
         if (non_whitespace_delimiter or current_field_active.*)
-            try finishField(expander.allocator, fields, bytes);
+            try expander.finishField(fields, bytes);
         current_field_active.* = false;
     }
 }
@@ -880,9 +1003,11 @@ fn appendQuotedAt(
         expander.allocator,
         expander.context.positional_parameters[0],
     );
+    try expander.protect(expander.context.positional_parameters[0].len, true);
     for (expander.context.positional_parameters[1..]) |parameter| {
-        try finishField(expander.allocator, fields, bytes);
+        try expander.finishField(fields, bytes);
         try bytes.appendSlice(expander.allocator, parameter);
+        try expander.protect(parameter.len, true);
     }
     current_field_active.* = true;
 }
@@ -895,7 +1020,7 @@ fn appendUnquotedAt(
 ) Error!void {
     for (expander.context.positional_parameters, 0..) |parameter, index| {
         if (index != 0 and current_field_active.*) {
-            try finishField(expander.allocator, fields, bytes);
+            try expander.finishField(fields, bytes);
             current_field_active.* = false;
         }
         try expander.appendFieldSplit(fields, bytes, current_field_active, parameter);
@@ -903,12 +1028,22 @@ fn appendUnquotedAt(
 }
 
 fn finishField(
-    allocator: std.mem.Allocator,
+    expander: Expander,
     fields: *std.ArrayList([]const u8),
     bytes: *std.ArrayList(u8),
 ) std.mem.Allocator.Error!void {
+    const allocator = expander.allocator;
     const field = try bytes.toOwnedSlice(allocator);
     errdefer allocator.free(field);
+    if (expander.patterns) |patterns| {
+        std.debug.assert(patterns.current.items.len == field.len);
+        const mask = try patterns.current.toOwnedSlice(allocator);
+        errdefer allocator.free(mask);
+        try patterns.fields.append(allocator, mask);
+        errdefer patterns.fields.items.len -= 1;
+        try fields.append(allocator, field);
+        return;
+    }
     try fields.append(allocator, field);
 }
 
