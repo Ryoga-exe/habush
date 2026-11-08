@@ -334,9 +334,9 @@ test "worker channel transfers input and preserves file action indexes" {
     const input = try receiveInput(child);
     if (input) |fd| close(fd);
     const reporter: Reporter = .{ .socket = child };
-    reporter.send(.{ .file_action = .{ .action_index = 2, .reason = .access_denied } });
+    reporter.send(.{ .file_action = .{ .action_index = 2, .reason = .bad_file_descriptor } });
     const report = parent.takeReport(3);
-    try std.testing.expectEqualDeep(@as(?Host.SpawnFailure, .{ .file_action = .{ .action_index = 5, .reason = .access_denied } }), try report.read());
+    try std.testing.expectEqualDeep(@as(?Host.SpawnFailure, .{ .file_action = .{ .action_index = 5, .reason = .bad_file_descriptor } }), try report.read());
 }
 
 test "closed input and an empty report preserve native termination" {

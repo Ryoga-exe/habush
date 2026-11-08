@@ -292,6 +292,7 @@ fn fileActionReason(err: anyerror) Host.FileActionFailure.Reason {
         error.AccessDenied, error.PermissionDenied, error.IsDir => .access_denied,
         error.InvalidName, error.BadPathName, error.NameTooLong => .invalid_path,
         error.PathAlreadyExists => .path_already_exists,
+        error.BadDescriptor => .bad_file_descriptor,
         error.OutOfMemory,
         error.NoDevice,
         error.SystemResources,
