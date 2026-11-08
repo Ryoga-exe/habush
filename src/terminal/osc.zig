@@ -68,16 +68,16 @@ pub fn writeWorkingDirectory(
     var sequence: std.Io.Writer = .fixed(&buffer);
     try sequence.writeAll("\x1b]7;file://");
     try sequence.writeAll(host);
-    if (drive) try sequence.writeByte('/');
-    for (tail, 0..) |byte, index| {
-        if (style == .windows and isSeparator(byte)) {
-            try sequence.writeByte('/');
-        } else if (isUnreserved(byte) or byte == '/' or (drive and index == 1)) {
-            try sequence.writeByte(byte);
-        } else {
-            const hex = "0123456789ABCDEF";
-            try sequence.writeAll(&.{ '%', hex[byte >> 4], hex[byte & 15] });
-        }
+    if (drive) {
+        try sequence.writeByte('/');
+        try sequence.writeAll(tail[0..2]);
+        tail = tail[2..];
+    }
+    var segments = std.mem.splitAny(u8, tail, if (style == .windows) "\\/" else "/");
+    try (std.Uri.Component{ .raw = segments.first() }).formatEscaped(&sequence);
+    while (segments.next()) |segment| {
+        try sequence.writeByte('/');
+        try (std.Uri.Component{ .raw = segment }).formatEscaped(&sequence);
     }
     try sequence.writeAll("\x1b\\");
     try writer.writeAll(sequence.buffered());
@@ -90,10 +90,6 @@ fn validHostname(host: []const u8) bool {
             return false;
     }
     return true;
-}
-
-fn isUnreserved(byte: u8) bool {
-    return std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '.' or byte == '_' or byte == '~';
 }
 
 fn isSeparator(byte: u8) bool {
