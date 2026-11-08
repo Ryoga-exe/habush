@@ -73,7 +73,12 @@ fn scan(
 ) Provider.Error!void {
     if (!std.fs.path.isAbsolute(directory) and
         (native.cwd == null or !std.fs.path.isAbsolute(native.cwd.?))) return error.Unavailable;
-    const path = try std.fs.path.resolve(collector.gpa, &.{ native.cwd orelse "", directory });
+    // Preserve symlink/.. traversal exactly as the eventual file operation
+    // does. Lexical normalization can select a different directory here.
+    const path = if (std.fs.path.isAbsolute(directory))
+        try collector.gpa.dupe(u8, directory)
+    else
+        try std.fs.path.join(collector.gpa, &.{ native.cwd.?, directory });
     defer collector.gpa.free(path);
     var dir = std.Io.Dir.openDirAbsolute(native.io, path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound, error.NotDir => return,
@@ -182,4 +187,37 @@ test "native completion uses shell cwd and PATH, functions, and literal file val
     var duplicate = try Provider.collect(std.testing.allocator, .{ .context = builtin_context, .prefix = "pw" }, &providers, .{});
     defer duplicate.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("pwd", duplicate.unique().?.value);
+}
+
+test "completion preserves relative and absolute symlink parent traversal" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "work", "target", "target/deeper" }) |path|
+        try tmp.dir.createDir(std.testing.io, path, .default_dir);
+    for ([_][]const u8{ "work/item-wrong", "target/item-right" }) |path| {
+        const file = try tmp.dir.createFile(std.testing.io, path, .{});
+        file.close(std.testing.io);
+    }
+    try tmp.dir.symLink(std.testing.io, "../target/deeper", "work/link", .{ .is_directory = true });
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const base = path_buffer[0..try tmp.dir.realPath(std.testing.io, &path_buffer)];
+    const cwd = try std.fs.path.join(std.testing.allocator, &.{ base, "work" });
+    defer std.testing.allocator.free(cwd);
+    for ([_]bool{ false, true }) |absolute| {
+        const prefix = if (absolute)
+            try std.fmt.allocPrint(std.testing.allocator, "{s}/link/../item", .{cwd})
+        else
+            try std.testing.allocator.dupe(u8, "link/../item");
+        defer std.testing.allocator.free(prefix);
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{ "cat ", prefix });
+        defer std.testing.allocator.free(source);
+        const context = try Completion.inspect(source, source.len, 1);
+        var native: Native = .{ .io = std.testing.io, .cwd = if (absolute) null else cwd };
+        var result = try Provider.collect(std.testing.allocator, .{ .context = context, .prefix = prefix }, &.{native.provider()}, .{});
+        defer result.deinit(std.testing.allocator);
+        const expected = try std.mem.concat(std.testing.allocator, u8, &.{ prefix, "-right" });
+        defer std.testing.allocator.free(expected);
+        try std.testing.expectEqualStrings(expected, result.unique().?.value);
+    }
 }
