@@ -97,7 +97,12 @@ pub fn init(
         .host = host,
         .resolver = options.resolver,
         .context = context,
-        .jobs = .{ .gpa = gpa, .terminal_control = options.job_control, .diagnostic_io = context.io },
+        .jobs = .{
+            .gpa = gpa,
+            .terminal_control = options.job_control,
+            .diagnostic_io = context.io,
+            .cancel_io = options.cancel_io,
+        },
         .concurrent_pipeline = options.concurrent_pipeline,
         .cancel_io = options.cancel_io,
         .observer = options.observer,

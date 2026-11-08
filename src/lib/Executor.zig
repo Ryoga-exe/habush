@@ -316,9 +316,12 @@ fn executeSubshell(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
     var subshell_executor = executor;
     var positional_parameters = executor.positionalParameters();
     subshell_executor.positional_parameters_override = &positional_parameters;
-    var jobs: runtime.Jobs = .{ .gpa = executor.gpa, .diagnostic_io = executor.io };
-    defer jobs.deinit();
-    defer jobs.cancelAll();
+    var jobs: runtime.Jobs = .{
+        .gpa = executor.gpa,
+        .diagnostic_io = executor.io,
+        .cancel_io = executor.cancel_io,
+    };
+    defer finishScopeJobs(executor, &jobs);
     subshell_executor.jobs = &jobs;
     var context_copy = try executor.context.clone(executor.gpa);
     defer context_copy.deinit();
@@ -660,7 +663,11 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
         if (executor.concurrent_pipeline) |config|
             stage.arena = std.heap.ArenaAllocator.init(config.allocator);
         const stage_allocator = stage.allocator(executor.gpa);
-        stage.jobs = .{ .gpa = stage_allocator, .diagnostic_io = executor.io };
+        stage.jobs = .{
+            .gpa = stage_allocator,
+            .diagnostic_io = executor.io,
+            .cancel_io = executor.cancel_io,
+        };
         stage.context = try executor.context.clone(stage_allocator);
         // A surrounding compound redirection changes the current executor's
         // streams without replacing the session's context. Stage snapshots
@@ -706,6 +713,7 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
         else => |other| return other,
     };
     var transferred = false;
+    var failed = false;
     defer {
         // This pipeline can itself be a stage of a canceled outer pipeline.
         // Its children and stage-local jobs must still be killed and reaped.
@@ -717,6 +725,9 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
             if (previous_protection) |previous|
                 _ = executor.cancel_io.?.swapCancelProtection(previous);
         }
+        // A failed evaluation may leave children running, or stopped at the
+        // startup gate. Waiting alone cannot release either kind of child.
+        if (!transferred and failed) pipeline.signal(.kill) catch {};
         // Stage-local jobs can inherit an outer pipe end. Terminate them
         // before waiting for the outer pipeline to drain.
         for (prepared) |*stage| stage.deinit();
@@ -737,6 +748,9 @@ fn executePipeline(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Re
             config,
         );
     }
+    // Concurrent execution already terminates peers before canceling and
+    // joining its stage tasks. This path still owns sequential stage startup.
+    errdefer failed = true;
 
     var result: Result = .{ .status = 0, .sandbox_coverage = .not_requested };
     const phase_count: usize = if (in_process_count == 0) 1 else 2;
@@ -840,6 +854,7 @@ const ConcurrentStageTask = struct {
             .index = stage_index,
         };
         stage_executor.cancel_io = task.io;
+        task.stage.jobs.?.cancel_io = task.io;
         const executed = stage_executor.executeInstruction(task.hir, task.stage.index);
         task.stage.finishJobs(task.io);
         if (executed) |completed| {
@@ -1988,13 +2003,14 @@ fn runCommandSubstitution(
     var jobs: runtime.Jobs = .{
         .gpa = allocator,
         .diagnostic_io = nested.io,
+        .cancel_io = nested.cancel_io,
         .last_background_process_id = if (parent.jobs) |jobs| jobs.last_background_process_id else null,
     };
-    defer finishSubstitutionJobs(parent.*, &jobs);
+    defer finishScopeJobs(parent.*, &jobs);
     nested.jobs = &jobs;
     const result = try nested.execute(hir);
-    finishSubstitutionJobs(parent.*, &jobs);
-    jobs = .{ .gpa = allocator, .diagnostic_io = nested.io };
+    finishScopeJobs(parent.*, &jobs);
+    jobs = .{ .gpa = allocator, .diagnostic_io = nested.io, .cancel_io = nested.cancel_io };
     try output.flush();
     const reader = parent.host.resourceReader(capture) orelse return error.CommandSubstitutionUnavailable;
     const bytes = reader.allocRemaining(allocator, .unlimited) catch |err| switch (err) {
@@ -2004,7 +2020,7 @@ fn runCommandSubstitution(
     return .{ .output = bytes, .status = result.status };
 }
 
-fn finishSubstitutionJobs(executor: Executor, jobs: *runtime.Jobs) void {
+fn finishScopeJobs(executor: Executor, jobs: *runtime.Jobs) void {
     const previous = if (executor.cancel_io) |io| io.swapCancelProtection(.blocked) else null;
     defer {
         if (previous) |value| _ = executor.cancel_io.?.swapCancelProtection(value);
