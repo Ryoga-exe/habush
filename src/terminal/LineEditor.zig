@@ -1,24 +1,20 @@
-//! Small interactive adapter connecting language completion and byte editing.
+//! Interactive byte editing with application-supplied completion.
 //! It reads through the shell's existing one-byte stdin Reader and restores
 //! cooked terminal modes before returning, so builtin/child stdin stays shared.
 const std = @import("std");
-const habush = @import("habush");
+const edit = @import("habush-edit");
 const platform = @import("../platform.zig");
 const render = @import("render.zig");
 const LineEditor = @This();
 
 gpa: std.mem.Allocator,
-io: std.Io,
 input: *std.Io.Reader,
 output: *std.Io.Writer,
-session: *habush.Session,
 prompt: []const u8,
-prefix: []const u8,
-allow_completion: bool = true,
-completion_limits: habush.Completion.Provider.Limits = .{},
-resolver_options: habush.CommandResolver.System.Options = .{},
+completion: ?edit.Completion = null,
 
 const max_input_bytes = 64 * 1024;
+const Menu = struct { result: edit.Completion.Result, selected: usize = 0 };
 
 pub fn read(editor: LineEditor) !?[:0]u8 {
     var terminal = try platform.LineInput.init() orelse return error.EditorUnavailable;
@@ -30,8 +26,9 @@ pub fn read(editor: LineEditor) !?[:0]u8 {
         editor.output.writeAll("\x1b[?2004l") catch {};
         editor.output.flush() catch {};
     }
-    var buffer: habush.edit.Buffer = .{ .gpa = editor.gpa };
+    var buffer: edit.Buffer = .{ .gpa = editor.gpa };
     defer buffer.deinit();
+    var menu: ?Menu = null;
     var pending: [4]u8 = undefined;
     var pending_len: usize = 0;
     var expected_len: usize = 0;
@@ -55,8 +52,15 @@ pub fn read(editor: LineEditor) !?[:0]u8 {
             try editor.insertTyped(&buffer, pending[0..pending_len]);
             pending_len = 0;
         }
+        if (byte != '\t' and byte != '\r' and byte != '\n' and byte != 27) menu = null;
         switch (byte) {
             '\r', '\n' => {
+                if (menu) |selection| {
+                    menu = null;
+                    if (!try editor.accept(&buffer, selection.selected)) try editor.output.writeByte(7);
+                    try render.redraw(editor.output, editor.prompt, buffer.text(), buffer.cursor, terminal.columns());
+                    continue;
+                }
                 try editor.output.writeAll("\r\n");
                 const line = try editor.gpa.dupeSentinel(u8, buffer.text(), 0);
                 errdefer editor.gpa.free(line);
@@ -82,9 +86,12 @@ pub fn read(editor: LineEditor) !?[:0]u8 {
             31 => {
                 _ = buffer.undo();
             },
-            '\t' => if (!editor.allow_completion or !try editor.complete(&buffer)) try editor.output.writeByte(7),
+            '\t' => if (!try editor.complete(&buffer, &menu)) try editor.output.writeByte(7),
             27 => {
-                if (editor.input.bufferedLen() == 0 and !terminal.ready(80)) continue;
+                if (editor.input.bufferedLen() == 0 and !terminal.ready(80)) {
+                    menu = null;
+                    continue;
+                }
                 var sequence: [16]u8 = undefined;
                 var length: usize = 0;
                 while (length < sequence.len) {
@@ -96,6 +103,16 @@ pub fn read(editor: LineEditor) !?[:0]u8 {
                     if (editor.input.bufferedLen() == 0 and !terminal.ready(80)) break;
                 }
                 const key = sequence[0..length];
+                if (menu) |*selection| {
+                    if (std.mem.eql(u8, key, "[A") or std.mem.eql(u8, key, "[B")) {
+                        const count = selection.result.labels.len;
+                        selection.selected = if (key[1] == 'A') (selection.selected + count - 1) % count else (selection.selected + 1) % count;
+                        try editor.showCandidates(selection.*);
+                        try render.redraw(editor.output, editor.prompt, buffer.text(), buffer.cursor, terminal.columns());
+                        continue;
+                    }
+                }
+                menu = null;
                 if (std.mem.eql(u8, key, "[D") or std.mem.eql(u8, key, "OD")) buffer.left() else if (std.mem.eql(u8, key, "[C") or std.mem.eql(u8, key, "OC")) buffer.right() else if (std.mem.eql(u8, key, "[H") or std.mem.eql(u8, key, "OH") or std.mem.eql(u8, key, "[1~")) buffer.cursor = 0 else if (std.mem.eql(u8, key, "[F") or std.mem.eql(u8, key, "OF") or std.mem.eql(u8, key, "[4~")) buffer.cursor = buffer.text().len else if (std.mem.eql(u8, key, "[3~")) try buffer.delete() else if (std.mem.eql(u8, key, "[200~")) try editor.paste(&buffer) else try editor.output.writeByte(7);
             },
             else => {
@@ -118,7 +135,7 @@ pub fn read(editor: LineEditor) !?[:0]u8 {
 
 /// A typed Unicode scalar is one edit and therefore one Undo operation. Invalid
 /// input stays byte-preserving; the size limit never leaves half a valid scalar.
-fn insertTyped(editor: LineEditor, buffer: *habush.edit.Buffer, bytes: []const u8) !void {
+fn insertTyped(editor: LineEditor, buffer: *edit.Buffer, bytes: []const u8) !void {
     if (!std.unicode.utf8ValidateSlice(bytes)) {
         for (bytes) |byte| {
             if (buffer.text().len < max_input_bytes)
@@ -134,7 +151,7 @@ fn insertTyped(editor: LineEditor, buffer: *habush.edit.Buffer, bytes: []const u
         try editor.output.writeByte(7);
 }
 
-fn paste(editor: LineEditor, buffer: *habush.edit.Buffer) !void {
+fn paste(editor: LineEditor, buffer: *edit.Buffer) !void {
     const end = "\x1b[201~";
     var pasted: std.ArrayList(u8) = .empty;
     defer pasted.deinit(editor.gpa);
@@ -161,56 +178,50 @@ fn paste(editor: LineEditor, buffer: *habush.edit.Buffer) !void {
     return error.EndOfStream;
 }
 
-fn complete(editor: LineEditor, buffer: *habush.edit.Buffer) !bool {
-    const source = try std.mem.concat(editor.gpa, u8, &.{ editor.prefix, buffer.text() });
-    defer editor.gpa.free(source);
-    const context = habush.Completion.inspect(source, editor.prefix.len + buffer.cursor, buffer.revision) catch return false;
-    if (context.replace.start < editor.prefix.len) return false;
-    const prefix = context.literalPrefix(editor.gpa) catch |err| switch (err) {
-        error.UnsupportedContext => return false,
-        else => return err,
-    };
-    defer editor.gpa.free(prefix);
-    var native: habush.Completion.Native = .{
-        .io = editor.io,
-        .cwd = editor.session.workingDirectory(),
-        .path = editor.session.variable("PATH"),
-        .default_search_path = editor.session.defaultSearchPath(),
-        .function_names = editor.session.functionNames(),
-        .executable_extensions = editor.resolver_options.executable_extensions,
-    };
-    var result = try habush.Completion.Provider.collect(editor.gpa, .{
-        .context = context,
-        .prefix = prefix,
-    }, &.{native.provider()}, editor.completion_limits);
-    defer result.deinit(editor.gpa);
-    if (result.unique() == null) {
-        if (result.candidates.len == 0) return false;
-        try editor.showCandidates(result);
+fn complete(editor: LineEditor, buffer: *edit.Buffer, menu: *?Menu) !bool {
+    if (menu.*) |*selection| {
+        selection.selected = (selection.selected + 1) % selection.result.labels.len;
+        try editor.showCandidates(selection.*);
         return true;
     }
-    var edit = result.makeEdit(editor.gpa, 0, source, buffer.revision) catch |err| switch (err) {
-        error.StaleContext, error.UnsupportedContext, error.InvalidCandidate => return false,
-        else => return err,
+    const service = editor.completion orelse return false;
+    const request: edit.Completion.Request = .{
+        .source = buffer.text(),
+        .cursor = buffer.cursor,
+        .revision = buffer.revision,
     };
-    defer edit.deinit(editor.gpa);
-    if (edit.text.len > max_input_bytes -| (buffer.text().len - (edit.range.end - edit.range.start))) return false;
-    try buffer.replace(edit.range.start - editor.prefix.len, edit.range.end - editor.prefix.len, edit.text);
-    return true;
+    const result = (try service.query(service.userdata, request)) orelse return false;
+    if (!result.unique()) {
+        if (result.labels.len == 0) return false;
+        menu.* = .{ .result = result };
+        try editor.showCandidates(menu.*.?);
+        return true;
+    }
+    return editor.accept(buffer, 0);
 }
 
-fn showCandidates(editor: LineEditor, result: habush.Completion.Provider.Result) !void {
+fn accept(editor: LineEditor, buffer: *edit.Buffer, index: usize) !bool {
+    const service = editor.completion orelse return false;
+    const request: edit.Completion.Request = .{ .source = buffer.text(), .cursor = buffer.cursor, .revision = buffer.revision };
+    var replacement = (try service.choose(service.userdata, editor.gpa, request, index)) orelse return false;
+    defer replacement.deinit(editor.gpa);
+    return replacement.apply(buffer, max_input_bytes);
+}
+
+fn showCandidates(editor: LineEditor, menu: Menu) !void {
+    const result = menu.result;
     const max_rows = 8;
+    const start = menu.selected / max_rows * max_rows;
     try editor.output.writeAll("\r\n");
-    for (result.candidates[0..@min(max_rows, result.candidates.len)]) |candidate| {
-        const label = candidate.label orelse candidate.value;
+    for (result.labels[start..@min(start + max_rows, result.labels.len)], start..) |label, index| {
+        try editor.output.writeAll(if (index == menu.selected) "> " else "  ");
         // Labels are data, never terminal sequences. Bound presentation as well
         // as provider output; insertion always uses the complete original value.
         try render.writeVisible(editor.output, label[0..@min(label.len, 256)]);
         if (label.len > 256) try editor.output.writeAll("...");
         try editor.output.writeAll("\r\n");
     }
-    if (result.candidates.len > max_rows) try editor.output.writeAll("... more matches\r\n");
+    if (result.labels.len > max_rows) try editor.output.writeAll("... more matches\r\n");
     if (result.truncated or result.incomplete) try editor.output.writeAll("... partial results\r\n");
 }
 

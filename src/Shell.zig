@@ -4,6 +4,7 @@ const std = @import("std");
 const habush = @import("habush");
 const ShellIntegration = @import("terminal/ShellIntegration.zig");
 const LineEditor = @import("terminal/LineEditor.zig");
+const CompletionService = @import("CompletionService.zig");
 const interrupt = @import("interrupt.zig");
 const Io = std.Io;
 const Shell = @This();
@@ -21,6 +22,7 @@ interruptible: bool = false,
 io: ?std.Io = null,
 line_edit: bool = false,
 completion_limits: habush.Completion.Provider.Limits = .{},
+completion_provider: ?habush.Completion.Provider = null,
 resolver_options: habush.CommandResolver.System.Options = .{},
 integration: ?ShellIntegration = null,
 input_line: usize = 0,
@@ -385,17 +387,30 @@ fn readInputLine(self: *Shell, prompt: []const u8, prefix: []const u8, allow_com
     const line = if (self.interactive and self.line_edit and self.io != null) editor: {
         self.last_line_ending = .lf;
         self.input_byte_offset = null;
+        var native: habush.Completion.Native = .{
+            .io = self.io.?,
+            .cwd = self.session.workingDirectory(),
+            .path = self.session.variable("PATH"),
+            .default_search_path = self.session.defaultSearchPath(),
+            .function_names = self.session.functionNames(),
+            .executable_extensions = self.resolver_options.executable_extensions,
+        };
+        var providers: [2]habush.Completion.Provider = undefined;
+        providers[0] = self.completion_provider orelse native.provider();
+        if (self.completion_provider != null) providers[1] = native.provider();
+        var completion: CompletionService = .{
+            .gpa = self.allocator,
+            .prefix = prefix,
+            .providers = providers[0..if (self.completion_provider != null) @as(usize, 2) else 1],
+            .limits = self.completion_limits,
+        };
+        defer completion.deinit();
         break :editor ((LineEditor{
             .gpa = self.allocator,
-            .io = self.io.?,
             .input = self.stdin,
             .output = self.stderr,
-            .session = self.session,
             .prompt = prompt,
-            .prefix = prefix,
-            .allow_completion = allow_completion,
-            .completion_limits = self.completion_limits,
-            .resolver_options = self.resolver_options,
+            .completion = if (allow_completion) completion.completion() else null,
         }).read() catch |err| switch (err) {
             error.EditorUnavailable => try readLineAlloc(self.stdin, self.allocator, &self.last_line_ending),
             error.EndOfStream => null,

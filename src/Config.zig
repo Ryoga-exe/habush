@@ -8,29 +8,60 @@ version: u32 = 1,
 line_edit: Mode = .auto,
 shell_integration: Mode = .auto,
 load_rc: bool = true,
+plugins: []Plugin = &.{},
 /// Shared by native providers and future adapters; guest execution budgets
 /// remain the plugin host's responsibility.
 completion_limits: @import("habush").Completion.Provider.Limits = .{},
 
 pub const Mode = enum { auto, on, off };
+pub const Plugin = struct {
+    path: []const u8,
+    commands: []const Command,
+    fuel: u64 = 10_000_000,
+    memory_bytes: u32 = 16 * 1024 * 1024,
+    timeout_ms: u32 = 1000,
+
+    pub const Command = struct {
+        name: []const u8,
+        entry: []const u8 = "command",
+        completion: ?[]const u8 = null,
+    };
+};
 pub const max_file_bytes = 64 * 1024;
 pub const max_rc_bytes = 1024 * 1024;
 
 pub fn parse(options: std.zon.parse.Options) !Config {
-    const config = try std.zon.parse.fromSliceNoAlloc(Config, options);
+    const config = try std.zon.parse.fromSlice(Config, options);
     if (config.version != 1) return error.UnsupportedConfigVersion;
+    for (config.plugins, 0..) |plugin, plugin_index| {
+        if (!validString(plugin.path) or plugin.commands.len == 0) return error.InvalidPluginConfiguration;
+        for (plugin.commands, 0..) |command, command_index| {
+            if (!validString(command.name) or std.fs.path.dirname(command.name) != null or
+                std.mem.indexOfAny(u8, command.name, "/\\") != null or
+                !validString(command.entry)) return error.InvalidPluginConfiguration;
+            if (command.completion) |entry| if (!validString(entry)) return error.InvalidPluginConfiguration;
+            if (@import("habush").Builtin.lookup(command.name) != null) return error.ReservedPluginCommand;
+            for (config.plugins[0 .. plugin_index + 1], 0..) |previous, previous_index| {
+                const end = if (previous_index == plugin_index) command_index else previous.commands.len;
+                for (previous.commands[0..end]) |registered|
+                    if (std.mem.eql(u8, registered.name, command.name)) return error.DuplicatePluginCommand;
+            }
+        }
+    }
     return config;
 }
 
-fn read(gpa: std.mem.Allocator, io: std.Io, path: []const u8, diagnostics: *std.Io.Writer) !Config {
+fn validString(value: []const u8) bool {
+    return value.len != 0 and std.mem.indexOfScalar(u8, value, 0) == null;
+}
+
+fn read(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, path: []const u8, diagnostics: *std.Io.Writer) !Config {
     const source = try std.Io.Dir.cwd().readFileAllocOptions(io, path, gpa, .limited(max_file_bytes), .of(u8), 0);
     defer gpa.free(source);
-    var arena: std.heap.ArenaAllocator = .init(gpa);
-    defer arena.deinit();
     var detail: std.zon.parse.Diagnostics = undefined;
-    return parse(.{
+    const config = parse(.{
         .gpa = gpa,
-        .arena = arena.allocator(),
+        .arena = arena,
         .source = source,
         .diagnostics = &detail,
     }) catch |err| {
@@ -38,15 +69,21 @@ fn read(gpa: std.mem.Allocator, io: std.Io, path: []const u8, diagnostics: *std.
             try diagnostics.print("habush: configuration: {f}\n", .{detail.fmt(path)});
         return err;
     };
+    for (config.plugins) |*plugin| {
+        if (!std.fs.path.isAbsolute(plugin.path))
+            plugin.path = try std.fs.path.join(arena, &.{ std.fs.path.dirname(path) orelse ".", plugin.path });
+    }
+    return config;
 }
 
 /// Loads the explicit path or config.zon; a missing default uses default values.
 /// Returns null after reporting an invalid or unreadable configuration.
-pub fn load(gpa: std.mem.Allocator, io: std.Io, paths: Paths, explicit: ?[]const u8, diagnostics: *std.Io.Writer) !?Config {
+/// Parsed strings and plugin declarations live in `arena` until the app exits.
+pub fn load(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, paths: Paths, explicit: ?[]const u8, diagnostics: *std.Io.Writer) !?Config {
     const default_path = if (explicit == null) try paths.configFile(gpa) else null;
     defer if (default_path) |path| gpa.free(path);
     const path = explicit orelse default_path orelse return .{};
-    return read(gpa, io, path, diagnostics) catch |err| {
+    return read(gpa, arena, io, path, diagnostics) catch |err| {
         if (err == error.FileNotFound and explicit == null) return .{};
         if (err == error.OutOfMemory or err == error.WriteFailed) return err;
         if (err != error.ParseZon) try reportError(diagnostics, path, err);
@@ -59,6 +96,9 @@ pub fn reportError(writer: *std.Io.Writer, path: ?[]const u8, err: anyerror) std
         error.InvalidLineEditSetting => "HABUSH_LINE_EDIT must be auto, on, or off",
         error.InvalidShellIntegrationSetting => "HABUSH_SHELL_INTEGRATION must be auto, on, or off",
         error.UnsupportedConfigVersion => "unsupported config version",
+        error.InvalidPluginConfiguration => "plugin paths, command names, and entries must be nonempty and valid",
+        error.ReservedPluginCommand => "plugin command name is reserved for a builtin",
+        error.DuplicatePluginCommand => "duplicate plugin command name",
         error.FileNotFound => "no such file or directory",
         error.AccessDenied => "permission denied",
         error.IsDir => "is a directory",
@@ -186,6 +226,9 @@ test "environment overrides reject invalid settings" {
 
 test "ZON configuration validates fields and honors explicit paths without JSON fallback" {
     const gpa = std.testing.allocator;
+    var storage: std.heap.ArenaAllocator = .init(gpa);
+    defer storage.deinit();
+    const arena = storage.allocator();
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -196,26 +239,38 @@ test "ZON configuration validates fields and honors explicit paths without JSON 
     var output: std.Io.Writer.Allocating = .init(gpa);
     defer output.deinit();
 
-    try std.testing.expectEqualDeep(Config{}, (try load(gpa, io, paths, null, &output.writer)).?);
+    try std.testing.expectEqualDeep(Config{}, (try load(gpa, arena, io, paths, null, &output.writer)).?);
     try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"load_rc\":false}" });
-    try std.testing.expectEqualDeep(Config{}, (try load(gpa, io, paths, null, &output.writer)).?);
+    try std.testing.expectEqualDeep(Config{}, (try load(gpa, arena, io, paths, null, &output.writer)).?);
     try tmp.dir.writeFile(io, .{ .sub_path = "config.zon", .data = ".{ .line_edit = .off, .completion_limits = .{ .candidates = 7 } }" });
-    const zon = (try load(gpa, io, paths, null, &output.writer)).?;
+    const zon = (try load(gpa, arena, io, paths, null, &output.writer)).?;
     try std.testing.expectEqual(Mode.off, zon.line_edit);
     try std.testing.expect(zon.load_rc);
     try std.testing.expectEqual(@as(usize, 7), zon.completion_limits.candidates);
     try std.testing.expectEqual((Config{}).completion_limits.bytes, zon.completion_limits.bytes);
     try std.testing.expectEqualStrings("", output.written());
 
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.zon", .data =
+        \\.{ .plugins = .{.{ .path = "plugins/demo.wasm", .commands = .{.{ .name = "demo", .completion = "complete" }} }} }
+    });
+    const configured = (try load(gpa, arena, io, paths, null, &output.writer)).?;
+    const module_path = try std.fs.path.join(arena, &.{ directory_path, "plugins/demo.wasm" });
+    try std.testing.expectEqualStrings(module_path, configured.plugins[0].path);
+    try std.testing.expectEqualStrings("demo", configured.plugins[0].commands[0].name);
+    try std.testing.expectEqualStrings("complete", configured.plugins[0].commands[0].completion.?);
+
     for ([_][]const u8{
         ".{\n    .line_edti = .off,\n}",
         ".{ .load_rc = true, .load_rc = false }",
         ".{ .line_edit = .maybe }",
         ".{ .version = 2 }",
+        ".{ .plugins = .{.{ .path = \"x\", .commands = .{.{ .name = \"true\" }} }} }",
+        ".{ .plugins = .{.{ .path = \"x\", .commands = .{.{ .name = \"demo\" }, .{ .name = \"demo\" }} }} }",
+        ".{ .plugins = .{.{ .path = \"\", .commands = .{.{ .name = \"demo\" }} }} }",
     }, 0..) |invalid, index| {
         output.clearRetainingCapacity();
         try tmp.dir.writeFile(io, .{ .sub_path = "config.zon", .data = invalid });
-        try std.testing.expect(try load(gpa, io, paths, null, &output.writer) == null);
+        try std.testing.expect(try load(gpa, arena, io, paths, null, &output.writer) == null);
         try std.testing.expect(output.written().len > 0);
         if (index == 0)
             try std.testing.expect(std.mem.indexOf(u8, output.written(), "config.zon:2:") != null);
@@ -225,18 +280,18 @@ test "ZON configuration validates fields and honors explicit paths without JSON 
     try tmp.dir.writeFile(io, .{ .sub_path = "custom.conf", .data = ".{ .load_rc = false }" });
     const explicit_path = try std.fs.path.join(gpa, &.{ directory_path, "custom.conf" });
     defer gpa.free(explicit_path);
-    try std.testing.expect(!(try load(gpa, io, paths, explicit_path, &output.writer)).?.load_rc);
+    try std.testing.expect(!(try load(gpa, arena, io, paths, explicit_path, &output.writer)).?.load_rc);
     try std.testing.expectEqualStrings("", output.written());
 
     const json_path = try std.fs.path.join(gpa, &.{ directory_path, "config.json" });
     defer gpa.free(json_path);
-    try std.testing.expect(try load(gpa, io, paths, json_path, &output.writer) == null);
+    try std.testing.expect(try load(gpa, arena, io, paths, json_path, &output.writer) == null);
     try std.testing.expect(output.written().len > 0);
 
     output.clearRetainingCapacity();
     const missing = try std.fs.path.join(gpa, &.{ directory_path, "missing.zon" });
     defer gpa.free(missing);
-    try std.testing.expect(try load(gpa, io, paths, missing, &output.writer) == null);
+    try std.testing.expect(try load(gpa, arena, io, paths, missing, &output.writer) == null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "no such file or directory") != null);
 }
 

@@ -1,16 +1,39 @@
 const std = @import("std");
 
-pub fn build(b: *std.Build) void {
+pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const wasm_plugins = b.option(bool, "wasm-plugins", "Enable Wasm plugins using the Wasmtime SDK") orelse false;
+    const wasmtime_sdk = if (wasm_plugins) sdk: {
+        const name = if (target.result.os.tag == .macos and target.result.cpu.arch == .aarch64)
+            "wasmtime_aarch64_macos"
+        else if (target.result.os.tag == .linux and target.result.cpu.arch == .x86_64 and target.result.abi == .gnu)
+            "wasmtime_x86_64_linux_gnu"
+        else {
+            std.log.err("Wasmtime SDK is unavailable for {t}-{t}-{t}; supported targets: aarch64-macos, x86_64-linux-gnu", .{
+                target.result.cpu.arch, target.result.os.tag, target.result.abi,
+            });
+            return error.UnsupportedWasmtimeTarget;
+        };
+        break :sdk try b.dependencyLazy(name, .{});
+    } else null;
+    var demo_plugin: ?*std.Build.Step.Compile = null;
+    const features = b.addOptions();
+    features.addOption(bool, "wasm_plugins", wasm_plugins);
     const skip_zig_36010 = (b.option(bool, "skip-zig-36010", "Skip macOS cancellation checks affected by Zig PR #36010") orelse false) and
         target.result.os.tag == .macos;
 
+    const habush_edit = b.addModule("habush-edit", .{
+        .root_source_file = b.path("src/lib/edit.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const habush = b.addModule("habush", .{
         .root_source_file = b.path("src/lib/main.zig"),
         .target = target,
         .optimize = optimize,
     });
+    habush.addImport("habush-edit", habush_edit);
     const habush_exec = b.addModule("habush-exec", .{
         .root_source_file = b.path("src/lib/exec.zig"),
         .target = target,
@@ -25,6 +48,8 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addImport("habush", habush);
+    exe.root_module.addImport("habush-edit", habush_edit);
+    exe.root_module.addOptions("features", features);
 
     b.installArtifact(exe);
 
@@ -92,6 +117,63 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_lib_tests.step);
+    const edit_tests = b.addTest(.{ .root_module = habush_edit });
+    const run_edit_tests = b.addRunArtifact(edit_tests);
+    test_step.dependOn(&run_edit_tests.step);
+    var plugin_module: ?*std.Build.Module = null;
+    if (wasmtime_sdk) |sdk| {
+        const headers = b.addTranslateC(.{
+            .root_source_file = sdk.path("include/wasmtime.h"),
+            .target = target,
+            .optimize = optimize,
+        });
+        headers.addIncludePath(sdk.path("include"));
+        if (target.result.os.tag == .windows) {
+            headers.defineCMacro("WASM_API_EXTERN", "");
+            headers.defineCMacro("WASI_API_EXTERN", "");
+        }
+        const plugin = b.addModule("habush-plugin", .{
+            .root_source_file = b.path("src/plugin.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        plugin.addImport("wasmtime", headers.createModule());
+        plugin_module = plugin;
+        exe.root_module.addImport("habush-plugin", plugin);
+        plugin.addLibraryPath(sdk.path("lib"));
+        plugin.linkSystemLibrary("wasmtime", .{
+            .preferred_link_mode = if (target.result.os.tag == .linux) .dynamic else .static,
+            .use_pkg_config = .no,
+        });
+        if (target.result.os.tag == .linux) {
+            // Use the SDK's shared library; Zig's ELF linker cannot resolve its Rust archive.
+            plugin.addRPath(sdk.path("lib"));
+            for ([_][]const u8{ "pthread", "dl", "m" }) |name| plugin.linkSystemLibrary(name, .{});
+        } else if (target.result.os.tag == .windows) {
+            for ([_][]const u8{ "ws2_32", "advapi32", "userenv", "ntdll", "shell32", "ole32", "bcrypt" }) |name|
+                plugin.linkSystemLibrary(name, .{});
+        }
+        const plugin_tests = b.addTest(.{ .root_module = plugin });
+        b.step("check-plugin", "Compile the optional Wasm plugin host tests").dependOn(&plugin_tests.step);
+        const run_plugin_tests = b.addRunArtifact(plugin_tests);
+        b.step("test-plugin", "Verify the optional Wasm plugin host").dependOn(&run_plugin_tests.step);
+        test_step.dependOn(&run_plugin_tests.step);
+        const demo = b.addExecutable(.{
+            .name = "habush-plugin-demo",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("examples/plugins/demo.zig"),
+                .target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding }),
+                .optimize = .ReleaseSmall,
+            }),
+        });
+        demo.entry = .disabled;
+        demo.rdynamic = true;
+        demo.export_memory = true;
+        demo.stack_size = 64 * 1024;
+        b.installArtifact(demo);
+        demo_plugin = demo;
+    }
     const terminal_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/app_test.zig"),
@@ -100,6 +182,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
     terminal_tests.root_module.addImport("habush", habush);
+    terminal_tests.root_module.addImport("habush-edit", habush_edit);
+    terminal_tests.root_module.addOptions("features", features);
+    if (plugin_module) |plugin| terminal_tests.root_module.addImport("habush-plugin", plugin);
     const run_terminal_tests = b.addRunArtifact(terminal_tests);
     run_terminal_tests.setEnvironmentVariable("HABUSH_TEST_SKIP_ZIG_36010", if (skip_zig_36010) "1" else "0");
     test_step.dependOn(&run_terminal_tests.step);
@@ -125,6 +210,14 @@ pub fn build(b: *std.Build) void {
             terminal_test.addArtifactArg(exe);
             terminal_test.expectExitCode(0);
             test_step.dependOn(&terminal_test.step);
+            if (demo_plugin) |demo| {
+                const plugin_terminal = b.addRunArtifact(terminal_probe);
+                plugin_terminal.setName("test CLI plugin commands and completion");
+                plugin_terminal.addArtifactArg(exe);
+                plugin_terminal.addArtifactArg(demo);
+                plugin_terminal.expectExitCode(0);
+                test_step.dependOn(&plugin_terminal.step);
+            }
         },
         else => {},
     }
@@ -140,6 +233,15 @@ pub fn build(b: *std.Build) void {
     zon_config_test.addFileArg(b.path("test/cli/config.zon"));
     zon_config_test.addArgs(&.{ "-c", "exit 17" });
     expectCliResult(zon_config_test, test_step, 17, "", "");
+
+    if (!wasm_plugins) {
+        const unavailable_plugin_test = b.addRunArtifact(exe);
+        unavailable_plugin_test.setName("test CLI rejects plugins in a build without Wasm support");
+        unavailable_plugin_test.addArg("--config");
+        unavailable_plugin_test.addFileArg(b.path("examples/plugins/demo.zon"));
+        unavailable_plugin_test.addArgs(&.{ "-c", "exit 17" });
+        expectCliResult(unavailable_plugin_test, test_step, 2, "", "habush: plugins require a build with -Dwasm-plugins=true\n");
+    }
 
     const invalid_config_test = b.addRunArtifact(exe);
     invalid_config_test.setName("test cli ZON config diagnostic");

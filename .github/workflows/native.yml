@@ -29,6 +29,9 @@ jobs:
       - run: zig build test -Dskip-zig-36010=${{ runner.os == 'macOS' }} --test-timeout 60s --summary all
       - if: runner.os == 'macOS'
         run: zig build test-sandbox --summary all
+      - name: Test optional Wasm host and CLI
+        if: runner.os != 'Windows'
+        run: zig build test -Dwasm-plugins=true -Dskip-zig-36010=${{ runner.os == 'macOS' }} --test-timeout 60s --summary all
 
   freebsd:
     runs-on: ubuntu-latest
