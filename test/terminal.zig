@@ -29,17 +29,22 @@ pub fn main(init: std.process.Init) !void {
         Io.Dir.cwd().deleteFile(io, path) catch {};
         gpa.free(path);
     };
+    var random: [16]u8 = undefined;
+    try Io.randomSecure(io, &random);
+    const hex = std.fmt.hex(@as(u128, @bitCast(random)));
+    config_path = try gpa.print("/tmp/habush-terminal-{s}.zon", .{hex[0..]});
+    var config: Io.Writer.Allocating = .init(gpa);
+    defer config.deinit();
+    const bindings = .{
+        .{ .key = "ctrl+space", .action = .complete },
+        .{ .key = "ctrl+x", .action = .ignore },
+    };
     if (args.len == 3) {
         const module_path = try Io.Dir.cwd().realPathFileAlloc(io, args[2], gpa);
         defer gpa.free(module_path);
-        var random: [16]u8 = undefined;
-        try Io.randomSecure(io, &random);
-        const hex = std.fmt.hex(@as(u128, @bitCast(random)));
-        config_path = try gpa.print("/tmp/habush-plugin-{s}.zon", .{hex[0..]});
-        var config: Io.Writer.Allocating = .init(gpa);
-        defer config.deinit();
         try std.zon.stringify.serialize(.{
             .load_rc = false,
+            .keybinds = bindings,
             .plugins = .{
                 .{
                     .path = module_path,
@@ -53,8 +58,10 @@ pub fn main(init: std.process.Init) !void {
                 },
             },
         }, .{}, &config.writer);
-        try Io.Dir.cwd().writeFile(io, .{ .sub_path = config_path.?, .data = config.written() });
+    } else {
+        try std.zon.stringify.serialize(.{ .load_rc = false, .keybinds = bindings }, .{}, &config.writer);
     }
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = config_path.?, .data = config.written() });
     var master_fd: c_int = undefined;
     var slave_fd: c_int = undefined;
     const size: posix.winsize = .{ .row = 24, .col = 100, .xpixel = 0, .ypixel = 0 };
@@ -105,7 +112,12 @@ pub fn main(init: std.process.Init) !void {
     _ = try terminal.expect(ready);
     try std.testing.expect(!(try posix.tcgetattr(slave_fd)).lflag.ICANON);
 
-    if (config_path != null) {
+    try master.writeStreamingAll(io, "/bin/echo CLEAR\x02\x0c!\x18\r");
+    const cleared = try terminal.expect(ready);
+    try std.testing.expect(std.mem.indexOf(u8, cleared, "\x1b[2J\x1b[H") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cleared, "CLEA!R\r\n") != null);
+
+    if (args.len == 3) {
         try pluginScenario(io, master, &terminal);
     } else {
         try historyScenario(io, master, &terminal);
@@ -238,7 +250,7 @@ const Terminal = struct {
 fn functionCompletionScenario(io: Io, master: Io.File, terminal: *Terminal) !void {
     try master.writeStreamingAll(io, "__ec() { /usr/bin/printf '%s\\0' \"$3-$1 '\\$(missing)\"; }; complete -F __ec /bin/echo; false\r");
     _ = try terminal.expect(ready);
-    try master.writeStreamingAll(io, "/bin/echo prev va\t STATUS:$?\r");
+    try master.writeStreamingAll(io, "/bin/echo prev va\x00 STATUS:$?\r");
     var output = try terminal.expect(ready);
     try std.testing.expect(std.mem.indexOf(u8, output, "prev prev-va '$(missing) STATUS:1\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "command not found") == null);
@@ -300,11 +312,11 @@ fn pluginScenario(io: Io, master: Io.File, terminal: *Terminal) !void {
     try master.writeStreamingAll(io, "END\r");
     output = try terminal.expect(ready);
     try std.testing.expect(std.mem.indexOf(u8, output, "INPUT:scoped input\r\n") != null);
-    try master.writeStreamingAll(io, "hb-demo sec\t\r");
+    try master.writeStreamingAll(io, "hb-demo sec\x00\r");
     output = try terminal.expect(ready);
     try std.testing.expect(std.mem.indexOf(u8, output, "VALUE:second '$(missing)\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "command not found") == null);
-    try master.writeStreamingAll(io, "hb-demo \t\t\r\r");
+    try master.writeStreamingAll(io, "hb-demo \t\x1b[B\r\r");
     output = try terminal.expect(ready);
     try std.testing.expect(std.mem.indexOf(u8, output, "VALUE:second '$(missing)\r\n") != null);
     try master.writeStreamingAll(io, "hb-demo \tq\r");

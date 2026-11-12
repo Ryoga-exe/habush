@@ -2255,29 +2255,39 @@ test "parameter assignment persists in shell variable state" {
 }
 
 test "parameter expansion failures become shell diagnostics" {
-    var hir = try generate("/bin/not-run ${missing:?custom message}");
-    defer hir.deinit(std.testing.allocator);
-    var fake = FakeHost.init(std.testing.allocator);
-    defer fake.deinit();
-    var variables = VariableStore.init(std.testing.allocator);
-    defer variables.deinit();
-    var diagnostics: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer diagnostics.deinit();
+    for ([_][:0]const u8{
+        "/bin/not-run ${missing:?custom message}",
+        "case ${missing:?custom message} in *) :;; esac 2>&1",
+        "case x in ${missing:?custom message}) :;; esac 2>&1",
+    }, 0..) |source, index| {
+        var hir = try generate(source);
+        defer hir.deinit(std.testing.allocator);
+        var fake = FakeHost.init(std.testing.allocator);
+        defer fake.deinit();
+        var variables = VariableStore.init(std.testing.allocator);
+        defer variables.deinit();
+        var diagnostics: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer diagnostics.deinit();
+        var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer output.deinit();
 
-    const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
-        .variables = &variables,
-        .context = .{ .io = .{
-            .stderr = &diagnostics.writer,
-            .diagnostic_options = .{ .program_name = "habush" },
-        } },
-    }).execute(hir);
+        const result = try Executor.initWithOptions(std.testing.allocator, fake.host(), .{
+            .variables = &variables,
+            .context = .{ .io = .{
+                .stderr = &diagnostics.writer,
+                .stdout = &output.writer,
+                .diagnostic_options = .{ .program_name = "habush" },
+            } },
+        }).execute(hir);
 
-    try std.testing.expectEqual(@as(u8, 1), result.status);
-    try std.testing.expectEqualStrings(
-        "habush: missing: custom message\n",
-        diagnostics.written(),
-    );
-    try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+        try std.testing.expectEqual(@as(u8, 1), result.status);
+        try std.testing.expectEqualStrings(
+            "habush: missing: custom message\n",
+            if (index == 0) diagnostics.written() else output.written(),
+        );
+        try std.testing.expectEqualStrings("", if (index == 0) output.written() else diagnostics.written());
+        try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+    }
 }
 
 test "unsupported expansions have no host side effects" {

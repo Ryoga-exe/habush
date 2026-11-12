@@ -22,6 +22,7 @@ interactive: bool,
 interruptible: bool = false,
 io: ?std.Io = null,
 line_edit: bool = false,
+keybinds: []const edit.Keybind = &.{},
 completion_limits: habush.Completion.Provider.Limits = .{},
 completion_provider: ?habush.Completion.Provider = null,
 resolver_options: habush.CommandResolver.System.Options = .{},
@@ -69,7 +70,7 @@ fn runInput(self: *Shell, source_name: ?[]const u8) !habush.runtime.ExitStatus {
             else => return err,
         }) orelse return self.session.lastResult().status;
         defer input.deinit(self.allocator);
-        if (self.interactive) {
+        if (self.interactive and input.original_source.len <= LineEditor.max_input_bytes) {
             if (self.editing) |editing| try editing.history.append(input.original_source);
         }
 
@@ -437,6 +438,7 @@ fn readInputLine(self: *Shell, prompt: []const u8, prefix: []const u8, allow_com
             .input = self.stdin,
             .output = self.stderr,
             .prompt = prompt,
+            .keybinds = self.keybinds,
             .completion = if (allow_completion) completion.completion() else null,
             .history = if (allow_completion and prefix.len == 0 and self.editing != null) &self.editing.?.history else null,
         }).read() catch |err| switch (err) {

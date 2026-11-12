@@ -9,6 +9,7 @@ line_edit: Mode = .auto,
 shell_integration: Mode = .auto,
 load_rc: bool = true,
 plugins: []Plugin = &.{},
+keybinds: []const @import("habush-edit").Keybind.Spec = &.{},
 /// Shared by completion providers; guest execution budgets
 /// remain the plugin host's responsibility.
 completion_limits: @import("habush").Completion.Provider.Limits = .{},
@@ -38,6 +39,7 @@ pub const max_rc_bytes = 1024 * 1024;
 pub fn parse(options: std.zon.parse.Options) !Config {
     const config = try std.zon.parse.fromSlice(Config, options);
     if (config.version != 1) return error.UnsupportedConfigVersion;
+    for (config.keybinds) |binding| _ = try @import("habush-edit").Keybind.Key.parse(binding.key);
     for (config.plugins, 0..) |plugin, plugin_index| {
         if (!validString(plugin.path) or (plugin.commands.len == 0 and plugin.completions.len == 0))
             return error.InvalidPluginConfiguration;
@@ -103,6 +105,7 @@ pub fn reportError(writer: *std.Io.Writer, path: ?[]const u8, err: anyerror) std
         error.InvalidLineEditSetting => "HABUSH_LINE_EDIT must be auto, on, or off",
         error.InvalidShellIntegrationSetting => "HABUSH_SHELL_INTEGRATION must be auto, on, or off",
         error.UnsupportedConfigVersion => "unsupported config version",
+        error.InvalidKeybind => "unsupported keybinding trigger",
         error.InvalidPluginConfiguration => "plugin paths, command names, and entries must be nonempty and valid",
         error.ReservedPluginCommand => "plugin command name is reserved for a builtin",
         error.DuplicatePluginCommand => "duplicate plugin command name",
@@ -249,12 +252,13 @@ test "ZON configuration validates fields and honors explicit paths without JSON 
     try std.testing.expectEqualDeep(Config{}, (try load(gpa, arena, io, paths, null, &output.writer)).?);
     try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"load_rc\":false}" });
     try std.testing.expectEqualDeep(Config{}, (try load(gpa, arena, io, paths, null, &output.writer)).?);
-    try tmp.dir.writeFile(io, .{ .sub_path = "config.zon", .data = ".{ .line_edit = .off, .completion_limits = .{ .candidates = 7 } }" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.zon", .data = ".{ .line_edit = .off, .completion_limits = .{ .candidates = 7 }, .keybinds = .{.{ .key = \"ctrl+space\", .action = .complete }} }" });
     const zon = (try load(gpa, arena, io, paths, null, &output.writer)).?;
     try std.testing.expectEqual(Mode.off, zon.line_edit);
     try std.testing.expect(zon.load_rc);
     try std.testing.expectEqual(@as(usize, 7), zon.completion_limits.candidates);
     try std.testing.expectEqual((Config{}).completion_limits.bytes, zon.completion_limits.bytes);
+    try std.testing.expectEqualStrings("ctrl+space", zon.keybinds[0].key);
     try std.testing.expectEqualStrings("", output.written());
 
     try tmp.dir.writeFile(io, .{ .sub_path = "config.zon", .data =
@@ -278,6 +282,8 @@ test "ZON configuration validates fields and honors explicit paths without JSON 
         ".{ .load_rc = true, .load_rc = false }",
         ".{ .line_edit = .maybe }",
         ".{ .version = 2 }",
+        ".{ .keybinds = .{.{ .key = \"super+a\", .action = .complete }} }",
+        ".{ .keybinds = .{.{ .key = \"ctrl+l\", .action = .missing }} }",
         ".{ .plugins = .{.{ .path = \"x\", .commands = .{.{ .name = \"true\" }} }} }",
         ".{ .plugins = .{.{ .path = \"x\", .commands = .{.{ .name = \"demo\" }, .{ .name = \"demo\" }} }} }",
         ".{ .plugins = .{.{ .path = \"\", .commands = .{.{ .name = \"demo\" }} }} }",

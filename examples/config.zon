@@ -1,0 +1,14 @@
+.{
+    .line_edit = .auto,
+    .keybinds = .{
+        // Calls the same native/function/Wasm completion providers as Tab.
+        .{ .key = "ctrl+space", .action = .complete },
+
+        // Up/Down traverse ordinary history by default. Optional prefix search:
+        // .{ .key = "up", .action = .history_search_previous },
+        // .{ .key = "down", .action = .history_search_next },
+
+        // Later bindings win. `ignore` consumes a key; `unbind` removes its action.
+        // .{ .key = "ctrl+l", .action = .ignore },
+    },
+}
