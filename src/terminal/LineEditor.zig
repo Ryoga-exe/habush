@@ -12,6 +12,7 @@ input: *std.Io.Reader,
 output: *std.Io.Writer,
 prompt: []const u8,
 completion: ?edit.Completion = null,
+history: ?*const edit.History = null,
 
 const max_input_bytes = 64 * 1024;
 const Menu = struct { result: edit.Completion.Result, selected: usize = 0 };
@@ -29,6 +30,8 @@ pub fn read(editor: LineEditor) !?[:0]u8 {
     var buffer: edit.Buffer = .{ .gpa = editor.gpa };
     defer buffer.deinit();
     var menu: ?Menu = null;
+    var navigation: edit.History.Navigation = .{};
+    defer navigation.deinit(editor.gpa);
     var pending: [4]u8 = undefined;
     var pending_len: usize = 0;
     var expected_len: usize = 0;
@@ -113,7 +116,15 @@ pub fn read(editor: LineEditor) !?[:0]u8 {
                     }
                 }
                 menu = null;
-                if (std.mem.eql(u8, key, "[D") or std.mem.eql(u8, key, "OD")) buffer.left() else if (std.mem.eql(u8, key, "[C") or std.mem.eql(u8, key, "OC")) buffer.right() else if (std.mem.eql(u8, key, "[H") or std.mem.eql(u8, key, "OH") or std.mem.eql(u8, key, "[1~")) buffer.cursor = 0 else if (std.mem.eql(u8, key, "[F") or std.mem.eql(u8, key, "OF") or std.mem.eql(u8, key, "[4~")) buffer.cursor = buffer.text().len else if (std.mem.eql(u8, key, "[3~")) try buffer.delete() else if (std.mem.eql(u8, key, "[200~")) try editor.paste(&buffer) else try editor.output.writeByte(7);
+                if (std.mem.eql(u8, key, "[A") or std.mem.eql(u8, key, "OA") or
+                    std.mem.eql(u8, key, "[B") or std.mem.eql(u8, key, "OB"))
+                {
+                    const moved = if (editor.history) |history|
+                        try navigation.move(history, &buffer, key[1] == 'A', false)
+                    else
+                        false;
+                    if (!moved) try editor.output.writeByte(7);
+                } else if (std.mem.eql(u8, key, "[D") or std.mem.eql(u8, key, "OD")) buffer.left() else if (std.mem.eql(u8, key, "[C") or std.mem.eql(u8, key, "OC")) buffer.right() else if (std.mem.eql(u8, key, "[H") or std.mem.eql(u8, key, "OH") or std.mem.eql(u8, key, "[1~")) buffer.cursor = 0 else if (std.mem.eql(u8, key, "[F") or std.mem.eql(u8, key, "OF") or std.mem.eql(u8, key, "[4~")) buffer.cursor = buffer.text().len else if (std.mem.eql(u8, key, "[3~")) try buffer.delete() else if (std.mem.eql(u8, key, "[200~")) try editor.paste(&buffer) else try editor.output.writeByte(7);
             },
             else => {
                 if (byte >= 0x20) {

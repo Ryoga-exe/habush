@@ -4,6 +4,7 @@ const std = @import("std");
 const habush = @import("habush");
 const ShellIntegration = @import("terminal/ShellIntegration.zig");
 const LineEditor = @import("terminal/LineEditor.zig");
+const edit = @import("habush-edit");
 const CompletionService = @import("CompletionService.zig");
 const interrupt = @import("interrupt.zig");
 const Io = std.Io;
@@ -30,8 +31,28 @@ input_line: usize = 0,
 input_byte_offset: ?u32 = null,
 last_line_ending: LineEnding = .lf,
 interrupt_generation: u32 = 0,
+editing: ?*Editing = null,
+
+const Editing = struct {
+    history: edit.History,
+    queued: ?[:0]u8 = null,
+    offset: usize = 0,
+
+    fn discard(editing: *Editing) void {
+        if (editing.queued) |source| editing.history.gpa.free(source);
+        editing.queued = null;
+        editing.offset = 0;
+    }
+};
 
 pub fn run(self: *Shell) !habush.runtime.ExitStatus {
+    var editing: Editing = .{ .history = .{ .gpa = self.allocator } };
+    self.editing = &editing;
+    defer {
+        self.editing = null;
+        editing.discard();
+        editing.history.deinit();
+    }
     return self.runInput(null);
 }
 
@@ -40,6 +61,7 @@ fn runInput(self: *Shell, source_name: ?[]const u8) !habush.runtime.ExitStatus {
         self.interrupt_generation = interrupt.snapshot();
         var input = (self.withInterrupt(?CommandInput, readCommand, .{self}, discardInput, true) catch |err| switch (err) {
             error.InputInterrupted, error.Canceled => {
+                if (self.editing) |editing| editing.discard();
                 self.session.interruptInput();
                 if (err == error.Canceled) try self.stderr.writeByte('\n');
                 continue;
@@ -47,6 +69,9 @@ fn runInput(self: *Shell, source_name: ?[]const u8) !habush.runtime.ExitStatus {
             else => return err,
         }) orelse return self.session.lastResult().status;
         defer input.deinit(self.allocator);
+        if (self.interactive) {
+            if (self.editing) |editing| try editing.history.append(input.original_source);
+        }
 
         if (input.incomplete_here_document) {
             try self.beginCommand(true);
@@ -384,7 +409,7 @@ fn readHereDocument(
 }
 
 fn readInputLine(self: *Shell, prompt: []const u8, prefix: []const u8, allow_completion: bool) !?[:0]u8 {
-    const line = if (self.interactive and self.line_edit and self.io != null) editor: {
+    const line = (try self.takeEditedLine()) orelse if (self.interactive and self.line_edit and self.io != null) editor: {
         self.last_line_ending = .lf;
         self.input_byte_offset = null;
         var native: habush.Completion.Native = .{
@@ -407,17 +432,23 @@ fn readInputLine(self: *Shell, prompt: []const u8, prefix: []const u8, allow_com
             .limits = self.completion_limits,
         };
         defer completion.deinit();
-        break :editor ((LineEditor{
+        const submitted = ((LineEditor{
             .gpa = self.allocator,
             .input = self.stdin,
             .output = self.stderr,
             .prompt = prompt,
             .completion = if (allow_completion) completion.completion() else null,
+            .history = if (allow_completion and prefix.len == 0 and self.editing != null) &self.editing.?.history else null,
         }).read() catch |err| switch (err) {
             error.EditorUnavailable => try readLineAlloc(self.stdin, self.allocator, &self.last_line_ending),
             error.EndOfStream => null,
             else => return err,
         }) orelse return null;
+        if (self.editing) |editing| {
+            editing.queued = submitted;
+            break :editor (try self.takeEditedLine()).?;
+        }
+        break :editor submitted;
     } else try readLineAlloc(self.stdin, self.allocator, &self.last_line_ending) orelse return null;
     self.input_line += 1;
     if (self.input_byte_offset) |offset| {
@@ -426,6 +457,25 @@ fn readInputLine(self: *Shell, prompt: []const u8, prefix: []const u8, allow_com
             break :offset std.math.add(u32, offset, len) catch null;
         };
     }
+    return line;
+}
+
+/// Recalled/pasted input follows the same physical-line and here-document path
+/// as typed input, without consuming stdin intended for a running command.
+fn takeEditedLine(self: *Shell) !?[:0]u8 {
+    if (!self.interactive) return null;
+    const editing = self.editing orelse return null;
+    const source = editing.queued orelse return null;
+    const start = editing.offset;
+    const end = std.mem.indexOfAnyPos(u8, source, start, "\r\n") orelse source.len;
+    const line = try self.allocator.dupeSentinel(u8, source[start..end], 0);
+    self.last_line_ending = .lf;
+    editing.offset = end + 1;
+    if (end < source.len and source[end] == '\r' and end + 1 < source.len and source[end + 1] == '\n') {
+        self.last_line_ending = .crlf;
+        editing.offset += 1;
+    }
+    if (editing.offset >= source.len) editing.discard();
     return line;
 }
 
@@ -470,6 +520,7 @@ fn handleInput(
         .source_mappings = mappings,
     }) catch |err| switch (err) {
         error.Canceled => {
+            if (self.editing) |editing| editing.discard();
             self.session.interruptInput();
             try self.stderr.writeByte('\n');
             return .none;
@@ -647,6 +698,36 @@ test "script diagnostics retain raw CRLF here-document and final-line byte range
     try std.testing.expectEqualDeep(habush.Source.Range{ .start = @intCast(nested), .end = @intCast(nested + "missing_nested".len) }, capture.ranges[1].?);
     try std.testing.expectEqualDeep(habush.Source.Range{ .start = @intCast(last), .end = @intCast(script.len) }, capture.ranges[2].?);
     try std.testing.expectEqualStrings("", stderr.written());
+}
+
+test "recalled compound input collects here-documents before execution" {
+    const gpa = std.testing.allocator;
+    var system: habush.Host.System = .{ .gpa = gpa, .io = std.testing.io };
+    defer system.deinit();
+    var session = try habush.Session.init(gpa, system.host(), .{});
+    defer session.deinit();
+    var output: Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var reader: Io.Reader = .fixed("");
+    const source = "{\n: <<'EOF'\nliteral $(missing)\nEOF\n}\n";
+    var editing: Editing = .{
+        .history = .{ .gpa = gpa },
+        .queued = try gpa.dupeSentinel(u8, source, 0),
+    };
+    defer editing.discard();
+    var shell: Shell = .{
+        .allocator = gpa,
+        .stdin = &reader,
+        .stderr = &output.writer,
+        .session = &session,
+        .interactive = true,
+        .editing = &editing,
+    };
+    var input = (try shell.readCommand()).?;
+    defer input.deinit(gpa);
+    try std.testing.expectEqualStrings(source, input.original_source);
+    try std.testing.expectEqualStrings("literal $(missing)\n", input.here_documents[0].body);
+    try std.testing.expect(editing.queued == null);
 }
 
 // NOTE: Zig's macOS stack unwinder can consume cancellation (also in 0.16):
