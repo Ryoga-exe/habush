@@ -1,12 +1,25 @@
 const std = @import("std");
 
-pub fn build(b: *std.Build) void {
+pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const wasmtime_sdk = b.option([]const u8, "wasmtime", "Wasmtime 50.0.1 C API SDK directory (optional)");
+    const wasm_plugins = b.option(bool, "wasm-plugins", "Enable Wasm plugins using the Wasmtime SDK") orelse false;
+    const wasmtime_sdk = if (wasm_plugins) sdk: {
+        const name = if (target.result.os.tag == .macos and target.result.cpu.arch == .aarch64)
+            "wasmtime_aarch64_macos"
+        else if (target.result.os.tag == .linux and target.result.cpu.arch == .x86_64 and target.result.abi == .gnu)
+            "wasmtime_x86_64_linux_gnu"
+        else {
+            std.log.err("Wasmtime SDK is unavailable for {t}-{t}-{t}; supported targets: aarch64-macos, x86_64-linux-gnu", .{
+                target.result.cpu.arch, target.result.os.tag, target.result.abi,
+            });
+            return error.UnsupportedWasmtimeTarget;
+        };
+        break :sdk try b.dependencyLazy(name, .{});
+    } else null;
     var demo_plugin: ?*std.Build.Step.Compile = null;
     const features = b.addOptions();
-    features.addOption(bool, "wasm_plugins", wasmtime_sdk != null);
+    features.addOption(bool, "wasm_plugins", wasm_plugins);
     const skip_zig_36010 = (b.option(bool, "skip-zig-36010", "Skip macOS cancellation checks affected by Zig PR #36010") orelse false) and
         target.result.os.tag == .macos;
 
@@ -110,11 +123,11 @@ pub fn build(b: *std.Build) void {
     var plugin_module: ?*std.Build.Module = null;
     if (wasmtime_sdk) |sdk| {
         const headers = b.addTranslateC(.{
-            .root_source_file = .{ .cwd_relative = b.pathJoin(&.{ sdk, "include", "wasmtime.h" }) },
+            .root_source_file = sdk.path("include/wasmtime.h"),
             .target = target,
             .optimize = optimize,
         });
-        headers.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "include" }) });
+        headers.addIncludePath(sdk.path("include"));
         if (target.result.os.tag == .windows) {
             headers.defineCMacro("WASM_API_EXTERN", "");
             headers.defineCMacro("WASI_API_EXTERN", "");
@@ -128,14 +141,14 @@ pub fn build(b: *std.Build) void {
         plugin.addImport("wasmtime", headers.createModule());
         plugin_module = plugin;
         exe.root_module.addImport("habush-plugin", plugin);
-        plugin.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "lib" }) });
+        plugin.addLibraryPath(sdk.path("lib"));
         plugin.linkSystemLibrary("wasmtime", .{
             .preferred_link_mode = if (target.result.os.tag == .linux) .dynamic else .static,
             .use_pkg_config = .no,
         });
         if (target.result.os.tag == .linux) {
             // Use the SDK's shared library; Zig's ELF linker cannot resolve its Rust archive.
-            plugin.addRPath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "lib" }) });
+            plugin.addRPath(sdk.path("lib"));
             for ([_][]const u8{ "pthread", "dl", "m" }) |name| plugin.linkSystemLibrary(name, .{});
         } else if (target.result.os.tag == .windows) {
             for ([_][]const u8{ "ws2_32", "advapi32", "userenv", "ntdll", "shell32", "ole32", "bcrypt" }) |name|
@@ -221,13 +234,13 @@ pub fn build(b: *std.Build) void {
     zon_config_test.addArgs(&.{ "-c", "exit 17" });
     expectCliResult(zon_config_test, test_step, 17, "", "");
 
-    if (wasmtime_sdk == null) {
+    if (!wasm_plugins) {
         const unavailable_plugin_test = b.addRunArtifact(exe);
-        unavailable_plugin_test.setName("test CLI rejects plugins in a build without the SDK");
+        unavailable_plugin_test.setName("test CLI rejects plugins in a build without Wasm support");
         unavailable_plugin_test.addArg("--config");
         unavailable_plugin_test.addFileArg(b.path("examples/plugins/demo.zon"));
         unavailable_plugin_test.addArgs(&.{ "-c", "exit 17" });
-        expectCliResult(unavailable_plugin_test, test_step, 2, "", "habush: plugins require a build with -Dwasmtime=<SDK>\n");
+        expectCliResult(unavailable_plugin_test, test_step, 2, "", "habush: plugins require a build with -Dwasm-plugins=true\n");
     }
 
     const invalid_config_test = b.addRunArtifact(exe);

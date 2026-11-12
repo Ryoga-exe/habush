@@ -2,20 +2,24 @@
 
 The optional `habush-plugin` Zig module uses the official Wasmtime **50.0.1 C API SDK**. One module can provide commands and their argument completion. The default shell build does not link Wasmtime; requesting plugins in that build reports an error.
 
-Download the SDK for your target from the [official release](https://github.com/bytecodealliance/wasmtime/releases/tag/v50.0.1), extract it, then run:
+Enable plugins when building, then start the demo:
 
 ```sh
-zig build -Dwasmtime=/absolute/path/to/wasmtime-v50.0.1-aarch64-macos-c-api
+zig build -Dwasm-plugins=true
 zig-out/bin/habush --config examples/plugins/demo.zon
 ```
 
-The directory must contain `include/wasmtime.h` and `lib/`. This builds the shell and `zig-out/bin/habush-plugin-demo.wasm` from [demo.zig](demo.zig). In the shell, run `hb-demo 'hello world'`: it prints `VALUE:hello world` and returns status 7. `hb-demo read` reads one chunk from stdin; `fail` traps and `loop` runs until canceled or limited.
+Zig fetches the official SDK declared in `build.zig.zon`, verifies its package hash, and caches it. No manual SDK path or Rust toolchain is needed. SDK selection follows the build target: currently `aarch64-macos` and `x86_64-linux-gnu` are supported. Enabling plugins for another target reports a configuration error. The default build leaves plugins disabled and does not fetch either SDK.
+
+This builds the shell and `zig-out/bin/habush-plugin-demo.wasm` from [demo.zig](demo.zig). In the shell, run `hb-demo 'hello world'`: it prints `VALUE:hello world` and returns status 7. `hb-demo read` reads one chunk from stdin; `fail` traps and `loop` runs until canceled or limited.
 
 Type `hb-demo sec` and press Tab to insert a safely quoted candidate containing an apostrophe and `$()`. For multiple candidates, Tab or Up/Down selects, Enter inserts, and a second Enter submits the command. Typing, moving the cursor, pasting, or undoing closes the selection. A plugin failure leaves the input editable; Ctrl-C cancels a running command.
 
-`zig build test -Dwasmtime=<SDK> --test-timeout 60s` includes host tests and a real CLI/PTY test. `test-plugin` runs just the host tests, and `check-plugin` compiles them without running. The SDK tests run on macOS and Linux in CI; Windows/FreeBSD shell tests continue without it. Wasm behavior on those two platforms has not been verified. On stock Zig 0.17.1, macOS full tests also use the existing `-Dskip-zig-36010=true` quarantine; the new plugin cancellation tests are not skipped.
+`zig build test -Dwasm-plugins=true --test-timeout 60s` includes host tests and a real CLI/PTY test. With the same option, `test-plugin` runs just the host tests, and `check-plugin` compiles them without running. The SDK tests run on macOS and Linux in CI; Windows/FreeBSD shell tests continue without plugins. On stock Zig 0.17.1, macOS full tests also use the existing `-Dskip-zig-36010=true` quarantine; the new plugin cancellation tests are not skipped.
 
-On Linux, the SDK's shared library is used with a build rpath pointing to the SDK because Zig 0.17.1's ELF linker does not resolve its Rust static archive. Keep that library directory available when running these development binaries. Runtime packaging is not implemented yet.
+On Linux, the SDK's shared library is used with a build rpath pointing to its package directory because Zig 0.17.1's ELF linker does not resolve its Rust static archive. Keep that package directory available when running these development binaries. Runtime packaging is not implemented yet.
+
+To update a dependency declaration, use Zig 0.17.1's `zig fetch --save-exact=<dependency-name> <official-sdk-url>` to write its URL and package hash, then ensure `.lazy = true` is retained. The build uses `try b.dependencyLazy(...)` and `Dependency.path(...)`; SDK archives do not need their own `build.zig`. Extracted packages are kept in Zig's generated `zig-pkg/` directory, which is ignored by Git.
 
 ## ZON registration
 

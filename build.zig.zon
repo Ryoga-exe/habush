@@ -3,7 +3,18 @@
     .version = "0.0.0",
     .fingerprint = 0x75592405941710d1, // Changing this has security and trust implications.
     .minimum_zig_version = "0.17.1",
-    .dependencies = .{},
+    .dependencies = .{
+        .wasmtime_aarch64_macos = .{
+            .url = "https://github.com/bytecodealliance/wasmtime/releases/download/v50.0.1/wasmtime-v50.0.1-aarch64-macos-c-api.tar.xz",
+            .hash = "N-V-__8AAABwBARFpa6bWC3xq_DQfHIMy5qY7JHxrBzjhBfp",
+            .lazy = true,
+        },
+        .wasmtime_x86_64_linux_gnu = .{
+            .url = "https://github.com/bytecodealliance/wasmtime/releases/download/v50.0.1/wasmtime-v50.0.1-x86_64-linux-c-api.tar.xz",
+            .hash = "N-V-__8AANyIMQbYIyp5XsWIsVbYqGYtiVLtO3IEqcdRA-kW",
+            .lazy = true,
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

@@ -122,7 +122,7 @@ pub fn main(init: std.process.Init) !habush.runtime.ExitStatus {
             return 2;
         };
     } else if (config.plugins.len != 0) {
-        try stderr.writeAll("habush: plugins require a build with -Dwasmtime=<SDK>\n");
+        try stderr.writeAll("habush: plugins require a build with -Dwasm-plugins=true\n");
         return 2;
     }
     var session = try habush.Session.init(gpa, runtime_host, .{
