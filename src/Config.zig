@@ -13,21 +13,11 @@ load_rc: bool = true,
 completion_limits: @import("habush").Completion.Provider.Limits = .{},
 
 pub const Mode = enum { auto, on, off };
-pub const Format = enum { zon, json };
 pub const max_file_bytes = 64 * 1024;
 pub const max_rc_bytes = 1024 * 1024;
 
-pub fn parse(gpa: std.mem.Allocator, source: []const u8) !Config {
-    const parsed = try std.json.parseFromSlice(Config, gpa, source, .{});
-    defer parsed.deinit();
-    return validate(parsed.value);
-}
-
-pub fn parseZon(options: std.zon.parse.Options) !Config {
-    return validate(try std.zon.parse.fromSliceNoAlloc(Config, options));
-}
-
-fn validate(config: Config) error{UnsupportedConfigVersion}!Config {
+pub fn parse(options: std.zon.parse.Options) !Config {
+    const config = try std.zon.parse.fromSliceNoAlloc(Config, options);
     if (config.version != 1) return error.UnsupportedConfigVersion;
     return config;
 }
@@ -35,44 +25,33 @@ fn validate(config: Config) error{UnsupportedConfigVersion}!Config {
 fn read(gpa: std.mem.Allocator, io: std.Io, path: []const u8, diagnostics: *std.Io.Writer) !Config {
     const source = try std.Io.Dir.cwd().readFileAllocOptions(io, path, gpa, .limited(max_file_bytes), .of(u8), 0);
     defer gpa.free(source);
-    if (std.mem.eql(u8, std.fs.path.extension(path), ".zon")) {
-        var arena: std.heap.ArenaAllocator = .init(gpa);
-        defer arena.deinit();
-        var detail: std.zon.parse.Diagnostics = undefined;
-        return parseZon(.{
-            .gpa = gpa,
-            .arena = arena.allocator(),
-            .source = source,
-            .diagnostics = &detail,
-        }) catch |err| {
-            if (err == error.ParseZon)
-                try diagnostics.print("habush: configuration: {f}\n", .{detail.fmt(path)});
-            return err;
-        };
-    }
-    // Preserve JSON parsing for existing explicit paths without a .json suffix.
-    return parse(gpa, source);
-}
-
-/// Selects one file. Only a missing default candidate permits fallback.
-/// Returns null after reporting an invalid or unreadable configuration.
-pub fn load(gpa: std.mem.Allocator, io: std.Io, paths: Paths, explicit: ?[]const u8, diagnostics: *std.Io.Writer) !?Config {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
-    const candidates: [2]?[]const u8 = if (explicit) |path|
-        .{ path, null }
-    else
-        .{ try paths.configFile(arena.allocator(), .zon), try paths.configFile(arena.allocator(), .json) };
-    for (candidates) |candidate| {
-        const path = candidate orelse continue;
-        return read(gpa, io, path, diagnostics) catch |err| {
-            if (err == error.FileNotFound and explicit == null) continue;
-            if (err == error.OutOfMemory or err == error.WriteFailed) return err;
-            if (err != error.ParseZon) try reportError(diagnostics, path, err);
-            return null;
-        };
-    }
-    return .{};
+    var detail: std.zon.parse.Diagnostics = undefined;
+    return parse(.{
+        .gpa = gpa,
+        .arena = arena.allocator(),
+        .source = source,
+        .diagnostics = &detail,
+    }) catch |err| {
+        if (err == error.ParseZon)
+            try diagnostics.print("habush: configuration: {f}\n", .{detail.fmt(path)});
+        return err;
+    };
+}
+
+/// Loads the explicit path or config.zon; a missing default uses default values.
+/// Returns null after reporting an invalid or unreadable configuration.
+pub fn load(gpa: std.mem.Allocator, io: std.Io, paths: Paths, explicit: ?[]const u8, diagnostics: *std.Io.Writer) !?Config {
+    const default_path = if (explicit == null) try paths.configFile(gpa) else null;
+    defer if (default_path) |path| gpa.free(path);
+    const path = explicit orelse default_path orelse return .{};
+    return read(gpa, io, path, diagnostics) catch |err| {
+        if (err == error.FileNotFound and explicit == null) return .{};
+        if (err == error.OutOfMemory or err == error.WriteFailed) return err;
+        if (err != error.ParseZon) try reportError(diagnostics, path, err);
+        return null;
+    };
 }
 
 pub fn reportError(writer: *std.Io.Writer, path: ?[]const u8, err: anyerror) std.Io.Writer.Error!void {
@@ -80,9 +59,6 @@ pub fn reportError(writer: *std.Io.Writer, path: ?[]const u8, err: anyerror) std
         error.InvalidLineEditSetting => "HABUSH_LINE_EDIT must be auto, on, or off",
         error.InvalidShellIntegrationSetting => "HABUSH_SHELL_INTEGRATION must be auto, on, or off",
         error.UnsupportedConfigVersion => "unsupported config version",
-        error.UnknownField => "unknown config field",
-        error.DuplicateField => "duplicate config field",
-        error.InvalidEnumTag => "expected auto, on, or off",
         error.FileNotFound => "no such file or directory",
         error.AccessDenied => "permission denied",
         error.IsDir => "is a directory",
@@ -147,13 +123,9 @@ pub const Paths = struct {
         paths.* = undefined;
     }
 
-    pub fn configFile(paths: Paths, gpa: std.mem.Allocator, format: Format) !?[]u8 {
+    pub fn configFile(paths: Paths, gpa: std.mem.Allocator) !?[]u8 {
         const directory_path = paths.config orelse return null;
-        const name = switch (format) {
-            .zon => "config.zon",
-            .json => "config.json",
-        };
-        return try std.fs.path.join(gpa, &.{ directory_path, name });
+        return try std.fs.path.join(gpa, &.{ directory_path, "config.zon" });
     }
 
     pub fn rcFile(paths: Paths, gpa: std.mem.Allocator) !?[]u8 {
@@ -196,16 +168,8 @@ fn directory(gpa: std.mem.Allocator, candidate: ?[]const u8, home: ?[]const u8, 
     };
 }
 
-test "typed JSON and environment overrides reject invalid or ambiguous settings" {
-    const config = try parse(std.testing.allocator, "{\"line_edit\":\"off\",\"load_rc\":false}");
-    try std.testing.expectEqual(Mode.off, config.line_edit);
-    try std.testing.expect(!config.load_rc);
-    const bounded = try parse(std.testing.allocator, "{\"completion_limits\":{\"candidates\":8,\"bytes\":4096,\"scanned\":256}}");
-    try std.testing.expectEqual(@as(usize, 8), bounded.completion_limits.candidates);
-    try std.testing.expectError(error.UnknownField, parse(std.testing.allocator, "{\"line_edti\":\"off\"}"));
-    try std.testing.expectError(error.DuplicateField, parse(std.testing.allocator, "{\"load_rc\":true,\"load_rc\":false}"));
-    try std.testing.expectError(error.UnsupportedConfigVersion, parse(std.testing.allocator, "{\"version\":2}"));
-    try std.testing.expectError(error.InvalidEnumTag, parse(std.testing.allocator, "{\"line_edit\":\"maybe\"}"));
+test "environment overrides reject invalid settings" {
+    const config: Config = .{ .line_edit = .off, .load_rc = false };
     var environ: std.process.Environ.Map = .init(std.testing.allocator);
     defer environ.deinit();
     try environ.put("HABUSH_LINE_EDIT", "on");
@@ -220,7 +184,7 @@ test "typed JSON and environment overrides reject invalid or ambiguous settings"
     try std.testing.expect(!config.lineEditEnabled(false, "xterm"));
 }
 
-test "configuration selection prefers ZON, falls back only on absence, and honors explicit paths" {
+test "ZON configuration validates fields and honors explicit paths without JSON fallback" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -234,7 +198,7 @@ test "configuration selection prefers ZON, falls back only on absence, and honor
 
     try std.testing.expectEqualDeep(Config{}, (try load(gpa, io, paths, null, &output.writer)).?);
     try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"load_rc\":false}" });
-    try std.testing.expect(!(try load(gpa, io, paths, null, &output.writer)).?.load_rc);
+    try std.testing.expectEqualDeep(Config{}, (try load(gpa, io, paths, null, &output.writer)).?);
     try tmp.dir.writeFile(io, .{ .sub_path = "config.zon", .data = ".{ .line_edit = .off, .completion_limits = .{ .candidates = 7 } }" });
     const zon = (try load(gpa, io, paths, null, &output.writer)).?;
     try std.testing.expectEqual(Mode.off, zon.line_edit);
@@ -258,11 +222,18 @@ test "configuration selection prefers ZON, falls back only on absence, and honor
     }
 
     output.clearRetainingCapacity();
-    const json_path = (try paths.configFile(gpa, .json)).?;
-    defer gpa.free(json_path);
-    try std.testing.expect(!(try load(gpa, io, paths, json_path, &output.writer)).?.load_rc);
+    try tmp.dir.writeFile(io, .{ .sub_path = "custom.conf", .data = ".{ .load_rc = false }" });
+    const explicit_path = try std.fs.path.join(gpa, &.{ directory_path, "custom.conf" });
+    defer gpa.free(explicit_path);
+    try std.testing.expect(!(try load(gpa, io, paths, explicit_path, &output.writer)).?.load_rc);
     try std.testing.expectEqualStrings("", output.written());
 
+    const json_path = try std.fs.path.join(gpa, &.{ directory_path, "config.json" });
+    defer gpa.free(json_path);
+    try std.testing.expect(try load(gpa, io, paths, json_path, &output.writer) == null);
+    try std.testing.expect(output.written().len > 0);
+
+    output.clearRetainingCapacity();
     const missing = try std.fs.path.join(gpa, &.{ directory_path, "missing.zon" });
     defer gpa.free(missing);
     try std.testing.expect(try load(gpa, io, paths, missing, &output.writer) == null);
@@ -327,7 +298,7 @@ test "XDG discovery preserves ownership on every allocation failure" {
             try environ.put("HOME", if (builtin.target.os.tag == .windows) "C:\\Users\\example" else "/home/example");
             var paths = try Paths.init(gpa, &environ);
             defer paths.deinit(gpa);
-            const file = (try paths.configFile(gpa, .zon)).?;
+            const file = (try paths.configFile(gpa)).?;
             defer gpa.free(file);
             const rc = (try paths.rcFile(gpa)).?;
             defer gpa.free(rc);
