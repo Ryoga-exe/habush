@@ -76,6 +76,7 @@ pub const Kind = union(enum) {
     no_such_job: []const u8,
     job_control_unavailable,
     cannot_execute: CannotExecuteReason,
+    extension_failed: @import("../Command.zig").Failure,
 };
 
 pub const ParameterExpansion = struct {
@@ -178,6 +179,7 @@ pub fn status(diagnostic: Diagnostic) types.ExitStatus {
         .working_directory_unavailable,
         .function_call_depth_exceeded,
         .job_control_unavailable,
+        .extension_failed,
         => 1,
         .command_not_found, .no_such_job => 127,
         .cannot_execute => 126,
@@ -205,6 +207,7 @@ pub fn render(
         .unsupported_option => |option| try writer.print("unsupported option: {s}", .{option}),
         .unexpected_argument => |argument| try writer.print("unexpected argument: {s}", .{argument}),
         .too_many_arguments => try writer.writeAll("too many arguments"),
+        .extension_failed => |failure| try writer.print("extension failed: {s}", .{failure.message()}),
         .numeric_argument_required => |argument| try writer.print("numeric argument required: {s}", .{argument}),
         .invalid_loop_count => |argument| try writer.print("invalid loop count: {s}", .{argument}),
         .shift_count_out_of_range => try writer.writeAll("shift count out of range"),

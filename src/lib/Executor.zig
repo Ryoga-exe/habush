@@ -12,6 +12,7 @@
 const std = @import("std");
 const Builtin = @import("Builtin.zig");
 const CommandPlan = @import("CommandPlan.zig");
+const Command = @import("Command.zig");
 const CommandResolver = @import("CommandResolver.zig");
 const ConcurrentWriter = @import("concurrent/Writer.zig");
 const Executor = @This();
@@ -32,6 +33,8 @@ gpa: std.mem.Allocator,
 host: Host,
 context: ExecutionContext.Ref,
 resolver: ?CommandResolver,
+commands: []const Command = &.{},
+extensions_allowed: bool = true,
 default_search_path: []const []const u8,
 invocation_name: []const u8,
 shell_process_id: ?runtime.ProcessId,
@@ -85,6 +88,7 @@ pub const Options = struct {
     context: ExecutionContext.View = .{},
     concurrent_pipeline: ?ConcurrentPipeline = null,
     resolver: ?CommandResolver = null,
+    commands: []const Command = &.{},
     /// Used only when neither the command bindings nor shell variables set PATH.
     default_search_path: []const []const u8 = &.{},
     invocation_name: []const u8 = "habush",
@@ -122,6 +126,7 @@ const CommandSelection = union(enum) {
     empty,
     external,
     builtin: Builtin,
+    extension: *const Command,
     function,
 
     fn pipelineStageKind(command: CommandSelection) PipelineStageKind {
@@ -130,6 +135,7 @@ const CommandSelection = union(enum) {
             .external => .external,
             .builtin => |builtin| if (builtin.pipeline_support == .reads_stdin) .in_process else .builtin,
             .function => .in_process,
+            .extension => .in_process,
         };
     }
 };
@@ -196,6 +202,7 @@ const PreparedPipelineStage = struct {
 
     fn executor(stage: *PreparedPipelineStage, base: Executor) Executor {
         var result = base;
+        result.extensions_allowed = false;
         if (stage.arena) |*arena| result.gpa = arena.allocator();
         if (stage.state) |*state| result.runtime_state = state;
         if (stage.variables) |*variables| result.variables = variables;
@@ -236,6 +243,7 @@ pub fn initWithOptions(gpa: std.mem.Allocator, host: Host, options: Options) Exe
         .host = host,
         .context = .{ .view = options.context },
         .resolver = options.resolver,
+        .commands = options.commands,
         .default_search_path = options.default_search_path,
         .invocation_name = options.invocation_name,
         .shell_process_id = options.shell_process_id,
@@ -909,6 +917,7 @@ fn executeConcurrentPipeline(
                 .empty => {},
                 .external, .function => requires_signals = true,
                 .builtin => {},
+                .extension => {},
             },
             .compound => requires_signals = true,
             .definition => {},
@@ -1092,6 +1101,7 @@ fn preparePipelineStage(
     };
     const expanded_argv = try argv.toOwnedSlice(allocator);
     const command: CommandSelection = if (expanded_argv.len == 0) .empty else executor.resolveCommand(expanded_argv[0]);
+    if (command == .extension) return error.UnsupportedInstruction;
     return .{ .ready = .{ .simple = .{
         .argv = expanded_argv,
         .command = command,
@@ -1105,6 +1115,9 @@ fn resolveCommand(executor: Executor, name: []const u8) CommandSelection {
     if (executor.runtime_state) |state|
         if (state.functionStore().contains(name)) return .function;
     if (builtin) |candidate| return .{ .builtin = candidate };
+    for (executor.commands) |*command| {
+        if (std.mem.eql(u8, name, command.name)) return .{ .extension = command };
+    }
     return .external;
 }
 
@@ -1175,6 +1188,14 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
             else => return error.UnsupportedInstruction,
         }
     }
+    const command = if (executor.prepared_simple) |prepared|
+        prepared.command
+    else if (argv.items.len == 0)
+        CommandSelection.empty
+    else
+        executor.resolveCommand(argv.items[0]);
+    if (command == .extension and (!executor.extensions_allowed or executor.background or
+        executor.pipeline_stage != null or executor.activeSandbox() != .inherit)) return error.UnsupportedInstruction;
     // Command words are expanded before redirect operands. Redirect actions
     // themselves still retain their source order when applied to the command.
     for (parts) |part| {
@@ -1241,12 +1262,31 @@ fn executeSimpleCommand(executor: Executor, hir: Hir, index: Hir.Inst.Index) Err
             try command_variables.set(assignment.name, value);
         }
     }
-    const command = if (executor.prepared_simple) |prepared|
-        prepared.command
-    else
-        executor.resolveCommand(argv.items[0]);
     switch (command) {
         .empty => unreachable,
+        .extension => |extension| {
+            var scope = switch (try executor.beginSimpleCommandRedirections(
+                file_actions.items,
+                &redirect_resources,
+                allocator,
+            )) {
+                .ready => |ready| ready,
+                .failed => |result| return result,
+            };
+            defer scope.deinit();
+            var environment = VariableStore.init(allocator);
+            defer environment.deinit();
+            const outcome = try extension.run(extension.userdata, .{
+                .gpa = allocator,
+                .cwd = scope.executor.workingDirectory(),
+                .environment = try prepareEnvironment(allocator, variables, &command_variables, &environment),
+                .io = scope.executor.io,
+            }, argv.items);
+            return switch (outcome) {
+                .exited => |status| .{ .status = status, .sandbox_coverage = .not_requested },
+                .failed => |failure| scope.executor.commandFailure(argv.items[0], .{ .extension_failed = failure }),
+            };
+        },
         .builtin => |candidate| {
             if (executor.background) return error.UnsupportedInstruction;
             if (executor.pipeline_stage != null and !candidate.supportsPipeline())

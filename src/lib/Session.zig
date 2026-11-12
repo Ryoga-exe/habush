@@ -4,6 +4,7 @@ const std = @import("std");
 const Ast = @import("Ast.zig");
 const AstGen = @import("AstGen.zig");
 const CommandPlan = @import("CommandPlan.zig");
+const Command = @import("Command.zig");
 const CommandResolver = @import("CommandResolver.zig");
 const Executor = @import("Executor.zig");
 const evaluation = @import("evaluation.zig");
@@ -18,6 +19,7 @@ const Session = @This();
 
 host: Host,
 resolver: ?CommandResolver,
+commands: []const Command,
 context: ExecutionContext,
 state: runtime.State,
 jobs: runtime.Jobs,
@@ -43,6 +45,7 @@ pub const Options = struct {
     /// and Host/Resolver adapters must outlive this session.
     concurrent_pipeline: ?Executor.ConcurrentPipeline = null,
     resolver: ?CommandResolver = null,
+    commands: []const Command = &.{},
     context: ExecutionContext.View = .{},
     invocation_name: []const u8 = "habush",
     shell_process_id: ?runtime.ProcessId = null,
@@ -96,6 +99,7 @@ pub fn init(
     return .{
         .host = host,
         .resolver = options.resolver,
+        .commands = options.commands,
         .context = context,
         .jobs = .{
             .gpa = gpa,
@@ -142,6 +146,7 @@ pub fn execute(session: *Session, hir: Hir) Executor.Error!Executor.Result {
     executor.job_control = session.jobs.terminal_control;
     executor.concurrent_pipeline = session.concurrent_pipeline;
     executor.cancel_io = session.cancel_io;
+    executor.commands = session.commands;
     var serialized_sink: runtime.Diagnostic.Sink.Serialized = undefined;
     if (executor.io.diagnostic_sink) |sink| {
         if (session.concurrent_pipeline) |config| {
