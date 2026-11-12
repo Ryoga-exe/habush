@@ -6,6 +6,8 @@ const Completion = @This();
 
 pub const Provider = @import("Completion/Provider.zig");
 pub const Native = @import("Completion/Native.zig");
+pub const Registry = @import("Completion/Registry.zig");
+pub const Registered = @import("Completion/Registered.zig");
 
 pub const Range = struct { start: usize, end: usize };
 pub const Quote = enum { unquoted, single, double };

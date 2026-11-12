@@ -395,13 +395,15 @@ fn readInputLine(self: *Shell, prompt: []const u8, prefix: []const u8, allow_com
             .function_names = self.session.functionNames(),
             .executable_extensions = self.resolver_options.executable_extensions,
         };
-        var providers: [2]habush.Completion.Provider = undefined;
-        providers[0] = self.completion_provider orelse native.provider();
-        if (self.completion_provider != null) providers[1] = native.provider();
+        var registered: habush.Completion.Registered = .{ .session = self.session, .io = self.io.? };
+        var providers: [3]habush.Completion.Provider = undefined;
+        providers[0] = registered.provider();
+        providers[1] = self.completion_provider orelse native.provider();
+        if (self.completion_provider != null) providers[2] = native.provider();
         var completion: CompletionService = .{
             .gpa = self.allocator,
             .prefix = prefix,
-            .providers = providers[0..if (self.completion_provider != null) @as(usize, 2) else 1],
+            .providers = providers[0..if (self.completion_provider != null) @as(usize, 3) else 2],
             .limits = self.completion_limits,
         };
         defer completion.deinit();

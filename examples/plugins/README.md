@@ -30,8 +30,8 @@ To update a dependency declaration, use Zig 0.17.1's `zig fetch --save-exact=<de
         .commands = .{.{
             .name = "hb-demo",
             .entry = "command",
-            .completion = "complete",
         }},
+        .completions = .{.{ .command = "hb-demo", .entry = "complete" }},
         .fuel = 10_000_000,
         .memory_bytes = 16 * 1024 * 1024,
         .timeout_ms = 1000,
@@ -39,13 +39,31 @@ To update a dependency declaration, use Zig 0.17.1's `zig fetch --save-exact=<de
 }
 ```
 
-Paths are relative to the configuration file's directory. `entry` defaults to `command`; completion is optional. Budget fields above show their defaults. Completion uses the same limits with a deadline capped at 100 ms. The CLI owns parsed strings until shutdown, loads modules before creating the Session, and destroys them after Session/input tasks have ended.
+Paths are relative to the configuration file's directory. Command entries default to `command`, completion entries to `complete`. Both lists default to empty; a plugin must provide at least one command or completion. A completion-only plugin may target existing builtins, functions, or external commands without changing their execution. Names match exactly, including explicit paths such as `/bin/echo`. Later completion registrations replace earlier ones. Budget fields above show their defaults. Wasm completion uses the same limits with a deadline capped at 100 ms. The CLI owns parsed strings until shutdown and destroys modules after Session/input tasks have ended.
 
 Empty paths/entries/names, command names containing path separators, duplicate names, and builtin name collisions are rejected. Shell functions retain precedence over registered commands. Explicit paths such as `./hb-demo` use external command lookup. File/compilation failures stop startup with status 2; entry/version/type failures are reported when called. Command failures produce status 1 and permit subsequent commands.
 
 The initial command API supports standalone execution, including standard-stream redirection. Pipeline stages, background execution, and restricted sandbox contexts reject these commands before opening their redirections. They do not fall back to external executables. No cwd/environment or Session access is passed to the Wasm guest.
 
 Argument completion receives the literal command and completed arguments before the current word, plus its literal prefix. It never evaluates substitutions or variable expansions; unsupported contexts use native fallback. A successful plugin result replaces file fallback for that command. Failed providers leave an incomplete result that cannot auto-insert an apparently unique candidate.
+
+## Shell function completion
+
+The default build also supports programmable completion. Add a definition and registration to your interactive rc, for example:
+
+```sh
+__echo_complete() {
+    /usr/bin/printf '%s\0' 'first choice' 'second choice'
+}
+complete -F __echo_complete /bin/echo
+# complete -r /bin/echo removes the registration.
+```
+
+Registration stores the function name and uses its current definition when called. The function receives `$1` as the literal prefix, then `$2` as the command and `$3...` as the completed arguments preceding the current word. Arguments are passed directly without constructing shell source. Output is raw candidate values terminated by NUL; an empty output is a successful empty result. A missing final NUL, nonzero status, timeout, or output overflow causes file fallback and marks the result incomplete. Providers decide matching/ranking; the adapter does not filter their returned values by prefix.
+
+The function runs with copied variables, functions, completion bindings, cwd, and positional state. Its mutations and exit status do not affect the main Session. Stdin is EOF and stderr is disconnected. Execution has a 100 ms deadline and stdout is captured through a bounded pipe using `completion_limits.bytes`; candidate/scan limits still apply. Cancellation joins the function and kills/reaps its private child jobs before input continues. External commands and pipelines can generate candidates, and their filesystem or other external side effects persist. This is state isolation, not an OS sandbox.
+
+ZON completion registrations are installed before the interactive rc is evaluated, so `complete -F` can override a Wasm provider. `complete -r` removes the current binding and restores native fallback; it does not restore an older registration.
 
 ## Ownership and calls
 

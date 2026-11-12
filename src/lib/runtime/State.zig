@@ -7,6 +7,7 @@ const Hir = @import("../Hir.zig");
 const State = @This();
 const types = @import("types.zig");
 const VariableStore = @import("../VariableStore.zig");
+const CompletionRegistry = @import("../Completion/Registry.zig");
 
 gpa: std.mem.Allocator,
 invocation_name: []u8,
@@ -15,6 +16,7 @@ default_search_path: []const []const u8,
 positional_parameters: []const []const u8,
 variables: VariableStore,
 functions: FunctionStore,
+completions: CompletionRegistry,
 
 pub const Options = struct {
     invocation_name: []const u8 = "habush",
@@ -54,6 +56,7 @@ pub fn init(gpa: std.mem.Allocator, options: Options) Error!State {
         .positional_parameters = positional_parameters,
         .variables = variables,
         .functions = FunctionStore.init(gpa),
+        .completions = .{ .gpa = gpa },
     };
 }
 
@@ -63,6 +66,7 @@ pub fn deinit(state: *State) void {
     deinitStrings(state.gpa, state.positional_parameters);
     state.variables.deinit();
     state.functions.deinit();
+    state.completions.deinit();
     state.* = undefined;
 }
 
@@ -83,6 +87,8 @@ pub fn cloneWithAllocator(state: State, gpa: std.mem.Allocator) std.mem.Allocato
 
     var variables = try state.variables.clone(gpa);
     errdefer variables.deinit();
+    var completions = try state.completions.clone(gpa);
+    errdefer completions.deinit();
 
     return .{
         .gpa = gpa,
@@ -92,6 +98,7 @@ pub fn cloneWithAllocator(state: State, gpa: std.mem.Allocator) std.mem.Allocato
         .positional_parameters = positional_parameters,
         .variables = variables,
         .functions = try state.functions.clone(gpa),
+        .completions = completions,
     };
 }
 
@@ -372,6 +379,7 @@ fn exerciseCloneAllocations(gpa: std.mem.Allocator) !void {
         .variables = &.{.{ .name = "name", .value = "value", .exported = true }},
     });
     defer state.deinit();
+    try state.completions.set("git", .{ .function = "__complete" });
     var copy = try state.clone();
     defer copy.deinit();
 }

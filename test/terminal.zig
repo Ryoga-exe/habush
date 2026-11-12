@@ -38,10 +38,21 @@ pub fn main(init: std.process.Init) !void {
         config_path = try gpa.print("/tmp/habush-plugin-{s}.zon", .{hex[0..]});
         var config: Io.Writer.Allocating = .init(gpa);
         defer config.deinit();
-        try config.writer.print(
-            ".{{ .load_rc = false, .plugins = .{{ .{{ .path = \"{f}\", .fuel = 18446744073709551615, .timeout_ms = 5000, .commands = .{{ .{{ .name = \"hb-demo\", .completion = \"complete\" }} }} }} }} }}\n",
-            .{std.zig.fmtString(module_path)},
-        );
+        try std.zon.stringify.serialize(.{
+            .load_rc = false,
+            .plugins = .{
+                .{
+                    .path = module_path,
+                    .fuel = std.math.maxInt(u64),
+                    .timeout_ms = 5000,
+                    .commands = .{.{ .name = "hb-demo" }},
+                },
+                .{
+                    .path = module_path,
+                    .completions = .{ .{ .command = "hb-demo" }, .{ .command = "/bin/echo" } },
+                },
+            },
+        }, .{}, &config.writer);
         try Io.Dir.cwd().writeFile(io, .{ .sub_path = config_path.?, .data = config.written() });
     }
     var master_fd: c_int = undefined;
@@ -97,6 +108,7 @@ pub fn main(init: std.process.Init) !void {
     if (config_path != null) {
         try pluginScenario(io, master, &terminal);
     } else {
+        try functionCompletionScenario(io, master, &terminal);
         try master.writeStreamingAll(io, "PATH=; habush_completion_probe() { /bin/echo COMPLETION:$1; }\r");
         _ = try terminal.expect(ready);
         try master.writeStreamingAll(io, "habush_completion_pr\t literal\r");
@@ -214,6 +226,37 @@ const Terminal = struct {
     }
 };
 
+fn functionCompletionScenario(io: Io, master: Io.File, terminal: *Terminal) !void {
+    try master.writeStreamingAll(io, "__ec() { /usr/bin/printf '%s\\0' \"$3-$1 '\\$(missing)\"; }; complete -F __ec /bin/echo; false\r");
+    _ = try terminal.expect(ready);
+    try master.writeStreamingAll(io, "/bin/echo prev va\t STATUS:$?\r");
+    var output = try terminal.expect(ready);
+    try std.testing.expect(std.mem.indexOf(u8, output, "prev prev-va '$(missing) STATUS:1\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "command not found") == null);
+    // A successful empty result suppresses the otherwise unique README match.
+    try master.writeStreamingAll(io, "__ec() { :; }\r");
+    _ = try terminal.expect(ready);
+    try master.writeStreamingAll(io, "/bin/echo READ\t\r");
+    try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "READ\r\n") != null);
+    try master.writeStreamingAll(io, "__ec() { /usr/bin/printf unterminated; }\r");
+    _ = try terminal.expect(ready);
+    try master.writeStreamingAll(io, "/bin/echo READ\t\x15/bin/echo FALLBACK-OK\r");
+    output = try terminal.expect(ready);
+    try std.testing.expect(std.mem.indexOf(u8, output, "README.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "partial results") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "FALLBACK-OK\r\n") != null);
+    try master.writeStreamingAll(io, "__ec() { /bin/sleep 5; }\r");
+    _ = try terminal.expect(ready);
+    const start = Io.Timestamp.now(io, .awake);
+    try master.writeStreamingAll(io, "/bin/echo READ\t\x15/bin/echo TIMEOUT-OK\r");
+    try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "TIMEOUT-OK\r\n") != null);
+    try std.testing.expect(Io.Timestamp.now(io, .awake).nanoseconds - start.nanoseconds < Io.Duration.fromSeconds(2).nanoseconds);
+    try master.writeStreamingAll(io, "complete -r /bin/echo\r");
+    _ = try terminal.expect(ready);
+    try master.writeStreamingAll(io, "/bin/echo READ\t\r");
+    try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "README.md\r\n") != null);
+}
+
 fn pluginScenario(io: Io, master: Io.File, terminal: *Terminal) !void {
     try master.writeStreamingAll(io, "PATH=; hb-demo 'literal arg'; /bin/echo STATUS:$?\r");
     var output = try terminal.expect(ready);
@@ -249,4 +292,17 @@ fn pluginScenario(io: Io, master: Io.File, terminal: *Terminal) !void {
     output = try terminal.expect(ready);
     try std.testing.expect(std.mem.indexOf(u8, output, "INTERRUPT:130\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "VALUE:after\r\n") != null);
+    // A completion-only plugin augments an existing executable, then a shell
+    // registration replaces it without changing command execution.
+    try master.writeStreamingAll(io, "/bin/echo sec\t STATUS:$?\r");
+    output = try terminal.expect(ready);
+    try std.testing.expect(std.mem.indexOf(u8, output, "second '$(missing) STATUS:7\r\n") != null);
+    try master.writeStreamingAll(io, "__override() { /usr/bin/printf '%s\\0' 'override choice'; }; complete -F __override /bin/echo\r");
+    _ = try terminal.expect(ready);
+    try master.writeStreamingAll(io, "/bin/echo ov\t\r");
+    try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "override choice\r\n") != null);
+    try master.writeStreamingAll(io, "complete -r /bin/echo\r");
+    _ = try terminal.expect(ready);
+    try master.writeStreamingAll(io, "/bin/echo READ\t\r");
+    try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "README.md\r\n") != null);
 }

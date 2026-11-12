@@ -2,6 +2,7 @@
     .load_rc = false,
     .plugins = .{.{
         .path = "../../zig-out/bin/habush-plugin-demo.wasm",
-        .commands = .{.{ .name = "hb-demo", .completion = "complete" }},
+        .commands = .{.{ .name = "hb-demo" }},
+        .completions = .{.{ .command = "hb-demo" }},
     }},
 }
