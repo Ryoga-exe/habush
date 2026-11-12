@@ -108,6 +108,14 @@ pub fn main(init: std.process.Init) !void {
     if (config_path != null) {
         try pluginScenario(io, master, &terminal);
     } else {
+        try master.writeStreamingAll(io, "jjjjjjjjj; /bin/echo STATUS:$?\r");
+        const missing = try terminal.expect(ready);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, missing, "habush: jjjjjjjjj: command not found\r\n"));
+        try std.testing.expect(std.mem.indexOf(u8, missing, "STATUS:127\r\n") != null);
+        try master.writeStreamingAll(io, "jjjjjjjjj 2>&1 | /usr/bin/grep -q 'habush: jjjjjjjjj: command not found'; /bin/echo REDIRECT:$?\r");
+        const redirected = try terminal.expect(ready);
+        try std.testing.expect(std.mem.indexOf(u8, redirected, "REDIRECT:0\r\n") != null);
+        try std.testing.expect(std.mem.indexOf(u8, redirected, "habush: jjjjjjjjj: command not found\r\n") == null);
         try functionCompletionScenario(io, master, &terminal);
         try master.writeStreamingAll(io, "PATH=; habush_completion_probe() { /bin/echo COMPLETION:$1; }\r");
         _ = try terminal.expect(ready);

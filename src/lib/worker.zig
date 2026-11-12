@@ -10,6 +10,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const CommandPlan = @import("CommandPlan.zig");
 const Host = @import("Host.zig");
+const Diagnostic = @import("runtime/Diagnostic.zig");
 const append_file = @import("Host/System/append_file.zig");
 const worker_channel = if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi)
     struct {}
@@ -84,6 +85,7 @@ pub fn prepare(gpa: std.mem.Allocator, plan: CommandPlan) PrepareError!Prepared 
     };
     if (plan.command_failure) |failure|
         try arguments.appendSlice(gpa, &.{ "fail", @tagName(failure) });
+    try arguments.appendSlice(gpa, &.{ "command", plan.argv[0] });
     try arguments.append(gpa, "--");
     try arguments.append(gpa, plan.executable);
     try arguments.appendSlice(gpa, plan.argv[1..]);
@@ -131,6 +133,7 @@ pub fn launch(
 pub const Decoded = struct {
     actions: []CommandPlan.FileAction,
     argv: []const []const u8,
+    command: ?[]const u8 = null,
     command_failure: ?CommandPlan.CommandFailure = null,
     suspend_before_execute: bool = false,
 
@@ -149,6 +152,7 @@ pub fn parse(gpa: std.mem.Allocator, arguments: []const []const u8) ParseError!D
     defer actions.deinit(gpa);
     var index: usize = 1;
     var command_failure: ?CommandPlan.CommandFailure = null;
+    var command: ?[]const u8 = null;
     var suspend_before_execute = false;
     while (index < arguments.len) {
         const opcode = arguments[index];
@@ -161,10 +165,15 @@ pub fn parse(gpa: std.mem.Allocator, arguments: []const []const u8) ParseError!D
                 .actions = try actions.toOwnedSlice(gpa),
                 .argv = arguments[index..],
                 .command_failure = command_failure,
+                .command = command,
                 .suspend_before_execute = suspend_before_execute,
             };
         }
-        if (std.mem.eql(u8, opcode, "suspend")) {
+        if (std.mem.eql(u8, opcode, "command")) {
+            if (command != null or index == arguments.len or arguments[index].len == 0) return error.InvalidArguments;
+            command = arguments[index];
+            index += 1;
+        } else if (std.mem.eql(u8, opcode, "suspend")) {
             if (suspend_before_execute or actions.items.len != 0 or command_failure != null) return error.InvalidArguments;
             suspend_before_execute = true;
         } else if (std.mem.eql(u8, opcode, "fail")) {
@@ -253,18 +262,19 @@ pub fn run(init: std.process.Init, arguments: []const [:0]const u8) u8 {
             // std.process.spawn has already exec'd this fresh worker, so its
             // parent's exec-error handshake is complete. Unlike stopping a
             // pre-exec child, this does not block the parent's spawn call.
-            std.posix.kill(std.posix.system.getpid(), .STOP) catch |err| {
+            std.posix.kill(std.posix.system.getpid(), .STOP) catch {
                 if (reporter) |channel| channel.send(.unsupported);
-                report(init.io, @errorName(err));
+                reportStartupFailure(init.io, decoded, .unsupported);
                 return 126;
             };
         }
         for (decoded.actions, 0..) |action, index| applyAction(init.io, action) catch |err| {
-            if (reporter) |channel| channel.send(.{ .file_action = .{
+            const failure: Host.SpawnFailure = .{ .file_action = .{
                 .action_index = @intCast(index),
                 .reason = fileActionReason(err),
-            } });
-            reportActionFailure(init.io, index, err);
+            } };
+            if (reporter) |channel| channel.send(failure);
+            reportStartupFailure(init.io, decoded, failure);
             return 126;
         };
         if (decoded.command_failure) |failure| {
@@ -273,15 +283,16 @@ pub fn run(init: std.process.Init, arguments: []const [:0]const u8) u8 {
                 .access_denied => .access_denied,
             };
             if (reporter) |channel| channel.send(reason);
-            report(init.io, @tagName(failure));
+            reportStartupFailure(init.io, decoded, reason);
             return if (failure == .command_not_found) 127 else 126;
         }
         const err = std.process.replace(init.io, .{
             .argv = decoded.argv,
             .environ_map = init.environ_map,
         });
-        if (reporter) |channel| channel.send(executeFailure(err));
-        report(init.io, @errorName(err));
+        const failure = executeFailure(err);
+        if (reporter) |channel| channel.send(failure);
+        reportStartupFailure(init.io, decoded, failure);
         return 126;
     }
 }
@@ -425,9 +436,18 @@ fn report(io: std.Io, message: []const u8) void {
     stderr.interface.print("habush: worker: {s}\n", .{message}) catch {};
 }
 
-fn reportActionFailure(io: std.Io, index: usize, err: anyerror) void {
+fn reportStartupFailure(io: std.Io, decoded: Decoded, failure: Host.SpawnFailure) void {
+    const diagnostic = Diagnostic.fromStartupFailure(.{
+        .command = decoded.command orelse decoded.argv[0],
+        .file_actions = decoded.actions,
+        .source = null,
+    }, failure) catch {
+        report(io, "invalid startup failure");
+        return;
+    };
     var stderr = std.Io.File.stderr().writerStreaming(io, &.{});
-    stderr.interface.print("habush: worker: file action {d}: {s}\n", .{ index, @errorName(err) }) catch {};
+    diagnostic.render(&stderr.interface, .{ .program_name = "habush" }) catch return;
+    stderr.interface.writeByte('\n') catch {};
 }
 
 test "startup suspension is parsed before every file action" {
@@ -469,6 +489,7 @@ test "worker protocol preserves ordered actions and literal argv without environ
     try std.testing.expectEqualDeep(actions[1..], decoded.actions);
     try std.testing.expectEqual(@as(usize, 5), decoded.argv.len);
     try std.testing.expectEqualStrings("/resolved/program", decoded.argv[0]);
+    try std.testing.expectEqualStrings("program", decoded.command.?);
     try std.testing.expectEqualStrings("$(false)", decoded.argv[2]);
     try std.testing.expectEqualStrings("", decoded.argv[3]);
     try std.testing.expectEqualStrings("line\nbreak", decoded.argv[4]);

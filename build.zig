@@ -311,6 +311,13 @@ pub fn build(b: *std.Build) !void {
         windows_pipeline_test.expectStdErrEqual("");
         test_step.dependOn(&windows_pipeline_test.step);
     } else {
+        const worker_diagnostic_test = b.addRunArtifact(exe);
+        worker_diagnostic_test.setName("test worker diagnostic preserves the command name");
+        worker_diagnostic_test.addArgs(&.{
+            "--internal-command-worker", "1", "command", "original-command", "--", "/definitely/missing-command",
+        });
+        expectCliResult(worker_diagnostic_test, test_step, 126, "", "habush: original-command: command not found\n");
+
         const heredoc_test = b.addRunArtifact(exe);
         heredoc_test.setName("test cli here-document input");
         heredoc_test.addFileArg(b.path("test/cli/heredoc.hb"));

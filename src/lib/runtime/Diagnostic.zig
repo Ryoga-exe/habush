@@ -12,7 +12,7 @@ const Pipeline = @import("../Pipeline.zig");
 subject: Subject,
 kind: Kind,
 source: ?Source = null,
-/// The fresh worker already attempted its legacy stderr presentation. A sink
+/// The fresh worker already attempted its stderr presentation. A sink
 /// still receives this diagnostic, while the default parent renderer skips it.
 worker_reported: bool = false,
 
