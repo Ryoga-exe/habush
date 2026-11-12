@@ -24,9 +24,9 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: '0.17.1'
-      # TODO: Recheck macOS unit/PTY cancellation with a Zig release containing:
+      # TODO: Remove the macOS-only quarantine with a Zig release containing:
       # https://codeberg.org/ziglang/zig/pulls/36010
-      - run: zig build test --test-timeout 60s --summary all
+      - run: zig build test -Dskip-zig-36010=${{ runner.os == 'macOS' }} --test-timeout 60s --summary all
       - if: runner.os == 'macOS'
         run: zig build test-sandbox --summary all
 

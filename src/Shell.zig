@@ -635,6 +635,12 @@ test "script diagnostics retain raw CRLF here-document and final-line byte range
 // NOTE: Zig's macOS stack unwinder can consume cancellation (also in 0.16):
 // https://codeberg.org/ziglang/zig/pulls/36010
 test "startup source stays interruptible without interactive presentation" {
+    if (@import("builtin").target.os.tag == .macos and
+        std.mem.eql(u8, std.testing.environ.getPosix("HABUSH_TEST_SKIP_ZIG_36010") orelse "", "1"))
+    {
+        std.debug.print("SKIP: startup cancellation check (Zig PR #36010)\n", .{});
+        return error.SkipZigTest;
+    }
     const Notify = struct {
         io: std.Io,
         started: std.Io.Event = .unset,
