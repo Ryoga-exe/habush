@@ -26,7 +26,7 @@ pub const directory_reads_supported = switch (@import("builtin").target.os.tag) 
     .linux, .macos, .freebsd => true,
     else => false,
 };
-pub const ReadError = error{ PermissionDenied, Unsupported, LimitExceeded, ReadFailed, Canceled };
+pub const ReadError = error{ PermissionDenied, Unsupported, LimitExceeded, ReadFailed, Canceled, Timeout };
 
 /// Directory handles are borrowed until all operations have joined. Narrowing
 /// retains resource identities and can only remove permissions.
@@ -63,18 +63,48 @@ pub const Scope = struct {
                 owned = true;
                 continue;
             }
-            const before = directory.statFile(io, part, .{ .follow_symlinks = false }) catch |err| return readError(err);
-            if (before.kind != .file) return error.PermissionDenied;
-            const file = directory.openFile(io, part, .{ .allow_directory = false, .follow_symlinks = false }) catch |err| return readError(err);
-            defer file.close(io);
-            const stat = file.stat(io) catch |err| return readError(err);
-            if (stat.kind != .file) return error.PermissionDenied;
-            if (stat.size > buffer.len) return error.LimitExceeded;
-            return file.readPositionalAll(io, buffer[0..@intCast(stat.size)], 0) catch |err| return readError(err);
+            return readRegularFile(io, directory, part, buffer, .none);
         }
         unreachable;
     }
 };
+
+/// A single file under an explicitly supplied directory. Trusted metadata
+/// readers can use this without granting arbitrary path traversal to guests.
+pub fn readRegularFile(io: Io, directory: Io.Dir, name: []const u8, buffer: []u8, timeout: Io.Timeout) ReadError!usize {
+    if (name.len == 0 or name.len > Io.Dir.max_path_bytes or std.mem.indexOfAny(u8, name, "/\\:\x00") != null or
+        std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return error.PermissionDenied;
+    const deadline = timeout.toTimestamp(io) orelse return readRegular(io, directory, name, buffer);
+    if (Io.Clock.Timestamp.now(io, deadline.clock).raw.nanoseconds >= deadline.raw.nanoseconds) return error.Timeout;
+    const Result = union(enum) { read: ReadError!usize, expired: Io.Cancelable!void };
+    var storage: [2]Result = undefined;
+    var pending: Io.Select(Result) = .init(io, &storage);
+    defer pending.cancelDiscard();
+    pending.concurrent(.read, readRegular, .{ io, directory, name, buffer }) catch return error.ReadFailed;
+    pending.concurrent(.expired, Io.Clock.Timestamp.wait, .{ deadline, io }) catch return error.ReadFailed;
+    switch (try pending.await()) {
+        .read => |result| {
+            const count = try result;
+            if (Io.Clock.Timestamp.now(io, deadline.clock).raw.nanoseconds >= deadline.raw.nanoseconds) return error.Timeout;
+            return count;
+        },
+        .expired => |result| {
+            try result;
+            return error.Timeout;
+        },
+    }
+}
+
+fn readRegular(io: Io, directory: Io.Dir, name: []const u8, buffer: []u8) ReadError!usize {
+    const before = directory.statFile(io, name, .{ .follow_symlinks = false }) catch |err| return readError(err);
+    if (before.kind != .file) return error.PermissionDenied;
+    const file = directory.openFile(io, name, .{ .allow_directory = false, .follow_symlinks = false }) catch |err| return readError(err);
+    defer file.close(io);
+    const stat = file.stat(io) catch |err| return readError(err);
+    if (stat.kind != .file) return error.PermissionDenied;
+    if (stat.size > buffer.len) return error.LimitExceeded;
+    return file.readPositionalAll(io, buffer[0..@intCast(stat.size)], 0) catch |err| return readError(err);
+}
 
 fn readError(err: anyerror) ReadError {
     return switch (err) {
@@ -98,6 +128,7 @@ test "tool scopes only attenuate authority and directory reads cannot escape thr
     defer root.close(io);
     const scope: Scope = .{ .permissions = .{ .fs_read = true }, .directory = root };
     var bytes: [32]u8 = undefined;
+    try std.testing.expectError(error.Timeout, readRegularFile(io, tmp.dir, "outside", &bytes, .{ .deadline = .now(io, .awake) }));
     try std.testing.expectEqualStrings("allowed", bytes[0..try scope.readFile(io, "sub/file", &bytes)]);
     try std.testing.expectError(error.LimitExceeded, scope.readFile(io, "sub/file", bytes[0..2]));
     const oversized: [Io.Dir.max_path_bytes + 1]u8 = @splat('a');
