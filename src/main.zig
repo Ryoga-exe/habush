@@ -7,6 +7,8 @@ const Shell = @import("Shell.zig");
 const ShellIntegration = @import("terminal/ShellIntegration.zig");
 const Config = @import("Config.zig");
 const Cli = @import("Cli.zig");
+const features = @import("features");
+const Plugins = if (features.wasm_plugins) @import("Plugins.zig") else void;
 
 pub fn main(init: std.process.Init) !habush.runtime.ExitStatus {
     const arena = init.arena.allocator();
@@ -46,7 +48,7 @@ pub fn main(init: std.process.Init) !habush.runtime.ExitStatus {
     // Ambient application settings and rc are interactive startup behavior.
     // An explicit --config is still validated for -c and script invocations.
     if (!startup.no_config and (interactive or startup.config_path != null)) {
-        config = (try Config.load(gpa, io, paths, startup.config_path, stderr)) orelse return 2;
+        config = (try Config.load(gpa, arena, io, paths, startup.config_path, stderr)) orelse return 2;
     }
     if (interactive or startup.config_path != null) {
         config = config.withEnvironment(init.environ_map) catch |err| {
@@ -111,7 +113,20 @@ pub fn main(init: std.process.Init) !habush.runtime.ExitStatus {
         .io = io,
     };
     const runtime_host = if (concurrent_host) |*adapter| adapter.host() else system_host.host();
+    var plugins: Plugins = if (features.wasm_plugins) .{ .gpa = gpa, .io = io } else {};
+    defer if (features.wasm_plugins) plugins.deinit();
+    if (features.wasm_plugins) {
+        plugins.load(config.plugins) catch |err| {
+            if (err == error.OutOfMemory or err == error.Canceled) return err;
+            try stderr.print("habush: plugin: {s}: {s}\n", .{ plugins.loading_path orelse "initialization", @errorName(err) });
+            return 2;
+        };
+    } else if (config.plugins.len != 0) {
+        try stderr.writeAll("habush: plugins require a build with -Dwasmtime=<SDK>\n");
+        return 2;
+    }
     var session = try habush.Session.init(gpa, runtime_host, .{
+        .commands = if (features.wasm_plugins) plugins.commands else &.{},
         .cancel_io = io,
         .job_control = interactive and runtime_host.capabilities().terminal_control,
         .concurrent_pipeline = if (concurrent_host != null) .{ .io = io, .allocator = gpa } else null,
@@ -160,6 +175,7 @@ pub fn main(init: std.process.Init) !habush.runtime.ExitStatus {
         .line_edit = config.lineEditEnabled(interactive, init.environ_map.get("TERM")),
         .completion_limits = config.completion_limits,
         .resolver_options = resolver_options,
+        .completion_provider = if (features.wasm_plugins) plugins.provider() else null,
         .integration = if (integration_enabled) .{
             .writer = stderr,
             .hostname = hostname,

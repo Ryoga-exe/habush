@@ -21,6 +21,7 @@ replace: Range,
 quote: Quote,
 kind: Kind,
 dynamic: bool,
+command_start: ?usize,
 
 /// Removes literal quoting for candidate matching. Dynamic words are left
 /// to richer providers; completion never evaluates their expansions.
@@ -51,6 +52,37 @@ pub fn literalPrefix(context: Completion, gpa: std.mem.Allocator) (std.mem.Alloc
     return output.toOwnedSlice(gpa);
 }
 
+/// Command and completed argument values before the current word. No expansion
+/// is evaluated. All allocations belong to the caller's scratch arena.
+pub fn literalArguments(context: Completion, arena: std.mem.Allocator) (std.mem.Allocator.Error || error{UnsupportedContext})![]const []const u8 {
+    const start = context.command_start orelse return error.UnsupportedContext;
+    if (start > context.replace.start) return error.UnsupportedContext;
+    const source = try arena.dupeSentinel(u8, context.source[start..context.replace.start], 0);
+    var tree = @import("Ast.zig").parse(arena, source) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.SourceTooLarge => return error.UnsupportedContext,
+    };
+    defer tree.deinit(arena);
+    if (tree.errors.len != 0 or tree.status != .complete) return error.UnsupportedContext;
+    const list = tree.nodeData(.root).opt_node.unwrap() orelse return error.UnsupportedContext;
+    if (tree.listItemCount(list) != 1) return error.UnsupportedContext;
+    const command = tree.listItem(list, 0).command;
+    if (tree.nodeTag(command) != .simple_command) return error.UnsupportedContext;
+    var args: std.ArrayList([]const u8) = .empty;
+    for (tree.simpleCommandParts(command)) |part| {
+        if (tree.nodeTag(part) != .word) continue;
+        const token = tree.nodeMainToken(part);
+        const word = tree.tokenSlice(token);
+        var word_context = context;
+        word_context.source = source;
+        word_context.replace = .{ .start = tree.tokenStart(token), .end = tree.tokenStart(token) + word.len };
+        word_context.cursor = word_context.replace.end;
+        word_context.dynamic = dynamicWord(word);
+        try args.append(arena, try word_context.literalPrefix(arena));
+    }
+    return args.toOwnedSlice(arena);
+}
+
 pub const Edit = struct {
     range: Range,
     /// Owned shell source containing exactly one literal word.
@@ -71,6 +103,7 @@ const Frame = struct {
     escaped: bool = false,
     parameter_depth: usize = 0,
     dynamic: bool = false,
+    command_start: ?usize = null,
 };
 
 pub fn inspect(source: []const u8, cursor: usize, revision: u64) error{ InvalidCursor, InputTooDeep }!Completion {
@@ -169,6 +202,7 @@ pub fn inspect(source: []const u8, cursor: usize, revision: u64) error{ InvalidC
         .quote = frame.quote,
         .kind = if (frame.comment) .comment else if (frame.parameter_depth != 0) .parameter else if (frame.redirection) .redirection else if (frame.command) .command else .argument,
         .dynamic = frame.dynamic or dynamicWord(source[start..end]),
+        .command_start = frame.command_start,
     };
 }
 
@@ -202,7 +236,10 @@ fn finishWord(frame: *Frame, source: []const u8, end: usize) void {
     const word = source[start..end];
     if (frame.redirection) {
         frame.redirection = false;
-    } else if (!assignment(word) and !commandKeyword(word)) frame.command = false;
+    } else if (frame.command and !assignment(word) and !commandKeyword(word)) {
+        frame.command = false;
+        frame.command_start = start;
+    }
     frame.word = null;
     frame.dynamic = false;
 }
@@ -224,6 +261,26 @@ fn allDigits(word: []const u8) bool {
     if (word.len == 0) return false;
     for (word) |byte| if (!std.ascii.isDigit(byte)) return false;
     return true;
+}
+
+test "literal arguments use the active command without evaluating expansions" {
+    var storage: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer storage.deinit();
+    const arena = storage.allocator();
+    for ([_][]const u8{
+        "FOO=bar demo 'a b' 2>out next",
+        "echo $(demo 'a b' next",
+        "true && demo 'a b' next",
+    }) |source| {
+        const context = try inspect(source, source.len, 1);
+        const args = try context.literalArguments(arena);
+        try std.testing.expectEqual(@as(usize, 2), args.len);
+        try std.testing.expectEqualStrings("demo", args[0]);
+        try std.testing.expectEqualStrings("a b", args[1]);
+    }
+    const source = "demo $secret next";
+    const dynamic_context = try inspect(source, source.len, 1);
+    try std.testing.expectError(error.UnsupportedContext, dynamic_context.literalArguments(arena));
 }
 
 fn wordEnd(source: []const u8, start: usize) usize {

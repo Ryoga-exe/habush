@@ -72,6 +72,9 @@ pub const Collector = struct {
     scanned: usize = 0,
     truncated: bool = false,
 
+    /// A successful provider can replace fallback candidates for this context.
+    exclusive: bool = false,
+
     /// Call before examining an entry. False asks the provider to stop work.
     pub fn step(collector: *Collector) bool {
         if (collector.scanned == collector.limits.scanned) {
@@ -124,9 +127,12 @@ pub fn collect(gpa: std.mem.Allocator, request: Request, providers: []const Prov
         provider.complete(provider.userdata, request, &collector) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Canceled => return error.Canceled,
-            error.Unavailable, error.InvalidCandidate => incomplete = true,
+            error.Unavailable, error.InvalidCandidate => {
+                incomplete = true;
+                collector.exclusive = false;
+            },
         };
-        if (collector.truncated) break;
+        if (collector.truncated or collector.exclusive) break;
     }
     return .{
         .context = request.context,
@@ -183,15 +189,21 @@ test "scan exhaustion and failed providers cannot produce a unique edit" {
             if (!collector.step()) return;
             _ = try collector.add(.{ .value = "one" });
             if (!collector.step()) return;
+            collector.exclusive = true;
             return error.Unavailable;
+        }
+
+        fn fallback(_: ?*anyopaque, _: Request, collector: *Collector) Error!void {
+            _ = try collector.add(.{ .value = "two" });
         }
     };
     const context = try Completion.inspect("", 0, 0);
-    const providers = [_]Provider{.{ .complete = TestProvider.complete }};
+    const providers = [_]Provider{ .{ .complete = TestProvider.complete }, .{ .complete = TestProvider.fallback } };
     for ([_]Limits{ .{ .scanned = 1 }, .{} }) |limits| {
         var result = try collect(std.testing.allocator, .{ .context = context, .prefix = "" }, &providers, limits);
         defer result.deinit(std.testing.allocator);
         try std.testing.expect(result.unique() == null);
         try std.testing.expect(result.truncated or result.incomplete);
+        if (result.incomplete) try std.testing.expectEqual(@as(usize, 2), result.candidates.len);
     }
 }

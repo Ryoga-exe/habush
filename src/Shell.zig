@@ -22,6 +22,7 @@ interruptible: bool = false,
 io: ?std.Io = null,
 line_edit: bool = false,
 completion_limits: habush.Completion.Provider.Limits = .{},
+completion_provider: ?habush.Completion.Provider = null,
 resolver_options: habush.CommandResolver.System.Options = .{},
 integration: ?ShellIntegration = null,
 input_line: usize = 0,
@@ -394,11 +395,13 @@ fn readInputLine(self: *Shell, prompt: []const u8, prefix: []const u8, allow_com
             .function_names = self.session.functionNames(),
             .executable_extensions = self.resolver_options.executable_extensions,
         };
-        const providers = [_]habush.Completion.Provider{native.provider()};
+        var providers: [2]habush.Completion.Provider = undefined;
+        providers[0] = self.completion_provider orelse native.provider();
+        if (self.completion_provider != null) providers[1] = native.provider();
         var completion: CompletionService = .{
             .gpa = self.allocator,
             .prefix = prefix,
-            .providers = &providers,
+            .providers = providers[0..if (self.completion_provider != null) @as(usize, 2) else 1],
             .limits = self.completion_limits,
         };
         defer completion.deinit();

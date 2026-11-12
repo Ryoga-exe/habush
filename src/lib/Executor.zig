@@ -1115,8 +1115,10 @@ fn resolveCommand(executor: Executor, name: []const u8) CommandSelection {
     if (executor.runtime_state) |state|
         if (state.functionStore().contains(name)) return .function;
     if (builtin) |candidate| return .{ .builtin = candidate };
-    for (executor.commands) |*command| {
-        if (std.mem.eql(u8, name, command.name)) return .{ .extension = command };
+    if (std.fs.path.dirname(name) == null) {
+        for (executor.commands) |*command| {
+            if (std.mem.eql(u8, name, command.name)) return .{ .extension = command };
+        }
     }
     return .external;
 }
