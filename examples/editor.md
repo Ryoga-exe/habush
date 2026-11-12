@@ -53,3 +53,11 @@ also supply an `edit.Prompt.Provider`, receiving cwd/status and allocating the
 result in the caller's arena. An unavailable or invalid result uses the configured
 prompt. The provider runs once before collecting an input, including continuation
 lines, and does not change the Session's status.
+
+Syntax diagnostics underline input ranges and show bounded messages below the
+input, without evaluating source or changing the exit status. Set `.diagnostics =
+false` in config.zon to disable them. Embedders can supply an `edit.Diagnostic.Provider`;
+results must match the input revision and contain valid byte ranges. Messages are
+literal display text. Old results disappear on editing; failed/invalid additional
+providers leave native syntax diagnostics available. This is an advisory display,
+not an execution policy.

@@ -2,8 +2,9 @@
 //! to ShellIntegration and never enters the editing buffer or width count.
 const std = @import("std");
 const Prompt = @import("habush-edit").Prompt;
+const Diagnostic = @import("habush-edit").Diagnostic;
 
-pub fn inputRow(writer: *std.Io.Writer, prompt: Prompt, source: []const u8, cursor: usize, columns: usize) std.Io.Writer.Error!usize {
+pub fn inputRow(writer: *std.Io.Writer, prompt: Prompt, source: []const u8, cursor: usize, columns: usize, diagnostics: []const Diagnostic, source_offset: usize) std.Io.Writer.Error!usize {
     const prompt_width = try writePrompt(null, prompt, columns -| 2);
     const available = columns -| (prompt_width + 1);
     const width = @max(available, 1);
@@ -19,13 +20,31 @@ pub fn inputRow(writer: *std.Io.Writer, prompt: Prompt, source: []const u8, curs
     _ = try writePrompt(writer, prompt, columns -| 2);
     var index = start;
     var used: usize = 0;
+    var active: ?Diagnostic.Severity = null;
     while (index < source.len) {
         const unit = decode(source[index..]);
         if (used + unit.width > width) break;
+        var severity: ?Diagnostic.Severity = null;
+        for (diagnostics) |diagnostic| {
+            if (diagnostic.start < source_offset + index + unit.len and diagnostic.end > source_offset + index)
+                if (severity == null or @backingInt(diagnostic.severity) > @backingInt(severity.?)) {
+                    severity = diagnostic.severity;
+                };
+        }
+        if (severity != active) {
+            if (active != null) try writer.writeAll("\x1b[0m");
+            if (severity) |value| try writer.print("\x1b[4;{d}m", .{@as(u8, switch (value) {
+                .note => 36,
+                .warning => 33,
+                .@"error" => 31,
+            })});
+            active = severity;
+        }
         try writeUnit(writer, source[index..][0..unit.len], unit);
         used += unit.width;
         index += unit.len;
     }
+    if (active != null) try writer.writeAll("\x1b[0m");
     return prompt_width + before_cursor -| skipped;
 }
 
@@ -132,7 +151,7 @@ test "display width and visible controls preserve terminal boundaries" {
     try writeVisible(&output.writer, "a\x1b\n\xff日本\xe2\x80\xae");
     try std.testing.expectEqualStrings("a^[^J\\xFF日本\\u{202E}", output.written());
     output.clearRetainingCapacity();
-    try std.testing.expectEqual(@as(usize, 6), try inputRow(&output.writer, Prompt.secondary, "0123456789", 10, 8));
+    try std.testing.expectEqual(@as(usize, 6), try inputRow(&output.writer, Prompt.secondary, "0123456789", 10, 8, &.{}, 0));
     try std.testing.expectEqualStrings("> 6789", output.written());
 }
 

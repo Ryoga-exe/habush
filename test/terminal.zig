@@ -121,6 +121,11 @@ pub fn main(init: std.process.Init) !void {
     const cleared = try terminal.expect(ready);
     try std.testing.expect(std.mem.indexOf(u8, cleared, "\x1b[2J\x1b[H") != null);
     try std.testing.expect(std.mem.indexOf(u8, cleared, "CLEA!R\r\n") != null);
+    try master.writeStreamingAll(io, ")");
+    const diagnosed = try terminal.expect("error: expected command");
+    try std.testing.expect(std.mem.indexOf(u8, diagnosed, "\x1b[4;31m)") != null);
+    try master.writeStreamingAll(io, "\x15/bin/echo DIAGNOSTIC:$?\r");
+    try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "DIAGNOSTIC:0\r\n") != null);
 
     if (args.len == 3) {
         try pluginScenario(io, master, &terminal);

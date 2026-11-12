@@ -14,6 +14,7 @@ prompt: edit.Prompt,
 completion: ?edit.Completion = null,
 history: ?*const edit.History = null,
 inspector: ?edit.Editor.Inspector = null,
+diagnostics: ?edit.Diagnostic.Provider = null,
 keybinds: []const edit.Keybind = &.{},
 
 pub const max_input_bytes = 64 * 1024;
@@ -37,6 +38,8 @@ pub fn read(editor: LineEditor) !?[:0]u8 {
     defer state.deinit();
     const buffer = &state.buffer;
     var view: View = .{};
+    var diagnostic_arena: std.heap.ArenaAllocator = .init(editor.gpa);
+    defer diagnostic_arena.deinit();
     var pending: [4]u8 = undefined;
     var pending_len: usize = 0;
     var expected_len: usize = 0;
@@ -52,7 +55,7 @@ pub fn read(editor: LineEditor) !?[:0]u8 {
                 if (pending_len != expected_len) continue;
                 try editor.insertTyped(&state, pending[0..pending_len]);
                 pending_len = 0;
-                try view.redraw(editor.output, editor.prompt, &state, terminal.columns(), terminal.rows());
+                try editor.redraw(&state, &view, terminal, &diagnostic_arena);
                 continue;
             }
             // Preserve an invalid or incomplete prefix, then process this key
@@ -75,7 +78,7 @@ pub fn read(editor: LineEditor) !?[:0]u8 {
             if (std.mem.eql(u8, sequence[0..length], "[200~")) {
                 state.menu = null;
                 try editor.paste(&state);
-                try view.redraw(editor.output, editor.prompt, &state, terminal.columns(), terminal.rows());
+                try editor.redraw(&state, &view, terminal, &diagnostic_arena);
                 continue;
             }
             key = edit.Keybind.Key.fromEscape(sequence[0..length]) orelse {
@@ -108,7 +111,7 @@ pub fn read(editor: LineEditor) !?[:0]u8 {
                     return error.InputInterrupted;
                 },
                 .eof => {
-                    try view.redraw(editor.output, editor.prompt, &state, terminal.columns(), terminal.rows());
+                    try editor.redraw(&state, &view, terminal, &diagnostic_arena);
                     try terminal.restore();
                     return null;
                 },
@@ -127,8 +130,25 @@ pub fn read(editor: LineEditor) !?[:0]u8 {
                 try editor.output.writeByte(7);
             }
         }
-        try view.redraw(editor.output, editor.prompt, &state, terminal.columns(), terminal.rows());
+        try editor.redraw(&state, &view, terminal, &diagnostic_arena);
     }
+}
+
+fn redraw(editor: LineEditor, state: *edit.Editor, view: *View, terminal: platform.LineInput, arena: *std.heap.ArenaAllocator) !void {
+    if (editor.diagnostics) |provider| {
+        if (state.diagnostics == null or state.diagnostics.?.revision != state.buffer.revision) {
+            state.diagnostics = null;
+            _ = arena.reset(.retain_capacity);
+            const request: edit.Diagnostic.Request = .{ .source = state.buffer.text(), .revision = state.buffer.revision };
+            const empty: edit.Diagnostic.Result = .{ .revision = request.revision };
+            const result = provider.query(provider.userdata, arena.allocator(), request) catch |err| switch (err) {
+                error.Canceled, error.OutOfMemory => return err,
+                error.Unavailable => empty,
+            };
+            if (!state.setDiagnostics(result)) _ = state.setDiagnostics(empty);
+        }
+    }
+    try view.redraw(editor.output, editor.prompt, state, terminal.columns(), terminal.rows());
 }
 
 /// A typed Unicode scalar is one edit and therefore one Undo operation. Invalid

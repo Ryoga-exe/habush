@@ -4,6 +4,7 @@ const Buffer = @import("Buffer.zig");
 const History = @import("History.zig");
 const Completion = @import("Completion.zig");
 const Keybind = @import("Keybind.zig");
+const Diagnostic = @import("Diagnostic.zig");
 const Editor = @This();
 
 buffer: Buffer,
@@ -13,6 +14,7 @@ inspector: ?Inspector = null,
 max_bytes: usize = 64 * 1024,
 menu: ?Menu = null,
 navigation: History.Navigation = .{},
+diagnostics: ?Diagnostic.Result = null,
 
 pub const Menu = struct { result: Completion.Result, selected: usize = 0 };
 pub const Effect = enum { redraw, show_candidates, submit, interrupt, eof, clear_screen, bell };
@@ -33,6 +35,17 @@ pub fn insert(editor: *Editor, bytes: []const u8) std.mem.Allocator.Error!bool {
     if (bytes.len > editor.max_bytes -| editor.buffer.text().len or std.mem.indexOfScalar(u8, bytes, 0) != null) return false;
     try editor.buffer.insert(bytes);
     return true;
+}
+
+pub fn setDiagnostics(editor: *Editor, result: Diagnostic.Result) bool {
+    if (!result.valid(.{ .source = editor.buffer.text(), .revision = editor.buffer.revision })) return false;
+    editor.diagnostics = result;
+    return true;
+}
+
+pub fn currentDiagnostics(editor: Editor) []const Diagnostic {
+    const result = editor.diagnostics orelse return &.{};
+    return if (result.revision == editor.buffer.revision) result.items else &.{};
 }
 
 pub fn perform(editor: *Editor, action: Keybind.Action) Completion.Error!Effect {
@@ -175,6 +188,10 @@ test "actions work without a terminal and completion selection is one reversible
     try std.testing.expectEqual(revision, editor.buffer.revision);
     try std.testing.expectEqual(Effect.submit, try editor.perform(.accept_line));
     try std.testing.expectEqual(Effect.interrupt, try editor.perform(.interrupt));
+    try std.testing.expect(editor.setDiagnostics(.{ .revision = editor.buffer.revision, .items = &.{.{ .start = 0, .end = 1, .message = "warning" }} }));
+    try std.testing.expectEqual(@as(usize, 1), editor.currentDiagnostics().len);
+    _ = try editor.perform(.backspace);
+    try std.testing.expectEqual(@as(usize, 0), editor.currentDiagnostics().len);
     editor.max_bytes = editor.buffer.text().len;
     try std.testing.expect(!try editor.insert("!"));
 }
