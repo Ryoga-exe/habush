@@ -23,7 +23,7 @@ pub fn main(init: std.process.Init) !void {
             .environ_map = init.environ_map,
         });
     }
-    if (args.len != 2 and args.len != 3) return error.InvalidArguments;
+    if (args.len != 2 and args.len != 4) return error.InvalidArguments;
     var config_path: ?[]u8 = null;
     defer if (config_path) |path| {
         Io.Dir.cwd().deleteFile(io, path) catch {};
@@ -39,9 +39,11 @@ pub fn main(init: std.process.Init) !void {
         .{ .key = "ctrl+space", .action = .complete },
         .{ .key = "ctrl+x", .action = .ignore },
     };
-    if (args.len == 3) {
+    if (args.len == 4) {
         const module_path = try Io.Dir.cwd().realPathFileAlloc(io, args[2], gpa);
         defer gpa.free(module_path);
+        const theme_path = try Io.Dir.cwd().realPathFileAlloc(io, args[3], gpa);
+        defer gpa.free(theme_path);
         try std.zon.stringify.serialize(.{
             .load_rc = false,
             .keybinds = bindings,
@@ -55,7 +57,9 @@ pub fn main(init: std.process.Init) !void {
                 .{
                     .path = module_path,
                     .completions = .{ .{ .command = "hb-demo" }, .{ .command = "/bin/echo" } },
+                    .diagnostics = .{},
                 },
+                .{ .path = theme_path, .prompt = .{} },
             },
         }, .{}, &config.writer);
     } else {
@@ -127,7 +131,7 @@ pub fn main(init: std.process.Init) !void {
     try master.writeStreamingAll(io, "\x15/bin/echo DIAGNOSTIC:$?\r");
     try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "DIAGNOSTIC:0\r\n") != null);
 
-    if (args.len == 3) {
+    if (args.len == 4) {
         try pluginScenario(io, master, &terminal);
     } else {
         try historyScenario(io, master, &terminal);
@@ -312,6 +316,18 @@ fn historyScenario(io: Io, master: Io.File, terminal: *Terminal) !void {
 }
 
 fn pluginScenario(io: Io, master: Io.File, terminal: *Terminal) !void {
+    try master.writeStreamingAll(io, "origin=$PWD; cd /\r");
+    try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "\x1b[0;36;49;1m/\x1b[0m") != null);
+    try master.writeStreamingAll(io, "cd \"$origin\"\r");
+    _ = try terminal.expect(ready);
+    try master.writeStreamingAll(io, "NOTE");
+    const diagnostic = try terminal.expect("warning: demo diagnostic: NOTE^[");
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "\x1b[4;33mNOTE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "demo diagnostic: NOTE\x1b") == null);
+    try master.writeStreamingAll(io, "\x15hb-demo after\r");
+    const themed = try terminal.expect(ready);
+    try std.testing.expect(std.mem.indexOf(u8, themed, "VALUE:after\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, themed, "\x1b[0;31;49m [7] ❯ ") != null);
     try master.writeStreamingAll(io, "PATH=; hb-demo 'literal arg'; /bin/echo STATUS:$?\r");
     var output = try terminal.expect(ready);
     try std.testing.expect(std.mem.indexOf(u8, output, "VALUE:literal arg\r\n") != null);

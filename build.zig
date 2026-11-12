@@ -20,6 +20,7 @@ pub fn build(b: *std.Build) !void {
         break :sdk try b.dependencyLazy(name, .{});
     } else null;
     var demo_plugin: ?*std.Build.Step.Compile = null;
+    var theme_plugin: ?*std.Build.Step.Compile = null;
     const features = b.addOptions();
     features.addOption(bool, "wasm_plugins", wasm_plugins);
 
@@ -139,6 +140,7 @@ pub fn build(b: *std.Build) !void {
             .link_libc = true,
         });
         plugin.addImport("wasmtime", headers.createModule());
+        plugin.addImport("habush-edit", habush_edit);
         plugin_module = plugin;
         exe.root_module.addImport("habush-plugin", plugin);
         plugin.addLibraryPath(sdk.path("lib"));
@@ -173,6 +175,20 @@ pub fn build(b: *std.Build) !void {
         demo.stack_size = 64 * 1024;
         b.installArtifact(demo);
         demo_plugin = demo;
+        const theme = b.addExecutable(.{
+            .name = "habush-theme",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("examples/plugins/theme.zig"),
+                .target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding }),
+                .optimize = .ReleaseSmall,
+            }),
+        });
+        theme.entry = .disabled;
+        theme.rdynamic = true;
+        theme.export_memory = true;
+        theme.stack_size = 64 * 1024;
+        b.installArtifact(theme);
+        theme_plugin = theme;
     }
     const terminal_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -215,6 +231,7 @@ pub fn build(b: *std.Build) !void {
                 plugin_terminal.setName("test CLI plugin commands and completion");
                 plugin_terminal.addArtifactArg(exe);
                 plugin_terminal.addArtifactArg(demo);
+                plugin_terminal.addArtifactArg(theme_plugin.?);
                 plugin_terminal.expectExitCode(0);
                 test_step.dependOn(&plugin_terminal.step);
             }
