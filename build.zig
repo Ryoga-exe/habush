@@ -102,6 +102,37 @@ pub fn build(b: *std.Build) void {
     const edit_tests = b.addTest(.{ .root_module = habush_edit });
     const run_edit_tests = b.addRunArtifact(edit_tests);
     test_step.dependOn(&run_edit_tests.step);
+    if (b.option([]const u8, "wasmtime", "Wasmtime 50.0.1 C API SDK directory (optional)")) |sdk| {
+        const headers = b.addTranslateC(.{
+            .root_source_file = .{ .cwd_relative = b.pathJoin(&.{ sdk, "include", "wasmtime.h" }) },
+            .target = target,
+            .optimize = optimize,
+        });
+        headers.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "include" }) });
+        if (target.result.os.tag == .windows) {
+            headers.defineCMacro("WASM_API_EXTERN", "");
+            headers.defineCMacro("WASI_API_EXTERN", "");
+        }
+        const plugin = b.addModule("habush-plugin", .{
+            .root_source_file = b.path("src/plugin.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        plugin.addImport("wasmtime", headers.createModule());
+        plugin.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "lib" }) });
+        plugin.linkSystemLibrary("wasmtime", .{ .preferred_link_mode = .static, .use_pkg_config = .no });
+        if (target.result.os.tag == .linux) {
+            for ([_][]const u8{ "pthread", "dl", "m" }) |name| plugin.linkSystemLibrary(name, .{});
+        } else if (target.result.os.tag == .windows) {
+            for ([_][]const u8{ "ws2_32", "advapi32", "userenv", "ntdll", "shell32", "ole32", "bcrypt" }) |name|
+                plugin.linkSystemLibrary(name, .{});
+        }
+        const plugin_tests = b.addTest(.{ .root_module = plugin });
+        const run_plugin_tests = b.addRunArtifact(plugin_tests);
+        b.step("test-plugin", "Verify the optional Wasm plugin host").dependOn(&run_plugin_tests.step);
+        test_step.dependOn(&run_plugin_tests.step);
+    }
     const terminal_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/app_test.zig"),

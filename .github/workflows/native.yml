@@ -29,6 +29,27 @@ jobs:
       - run: zig build test -Dskip-zig-36010=${{ runner.os == 'macOS' }} --test-timeout 60s --summary all
       - if: runner.os == 'macOS'
         run: zig build test-sandbox --summary all
+      - name: Test optional Wasm host
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$RUNNER_ARCH" in
+            X64) wasm_arch=x86_64 ;;
+            ARM64) wasm_arch=aarch64 ;;
+            *) exit 1 ;;
+          esac
+          case "$RUNNER_OS" in
+            Linux) wasm_os=linux ;;
+            macOS) wasm_os=macos ;;
+            *) exit 1 ;;
+          esac
+          wasm_sdk="wasmtime-v50.0.1-${wasm_arch}-${wasm_os}-c-api"
+          curl --fail --location --silent --show-error \
+            "https://github.com/bytecodealliance/wasmtime/releases/download/v50.0.1/${wasm_sdk}.tar.xz" \
+            -o "$RUNNER_TEMP/wasmtime.tar.xz"
+          tar -xf "$RUNNER_TEMP/wasmtime.tar.xz" -C "$RUNNER_TEMP"
+          zig build test-plugin -Dwasmtime="$RUNNER_TEMP/$wasm_sdk" --test-timeout 60s --summary all
 
   freebsd:
     runs-on: ubuntu-latest
