@@ -45,6 +45,7 @@ pub const Scope = struct {
     pub fn readFile(scope: Scope, io: Io, path: []const u8, buffer: []u8) ReadError!usize {
         if (!scope.permissions.fs_read) return error.PermissionDenied;
         if (!directory_reads_supported) return error.Unsupported;
+        if (path.len > Io.Dir.max_path_bytes) return error.LimitExceeded;
         var directory = scope.directory orelse return error.PermissionDenied;
         if (path.len == 0 or std.mem.indexOfAny(u8, path, "\x00\\:") != null) return error.PermissionDenied;
         var validation = std.mem.splitScalar(u8, path, '/');
@@ -99,6 +100,8 @@ test "tool scopes only attenuate authority and directory reads cannot escape thr
     var bytes: [32]u8 = undefined;
     try std.testing.expectEqualStrings("allowed", bytes[0..try scope.readFile(io, "sub/file", &bytes)]);
     try std.testing.expectError(error.LimitExceeded, scope.readFile(io, "sub/file", bytes[0..2]));
+    const oversized: [Io.Dir.max_path_bytes + 1]u8 = @splat('a');
+    try std.testing.expectError(error.LimitExceeded, scope.readFile(io, &oversized, &bytes));
     try std.testing.expectError(error.PermissionDenied, scope.narrow(.{}).narrow(.all).readFile(io, "sub/file", &bytes));
     for ([_][]const u8{ "../outside", "/outside", "sub/../../outside", "sub//file", "C:outside", "sub\\file", "link", "directory-link/sub/file" }) |path|
         try std.testing.expectError(error.PermissionDenied, scope.readFile(io, path, &bytes));
