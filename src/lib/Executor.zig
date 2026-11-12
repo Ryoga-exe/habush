@@ -350,14 +350,14 @@ fn executeCaseClause(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!
     var expansion_failure: Expander.Failure = undefined;
     const expander = scope.executor.wordExpander(allocator, null, &expansion_failure);
     const value = expander.expandAssignment(hir, clause.word) catch |err| switch (err) {
-        error.ParameterExpansionFailed => return executor.parameterExpansionFailure(allocator, expansion_failure),
+        error.ParameterExpansionFailed => return scope.executor.parameterExpansionFailure(allocator, expansion_failure),
         else => return err,
     };
     for (clause.items) |item_index| {
         const item = hir.caseItem(item_index);
         for (item.patterns) |pattern_index| {
             const pattern = expander.expandPattern(hir, pattern_index) catch |err| switch (err) {
-                error.ParameterExpansionFailed => return executor.parameterExpansionFailure(allocator, expansion_failure),
+                error.ParameterExpansionFailed => return scope.executor.parameterExpansionFailure(allocator, expansion_failure),
                 else => return err,
             };
             if (pattern.matches(value)) {
