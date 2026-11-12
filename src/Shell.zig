@@ -285,7 +285,7 @@ fn readCommand(self: *Shell) !?CommandInput {
 
     while (true) {
         const prompt = if (continuation) edit.Prompt.secondary else primary_prompt;
-        if (self.interactive) try self.printPrompt(continuation, prompt);
+        if (self.interactive and !(continuation and self.hasQueuedInput())) try self.printPrompt(continuation, prompt);
         const line = try self.readInputLine(prompt, command.written(), true) orelse {
             if (self.interactive) try self.stderr.writeByte('\n');
             if (command.written().len == 0) {
@@ -407,7 +407,7 @@ fn readHereDocument(
     var delimiter_candidate: Io.Writer.Allocating = .init(self.allocator);
     defer delimiter_candidate.deinit();
     while (true) {
-        if (self.interactive) try self.printPrompt(true, edit.Prompt.secondary);
+        if (self.interactive and !self.hasQueuedInput()) try self.printPrompt(true, edit.Prompt.secondary);
         const line = try self.readInputLine(edit.Prompt.secondary, "", false) orelse {
             body.deinit();
             return null;
@@ -505,6 +505,10 @@ fn takeEditedLine(self: *Shell) !?[:0]u8 {
     }
     if (editing.offset >= source.len) editing.discard();
     return line;
+}
+
+fn hasQueuedInput(self: Shell) bool {
+    return if (self.editing) |editing| editing.queued != null else false;
 }
 
 fn inspectEditedSource(userdata: ?*anyopaque, source: []const u8) edit.Completion.Error!edit.Editor.Inspector.Status {
@@ -816,6 +820,7 @@ test "recalled compound input collects here-documents before execution" {
     try std.testing.expectEqualStrings(source, input.original_source);
     try std.testing.expectEqualStrings("literal $(missing)\n", input.here_documents[0].body);
     try std.testing.expect(editing.queued == null);
+    try std.testing.expectEqualStrings("habush> ", output.written());
 }
 
 // NOTE: Zig's macOS stack unwinder can consume cancellation (also in 0.16):

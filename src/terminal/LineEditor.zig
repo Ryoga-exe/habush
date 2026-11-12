@@ -84,7 +84,7 @@ pub fn read(editor: LineEditor) !?[:0]u8 {
             key = edit.Keybind.Key.fromEscape(sequence[0..length]) orelse {
                 state.menu = null;
                 try editor.output.writeByte(7);
-                try editor.output.flush();
+                try editor.redraw(&state, &view, terminal, &diagnostic_arena);
                 continue;
             };
         }

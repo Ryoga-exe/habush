@@ -1,6 +1,6 @@
 # Wasm plugin host (experimental)
 
-The optional `habush-plugin` Zig module uses the official Wasmtime **50.0.1 C API SDK**. One module can provide commands and their argument completion. The default shell build does not link Wasmtime; requesting plugins in that build reports an error.
+The optional `habush-plugin` Zig module uses the official Wasmtime **50.0.1 C API SDK**. One module can provide commands, completion, prompts, and input diagnostics. The default shell build does not link Wasmtime; requesting plugins in that build reports an error.
 
 Enable plugins when building, then start the demo:
 
@@ -39,7 +39,7 @@ To update a dependency declaration, use Zig 0.17.1's `zig fetch --save-exact=<de
 }
 ```
 
-Paths are relative to the configuration file's directory. Command entries default to `command`, completion entries to `complete`. Both lists default to empty; a plugin must provide at least one command or completion. A completion-only plugin may target existing builtins, functions, or external commands without changing their execution. Names match exactly, including explicit paths such as `/bin/echo`. Later completion registrations replace earlier ones. Budget fields above show their defaults. Wasm completion uses the same limits with a deadline capped at 100 ms. The CLI owns parsed strings until shutdown and destroys modules after Session/input tasks have ended.
+Paths are relative to the configuration file's directory. Command entries default to `command`, completion entries to `complete`. A plugin must declare at least one command, completion, prompt, or diagnostic entry. A completion-only plugin may target existing builtins, functions, or external commands without changing their execution. Names match exactly, including explicit paths such as `/bin/echo`. Later completion registrations replace earlier ones. Budget fields above show their defaults. Wasm completion uses the same limits with a deadline capped at 100 ms. The CLI owns parsed strings until shutdown and destroys modules after Session/input tasks have ended.
 
 Empty paths/entries/names, command names containing path separators, duplicate names, and builtin name collisions are rejected. Shell functions retain precedence over registered commands. Explicit paths such as `./hb-demo` use external command lookup. File/compilation failures stop startup with status 2; entry/version/type failures are reported when called. Command failures produce status 1 and permit subsequent commands.
 
@@ -64,6 +64,53 @@ Registration stores the function name and uses its current definition when calle
 The function runs with copied variables, functions, completion bindings, cwd, and positional state. Its mutations and exit status do not affect the main Session. Stdin is EOF and stderr is disconnected. Execution has a 100 ms deadline and stdout is captured through a bounded pipe using `completion_limits.bytes`; candidate/scan limits still apply. Cancellation joins the function and kills/reaps its private child jobs before input continues. External commands and pipelines can generate candidates, and their filesystem or other external side effects persist. This is state isolation, not an OS sandbox.
 
 ZON completion registrations are installed before the interactive rc is evaluated, so `complete -F` can override a Wasm provider. `complete -r` removes the current binding and restores native fallback; it does not restore an older registration.
+
+## Wasm theme and diagnostics
+
+The same build also installs `zig-out/bin/habush-theme.wasm` from
+[theme.zig](theme.zig). Start the small theme with:
+
+```sh
+zig build -Dwasm-plugins=true
+zig-out/bin/habush --config examples/plugins/theme.zon
+```
+
+It displays cwd and the previous exit status, with a green/red marker. It uses
+no host imports. The app passes only cwd/status; Git, environment discovery,
+and subprocess execution are not provided. Prompt failures use the configured
+literal prompt (or `habush> `). The final prompt declaration wins.
+
+The demo module also has a `diagnose` entry. Its shipped config enables an
+advisory warning on `NOTE`, with a deliberately embedded ESC in the message to
+demonstrate literal display. Editing the input removes stale results. Diagnostics
+do not execute input or change exit status; `.diagnostics = false` disables the
+display. Native syntax errors remain available if a guest fails or replies with
+invalid data. Multiple diagnostic declarations are collected in order with a
+shared 100 ms guest budget, at most 32 items and 4096 message bytes; native errors
+have priority when merging results. At most three messages fit below input.
+
+Registration uses `.prompt = .{ .entry = "prompt" }` or
+`.diagnostics = .{ .entry = "diagnose" }` on a plugin; those are also the default
+entry names. Prompt and diagnostic calls receive no streams, and prompt calls
+also cap their guest deadline at 100 ms. Results are allocated in the caller's
+arena and stay alive for their display scope. Rendering owns ANSI styles, Unicode
+width/clipping, and OSC; guest text cannot emit terminal commands.
+
+Their schema v0 uses the existing byte-list transport:
+
+- Prompt request: `[cwd, status]`, with status in decimal ASCII. Reply:
+  `[style, text, style, text, ...]`, up to 16 spans and 1024 text bytes. A style is
+  three ASCII digits: foreground, background, bold. Colors are 0=default,
+  1=black, 2=red, 3=green, 4=yellow, 5=blue, 6=magenta, 7=cyan, 8=white;
+  bold is 0 or 1. For example, `301` is bold green on the default background.
+  Malformed styles or arity are rejected; the raw reply is limited to 4096 bytes.
+- Diagnostic request: `[revision, source]`. Reply:
+  `[revision, start, end, severity, message, ...]`, with one revision followed by
+  groups of four. Numbers are decimal ASCII and severity is `note`, `warning`,
+  or `error`. Ranges are half-open byte offsets into that exact source. Empty
+  results contain only the revision. Stale revisions, out-of-bounds/reversed
+  ranges, invalid severity/arity, NUL and excessive output are rejected; the raw
+  reply is limited to 8192 bytes.
 
 ## Ownership and calls
 

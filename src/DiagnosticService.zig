@@ -19,9 +19,16 @@ fn query(userdata: ?*anyopaque, arena: std.mem.Allocator, request: Diagnostic.Re
         error.Unavailable => return result,
     };
     if (!added.valid(request)) return result;
-    const items = try std.mem.concat(arena, Diagnostic, &.{ result.items, added.items });
-    const combined: Diagnostic.Result = .{ .revision = request.revision, .items = items };
-    if (combined.valid(request)) result = combined;
+    var items: std.ArrayList(Diagnostic) = .empty;
+    try items.appendSlice(arena, result.items);
+    var bytes: usize = 0;
+    for (result.items) |item| bytes += item.message.len;
+    for (added.items) |item| {
+        if (items.items.len == Diagnostic.max_items or item.message.len > Diagnostic.max_bytes - bytes) break;
+        try items.append(arena, item);
+        bytes += item.message.len;
+    }
+    result.items = items.items;
     return result;
 }
 

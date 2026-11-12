@@ -1,0 +1,7 @@
+.{
+    .load_rc = false,
+    .plugins = .{.{
+        .path = "../../zig-out/bin/habush-theme.wasm",
+        .prompt = .{},
+    }},
+}

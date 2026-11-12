@@ -4,5 +4,6 @@
         .path = "../../zig-out/bin/habush-plugin-demo.wasm",
         .commands = .{.{ .name = "hb-demo" }},
         .completions = .{.{ .command = "hb-demo" }},
+        .diagnostics = .{},
     }},
 }

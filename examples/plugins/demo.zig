@@ -76,3 +76,31 @@ export fn complete(pointer: u32, length: u32) u64 {
     std.mem.writeInt(u32, reply_buffer[0..4], count, .little);
     return reply(reply_buffer[0..offset]);
 }
+
+export fn diagnose(pointer: u32, length: u32) u64 {
+    const bytes: [*]const u8 = @ptrFromInt(pointer);
+    var reader: std.Io.Reader = .fixed(bytes[0..length]);
+    if ((reader.takeInt(u32, .little) catch @trap()) != 2) @trap();
+    const revision = take(&reader);
+    const source = take(&reader);
+    if (reader.bufferedLen() != 0) @trap();
+    const position = std.mem.indexOf(u8, source, "NOTE");
+    var start: [20]u8 = undefined;
+    var end: [20]u8 = undefined;
+    const fields: []const []const u8 = if (position) |index| &.{
+        revision,
+        std.fmt.bufPrint(&start, "{d}", .{index}) catch @trap(),
+        std.fmt.bufPrint(&end, "{d}", .{index + 4}) catch @trap(),
+        "warning",
+        "demo diagnostic: NOTE\x1b",
+    } else &.{revision};
+    std.mem.writeInt(u32, reply_buffer[0..4], @intCast(fields.len), .little);
+    var offset: usize = 4;
+    for (fields) |value| {
+        std.mem.writeInt(u32, reply_buffer[offset..][0..4], @intCast(value.len), .little);
+        offset += 4;
+        @memcpy(reply_buffer[offset..][0..value.len], value);
+        offset += value.len;
+    }
+    return reply(reply_buffer[0..offset]);
+}

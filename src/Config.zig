@@ -21,6 +21,8 @@ pub const Plugin = struct {
     path: []const u8,
     commands: []const Command = &.{},
     completions: []const Completion = &.{},
+    prompt: ?struct { entry: []const u8 = "prompt" } = null,
+    diagnostics: ?struct { entry: []const u8 = "diagnose" } = null,
     fuel: u64 = 10_000_000,
     memory_bytes: u32 = 16 * 1024 * 1024,
     timeout_ms: u32 = 1000,
@@ -44,8 +46,10 @@ pub fn parse(options: std.zon.parse.Options) !Config {
     if (config.prompt) |prompt| if (!prompt.valid()) return error.InvalidPrompt;
     for (config.keybinds) |binding| _ = try @import("habush-edit").Keybind.Key.parse(binding.key);
     for (config.plugins, 0..) |plugin, plugin_index| {
-        if (!validString(plugin.path) or (plugin.commands.len == 0 and plugin.completions.len == 0))
+        if (!validString(plugin.path) or (plugin.commands.len == 0 and plugin.completions.len == 0 and plugin.prompt == null and plugin.diagnostics == null))
             return error.InvalidPluginConfiguration;
+        if (plugin.prompt) |prompt| if (!validString(prompt.entry)) return error.InvalidPluginConfiguration;
+        if (plugin.diagnostics) |diagnostic| if (!validString(diagnostic.entry)) return error.InvalidPluginConfiguration;
         for (plugin.commands, 0..) |command, command_index| {
             if (!validString(command.name) or std.fs.path.dirname(command.name) != null or
                 std.mem.indexOfAny(u8, command.name, "/\\") != null or
@@ -281,11 +285,20 @@ test "ZON configuration validates fields and honors explicit paths without JSON 
     try std.testing.expectEqual(@as(usize, 0), completion_only.plugins[0].commands.len);
     try std.testing.expectEqual(@as(usize, 2), completion_only.plugins[0].completions.len);
 
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.zon", .data =
+        \\.{ .plugins = .{ .{ .path = "theme.wasm", .prompt = .{} }, .{ .path = "diagnostic.wasm", .diagnostics = .{} } } }
+    });
+    const presentation = (try load(gpa, arena, io, paths, null, &output.writer)).?;
+    try std.testing.expectEqualStrings("prompt", presentation.plugins[0].prompt.?.entry);
+    try std.testing.expectEqualStrings("diagnose", presentation.plugins[1].diagnostics.?.entry);
+
     for ([_][]const u8{
         ".{\n    .line_edti = .off,\n}",
         ".{ .load_rc = true, .load_rc = false }",
         ".{ .line_edit = .maybe }",
         ".{ .version = 2 }",
+        ".{ .plugins = .{.{ .path = \"theme.wasm\", .prompt = .{ .entry = \"\" } }} }",
+        ".{ .plugins = .{.{ .path = \"diagnostic.wasm\", .diagnostics = .{ .entry = \"\" } }} }",
         ".{ .prompt = .{ .spans = .{.{ .text = \"bad\\x00\" }} } }",
         ".{ .keybinds = .{.{ .key = \"super+a\", .action = .complete }} }",
         ".{ .keybinds = .{.{ .key = \"ctrl+l\", .action = .missing }} }",
