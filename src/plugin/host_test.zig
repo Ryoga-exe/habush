@@ -7,6 +7,7 @@ const completion = @import("completion.zig");
 const fixture =
     \\(module
     \\ (import "habush" "write" (func $write (param i32 i32 i32) (result i32)))
+    \\ (import "habush" "read" (func $read (param i32 i32 i32) (result i32)))
     \\ (memory (export "memory") 1)
     \\ (data (i32.const 0) "\07choice")
     \\ (data (i32.const 32) "\01\00\00\00\08\00\00\00a b'$(x)")
@@ -19,6 +20,10 @@ const fixture =
     \\   i64.const 25769803777)
     \\ (func (export "candidates") (param i32 i32) (result i64)
     \\   i64.const 68719476768)
+    \\ (func (export "read_echo") (param i32 i32) (result i64) (local $n i32)
+    \\   i32.const 0 i32.const 1024 i32.const 32 call $read local.set $n
+    \\   i32.const 1 i32.const 1024 local.get $n call $write drop
+    \\   i64.const 4294967296)
     \\ (func (export "run") (param i32 i32) (result i64)
     \\   local.get 0 i32.load i32.const 2 i32.ne if unreachable end
     \\   i32.const 1 local.get 0 i32.const 16 i32.add
@@ -77,6 +82,17 @@ test "one module serves command and completion with call-scoped streams" {
     try std.testing.expectEqualStrings("a b'$(x)", candidates.values[0]);
     try std.testing.expectError(error.InvalidResponse, command.run(&module, gpa, "complete", &.{"demo"}, .{}));
     try std.testing.expectError(error.LimitExceeded, completion.collect(&module, gpa, "candidates", "a", &.{"demo"}, .{}, 0));
+    var input: std.Io.Reader = .fixed("data");
+    input.vtable = std.Io.Reader.failing.vtable;
+    output.clearRetainingCapacity();
+    const read_reply = try module.invoke(gpa, "read_echo", "", .{ .stdin = &input, .stdout = &output.writer });
+    defer gpa.free(read_reply);
+    try std.testing.expectEqualStrings("data", output.written());
+    try std.testing.expectEqual(@as(usize, 0), input.bufferedLen());
+    try std.testing.expectError(error.PermissionDenied, module.invoke(gpa, "read_echo", "", .{ .stdout = &output.writer }));
+    input = .fixed("data");
+    try std.testing.expectError(error.LimitExceeded, module.invoke(gpa, "read_echo", "", .{ .stdin = &input, .limits = .{ .input_bytes = 1 } }));
+    try std.testing.expectEqual(@as(usize, 4), input.bufferedLen());
 }
 
 test "guest failure, memory bounds and budgets do not poison the module" {

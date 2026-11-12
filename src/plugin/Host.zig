@@ -1,5 +1,5 @@
 //! Core Wasm ABI v0. The embedding application owns modules and call scopes.
-//! No WASI is linked. The only import is call-scoped stdout/stderr writing.
+//! No WASI is linked. Imports provide only call-scoped stream access.
 const std = @import("std");
 const c = @import("wasmtime");
 const Host = @This();
@@ -20,6 +20,7 @@ pub const Error = std.mem.Allocator.Error || error{
     InvalidRequest,
     PermissionDenied,
     WriteFailed,
+    ReadFailed,
     Trap,
 };
 
@@ -29,13 +30,15 @@ pub const Limits = struct {
     request_bytes: u32 = 64 * 1024,
     response_bytes: u32 = 64 * 1024,
     output_bytes: u32 = 1024 * 1024,
+    input_bytes: u32 = 1024 * 1024,
     timeout: ?std.Io.Duration = .fromMilliseconds(100),
 };
 
-/// A writer is an explicit grant for this call, not a process-global stream.
-/// Borrowed writers must stay alive and obey cancellation for the whole call.
+/// Each stream is an explicit grant for this call, not a process-global stream.
+/// Borrowed streams must stay alive and obey cancellation for the whole call.
 pub const Scope = struct {
     limits: Limits = .{},
+    stdin: ?*std.Io.Reader = null,
     stdout: ?*std.Io.Writer = null,
     stderr: ?*std.Io.Writer = null,
 };
@@ -114,7 +117,7 @@ pub const Module = struct {
         c.wasmtime_context_set_epoch_deadline(context, 1);
         const linker = c.wasmtime_linker_new(host.engine) orelse return error.OutOfMemory;
         defer c.wasmtime_linker_delete(linker);
-        try defineWrite(linker, &call);
+        try defineStreams(linker, &call);
         var instance: c.wasmtime_instance_t = undefined;
         var trap: ?*c.wasm_trap_t = null;
         const failure = c.wasmtime_linker_instantiate(linker, context, module.module, &instance, &trap);
@@ -138,6 +141,7 @@ const Call = struct {
     deadline: ?std.Io.Timestamp,
     failure: ?Error = null,
     written: usize = 0,
+    read: usize = 0,
 
     fn checkpoint(call: *Call) Error!void {
         try call.io.checkCancel();
@@ -202,7 +206,7 @@ fn instanceBytes(context: *c.wasmtime_context_t, instance: *const c.wasmtime_ins
     return memoryBytes(context, &exported.of.memory, start, length);
 }
 
-fn defineWrite(linker: *c.wasmtime_linker_t, call: *Call) Error!void {
+fn defineStreams(linker: *c.wasmtime_linker_t, call: *Call) Error!void {
     var parameters: c.wasm_valtype_vec_t = undefined;
     c.wasm_valtype_vec_new_uninitialized(&parameters, 3);
     for (0..3) |index| parameters.data[index] = c.wasm_valtype_new(c.WASM_I32);
@@ -214,6 +218,42 @@ fn defineWrite(linker: *c.wasmtime_linker_t, call: *Call) Error!void {
     if (c.wasmtime_linker_define_func(linker, "habush", 6, "write", 5, signature, write, call, null)) |failure| {
         c.wasmtime_error_delete(failure);
         return error.InvalidAbi;
+    }
+    if (c.wasmtime_linker_define_func(linker, "habush", 6, "read", 4, signature, read, call, null)) |failure| {
+        c.wasmtime_error_delete(failure);
+        return error.InvalidAbi;
+    }
+}
+
+fn read(data: ?*anyopaque, caller: ?*c.wasmtime_caller_t, args: [*c]const c.wasmtime_val_t, _: usize, results: [*c]c.wasmtime_val_t, _: usize) callconv(.c) ?*c.wasm_trap_t {
+    const call: *Call = @ptrCast(@alignCast(data.?));
+    const length = readBytes(call, caller.?, @bitCast(args[0].of.i32), @bitCast(args[1].of.i32), @bitCast(args[2].of.i32)) catch |err| {
+        call.failure = err;
+        const message = "habush: plugin read failed";
+        return c.wasmtime_trap_new(message.ptr, message.len);
+    };
+    results[0] = i32Value(length);
+    return null;
+}
+
+fn readBytes(call: *Call, caller: *c.wasmtime_caller_t, descriptor: u32, pointer: u32, length: u32) Error!u32 {
+    try call.checkpoint();
+    if (descriptor != 0) return error.PermissionDenied;
+    const reader = call.scope.stdin orelse return error.PermissionDenied;
+    if (length > call.scope.limits.input_bytes -| call.read) return error.LimitExceeded;
+    const bytes = try callerBytes(caller, pointer, length);
+    if (bytes.len == 0) return 0;
+    while (true) {
+        // Return buffered input immediately rather than waiting to fill the request.
+        const buffered = reader.bufferedLen();
+        var data = [_][]u8{if (buffered != 0) bytes[0..@min(bytes.len, buffered)] else bytes};
+        const count = reader.readVec(&data) catch |err| switch (err) {
+            error.EndOfStream => return 0,
+            error.ReadFailed => return error.ReadFailed,
+        };
+        call.read += count;
+        if (count != 0) return @intCast(count);
+        try call.checkpoint();
     }
 }
 
@@ -235,14 +275,18 @@ fn writeBytes(call: *Call, caller: *c.wasmtime_caller_t, descriptor: u32, pointe
         else => null,
     }) orelse return error.PermissionDenied;
     if (length > call.scope.limits.output_bytes -| call.written) return error.LimitExceeded;
+    const bytes = try callerBytes(caller, pointer, length);
+    try writer.writeAll(bytes);
+    call.written += length;
+    return length;
+}
+
+fn callerBytes(caller: *c.wasmtime_caller_t, pointer: u32, length: u32) Error![]u8 {
     var exported: c.wasmtime_extern_t = undefined;
     if (!c.wasmtime_caller_export_get(caller, "memory", 6, &exported)) return error.InvalidAbi;
     defer c.wasmtime_extern_delete(&exported);
     if (exported.kind != c.WASMTIME_EXTERN_MEMORY) return error.InvalidAbi;
-    const bytes = try memoryBytes(c.wasmtime_caller_context(caller).?, &exported.of.memory, pointer, length);
-    try writer.writeAll(bytes);
-    call.written += length;
-    return length;
+    return memoryBytes(c.wasmtime_caller_context(caller).?, &exported.of.memory, pointer, length);
 }
 
 test {
