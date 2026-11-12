@@ -3,10 +3,12 @@ pub const Buffer = @import("edit/Buffer.zig");
 pub const Completion = @import("edit/Completion.zig");
 pub const History = @import("edit/History.zig");
 pub const Keybind = @import("edit/Keybind.zig");
+pub const Editor = @import("edit/Editor.zig");
 
 test {
     _ = Buffer;
     _ = Completion;
     _ = History;
     _ = Keybind;
+    _ = Editor;
 }

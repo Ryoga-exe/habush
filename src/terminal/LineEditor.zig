@@ -16,7 +16,7 @@ history: ?*const edit.History = null,
 keybinds: []const edit.Keybind = &.{},
 
 pub const max_input_bytes = 64 * 1024;
-const Menu = struct { result: edit.Completion.Result, selected: usize = 0 };
+const Menu = edit.Editor.Menu;
 
 pub fn read(editor: LineEditor) !?[:0]u8 {
     var terminal = try platform.LineInput.init() orelse return error.EditorUnavailable;
@@ -28,11 +28,13 @@ pub fn read(editor: LineEditor) !?[:0]u8 {
         editor.output.writeAll("\x1b[?2004l") catch {};
         editor.output.flush() catch {};
     }
-    var buffer: edit.Buffer = .{ .gpa = editor.gpa };
-    defer buffer.deinit();
-    var menu: ?Menu = null;
-    var navigation: edit.History.Navigation = .{};
-    defer navigation.deinit(editor.gpa);
+    var state: edit.Editor = .{
+        .buffer = .{ .gpa = editor.gpa },
+        .history = editor.history,
+        .completion = editor.completion,
+    };
+    defer state.deinit();
+    const buffer = &state.buffer;
     var pending: [4]u8 = undefined;
     var pending_len: usize = 0;
     var expected_len: usize = 0;
@@ -46,14 +48,14 @@ pub fn read(editor: LineEditor) !?[:0]u8 {
                 pending[pending_len] = byte;
                 pending_len += 1;
                 if (pending_len != expected_len) continue;
-                try editor.insertTyped(&buffer, pending[0..pending_len]);
+                try editor.insertTyped(&state, pending[0..pending_len]);
                 pending_len = 0;
                 try render.redraw(editor.output, editor.prompt, buffer.text(), buffer.cursor, terminal.columns());
                 continue;
             }
             // Preserve an invalid or incomplete prefix, then process this key
             // normally. In particular, Enter and editing keys are never lost.
-            try editor.insertTyped(&buffer, pending[0..pending_len]);
+            try editor.insertTyped(&state, pending[0..pending_len]);
             pending_len = 0;
         }
         var key = edit.Keybind.Key.fromByte(byte);
@@ -69,39 +71,25 @@ pub fn read(editor: LineEditor) !?[:0]u8 {
                 if (editor.input.bufferedLen() == 0 and !terminal.ready(80)) break;
             }
             if (std.mem.eql(u8, sequence[0..length], "[200~")) {
-                menu = null;
-                try editor.paste(&buffer);
+                state.menu = null;
+                try editor.paste(&state);
                 try render.redraw(editor.output, editor.prompt, buffer.text(), buffer.cursor, terminal.columns());
                 continue;
             }
             key = edit.Keybind.Key.fromEscape(sequence[0..length]) orelse {
-                menu = null;
+                state.menu = null;
                 try editor.output.writeByte(7);
                 try editor.output.flush();
                 continue;
             };
         }
         if (edit.Keybind.lookup(editor.keybinds, key)) |action| {
-            switch (action) {
-                .accept_line,
-                .complete,
-                .complete_previous,
-                .history_previous,
-                .history_next,
-                .history_search_previous,
-                .history_search_next,
-                .ignore,
-                => {},
-                else => menu = null,
-            }
-            switch (action) {
-                .accept_line => {
-                    if (menu) |selection| {
-                        menu = null;
-                        if (!try editor.accept(&buffer, selection.selected)) try editor.output.writeByte(7);
-                        try render.redraw(editor.output, editor.prompt, buffer.text(), buffer.cursor, terminal.columns());
-                        continue;
-                    }
+            switch (try state.perform(action)) {
+                .redraw => {},
+                .show_candidates => try editor.showCandidates(state.menu.?),
+                .bell => try editor.output.writeByte(7),
+                .clear_screen => try editor.output.writeAll("\x1b[2J\x1b[H"),
+                .submit => {
                     try editor.output.writeAll("\r\n");
                     const line = try editor.gpa.dupeSentinel(u8, buffer.text(), 0);
                     errdefer editor.gpa.free(line);
@@ -113,42 +101,13 @@ pub fn read(editor: LineEditor) !?[:0]u8 {
                     try terminal.restore();
                     return error.InputInterrupted;
                 },
-                .eof_or_delete => if (buffer.text().len == 0) {
+                .eof => {
                     try terminal.restore();
                     return null;
-                } else try buffer.delete(),
-                .cursor_start => buffer.cursor = 0,
-                .cursor_end => buffer.cursor = buffer.text().len,
-                .cursor_left => buffer.left(),
-                .cursor_right => buffer.right(),
-                .backspace => try buffer.backspace(),
-                .delete => try buffer.delete(),
-                .kill_to_end => try buffer.replace(buffer.cursor, buffer.text().len, ""),
-                .kill_to_start => try buffer.replace(0, buffer.cursor, ""),
-                .undo => {
-                    _ = buffer.undo();
                 },
-                .complete, .complete_previous => if (!try editor.complete(&buffer, &menu, action == .complete_previous)) try editor.output.writeByte(7),
-                .clear_screen => try editor.output.writeAll("\x1b[2J\x1b[H"),
-                .history_previous, .history_next, .history_search_previous, .history_search_next => {
-                    const previous = action == .history_previous or action == .history_search_previous;
-                    if (menu) |*selection| {
-                        const count = selection.result.labels.len;
-                        selection.selected = if (previous) (selection.selected + count - 1) % count else (selection.selected + 1) % count;
-                        try editor.showCandidates(selection.*);
-                    } else {
-                        const moved = if (editor.history) |history|
-                            try navigation.move(history, &buffer, previous, action == .history_search_previous or action == .history_search_next)
-                        else
-                            false;
-                        if (!moved) try editor.output.writeByte(7);
-                    }
-                },
-                .dismiss_completion, .ignore => {},
-                .unbind => unreachable,
             }
         } else {
-            menu = null;
+            state.menu = null;
             if (byte >= 0x20 and byte != 127) {
                 expected_len = std.unicode.utf8ByteSequenceLength(byte) catch 1;
                 if (expected_len > 1) {
@@ -156,7 +115,7 @@ pub fn read(editor: LineEditor) !?[:0]u8 {
                     pending_len = 1;
                     continue;
                 }
-                try editor.insertTyped(&buffer, &.{byte});
+                try editor.insertTyped(&state, &.{byte});
             } else {
                 try editor.output.writeByte(7);
             }
@@ -167,23 +126,15 @@ pub fn read(editor: LineEditor) !?[:0]u8 {
 
 /// A typed Unicode scalar is one edit and therefore one Undo operation. Invalid
 /// input stays byte-preserving; the size limit never leaves half a valid scalar.
-fn insertTyped(editor: LineEditor, buffer: *edit.Buffer, bytes: []const u8) !void {
+fn insertTyped(editor: LineEditor, state: *edit.Editor, bytes: []const u8) !void {
     if (!std.unicode.utf8ValidateSlice(bytes)) {
         for (bytes) |byte| {
-            if (buffer.text().len < max_input_bytes)
-                try buffer.insert(&.{byte})
-            else
-                try editor.output.writeByte(7);
+            if (!try state.insert(&.{byte})) try editor.output.writeByte(7);
         }
-        return;
-    }
-    if (bytes.len <= max_input_bytes -| buffer.text().len)
-        try buffer.insert(bytes)
-    else
-        try editor.output.writeByte(7);
+    } else if (!try state.insert(bytes)) try editor.output.writeByte(7);
 }
 
-fn paste(editor: LineEditor, buffer: *edit.Buffer) !void {
+fn paste(editor: LineEditor, state: *edit.Editor) !void {
     const end = "\x1b[201~";
     var pasted: std.ArrayList(u8) = .empty;
     defer pasted.deinit(editor.gpa);
@@ -195,50 +146,19 @@ fn paste(editor: LineEditor, buffer: *edit.Buffer) !void {
         tail[tail.len - 1] = byte;
         seen += 1;
         if (!discarded) {
-            if (byte == 0 or pasted.items.len + buffer.text().len >= max_input_bytes + end.len) {
+            if (byte == 0 or pasted.items.len + state.buffer.text().len >= max_input_bytes + end.len) {
                 discarded = true;
             } else try pasted.append(editor.gpa, byte);
         }
         if (seen >= end.len and std.mem.eql(u8, &tail, end)) {
             if (discarded) {
                 try editor.output.writeByte(7);
-            } else try buffer.insert(pasted.items[0 .. pasted.items.len - end.len]);
+            } else if (!try state.insert(pasted.items[0 .. pasted.items.len - end.len])) try editor.output.writeByte(7);
             return;
         }
     }
     // An unterminated paste is never submitted as a command on EOF.
     return error.EndOfStream;
-}
-
-fn complete(editor: LineEditor, buffer: *edit.Buffer, menu: *?Menu, previous: bool) !bool {
-    if (menu.*) |*selection| {
-        const count = selection.result.labels.len;
-        selection.selected = if (previous) (selection.selected + count - 1) % count else (selection.selected + 1) % count;
-        try editor.showCandidates(selection.*);
-        return true;
-    }
-    const service = editor.completion orelse return false;
-    const request: edit.Completion.Request = .{
-        .source = buffer.text(),
-        .cursor = buffer.cursor,
-        .revision = buffer.revision,
-    };
-    const result = (try service.query(service.userdata, request)) orelse return false;
-    if (!result.unique()) {
-        if (result.labels.len == 0) return false;
-        menu.* = .{ .result = result, .selected = if (previous) result.labels.len - 1 else 0 };
-        try editor.showCandidates(menu.*.?);
-        return true;
-    }
-    return editor.accept(buffer, 0);
-}
-
-fn accept(editor: LineEditor, buffer: *edit.Buffer, index: usize) !bool {
-    const service = editor.completion orelse return false;
-    const request: edit.Completion.Request = .{ .source = buffer.text(), .cursor = buffer.cursor, .revision = buffer.revision };
-    var replacement = (try service.choose(service.userdata, editor.gpa, request, index)) orelse return false;
-    defer replacement.deinit(editor.gpa);
-    return replacement.apply(buffer, max_input_bytes);
 }
 
 fn showCandidates(editor: LineEditor, menu: Menu) !void {
