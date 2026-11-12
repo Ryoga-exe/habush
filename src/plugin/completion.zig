@@ -16,6 +16,7 @@ pub const Result = struct {
 };
 
 pub fn collect(module: *const Host.Module, gpa: std.mem.Allocator, entry: []const u8, prefix: []const u8, argv: []const []const u8, scope: Host.Scope, max_candidates: u32) Host.Error!Result {
+    if (!module.permissions(scope.capabilities.permissions).source) return error.PermissionDenied;
     const request = try protocol.encode(gpa, &.{ &.{prefix}, argv }, scope.limits.request_bytes);
     defer gpa.free(request);
     const response = try module.invoke(gpa, entry, request, scope);

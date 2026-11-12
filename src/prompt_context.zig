@@ -29,7 +29,7 @@ pub fn git(gpa: std.mem.Allocator, io: Io, cwd: []const u8) !?Git {
                 if (!std.mem.startsWith(u8, contents, "gitdir: ")) return null;
                 const path = std.mem.trim(u8, contents[8..], "\r\n");
                 if (path.len == 0 or std.mem.indexOfScalar(u8, path, 0) != null) return null;
-                break :worktree try std.fs.path.resolveAlloc(scratch, &.{ root, path });
+                break :worktree if (std.fs.path.isAbsolute(path)) path else try std.fs.path.join(scratch, &.{ root, path });
             },
             else => return null,
         };

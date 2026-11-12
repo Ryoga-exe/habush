@@ -11,6 +11,7 @@ pub const CommandResolver = @import("CommandResolver.zig");
 pub const Completion = @import("Completion.zig");
 pub const edit = @import("habush-edit");
 pub const concurrent = @import("concurrent.zig");
+pub const capability = @import("capability.zig");
 pub const Executor = @import("Executor.zig");
 pub const Evaluation = @import("evaluation.zig").Result;
 pub const ExecutionContext = @import("ExecutionContext.zig");

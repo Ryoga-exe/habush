@@ -3,6 +3,7 @@ const std = @import("std");
 
 extern "habush" fn write(descriptor: u32, pointer: [*]const u8, length: u32) i32;
 extern "habush" fn read(descriptor: u32, pointer: [*]u8, length: u32) u32;
+extern "habush" fn read_file(path: [*]const u8, length: u32, output_buffer: [*]u8, capacity: u32) u32;
 
 var request_buffer: [64 * 1024]u8 = undefined;
 var reply_buffer: [4096]u8 = undefined;
@@ -75,6 +76,18 @@ export fn complete(pointer: u32, length: u32) u64 {
     }
     std.mem.writeInt(u32, reply_buffer[0..4], count, .little);
     return reply(reply_buffer[0..offset]);
+}
+
+export fn file(pointer: u32, length: u32) u64 {
+    const bytes: [*]const u8 = @ptrFromInt(pointer);
+    var reader: std.Io.Reader = .fixed(bytes[0..length]);
+    if ((reader.takeInt(u32, .little) catch @trap()) != 2) @trap();
+    _ = take(&reader);
+    const path = take(&reader);
+    if (reader.bufferedLen() != 0) @trap();
+    const size = read_file(path.ptr, @intCast(path.len), &reply_buffer, reply_buffer.len);
+    output(reply_buffer[0..size]);
+    return reply(&status);
 }
 
 export fn diagnose(pointer: u32, length: u32) u64 {

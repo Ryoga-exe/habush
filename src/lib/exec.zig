@@ -5,6 +5,7 @@ const std = @import("std");
 pub const CommandPlan = @import("CommandPlan.zig");
 pub const ExecutionContext = @import("ExecutionContext.zig");
 pub const Host = @import("Host.zig");
+pub const capability = @import("capability.zig");
 pub const Pipeline = @import("Pipeline.zig");
 pub const Source = @import("Source.zig");
 pub const SandboxBackend = @import("SandboxBackend.zig");

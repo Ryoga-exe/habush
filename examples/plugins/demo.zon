@@ -2,6 +2,8 @@
     .load_rc = false,
     .plugins = .{.{
         .path = "../../zig-out/bin/habush-plugin-demo.wasm",
+        .declares = .{ .stdin = true, .stdout = true, .source = true },
+        .grants = .{ .stdin = true, .stdout = true, .source = true },
         .commands = .{.{ .name = "hb-demo" }},
         .completions = .{.{ .command = "hb-demo" }},
         .diagnostics = .{},
