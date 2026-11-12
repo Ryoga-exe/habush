@@ -57,8 +57,12 @@ pub fn parse(options: std.zon.parse.Options) !Config {
     if (config.history.memory.max_bytes > @import("HistoryStore.zig").max_file_bytes or
         config.history.storage.max_bytes < 13 or config.history.storage.max_bytes > @import("HistoryStore.zig").max_file_bytes)
         return error.InvalidHistoryConfiguration;
-    if (config.history.storage.path) |path| if (!validString(path) or std.fs.path.basename(path).len == 0)
-        return error.InvalidHistoryConfiguration;
+    if (config.history.storage.path) |path| {
+        if (!validString(path)) return error.InvalidHistoryConfiguration;
+        const name = std.fs.path.basename(path);
+        if (name.len == 0 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..") or
+            path[path.len - 1] == '/' or path[path.len - 1] == std.fs.path.sep) return error.InvalidHistoryConfiguration;
+    }
     if (config.prompt) |prompt| if (!prompt.valid()) return error.InvalidPrompt;
     for (config.keybinds) |binding| _ = try @import("habush-edit").Keybind.Key.parse(binding.key);
     for (config.plugins, 0..) |plugin, plugin_index| {
@@ -351,6 +355,8 @@ test "ZON configuration validates fields and honors explicit paths without JSON 
         ".{ .history = .{ .storage = .{ .path = \"bad\\x00\" } } }",
         ".{ .history = .{ .storage = .{ .max_bytes = 0 } } }",
         ".{ .history = .{ .storage = .{ .max_bytes = 67108865 } } }",
+        ".{ .history = .{ .storage = .{ .path = \"history/\" } } }",
+        ".{ .history = .{ .storage = .{ .path = \".\" } } }",
         ".{ .plugins = .{.{ .path = \"theme.wasm\", .prompt = .{}, .options = .{ .{ \"symbol\", \">\" }, .{ \"symbol\", \"$\" } } }} }",
         ".{ .plugins = .{.{ .path = \"theme.wasm\", .prompt = .{}, .options = .{ .{ \"\", \">\" } } }} }",
         ".{ .plugins = .{.{ .path = \"theme.wasm\", .prompt = .{}, .grants = .{ .context = true } }} }",
