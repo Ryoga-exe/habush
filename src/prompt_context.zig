@@ -2,6 +2,7 @@
 const std = @import("std");
 const Io = std.Io;
 const Git = @import("habush-edit").Prompt.Git;
+const capability = @import("habush").capability;
 
 pub fn git(gpa: std.mem.Allocator, io: Io, cwd: []const u8) !?Git {
     if (!std.fs.path.isAbsolute(cwd)) return null;
@@ -25,7 +26,7 @@ pub fn git(gpa: std.mem.Allocator, io: Io, cwd: []const u8) !?Git {
         const directory = switch (stat.kind) {
             .directory => marker,
             .file => worktree: {
-                const contents = try Io.Dir.cwd().readFileAlloc(io, marker, scratch, .limited(4096));
+                const contents = try metadata(scratch, io, root, ".git", deadline);
                 if (!std.mem.startsWith(u8, contents, "gitdir: ")) return null;
                 const path = std.mem.trim(u8, contents[8..], "\r\n");
                 if (path.len == 0 or std.mem.indexOfScalar(u8, path, 0) != null) return null;
@@ -33,8 +34,7 @@ pub fn git(gpa: std.mem.Allocator, io: Io, cwd: []const u8) !?Git {
             },
             else => return null,
         };
-        const head_path = try std.fs.path.join(scratch, &.{ directory, "HEAD" });
-        const bytes = try Io.Dir.cwd().readFileAlloc(io, head_path, scratch, .limited(4096));
+        const bytes = try metadata(scratch, io, directory, "HEAD", deadline);
         const head = std.mem.trimEnd(u8, bytes, "\r\n");
         const branch_prefix = "ref: refs/heads/";
         if (std.mem.startsWith(u8, head, branch_prefix)) {
@@ -52,6 +52,14 @@ pub fn git(gpa: std.mem.Allocator, io: Io, cwd: []const u8) !?Git {
         return .{ .root = owned_root, .commit = try gpa.dupe(u8, head) };
     }
     return null;
+}
+
+fn metadata(gpa: std.mem.Allocator, io: Io, directory_path: []const u8, name: []const u8, deadline: Io.Timestamp) ![]u8 {
+    const directory = try Io.Dir.cwd().openDir(io, directory_path, .{});
+    defer directory.close(io);
+    var buffer: [4096]u8 = undefined;
+    const length = try capability.readRegularFile(io, directory, name, &buffer, .{ .deadline = .{ .clock = .awake, .raw = deadline } });
+    return gpa.dupe(u8, buffer[0..length]);
 }
 
 test "Git metadata finds parent repositories, detached HEADs, and linked worktrees" {
@@ -75,4 +83,7 @@ test "Git metadata finds parent repositories, detached HEADs, and linked worktre
     try std.testing.expect((try git(gpa, io, linked)).?.commit != null);
     try tmp.dir.writeFile(io, .{ .sub_path = "repo/.git/HEAD", .data = "ref: refs/heads/bad\x1b\n" });
     try std.testing.expect(try git(gpa, io, linked) == null);
+    try tmp.dir.deleteFile(io, "repo/.git/HEAD");
+    try tmp.dir.createDirPath(io, "repo/.git/HEAD");
+    try std.testing.expectError(error.PermissionDenied, git(gpa, io, linked));
 }
