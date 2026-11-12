@@ -68,6 +68,20 @@ const Writer = struct {
             .if_clause => try writer.writeIf(stream, index),
             .while_clause, .until_clause => try writer.writeLoop(stream, index),
             .for_clause => try writer.writeFor(stream, index),
+            .case_clause => {
+                const clause = writer.code.caseClause(index);
+                try writer.writeInst(stream, clause.word);
+                try stream.writeAll(", items=");
+                try writer.writeInstList(stream, clause.items);
+                try stream.writeAll(", redirects=");
+                try writer.writeInstList(stream, clause.redirects);
+            },
+            .case_item => {
+                const item = writer.code.caseItem(index);
+                try writer.writeInstList(stream, item.patterns);
+                try stream.writeAll(", body=");
+                try writer.writeOptionalInst(stream, item.body);
+            },
             .function_definition => try writer.writeFunction(stream, index),
             .literal,
             .escaped,
@@ -242,6 +256,8 @@ const Writer = struct {
             .while_clause,
             .until_clause,
             .for_clause,
+            .case_clause,
+            .case_item,
             .function_definition,
             .command_substitution,
             .double_quoted_command_substitution,

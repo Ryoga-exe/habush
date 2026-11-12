@@ -133,14 +133,65 @@ fn substitutionEnd(source: []const u8, start: usize, nesting: usize) ?usize {
     var index = start + 2;
     var parentheses: usize = 1;
     var word_start = true;
+    var command_start = true;
+    const Case = struct { stage: enum { word, in, pattern_start, pattern, body }, depth: usize };
+    var cases: [128]Case = undefined;
+    var case_count: usize = 0;
     var document_header: ?usize = null;
     while (index < source.len) {
+        // A case pattern's ')' closes its header, not this substitution.
+        if (word_start and std.mem.indexOfScalar(u8, " \t\r\n;|&()<>", source[index]) == null and source[index] != '#') {
+            var end = index;
+            while (end < source.len and std.mem.indexOfScalar(u8, " \t\r\n;|&()<>", source[end]) == null) : (end += 1) {}
+            const raw = source[index..end];
+            var command_word = true;
+            if (case_count != 0 and cases[case_count - 1].depth == parentheses) {
+                const active = &cases[case_count - 1];
+                switch (active.stage) {
+                    .word => {
+                        active.stage = .in;
+                        command_word = false;
+                    },
+                    .in => {
+                        if (std.mem.eql(u8, raw, "in")) active.stage = .pattern_start;
+                        command_word = false;
+                    },
+                    .pattern_start => {
+                        if (std.mem.eql(u8, raw, "esac")) {
+                            case_count -= 1;
+                        } else active.stage = .pattern;
+                        command_word = false;
+                    },
+                    .pattern => command_word = false,
+                    .body => if (command_start and std.mem.eql(u8, raw, "esac")) {
+                        case_count -= 1;
+                        command_word = false;
+                    },
+                }
+            }
+            if (command_word and command_start and std.mem.eql(u8, raw, "case")) {
+                if (case_count == cases.len) return null;
+                cases[case_count] = .{ .stage = .word, .depth = parentheses };
+                case_count += 1;
+                command_start = false;
+            } else if (command_word and command_start and
+                (std.mem.eql(u8, raw, "if") or std.mem.eql(u8, raw, "then") or
+                    std.mem.eql(u8, raw, "elif") or std.mem.eql(u8, raw, "else") or
+                    std.mem.eql(u8, raw, "while") or std.mem.eql(u8, raw, "until") or
+                    std.mem.eql(u8, raw, "do") or std.mem.eql(u8, raw, "{") or std.mem.eql(u8, raw, "!")))
+            {
+                command_start = true;
+            } else command_start = false;
+        }
         switch (source[index]) {
             '\n' => if (document_header) |header| {
                 index = skipHereDocuments(source, header, index, index + 1) orelse return null;
                 document_header = null;
                 word_start = true;
+                command_start = true;
                 continue;
+            } else {
+                command_start = true;
             },
             '<' => if (isHereDocument(source, index)) {
                 const delimiter = scanHereDocument(source, index) orelse return null;
@@ -180,11 +231,34 @@ fn substitutionEnd(source: []const u8, start: usize, nesting: usize) ?usize {
                     continue;
                 }
             },
-            '(' => parentheses += 1,
+            '(' => {
+                if (case_count != 0 and cases[case_count - 1].depth == parentheses and cases[case_count - 1].stage == .pattern_start) {
+                    cases[case_count - 1].stage = .pattern;
+                } else parentheses += 1;
+                command_start = true;
+            },
             ')' => {
+                if (case_count != 0 and cases[case_count - 1].depth == parentheses and cases[case_count - 1].stage == .pattern) {
+                    cases[case_count - 1].stage = .body;
+                    command_start = true;
+                    word_start = true;
+                    index += 1;
+                    continue;
+                }
                 parentheses -= 1;
                 if (parentheses == 0) return index;
+                command_start = true;
             },
+            ';' => {
+                command_start = true;
+                if (index + 1 < source.len and source[index + 1] == ';' and case_count != 0 and
+                    cases[case_count - 1].depth == parentheses and cases[case_count - 1].stage == .body)
+                {
+                    cases[case_count - 1].stage = .pattern_start;
+                    index += 1;
+                }
+            },
+            '|', '&' => command_start = true,
             '#' => if (word_start) {
                 index = std.mem.indexOfScalarPos(u8, source, index, '\n') orelse return null;
                 word_start = true;

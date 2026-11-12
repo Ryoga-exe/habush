@@ -116,6 +116,8 @@ fn command(astgen: *AstGen, node: Ast.Node.Index) Error!Hir.Inst.Index {
         .if_clause => astgen.ifClause(node),
         .while_clause, .until_clause => astgen.loopClause(node),
         .for_clause => astgen.forClause(node),
+        .case_clause => astgen.caseClause(node),
+        .case_item => error.InvalidAst,
         .function_definition => astgen.functionDefinition(node),
         .root, .list, .word, .assignment, .redirect => error.InvalidAst,
     };
@@ -131,6 +133,7 @@ fn functionDefinition(astgen: *AstGen, node: Ast.Node.Index) Error!Hir.Inst.Inde
         .while_clause,
         .until_clause,
         .for_clause,
+        .case_clause,
         => try astgen.command(body_node),
         else => return error.InvalidAst,
     };
@@ -147,6 +150,31 @@ fn functionDefinition(astgen: *AstGen, node: Ast.Node.Index) Error!Hir.Inst.Inde
             .payload_index = payload_index,
         } },
     });
+}
+
+fn caseClause(astgen: *AstGen, node: Ast.Node.Index) Error!Hir.Inst.Index {
+    const clause = astgen.tree.caseClause(node);
+    const value = try astgen.word(clause.word.unwrap() orelse return error.InvalidAst);
+    const scratch_top = astgen.scratch.items.len;
+    defer astgen.scratch.items.len = scratch_top;
+    const items = astgen.tree.extraDataSlice(.{ .start = clause.items_start, .end = clause.items_end }, Ast.Node.Index);
+    for (items) |item| try astgen.scratch.append(astgen.gpa, @backingInt(try astgen.caseItem(item)));
+    const redirects_len = try astgen.appendRedirects(clause.redirects_start, clause.redirects_end);
+    const payload = try astgen.addExtra(Hir.Case{ .word = value, .items_len = try index(u32, items.len), .redirects_len = redirects_len });
+    try astgen.extra.appendSlice(astgen.gpa, astgen.scratch.items[scratch_top..]);
+    return astgen.addInstruction(.{ .tag = .case_clause, .data = .{ .pl = .{ .src_start = astgen.sourceStart(node), .payload_index = payload } } });
+}
+
+fn caseItem(astgen: *AstGen, node: Ast.Node.Index) Error!Hir.Inst.Index {
+    const item = astgen.tree.caseItem(node);
+    const scratch_top = astgen.scratch.items.len;
+    defer astgen.scratch.items.len = scratch_top;
+    const patterns = astgen.tree.extraDataSlice(.{ .start = item.patterns_start, .end = item.patterns_end }, Ast.Node.Index);
+    for (patterns) |pattern| try astgen.scratch.append(astgen.gpa, @backingInt(try astgen.word(pattern)));
+    const body = if (item.body.unwrap()) |body| (try astgen.list(body)).toOptional() else Hir.Inst.OptionalIndex.none;
+    const payload = try astgen.addExtra(Hir.CaseItem{ .body = body, .patterns_len = try index(u32, patterns.len) });
+    try astgen.extra.appendSlice(astgen.gpa, astgen.scratch.items[scratch_top..]);
+    return astgen.addInstruction(.{ .tag = .case_item, .data = .{ .pl = .{ .src_start = astgen.sourceStart(node), .payload_index = payload } } });
 }
 
 fn forClause(astgen: *AstGen, node: Ast.Node.Index) Error!Hir.Inst.Index {

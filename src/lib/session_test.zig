@@ -12,6 +12,33 @@ const Session = @import("Session.zig");
 const Diagnostic = @import("runtime/Diagnostic.zig");
 const Source = @import("Source.zig");
 
+test "case matches scalar words with quoting, nested substitution and control flow" {
+    const gpa = std.testing.allocator;
+    var fake = FakeHost.init(gpa);
+    defer fake.deinit();
+    var session = try Session.init(gpa, fake.host(), .{ .context = .{ .cwd = "/work" } });
+    defer session.deinit();
+    const cases = [_]struct { [:0]const u8, u8, []const u8 }{
+        .{ "matched=none; case 'a b' in a*) matched=first; false;; 'a b') matched=wrong;; esac", 1, "first" },
+        .{ "matched=none; p='a*'; case ab in \"$p\") matched=wrong;; $p|z) matched=unquoted;; esac", 0, "unquoted" },
+        .{ "matched=none; false; case x in y) matched=wrong;; esac", 0, "none" },
+        .{ "matched=empty; case esac in esac; case x in x) ;; esac", 0, "empty" },
+        .{ "matched=none; f() { for x in one two; do case $x in one) continue;; two) matched=loop; break;; esac; matched=wrong; done; return 7; }; f", 7, "loop" },
+        .{ "matched=none; case x in x) case y in y) matched=nested;; esac;; esac", 0, "nested" },
+        .{ "matched=$(case x in x) pwd;; esac)", 0, "/work" },
+        .{ "matched=$(case x in (x|y) case y in y) pwd;; esac;; esac)", 0, "/work" },
+        .{ "matched=$(for x in foo; do case $x in foo) pwd;; esac; done)", 0, "/work" },
+    };
+    for (cases) |item| {
+        var result = try session.evaluate(item[0], .{});
+        defer result.deinit(gpa);
+        try std.testing.expect(result == .executed);
+        try std.testing.expectEqual(item[1], result.executed.status);
+        try std.testing.expectEqualStrings(item[2], session.variable("matched").?);
+    }
+    try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
+}
+
 test "evaluation events pair outcomes and reject callback reentry" {
     const Capture = struct {
         const Kind = enum { started, executed, syntax, unsupported, failed };

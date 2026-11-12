@@ -389,6 +389,7 @@ fn parseCompoundCommand(parser: *Parse) Ast.ParseError!Node.Index {
         .keyword_while => parser.parseLoopClause(.while_clause),
         .keyword_until => parser.parseLoopClause(.until_clause),
         .keyword_for => parser.parseForClause(),
+        .keyword_case => parser.parseCaseClause(),
         .keyword_l_brace => parser.parseBraceGroup(),
         .l_paren => parser.parseSubshell(),
         else => unreachable,
@@ -916,6 +917,122 @@ fn finishFor(
     });
 }
 
+fn parseCaseClause(parser: *Parse) Ast.ParseError!Node.Index {
+    const open = parser.nextToken();
+    const empty = try parser.emptySpan();
+    var clause: Node.Case = .{
+        .word = .none,
+        .in_token = .none,
+        .items_start = empty.start,
+        .items_end = empty.end,
+        .esac_token = .none,
+        .redirects_start = empty.start,
+        .redirects_end = empty.end,
+    };
+    const node = try parser.addNode(.{ .tag = .case_clause, .main_token = open, .data = .{ .none = {} } });
+    const scratch_top = parser.scratch.items.len;
+    defer parser.scratch.shrinkRetainingCapacity(scratch_top);
+    case_body: {
+        if (parser.tokenTag(parser.tok_i) == .eof) {
+            parser.setCompoundIncomplete(.case_clause, .word, open);
+            break :case_body;
+        }
+        if (!isWord(parser.tokenTag(parser.tok_i))) {
+            try parser.warn(.{ .tag = .expected_token, .token = parser.tok_i, .extra = .{ .expected_tag = .word } });
+            break :case_body;
+        }
+        clause.word = (try parser.parseWord()).toOptional();
+        parser.skipNewlines();
+        if (parser.tokenTag(parser.tok_i) == .eof) {
+            parser.setCompoundIncomplete(.case_clause, .in_keyword, open);
+            break :case_body;
+        }
+        if (parser.tokenTag(parser.tok_i) != .keyword_in) {
+            try parser.warn(.{ .tag = .expected_token, .token = parser.tok_i, .extra = .{ .expected_tag = .keyword_in } });
+            break :case_body;
+        }
+        clause.in_token = Node.OptionalTokenIndex.fromOptional(parser.nextToken());
+        parser.skipNewlines();
+        while (parser.tokenTag(parser.tok_i) != .keyword_esac) {
+            if (parser.tokenTag(parser.tok_i) == .eof) {
+                parser.setCompoundIncomplete(.case_clause, .esac_keyword, open);
+                break :case_body;
+            }
+            const before = parser.errors.items.len;
+            const item = try parser.parseCaseItem(open);
+            try parser.scratch.append(parser.gpa, item);
+            if (parser.failedSince(before)) break :case_body;
+            parser.skipNewlines();
+        }
+        clause.esac_token = Node.OptionalTokenIndex.fromOptional(parser.nextToken());
+    }
+    const items = try parser.listToSpan(parser.scratch.items[scratch_top..]);
+    clause.items_start = items.start;
+    clause.items_end = items.end;
+    parser.scratch.shrinkRetainingCapacity(scratch_top);
+    if (clause.esac_token != .none) {
+        while (parser.startsRedirect()) try parser.scratch.append(parser.gpa, try parser.parseRedirect());
+        const redirects = try parser.listToSpan(parser.scratch.items[scratch_top..]);
+        clause.redirects_start = redirects.start;
+        clause.redirects_end = redirects.end;
+    }
+    parser.nodes.items(.data)[@backingInt(node)] = .{ .extra = try parser.addExtra(clause) };
+    return node;
+}
+
+fn parseCaseItem(parser: *Parse, open: Ast.TokenIndex) Ast.ParseError!Node.Index {
+    const main_token = parser.tok_i;
+    if (parser.tokenTag(parser.tok_i) == .l_paren) _ = parser.nextToken();
+    const scratch_top = parser.scratch.items.len;
+    defer parser.scratch.shrinkRetainingCapacity(scratch_top);
+    var close: Node.OptionalTokenIndex = .none;
+    var body: Node.OptionalIndex = .none;
+    var terminator: Node.OptionalTokenIndex = .none;
+    patterns: while (true) {
+        if (parser.tokenTag(parser.tok_i) == .eof) {
+            parser.setCompoundIncomplete(.case_clause, .pattern, open);
+            break;
+        }
+        if (!isWord(parser.tokenTag(parser.tok_i))) {
+            try parser.warn(.{ .tag = .expected_token, .token = parser.tok_i, .extra = .{ .expected_tag = .word } });
+            break;
+        }
+        try parser.scratch.append(parser.gpa, try parser.parseWord());
+        switch (parser.tokenTag(parser.tok_i)) {
+            .pipe => {
+                _ = parser.nextToken();
+            },
+            .r_paren => {
+                close = Node.OptionalTokenIndex.fromOptional(parser.nextToken());
+                body = Node.OptionalIndex.fromOptional(try parser.parseList(.{ .token_tag = .semicolon_semicolon, .reserved_words = &.{.keyword_esac} }));
+                if (parser.tokenTag(parser.tok_i) == .semicolon_semicolon)
+                    terminator = Node.OptionalTokenIndex.fromOptional(parser.nextToken());
+                break :patterns;
+            },
+            .eof => {
+                parser.setCompoundIncomplete(.case_clause, .closing_pattern, open);
+                break :patterns;
+            },
+            else => {
+                try parser.warn(.{ .tag = .expected_token, .token = parser.tok_i, .extra = .{ .expected_tag = .r_paren } });
+                break :patterns;
+            },
+        }
+    }
+    const span = try parser.listToSpan(parser.scratch.items[scratch_top..]);
+    return parser.addNode(.{
+        .tag = .case_item,
+        .main_token = main_token,
+        .data = .{ .extra = try parser.addExtra(Node.CaseItem{
+            .patterns_start = span.start,
+            .patterns_end = span.end,
+            .close_token = close,
+            .body = body,
+            .terminator = terminator,
+        }) },
+    });
+}
+
 fn parseSubshell(parser: *Parse) Ast.ParseError!Node.Index {
     const open = parser.nextToken();
     const body = try parser.parseList(.{ .token_tag = .r_paren });
@@ -1326,7 +1443,7 @@ fn canStartCommand(parser: *const Parse) bool {
     const tag = parser.tokenTag(parser.tok_i);
     if (isReservedWord(tag)) {
         return tag == .keyword_if or tag == .keyword_while or tag == .keyword_until or
-            tag == .keyword_for or tag == .keyword_l_brace;
+            tag == .keyword_for or tag == .keyword_case or tag == .keyword_l_brace;
     }
     return tag == .l_paren or isWord(tag) or parser.startsRedirect();
 }
@@ -1337,6 +1454,7 @@ fn canStartCompoundCommand(parser: *const Parse) bool {
         .keyword_while,
         .keyword_until,
         .keyword_for,
+        .keyword_case,
         .keyword_l_brace,
         .l_paren,
         => true,
@@ -1458,6 +1576,8 @@ fn isReservedWord(tag: Token.Tag) bool {
         .keyword_done,
         .keyword_for,
         .keyword_in,
+        .keyword_case,
+        .keyword_esac,
         .keyword_l_brace,
         .keyword_r_brace,
         .keyword_bang,

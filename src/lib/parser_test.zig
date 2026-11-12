@@ -4,6 +4,25 @@ const Node = Ast.Node;
 const heredoc = @import("heredoc.zig");
 const Token = @import("tokenizer.zig").Token;
 
+test "case items preserve patterns, optional bodies and continuation state" {
+    var tree = try Ast.parse(std.testing.allocator, "case \"$value\" in (foo|b*) true;; '') ;; *) false; esac >out");
+    defer tree.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+    try std.testing.expect(tree.status == .complete);
+    const clause = tree.caseClause(firstCommand(&tree));
+    const items = tree.extraDataSlice(.{ .start = clause.items_start, .end = clause.items_end }, Node.Index);
+    try std.testing.expectEqual(@as(usize, 3), items.len);
+    const first = tree.caseItem(items[0]);
+    try std.testing.expectEqual(@as(usize, 2), tree.extraDataSlice(.{ .start = first.patterns_start, .end = first.patterns_end }, Node.Index).len);
+    try std.testing.expect(tree.caseItem(items[1]).body.unwrap() == null);
+    try std.testing.expectEqual(@as(u32, 1), @backingInt(clause.redirects_end) - @backingInt(clause.redirects_start));
+    try expectCompoundContinuation("case", .case_clause, .word);
+    try expectCompoundContinuation("case x", .case_clause, .in_keyword);
+    try expectCompoundContinuation("case x in (", .case_clause, .pattern);
+    try expectCompoundContinuation("case x in a", .case_clause, .closing_pattern);
+    try expectCompoundContinuation("case x in a)", .case_clause, .esac_keyword);
+}
+
 test "parses empty input" {
     var tree = try Ast.parse(std.testing.allocator, "");
     defer tree.deinit(std.testing.allocator);

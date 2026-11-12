@@ -248,6 +248,22 @@ pub fn functionDefinition(hir: Hir, index: Inst.Index) Function.Value {
     };
 }
 
+pub fn caseClause(hir: Hir, index: Inst.Index) Case.Value {
+    std.debug.assert(hir.instructionTag(index) == .case_clause);
+    const payload = hir.extraData(Case, hir.instructionData(index).pl.payload_index);
+    return .{
+        .word = payload.data.word,
+        .items = hir.instructionSlice(payload.end, payload.data.items_len),
+        .redirects = hir.instructionSlice(payload.end + payload.data.items_len, payload.data.redirects_len),
+    };
+}
+
+pub fn caseItem(hir: Hir, index: Inst.Index) CaseItem.Value {
+    std.debug.assert(hir.instructionTag(index) == .case_item);
+    const payload = hir.extraData(CaseItem, hir.instructionData(index).pl.payload_index);
+    return .{ .body = payload.data.body, .patterns = hir.instructionSlice(payload.end, payload.data.patterns_len) };
+}
+
 pub fn extraData(hir: Hir, comptime T: type, index: ExtraIndex) ExtraData(T) {
     const fields = @typeInfo(T).@"struct";
     var result: T = undefined;
@@ -397,6 +413,10 @@ pub const Inst = struct {
         /// `data.pl`: `For`, followed by word and redirect `Inst.Index` values.
         for_clause,
 
+        /// `data.pl`: `Case` / `CaseItem`, followed by instruction indices.
+        case_clause,
+        case_item,
+
         /// `data.pl`: `Function`.
         function_definition,
 
@@ -541,6 +561,19 @@ pub const Function = struct {
         name: []const u8,
         body: Inst.Index,
     };
+};
+
+pub const Case = struct {
+    word: Inst.Index,
+    items_len: u32,
+    redirects_len: u32,
+    pub const Value = struct { word: Inst.Index, items: []const Inst.Index, redirects: []const Inst.Index };
+};
+
+pub const CaseItem = struct {
+    body: Inst.OptionalIndex,
+    patterns_len: u32,
+    pub const Value = struct { body: Inst.OptionalIndex, patterns: []const Inst.Index };
 };
 
 pub const SimpleCommand = struct {
