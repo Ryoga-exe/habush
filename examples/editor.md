@@ -39,3 +39,12 @@ The trigger/action separation and override order follow the approach in
 This terminal editor does not implement Ghostty's GUI/global keys or key sequences.
 The `complete` action uses the existing application-supplied completion service;
 it grants no new permissions to plugins. See [plugin examples](plugins/README.md).
+
+`prompt.spans` configures literal text with optional `style.foreground`,
+`style.background` (`default`, black, red, green, yellow, blue, magenta, cyan,
+white) and `style.bold`. Prompts are clipped to terminal width; control bytes
+are displayed visibly. ANSI and OSC in text are never executed. Embedders can
+also supply an `edit.Prompt.Provider`, receiving cwd/status and allocating the
+result in the caller's arena. An unavailable or invalid result uses the configured
+prompt. The provider runs once before collecting an input, including continuation
+lines, and does not change the Session's status.

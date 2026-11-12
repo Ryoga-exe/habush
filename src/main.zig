@@ -178,6 +178,7 @@ pub fn main(init: std.process.Init) !habush.runtime.ExitStatus {
         .io = io,
         .line_edit = config.lineEditEnabled(interactive, init.environ_map.get("TERM")),
         .keybinds = try habush.edit.Keybind.compile(arena, config.keybinds),
+        .prompt = config.prompt orelse habush.edit.Prompt.primary,
         .completion_limits = config.completion_limits,
         .resolver_options = resolver_options,
         .completion_provider = if (features.wasm_plugins) plugins.provider() else null,

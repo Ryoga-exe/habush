@@ -63,9 +63,13 @@ pub const LineInput = struct {
     }
 
     pub fn columns(_: LineInput) usize {
-        var size: posix.winsize = undefined;
-        const rc = posix.system.ioctl(0, posix.T.IOCGWINSZ, @intFromPtr(&size));
-        if (posix.errno(rc) != .SUCCESS or size.col < 16) return 80;
-        return size.col;
+        return terminalColumns();
     }
 };
+
+pub fn terminalColumns() usize {
+    var size: posix.winsize = undefined;
+    const rc = posix.system.ioctl(0, posix.T.IOCGWINSZ, @intFromPtr(&size));
+    if (posix.errno(rc) != .SUCCESS or size.col < 16) return 80;
+    return size.col;
+}

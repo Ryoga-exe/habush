@@ -10,6 +10,7 @@ shell_integration: Mode = .auto,
 load_rc: bool = true,
 plugins: []Plugin = &.{},
 keybinds: []const @import("habush-edit").Keybind.Spec = &.{},
+prompt: ?@import("habush-edit").Prompt = null,
 /// Shared by completion providers; guest execution budgets
 /// remain the plugin host's responsibility.
 completion_limits: @import("habush").Completion.Provider.Limits = .{},
@@ -39,6 +40,7 @@ pub const max_rc_bytes = 1024 * 1024;
 pub fn parse(options: std.zon.parse.Options) !Config {
     const config = try std.zon.parse.fromSlice(Config, options);
     if (config.version != 1) return error.UnsupportedConfigVersion;
+    if (config.prompt) |prompt| if (!prompt.valid()) return error.InvalidPrompt;
     for (config.keybinds) |binding| _ = try @import("habush-edit").Keybind.Key.parse(binding.key);
     for (config.plugins, 0..) |plugin, plugin_index| {
         if (!validString(plugin.path) or (plugin.commands.len == 0 and plugin.completions.len == 0))
@@ -106,6 +108,7 @@ pub fn reportError(writer: *std.Io.Writer, path: ?[]const u8, err: anyerror) std
         error.InvalidShellIntegrationSetting => "HABUSH_SHELL_INTEGRATION must be auto, on, or off",
         error.UnsupportedConfigVersion => "unsupported config version",
         error.InvalidKeybind => "unsupported keybinding trigger",
+        error.InvalidPrompt => "prompt exceeds display limits or contains NUL",
         error.InvalidPluginConfiguration => "plugin paths, command names, and entries must be nonempty and valid",
         error.ReservedPluginCommand => "plugin command name is reserved for a builtin",
         error.DuplicatePluginCommand => "duplicate plugin command name",
@@ -282,6 +285,7 @@ test "ZON configuration validates fields and honors explicit paths without JSON 
         ".{ .load_rc = true, .load_rc = false }",
         ".{ .line_edit = .maybe }",
         ".{ .version = 2 }",
+        ".{ .prompt = .{ .spans = .{.{ .text = \"bad\\x00\" }} } }",
         ".{ .keybinds = .{.{ .key = \"super+a\", .action = .complete }} }",
         ".{ .keybinds = .{.{ .key = \"ctrl+l\", .action = .missing }} }",
         ".{ .plugins = .{.{ .path = \"x\", .commands = .{.{ .name = \"true\" }} }} }",

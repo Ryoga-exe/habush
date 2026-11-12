@@ -10,7 +10,7 @@ const LineEditor = @This();
 gpa: std.mem.Allocator,
 input: *std.Io.Reader,
 output: *std.Io.Writer,
-prompt: []const u8,
+prompt: edit.Prompt,
 completion: ?edit.Completion = null,
 history: ?*const edit.History = null,
 keybinds: []const edit.Keybind = &.{},

@@ -1,9 +1,11 @@
 //! One-row terminal presentation. Control bytes are visible text; OSC belongs
 //! to ShellIntegration and never enters the editing buffer or width count.
 const std = @import("std");
+const Prompt = @import("habush-edit").Prompt;
 
-pub fn redraw(writer: *std.Io.Writer, prompt: []const u8, source: []const u8, cursor: usize, columns: usize) std.Io.Writer.Error!void {
-    const available = columns -| (prompt.len + 1);
+pub fn redraw(writer: *std.Io.Writer, prompt: Prompt, source: []const u8, cursor: usize, columns: usize) std.Io.Writer.Error!void {
+    const prompt_width = try writePrompt(null, prompt, columns -| 2);
+    const available = columns -| (prompt_width + 1);
     const width = @max(available, 1);
     const before_cursor = displayWidth(source[0..cursor]);
     const desired_start = before_cursor -| (width - 1);
@@ -15,7 +17,7 @@ pub fn redraw(writer: *std.Io.Writer, prompt: []const u8, source: []const u8, cu
         start += unit.len;
     }
     try writer.writeAll("\r\x1b[2K");
-    try writer.writeAll(prompt);
+    _ = try writePrompt(writer, prompt, columns -| 2);
     var index = start;
     var used: usize = 0;
     while (index < source.len) {
@@ -26,9 +28,38 @@ pub fn redraw(writer: *std.Io.Writer, prompt: []const u8, source: []const u8, cu
         index += unit.len;
     }
     try writer.writeByte('\r');
-    const column = prompt.len + before_cursor -| skipped;
+    const column = prompt_width + before_cursor -| skipped;
     if (column != 0) try writer.print("\x1b[{d}C", .{column});
     try writer.flush();
+}
+
+/// Width and output share the same clipping and escaping rules. ANSI is emitted
+/// from validated style values only; provider text is always literal data.
+pub fn writePrompt(writer: ?*std.Io.Writer, prompt: Prompt, max_width: usize) std.Io.Writer.Error!usize {
+    var width: usize = 0;
+    for (prompt.spans) |span| {
+        const styled = !std.meta.eql(span.style, Prompt.Style{});
+        if (writer) |output| {
+            if (styled) try output.print("\x1b[0;{d};{d}{s}m", .{
+                if (span.style.foreground == .default) @as(u8, 39) else 29 + @backingInt(span.style.foreground),
+                if (span.style.background == .default) @as(u8, 49) else 39 + @backingInt(span.style.background),
+                if (span.style.bold) ";1" else "",
+            });
+        }
+        var index: usize = 0;
+        while (index < span.text.len) {
+            const unit = decode(span.text[index..]);
+            if (unit.width > max_width - width) break;
+            if (writer) |output| try writeUnit(output, span.text[index..][0..unit.len], unit);
+            width += unit.width;
+            index += unit.len;
+        }
+        if (writer) |output| if (styled) {
+            try output.writeAll("\x1b[0m");
+        };
+        if (index != span.text.len) break;
+    }
+    return width;
 }
 
 pub fn writeVisible(writer: *std.Io.Writer, source: []const u8) std.Io.Writer.Error!void {
@@ -105,6 +136,15 @@ test "display width and visible controls preserve terminal boundaries" {
     try writeVisible(&output.writer, "a\x1b\n\xff日本\xe2\x80\xae");
     try std.testing.expectEqualStrings("a^[^J\\xFF日本\\u{202E}", output.written());
     output.clearRetainingCapacity();
-    try redraw(&output.writer, "> ", "0123456789", 10, 8);
+    try redraw(&output.writer, Prompt.secondary, "0123456789", 10, 8);
     try std.testing.expectEqualStrings("\r\x1b[2K> 6789\r\x1b[6C", output.written());
+}
+
+test "styled prompts measure Unicode cells and escape provider controls" {
+    const prompt: Prompt = .{ .spans = &.{.{ .text = "日\x1b]7;bad\n", .style = .{ .foreground = .green } }} };
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try std.testing.expectEqual(@as(usize, 4), try writePrompt(&output.writer, prompt, 4));
+    try std.testing.expectEqualStrings("\x1b[0;32;49m日^[\x1b[0m", output.written());
+    try std.testing.expectEqual(@as(usize, 4), try writePrompt(null, prompt, 4));
 }

@@ -5,6 +5,8 @@ const habush = @import("habush");
 const ShellIntegration = @import("terminal/ShellIntegration.zig");
 const LineEditor = @import("terminal/LineEditor.zig");
 const edit = @import("habush-edit");
+const render = @import("terminal/render.zig");
+const platform = @import("platform.zig");
 const CompletionService = @import("CompletionService.zig");
 const interrupt = @import("interrupt.zig");
 const Io = std.Io;
@@ -23,6 +25,8 @@ interruptible: bool = false,
 io: ?std.Io = null,
 line_edit: bool = false,
 keybinds: []const edit.Keybind = &.{},
+prompt: edit.Prompt = edit.Prompt.primary,
+prompt_provider: ?edit.Prompt.Provider = null,
 completion_limits: habush.Completion.Provider.Limits = .{},
 completion_provider: ?habush.Completion.Provider = null,
 resolver_options: habush.CommandResolver.System.Options = .{},
@@ -243,6 +247,21 @@ fn finishInput(
 }
 
 fn readCommand(self: *Shell) !?CommandInput {
+    var prompt_arena: std.heap.ArenaAllocator = .init(self.allocator);
+    defer prompt_arena.deinit();
+    var primary_prompt = self.prompt;
+    if (self.interactive) {
+        if (self.prompt_provider) |provider| {
+            const generated = provider.render(provider.userdata, prompt_arena.allocator(), .{
+                .cwd = self.session.workingDirectory(),
+                .status = self.session.lastResult().status,
+            }) catch |err| switch (err) {
+                error.Canceled, error.OutOfMemory => return err,
+                error.Unavailable => self.prompt,
+            };
+            if (generated.valid()) primary_prompt = generated;
+        }
+    }
     const source_line = self.input_line;
     const source_offset = self.input_byte_offset;
     var command: Io.Writer.Allocating = .init(self.allocator);
@@ -262,8 +281,9 @@ fn readCommand(self: *Shell) !?CommandInput {
     var continuation = false;
 
     while (true) {
-        if (self.interactive) try self.printPrompt(continuation);
-        const line = try self.readInputLine(if (continuation) "> " else "habush> ", command.written(), true) orelse {
+        const prompt = if (continuation) edit.Prompt.secondary else primary_prompt;
+        if (self.interactive) try self.printPrompt(continuation, prompt);
+        const line = try self.readInputLine(prompt, command.written(), true) orelse {
             if (self.interactive) try self.stderr.writeByte('\n');
             if (command.written().len == 0) {
                 command.deinit();
@@ -384,8 +404,8 @@ fn readHereDocument(
     var delimiter_candidate: Io.Writer.Allocating = .init(self.allocator);
     defer delimiter_candidate.deinit();
     while (true) {
-        if (self.interactive) try self.printPrompt(true);
-        const line = try self.readInputLine("> ", "", false) orelse {
+        if (self.interactive) try self.printPrompt(true, edit.Prompt.secondary);
+        const line = try self.readInputLine(edit.Prompt.secondary, "", false) orelse {
             body.deinit();
             return null;
         };
@@ -409,7 +429,7 @@ fn readHereDocument(
     }
 }
 
-fn readInputLine(self: *Shell, prompt: []const u8, prefix: []const u8, allow_completion: bool) !?[:0]u8 {
+fn readInputLine(self: *Shell, prompt: edit.Prompt, prefix: []const u8, allow_completion: bool) !?[:0]u8 {
     const line = (try self.takeEditedLine()) orelse if (self.interactive and self.line_edit and self.io != null) editor: {
         self.last_line_ending = .lf;
         self.input_byte_offset = null;
@@ -481,12 +501,12 @@ fn takeEditedLine(self: *Shell) !?[:0]u8 {
     return line;
 }
 
-fn printPrompt(self: *Shell, continuation: bool) !void {
+fn printPrompt(self: *Shell, continuation: bool, prompt: edit.Prompt) !void {
     if (!continuation) {
         if (self.integration) |*integration|
             try integration.beginPrompt(self.session.workingDirectory());
     }
-    try self.stderr.writeAll(if (continuation) "> " else "habush> ");
+    _ = try render.writePrompt(self.stderr, prompt, platform.terminalColumns() -| 2);
     if (!continuation) {
         if (self.integration) |*integration| try integration.endPrompt();
     }
@@ -700,6 +720,47 @@ test "script diagnostics retain raw CRLF here-document and final-line byte range
     try std.testing.expectEqualDeep(habush.Source.Range{ .start = @intCast(nested), .end = @intCast(nested + "missing_nested".len) }, capture.ranges[1].?);
     try std.testing.expectEqualDeep(habush.Source.Range{ .start = @intCast(last), .end = @intCast(script.len) }, capture.ranges[2].?);
     try std.testing.expectEqualStrings("", stderr.written());
+}
+
+test "prompt providers receive session context and failures use the configured fallback" {
+    const Provider = struct {
+        fail: bool = false,
+        fn renderPrompt(userdata: ?*anyopaque, arena: std.mem.Allocator, context: edit.Prompt.Context) edit.Prompt.Error!edit.Prompt {
+            const provider: *@This() = @ptrCast(@alignCast(userdata.?));
+            if (provider.fail) return error.Unavailable;
+            const text = try arena.print("{s}:{d}> ", .{ context.cwd.?, context.status });
+            return .{ .spans = try arena.dupe(edit.Prompt.Span, &.{.{ .text = text }}) };
+        }
+    };
+    const gpa = std.testing.allocator;
+    var system: habush.Host.System = .{ .gpa = gpa, .io = std.testing.io };
+    defer system.deinit();
+    var session = try habush.Session.init(gpa, system.host(), .{ .context = .{ .cwd = "/work" } });
+    defer session.deinit();
+    var evaluated = try session.evaluate("false", .{});
+    defer evaluated.deinit(gpa);
+    var output: Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var reader: Io.Reader = .fixed(":\n");
+    var provider: Provider = .{};
+    var shell: Shell = .{
+        .allocator = gpa,
+        .stdin = &reader,
+        .stderr = &output.writer,
+        .session = &session,
+        .interactive = true,
+        .prompt_provider = .{ .userdata = &provider, .render = Provider.renderPrompt },
+    };
+    var first = (try shell.readCommand()).?;
+    defer first.deinit(gpa);
+    try std.testing.expectEqualStrings("/work:1> ", output.written());
+    output.clearRetainingCapacity();
+    reader = .fixed(":\n");
+    provider.fail = true;
+    var second = (try shell.readCommand()).?;
+    defer second.deinit(gpa);
+    try std.testing.expectEqualStrings("habush> ", output.written());
+    try std.testing.expectEqual(@as(u8, 1), session.lastResult().status);
 }
 
 test "recalled compound input collects here-documents before execution" {
