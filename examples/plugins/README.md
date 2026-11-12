@@ -140,7 +140,72 @@ Their schemas use the existing byte-list transport; Core ABI remains v0:
 
 Join all calls before destroying their module, and destroy modules before their host. This first implementation uses ordinary borrowed Zig objects; it does not provide hot unload or persistent guest instances. Compilation is limited to 4 MiB of Wasm input but is not covered by invocation deadlines/fuel or a process-wide memory limit.
 
-`Scope` grants optional stdin/stdout/stderr streams for one invocation. Missing grants deny access, so the same module's completion entry cannot use its command's streams. No WASI, environment, filesystem, network, subprocess, or Session access is linked. Native streams are supplied by the embedding application and must honor cancellation and their I/O deadlines; epoch interruption cannot stop an arbitrary blocking native callback.
+`Scope` grants optional streams and a read directory for one invocation. Missing
+grants deny access; completion, prompt, and diagnostic calls receive no command
+streams. No WASI, filesystem writes, environment, network, subprocess, or Session
+mutation API is linked. Native streams supplied by an embedding application must
+honor cancellation and I/O deadlines; epoch interruption cannot stop an arbitrary
+blocking native callback.
+
+## Capability declarations and grants
+
+ZON registrations retain `.declares` separately from `.grants`; both default to
+no permissions. A grant exceeding the declaration is a configuration error.
+Supported flags are `stdin`, `stdout`, `stderr`, `fs_read`, `source` (editor input
+for completion/diagnostics), and `context` (the selected Prompt snapshot).
+Explicit command argv and plugin-local options are supplied by the caller.
+
+```zon
+.declares = .{ .fs_read = true, .stdout = true },
+.grants = .{ .fs_read = true, .stdout = true },
+.read_directory = ".",
+```
+
+This allows reading files under the config file's directory and writing to the
+command's explicitly supplied stdout. `.read_directory` is required for an
+`fs_read` grant and opened once when loading the plugin; later `cd` or path-link
+changes do not select a new root. Try the read-only filesystem demo:
+
+```sh
+zig build -Dwasm-plugins=true
+zig-out/bin/habush --config examples/plugins/read-file.zon -c 'hb-read theme.zon'
+```
+
+The demo prints that file and exits 7 like its other command entry. `../` and
+absolute paths fail. The initial broker supports native Linux, macOS, and
+FreeBSD, using directory handles and no-follow component traversal. Child paths
+use `/`; empty/parent/dot steps, NUL, backslashes, colons, symlinks, and special
+files are rejected. Other targets report unsupported instead of falling back
+to unrestricted access. The Wasmtime SDK still supports only the two targets
+listed above.
+
+The effective set is the intersection of the configured declaration, user grant,
+and caller's ceiling. The CLI further limits each extension purpose. A permission
+bit never supplies a missing resource. Prompt snapshots are redacted without
+`context`; completion and diagnostic adapters deny input access without `source`.
+These checks live in the shared adapters as well as the host imports. Raw
+`Module.invoke` request bytes are data explicitly supplied by the embedding host.
+
+`habush.capability.Set` and `Scope` are also exported by `habush-exec`, so agent
+tool adapters can use the same attenuation and read boundary:
+
+```zig
+const tool_scope = parent_scope.narrow(.{ .fs_read = true });
+const count = try tool_scope.readFile(io, relative_path, output_buffer);
+```
+
+The parent keeps the directory alive until all operations have joined. The
+native `readFile` method checks authority and bounds; its caller controls task
+scheduling/deadlines. The Wasm host couples file I/O to the call's input-byte
+budget, cancellation, and deadline, joining native I/O before destroying guest
+memory. Declared/granted fields remain inspectable on `Host.Module`; guests can
+query their current effective mask with `habush.capabilities()`.
+
+This is a host-mediated capability boundary. Native callbacks and external
+commands require their own enforcement; a `Set` does not sandbox arbitrary
+syscalls. External-process restrictions continue to use `SandboxPolicy` and an
+explicit OS backend. A filesystem grant covering the history file also allows
+reading that file; separate editor APIs do not revoke that access.
 
 Fuel, linear memory, table/instance counts, request/reply bytes, input/output bytes and an optional deadline bound calls. Initialization and ABI helpers share the same budgets as the entry. Epoch checkpoints propagate cancellation and deadlines while executing Wasm. A normal command's nonzero status is separate from a trap or host failure. Bytes already read or written before a failure are not rolled back.
 
@@ -163,6 +228,8 @@ The host imports are:
 habush.write(descriptor: i32, pointer: i32, length: i32) -> i32
 habush.read(descriptor: i32, pointer: i32, length: i32) -> i32
 habush.option(key_pointer: i32, key_length: i32, output: i32, capacity: i32) -> i32
+habush.read_file(path_pointer: i32, path_length: i32, output: i32, capacity: i32) -> i32
+habush.capabilities() -> i32
 ```
 
 Write descriptors 1 and 2 require the corresponding scope writer. Read descriptor 0 requires stdin. Other descriptors and missing grants fail the call. Return values count bytes transferred; read may return fewer bytes than requested and returns zero at EOF or for an empty request. Both validate guest memory and enforce byte budgets before I/O. A failed operation traps the call rather than returning an unchecked error code to the guest.
@@ -171,6 +238,13 @@ Write descriptors 1 and 2 require the corresponding scope writer. Read descripto
 length, or -1 for a missing key. An insufficient capacity, invalid guest memory,
 or expired call fails the invocation. Settings are available during initialization
 and never include the full configuration, environment, or another plugin's values.
+
+`read_file` copies a regular file from the granted directory, returning the byte
+count. The file must fit the supplied capacity and remaining input budget;
+failures trap the invocation. It exposes no write/open-handle operation.
+`capabilities` returns bits 0..5 for stdin, stdout, stderr, fs_read, source,
+context. Stream/file bits are removed when the call lacks the corresponding
+resource; reserved bits are zero.
 
 ## Extension schemas v0
 

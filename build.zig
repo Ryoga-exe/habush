@@ -141,6 +141,7 @@ pub fn build(b: *std.Build) !void {
         });
         plugin.addImport("wasmtime", headers.createModule());
         plugin.addImport("habush-edit", habush_edit);
+        plugin.addImport("habush", habush);
         plugin_module = plugin;
         exe.root_module.addImport("habush-plugin", plugin);
         plugin.addLibraryPath(sdk.path("lib"));

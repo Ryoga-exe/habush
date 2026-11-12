@@ -52,6 +52,8 @@ pub fn main(init: std.process.Init) !void {
             .plugins = .{
                 .{
                     .path = module_path,
+                    .declares = .{ .stdin = true, .stdout = true },
+                    .grants = .{ .stdin = true, .stdout = true },
                     .fuel = std.math.maxInt(u64),
                     .timeout_ms = 5000,
                     .commands = .{.{ .name = "hb-demo" }},
@@ -59,9 +61,18 @@ pub fn main(init: std.process.Init) !void {
                 .{
                     .path = module_path,
                     .completions = .{ .{ .command = "hb-demo" }, .{ .command = "/bin/echo" } },
+                    .declares = .{ .source = true },
+                    .grants = .{ .source = true },
                     .diagnostics = .{},
                 },
-                .{ .path = theme_path, .prompt = .{}, .options = .{ .{ "symbol", "THEME>" }, .{ "failure_color", "yellow" } } },
+                .{ .path = theme_path, .prompt = .{}, .declares = .{ .context = true }, .grants = .{ .context = true }, .options = .{ .{ "symbol", "THEME>" }, .{ "failure_color", "yellow" } } },
+                .{
+                    .path = module_path,
+                    .commands = .{.{ .name = "hb-read", .entry = "file" }},
+                    .declares = .{ .fs_read = true, .stdout = true },
+                    .grants = .{ .fs_read = true, .stdout = true },
+                    .read_directory = std.fs.path.dirname(config_path.?).?,
+                },
             },
         }, .{}, &config.writer);
     } else {
@@ -135,7 +146,7 @@ pub fn main(init: std.process.Init) !void {
     try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "DIAGNOSTIC:0\r\n") != null);
 
     if (args.len == 4) {
-        try pluginScenario(io, master, &terminal);
+        try pluginScenario(io, master, &terminal, config_path.?);
     } else {
         try historyScenario(io, master, &terminal);
         try master.writeStreamingAll(io, "jjjjjjjjj; /bin/echo STATUS:$?\r");
@@ -336,9 +347,15 @@ fn historyScenario(io: Io, master: Io.File, terminal: *Terminal) !void {
     try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "README.md\r\n") != null);
 }
 
-fn pluginScenario(io: Io, master: Io.File, terminal: *Terminal) !void {
+fn pluginScenario(io: Io, master: Io.File, terminal: *Terminal, config_path: []const u8) !void {
     try master.writeStreamingAll(io, "origin=$PWD; cd /\r");
     try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "\x1b[0;36;49;1m/\x1b[0m") != null);
+    const read_command = try std.fmt.allocPrint(std.heap.smp_allocator, "hb-read {s}\r", .{std.fs.path.basename(config_path)});
+    defer std.heap.smp_allocator.free(read_command);
+    try master.writeStreamingAll(io, read_command);
+    try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "read_directory") != null);
+    try master.writeStreamingAll(io, "hb-read ../etc/passwd\r");
+    try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "permission denied") != null);
     try master.writeStreamingAll(io, "cd \"$origin\"\r");
     _ = try terminal.expect(ready);
     try master.writeStreamingAll(io, "NOTE");

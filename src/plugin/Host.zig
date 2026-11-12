@@ -1,7 +1,8 @@
 //! Core Wasm ABI v0. The embedding application owns modules and call scopes.
-//! No WASI is linked. Imports expose call-scoped streams and plugin settings.
+//! No WASI is linked. Imports expose explicit streams, read roots, and settings.
 const std = @import("std");
 const c = @import("wasmtime");
+const capability = @import("habush").capability;
 const Host = @This();
 
 io: std.Io,
@@ -39,6 +40,8 @@ pub const Limits = struct {
 pub const Scope = struct {
     limits: Limits = .{},
     options: []const [2][]const u8 = &.{},
+    /// Explicit resources are still required; permissions alone grant no I/O.
+    capabilities: capability.Scope = .{ .permissions = .all },
     stdin: ?*std.Io.Reader = null,
     stdout: ?*std.Io.Writer = null,
     stderr: ?*std.Io.Writer = null,
@@ -87,6 +90,13 @@ pub fn load(host: *Host, bytes: []const u8) Error!Module {
 pub const Module = struct {
     host: *Host,
     module: *c.wasmtime_module_t,
+    /// Embedders can inspect the declaration separately from their own grant.
+    declared: capability.Set = .all,
+    granted: capability.Set = .all,
+
+    pub fn permissions(module: Module, ceiling: capability.Set) capability.Set {
+        return module.declared.intersect(module.granted).intersect(ceiling);
+    }
 
     /// Calls borrow the module. The caller joins them before deinit/unload.
     pub fn deinit(module: *Module) void {
@@ -114,6 +124,11 @@ pub const Module = struct {
             .scope = scope,
             .deadline = if (scope.limits.timeout) |duration| std.Io.Timestamp.now(host.io, .awake).addDuration(duration) else null,
         };
+        call.scope.capabilities = scope.capabilities.narrow(module.permissions(.all));
+        call.scope.capabilities.permissions.stdin = call.scope.capabilities.permissions.stdin and scope.stdin != null;
+        call.scope.capabilities.permissions.stdout = call.scope.capabilities.permissions.stdout and scope.stdout != null;
+        call.scope.capabilities.permissions.stderr = call.scope.capabilities.permissions.stderr and scope.stderr != null;
+        call.scope.capabilities.permissions.fs_read = call.scope.capabilities.permissions.fs_read and scope.capabilities.directory != null;
         const store = c.wasmtime_store_new(host.engine, null, null) orelse return error.OutOfMemory;
         defer c.wasmtime_store_delete(store);
         const context = c.wasmtime_store_context(store).?;
@@ -126,8 +141,11 @@ pub const Module = struct {
         c.wasmtime_context_set_epoch_deadline(context, 1);
         const linker = c.wasmtime_linker_new(host.engine) orelse return error.OutOfMemory;
         defer c.wasmtime_linker_delete(linker);
-        try defineStreams(linker, &call);
-        try defineOption(linker, &call);
+        try defineImport(linker, &call, "write", 3, write);
+        try defineImport(linker, &call, "read", 3, read);
+        try defineImport(linker, &call, "option", 4, option);
+        try defineImport(linker, &call, "read_file", 4, readFile);
+        try defineImport(linker, &call, "capabilities", 0, capabilities);
         var instance: c.wasmtime_instance_t = undefined;
         var trap: ?*c.wasm_trap_t = null;
         const failure = c.wasmtime_linker_instantiate(linker, context, module.module, &instance, &trap);
@@ -216,35 +234,16 @@ fn instanceBytes(context: *c.wasmtime_context_t, instance: *const c.wasmtime_ins
     return memoryBytes(context, &exported.of.memory, start, length);
 }
 
-fn defineStreams(linker: *c.wasmtime_linker_t, call: *Call) Error!void {
+fn defineImport(linker: *c.wasmtime_linker_t, call: *Call, name: []const u8, arity: usize, callback: c.wasmtime_func_callback_t) Error!void {
     var parameters: c.wasm_valtype_vec_t = undefined;
-    c.wasm_valtype_vec_new_uninitialized(&parameters, 3);
-    for (0..3) |index| parameters.data[index] = c.wasm_valtype_new(c.WASM_I32);
+    c.wasm_valtype_vec_new_uninitialized(&parameters, arity);
+    for (0..arity) |index| parameters.data[index] = c.wasm_valtype_new(c.WASM_I32);
     var results: c.wasm_valtype_vec_t = undefined;
     c.wasm_valtype_vec_new_uninitialized(&results, 1);
     results.data[0] = c.wasm_valtype_new(c.WASM_I32);
     const signature = c.wasm_functype_new(&parameters, &results) orelse return error.OutOfMemory;
     defer c.wasm_functype_delete(signature);
-    if (c.wasmtime_linker_define_func(linker, "habush", 6, "write", 5, signature, write, call, null)) |failure| {
-        c.wasmtime_error_delete(failure);
-        return error.InvalidAbi;
-    }
-    if (c.wasmtime_linker_define_func(linker, "habush", 6, "read", 4, signature, read, call, null)) |failure| {
-        c.wasmtime_error_delete(failure);
-        return error.InvalidAbi;
-    }
-}
-
-fn defineOption(linker: *c.wasmtime_linker_t, call: *Call) Error!void {
-    var parameters: c.wasm_valtype_vec_t = undefined;
-    c.wasm_valtype_vec_new_uninitialized(&parameters, 4);
-    for (0..4) |index| parameters.data[index] = c.wasm_valtype_new(c.WASM_I32);
-    var results: c.wasm_valtype_vec_t = undefined;
-    c.wasm_valtype_vec_new_uninitialized(&results, 1);
-    results.data[0] = c.wasm_valtype_new(c.WASM_I32);
-    const signature = c.wasm_functype_new(&parameters, &results) orelse return error.OutOfMemory;
-    defer c.wasm_functype_delete(signature);
-    if (c.wasmtime_linker_define_func(linker, "habush", 6, "option", 6, signature, option, call, null)) |failure| {
+    if (c.wasmtime_linker_define_func(linker, "habush", 6, name.ptr, name.len, signature, callback, call, null)) |failure| {
         c.wasmtime_error_delete(failure);
         return error.InvalidAbi;
     }
@@ -263,6 +262,7 @@ fn option(data: ?*anyopaque, caller: ?*c.wasmtime_caller_t, args: [*c]const c.wa
 
 fn optionBytes(call: *Call, caller: *c.wasmtime_caller_t, key_pointer: u32, key_length: u32, pointer: u32, capacity: u32) Error!u32 {
     try call.checkpoint();
+    if (key_length > 4096) return error.LimitExceeded;
     const key = try callerBytes(caller, key_pointer, key_length);
     for (call.scope.options) |pair| {
         if (!std.mem.eql(u8, pair[0], key)) continue;
@@ -286,7 +286,7 @@ fn read(data: ?*anyopaque, caller: ?*c.wasmtime_caller_t, args: [*c]const c.wasm
 
 fn readBytes(call: *Call, caller: *c.wasmtime_caller_t, descriptor: u32, pointer: u32, length: u32) Error!u32 {
     try call.checkpoint();
-    if (descriptor != 0) return error.PermissionDenied;
+    if (descriptor != 0 or !call.scope.capabilities.permissions.stdin) return error.PermissionDenied;
     const reader = call.scope.stdin orelse return error.PermissionDenied;
     if (length > call.scope.limits.input_bytes -| call.read) return error.LimitExceeded;
     const bytes = try callerBytes(caller, pointer, length);
@@ -318,8 +318,8 @@ fn write(data: ?*anyopaque, caller: ?*c.wasmtime_caller_t, args: [*c]const c.was
 fn writeBytes(call: *Call, caller: *c.wasmtime_caller_t, descriptor: u32, pointer: u32, length: u32) Error!u32 {
     try call.checkpoint();
     const writer = (switch (descriptor) {
-        1 => call.scope.stdout,
-        2 => call.scope.stderr,
+        1 => if (call.scope.capabilities.permissions.stdout) call.scope.stdout else null,
+        2 => if (call.scope.capabilities.permissions.stderr) call.scope.stderr else null,
         else => null,
     }) orelse return error.PermissionDenied;
     if (length > call.scope.limits.output_bytes -| call.written) return error.LimitExceeded;
@@ -327,6 +327,60 @@ fn writeBytes(call: *Call, caller: *c.wasmtime_caller_t, descriptor: u32, pointe
     try writer.writeAll(bytes);
     call.written += length;
     return length;
+}
+
+fn capabilities(data: ?*anyopaque, _: ?*c.wasmtime_caller_t, _: [*c]const c.wasmtime_val_t, _: usize, results: [*c]c.wasmtime_val_t, _: usize) callconv(.c) ?*c.wasm_trap_t {
+    const call: *const Call = @ptrCast(@alignCast(data.?));
+    results[0] = i32Value(@as(u8, @bitCast(call.scope.capabilities.permissions)));
+    return null;
+}
+
+fn readFile(data: ?*anyopaque, caller: ?*c.wasmtime_caller_t, args: [*c]const c.wasmtime_val_t, _: usize, results: [*c]c.wasmtime_val_t, _: usize) callconv(.c) ?*c.wasm_trap_t {
+    const call: *Call = @ptrCast(@alignCast(data.?));
+    const length = readFileBytes(call, caller.?, @bitCast(args[0].of.i32), @bitCast(args[1].of.i32), @bitCast(args[2].of.i32), @bitCast(args[3].of.i32)) catch |err| {
+        call.failure = err;
+        const message = "habush: plugin file read failed";
+        return c.wasmtime_trap_new(message.ptr, message.len);
+    };
+    results[0] = i32Value(length);
+    return null;
+}
+
+fn grantedRead(scope: capability.Scope, io: std.Io, path: []const u8, buffer: []u8) Error!usize {
+    return scope.readFile(io, path, buffer) catch |err| switch (err) {
+        error.Unsupported => error.PermissionDenied,
+        else => |other| other,
+    };
+}
+
+fn expire(io: std.Io, duration: std.Io.Duration) std.Io.Cancelable!void {
+    return io.sleep(duration, .awake);
+}
+
+fn readFileBytes(call: *Call, caller: *c.wasmtime_caller_t, path_pointer: u32, path_length: u32, pointer: u32, capacity: u32) Error!u32 {
+    try call.checkpoint();
+    if (!call.scope.capabilities.permissions.fs_read or call.scope.capabilities.directory == null) return error.PermissionDenied;
+    if (path_length > std.Io.Dir.max_path_bytes or capacity > call.scope.limits.input_bytes -| call.read) return error.LimitExceeded;
+    const path = try callerBytes(caller, path_pointer, path_length);
+    const buffer = try callerBytes(caller, pointer, capacity);
+    const count = if (call.deadline) |deadline| read: {
+        const Result = union(enum) { read: Error!usize, expired: std.Io.Cancelable!void };
+        var storage: [2]Result = undefined;
+        var pending: std.Io.Select(Result) = .init(call.io, &storage);
+        defer pending.cancelDiscard();
+        pending.concurrent(.read, grantedRead, .{ call.scope.capabilities, call.io, path, buffer }) catch return error.ReadFailed;
+        pending.concurrent(.expired, expire, .{ call.io, std.Io.Duration{ .nanoseconds = @max(0, deadline.nanoseconds - std.Io.Timestamp.now(call.io, .awake).nanoseconds) } }) catch return error.ReadFailed;
+        switch (try pending.await()) {
+            .read => |result| break :read try result,
+            .expired => |result| {
+                try result;
+                return error.Timeout;
+            },
+        }
+    } else try grantedRead(call.scope.capabilities, call.io, path, buffer);
+    call.read += count;
+    try call.checkpoint();
+    return @intCast(count);
 }
 
 fn callerBytes(caller: *c.wasmtime_caller_t, pointer: u32, length: u32) Error![]u8 {

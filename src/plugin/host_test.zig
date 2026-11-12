@@ -3,16 +3,20 @@ const c = @import("wasmtime");
 const Host = @import("Host.zig");
 const command = @import("command.zig");
 const completion = @import("completion.zig");
+extern "c" fn mkfifo(path: [*:0]const u8, mode: std.posix.mode_t) c_int;
 
 const fixture =
     \\(module
     \\ (import "habush" "write" (func $write (param i32 i32 i32) (result i32)))
     \\ (import "habush" "read" (func $read (param i32 i32 i32) (result i32)))
     \\ (import "habush" "option" (func $option (param i32 i32 i32 i32) (result i32)))
+    \\ (import "habush" "read_file" (func $read_file (param i32 i32 i32 i32) (result i32)))
+    \\ (import "habush" "capabilities" (func $capabilities (result i32)))
     \\ (memory (export "memory") 1)
     \\ (data (i32.const 0) "\07choice")
     \\ (data (i32.const 32) "\01\00\00\00\08\00\00\00a b'$(x)")
     \\ (data (i32.const 128) "symbol")
+    \\ (data (i32.const 512) "\02\00\00\00\03\00\00\00000\04\00\00\00safe")
     \\ (func (export "habush_version") (result i32) i32.const 0)
     \\ (func (export "habush_alloc") (param i32) (result i32) i32.const 4096)
     \\ (func (export "command") (param i32 i32) (result i64)
@@ -25,6 +29,15 @@ const fixture =
     \\   i32.const 128 i32.const 6 local.get $out i32.const 64 call $option local.set $n
     \\   local.get $n i32.const 0 i32.lt_s if (result i64) i64.const 0 else
     \\     local.get $n i64.extend_i32_u i64.const 32 i64.shl local.get $out i64.extend_i32_u i64.or end)
+    \\ (func (export "read_file") (param i32 i32) (result i64)
+    \\   local.get 0 local.get 1 i32.const 1024 i32.const 64 call $read_file
+    \\   i64.extend_i32_u i64.const 32 i64.shl i64.const 1024 i64.or)
+    \\ (func (export "capabilities") (param i32 i32) (result i64)
+    \\   i32.const 1024 call $capabilities i32.store8 i64.const 4294968320)
+    \\ (func (export "redacted_prompt") (param i32 i32) (result i64)
+    \\   local.get 0 i32.load offset=9 if unreachable end
+    \\   local.get 0 i32.load8_u offset=17 i32.const 48 i32.ne if unreachable end
+    \\   i64.const 19 i64.const 32 i64.shl i64.const 512 i64.or)
     \\ (func (export "candidates") (param i32 i32) (result i64)
     \\   i64.const 68719476768)
     \\ (func (export "read_echo") (param i32 i32) (result i64) (local $n i32)
@@ -58,6 +71,59 @@ fn load(host: *Host, wat: []const u8) !Host.Module {
     }
     defer c.wasm_byte_vec_delete(&wasm);
     return host.load(wasm.data[0..wasm.size]);
+}
+
+test "declared file reads require grants and parent scope, redact context, and reject special files" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "file", .data = "allowed" });
+    var host = try Host.init(io);
+    defer host.deinit();
+    var module = try load(&host, fixture);
+    defer module.deinit();
+    module.declared = .{ .fs_read = true };
+    module.granted = .{ .fs_read = true };
+    const scope: Host.Scope = .{ .capabilities = .{ .permissions = .{ .fs_read = true }, .directory = tmp.dir } };
+    const bytes = try module.invoke(gpa, "read_file", "file", scope);
+    defer gpa.free(bytes);
+    try std.testing.expectEqualStrings("allowed", bytes);
+    const mask = try module.invoke(gpa, "capabilities", "", scope);
+    defer gpa.free(mask);
+    try std.testing.expectEqualSlices(u8, &.{8}, mask);
+    try std.testing.expectError(error.PermissionDenied, module.invoke(gpa, "read_file", "../outside", scope));
+    var narrowed = scope;
+    narrowed.capabilities = scope.capabilities.narrow(.{}).narrow(.all);
+    try std.testing.expectError(error.PermissionDenied, module.invoke(gpa, "read_file", "file", narrowed));
+    try std.testing.expectError(error.PermissionDenied, module.invoke(gpa, "read_file", "file", .{}));
+    try std.testing.expectError(error.PermissionDenied, completion.collect(&module, gpa, "spin", "", &.{}, scope, 128));
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const prompt = try @import("prompt.zig").render(&module, arena.allocator(), "redacted_prompt", .{ .cwd = "/private", .status = 7 }, .{});
+    try std.testing.expectEqualStrings("safe", prompt.spans[0].text);
+    module.granted = .{};
+    try std.testing.expectError(error.PermissionDenied, module.invoke(gpa, "read_file", "file", scope));
+    module.granted = .{ .fs_read = true };
+    module.declared = .{};
+    try std.testing.expectError(error.PermissionDenied, module.invoke(gpa, "read_file", "file", scope));
+    module.declared = .{ .fs_read = true };
+    const directory_path = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(directory_path);
+    const fifo_path = try std.fs.path.join(gpa, &.{ directory_path, "pipe" });
+    defer gpa.free(fifo_path);
+    const fifo_z = try gpa.dupeSentinel(u8, fifo_path, 0);
+    defer gpa.free(fifo_z);
+    if (mkfifo(fifo_z, 0o600) != 0) return error.CreateFifoFailed;
+    var timed = scope;
+    try std.testing.expectError(error.PermissionDenied, module.invoke(gpa, "read_file", "pipe", timed));
+    timed.limits.timeout = .fromMilliseconds(0);
+    try std.testing.expectError(error.Timeout, module.invoke(gpa, "read_file", "file", timed));
+    var unsupported = try load(&host,
+        \\(module (import "habush" "write_file" (func)))
+    );
+    defer unsupported.deinit();
+    try std.testing.expectError(error.InstantiationFailed, unsupported.invoke(gpa, "unused", "", scope));
 }
 
 test "plugin options are call-local, bounded, and validate guest memory" {

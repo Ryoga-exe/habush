@@ -1,0 +1,10 @@
+.{
+    .load_rc = false,
+    .plugins = .{.{
+        .path = "../../zig-out/bin/habush-plugin-demo.wasm",
+        .commands = .{.{ .name = "hb-read", .entry = "file" }},
+        .declares = .{ .fs_read = true, .stdout = true },
+        .grants = .{ .fs_read = true, .stdout = true },
+        .read_directory = ".",
+    }},
+}

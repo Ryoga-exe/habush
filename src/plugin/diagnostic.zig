@@ -5,6 +5,7 @@ const protocol = @import("protocol.zig");
 const Diagnostic = @import("habush-edit").Diagnostic;
 
 pub fn collect(module: *const Host.Module, arena: std.mem.Allocator, entry: []const u8, request: Diagnostic.Request, scope: Host.Scope) Host.Error!Diagnostic.Result {
+    if (!module.permissions(scope.capabilities.permissions).source) return error.PermissionDenied;
     var number: [20]u8 = undefined;
     const revision = std.fmt.bufPrint(&number, "{d}", .{request.revision}) catch unreachable;
     const bytes = try protocol.encode(arena, &.{&.{ revision, request.source }}, scope.limits.request_bytes);

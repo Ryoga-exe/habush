@@ -3,6 +3,8 @@
     .prompt_context = .{ .git = true },
     .plugins = .{.{
         .path = "../../zig-out/bin/habush-theme.wasm",
+        .declares = .{ .context = true },
+        .grants = .{ .context = true },
         .prompt = .{},
         .options = .{
             .{ "symbol", "❯" },

@@ -4,7 +4,8 @@ const Host = @import("Host.zig");
 const protocol = @import("protocol.zig");
 const Prompt = @import("habush-edit").Prompt;
 
-pub fn render(module: *const Host.Module, arena: std.mem.Allocator, entry: []const u8, context: Prompt.Context, scope: Host.Scope) Host.Error!Prompt {
+pub fn render(module: *const Host.Module, arena: std.mem.Allocator, entry: []const u8, supplied_context: Prompt.Context, scope: Host.Scope) Host.Error!Prompt {
+    const context = if (module.permissions(scope.capabilities.permissions).context) supplied_context else Prompt.Context{ .cwd = null, .status = 0 };
     var status: [3]u8 = undefined;
     const code = std.fmt.bufPrint(&status, "{d}", .{context.status}) catch unreachable;
     var duration_buffer: [20]u8 = undefined;

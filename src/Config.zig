@@ -25,6 +25,9 @@ pub const History = struct {
 };
 pub const Plugin = struct {
     path: []const u8,
+    declares: @import("habush").capability.Set = .{},
+    grants: @import("habush").capability.Set = .{},
+    read_directory: ?[]const u8 = null,
     /// Plugin-defined UTF-8/byte settings; never the app's full configuration.
     options: []const [2][]const u8 = &.{},
     commands: []const Command = &.{},
@@ -59,6 +62,10 @@ pub fn parse(options: std.zon.parse.Options) !Config {
     if (config.prompt) |prompt| if (!prompt.valid()) return error.InvalidPrompt;
     for (config.keybinds) |binding| _ = try @import("habush-edit").Keybind.Key.parse(binding.key);
     for (config.plugins, 0..) |plugin, plugin_index| {
+        const permissions = @import("habush").capability.Set;
+        if (!permissions.all.contains(plugin.declares) or !plugin.declares.contains(plugin.grants) or
+            plugin.grants.fs_read != (plugin.read_directory != null)) return error.InvalidPluginPermissions;
+        if (plugin.read_directory) |root| if (!validString(root)) return error.InvalidPluginPermissions;
         var option_bytes: usize = 0;
         if (plugin.options.len > 32) return error.InvalidPluginOptions;
         for (plugin.options, 0..) |option, index| {
@@ -110,6 +117,10 @@ fn read(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, path: []co
     for (config.plugins) |*plugin| {
         if (!std.fs.path.isAbsolute(plugin.path))
             plugin.path = try std.fs.path.join(arena, &.{ std.fs.path.dirname(path) orelse ".", plugin.path });
+        if (plugin.read_directory) |root| if (!std.fs.path.isAbsolute(root)) {
+            const base = try std.Io.Dir.cwd().realPathFileAlloc(io, std.fs.path.dirname(path) orelse ".", arena);
+            plugin.read_directory = try std.fs.path.join(arena, &.{ base, root });
+        };
     }
     if (config.history.storage.path) |history_path| {
         if (!std.fs.path.isAbsolute(history_path)) {
@@ -145,6 +156,7 @@ pub fn reportError(writer: *std.Io.Writer, path: ?[]const u8, err: anyerror) std
         error.InvalidHistoryConfiguration => "invalid history path or size (memory at most 64 MiB; storage 13 bytes to 64 MiB)",
         error.InvalidPluginConfiguration => "plugin paths, command names, and entries must be nonempty and valid",
         error.InvalidPluginOptions => "plugin options require unique nonempty keys, no NUL, at most 32 pairs and 4096 bytes",
+        error.InvalidPluginPermissions => "plugin grants must fit their declaration; fs_read requires a read_directory grant",
         error.ReservedPluginCommand => "plugin command name is reserved for a builtin",
         error.DuplicatePluginCommand => "duplicate plugin command name",
         error.FileNotFound => "no such file or directory",
@@ -341,6 +353,8 @@ test "ZON configuration validates fields and honors explicit paths without JSON 
         ".{ .history = .{ .storage = .{ .max_bytes = 67108865 } } }",
         ".{ .plugins = .{.{ .path = \"theme.wasm\", .prompt = .{}, .options = .{ .{ \"symbol\", \">\" }, .{ \"symbol\", \"$\" } } }} }",
         ".{ .plugins = .{.{ .path = \"theme.wasm\", .prompt = .{}, .options = .{ .{ \"\", \">\" } } }} }",
+        ".{ .plugins = .{.{ .path = \"theme.wasm\", .prompt = .{}, .grants = .{ .context = true } }} }",
+        ".{ .plugins = .{.{ .path = \"theme.wasm\", .prompt = .{}, .declares = .{ .fs_read = true }, .grants = .{ .fs_read = true } }} }",
         ".{ .plugins = .{.{ .path = \"theme.wasm\", .prompt = .{ .entry = \"\" } }} }",
         ".{ .plugins = .{.{ .path = \"diagnostic.wasm\", .diagnostics = .{ .entry = \"\" } }} }",
         ".{ .prompt = .{ .spans = .{.{ .text = \"bad\\x00\" }} } }",
