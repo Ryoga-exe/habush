@@ -632,7 +632,7 @@ test "script diagnostics retain raw CRLF here-document and final-line byte range
     try std.testing.expectEqualStrings("", stderr.written());
 }
 
-// Zig's macOS stack unwinder can consume cancellation (also in 0.16):
+// NOTE: Zig's macOS stack unwinder can consume cancellation (also in 0.16):
 // https://codeberg.org/ziglang/zig/pulls/36010
 test "startup source stays interruptible without interactive presentation" {
     const Notify = struct {
