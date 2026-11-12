@@ -52,11 +52,14 @@ const Editing = struct {
     history: edit.History,
     queued: ?[:0]u8 = null,
     offset: usize = 0,
+    queued_recorded: bool = false,
+    history_recorded: bool = false,
 
     fn discard(editing: *Editing) void {
         if (editing.queued) |source| editing.history.gpa.free(source);
         editing.queued = null;
         editing.offset = 0;
+        editing.queued_recorded = false;
     }
 };
 
@@ -94,6 +97,14 @@ fn historyError(self: *Shell, err: anyerror) !void {
     self.history_path = null;
 }
 
+fn recordHistory(self: *Shell, source: []const u8) !void {
+    if (!self.interactive or source.len > LineEditor.max_input_bytes) return;
+    if (self.editing) |editing| try editing.history.append(source);
+    if (self.historyStore()) |store| store.append(source) catch |err| {
+        try self.historyError(err);
+    };
+}
+
 fn runInput(self: *Shell, source_name: ?[]const u8) !habush.runtime.ExitStatus {
     while (true) {
         self.interrupt_generation = interrupt.snapshot();
@@ -107,12 +118,7 @@ fn runInput(self: *Shell, source_name: ?[]const u8) !habush.runtime.ExitStatus {
             else => return err,
         }) orelse return self.session.lastResult().status;
         defer input.deinit(self.allocator);
-        if (self.interactive and input.original_source.len <= LineEditor.max_input_bytes) {
-            if (self.editing) |editing| try editing.history.append(input.original_source);
-            if (self.historyStore()) |store| store.append(input.original_source) catch |err| {
-                try self.historyError(err);
-            };
-        }
+        if (self.editing == null or !self.editing.?.history_recorded) try self.recordHistory(input.original_source);
 
         if (input.incomplete_here_document) {
             try self.beginCommand(true);
@@ -287,6 +293,7 @@ fn finishInput(
 }
 
 fn readCommand(self: *Shell) !?CommandInput {
+    if (self.editing) |editing| editing.history_recorded = false;
     var prompt_arena: std.heap.ArenaAllocator = .init(self.allocator);
     defer prompt_arena.deinit();
     var primary_prompt = self.prompt;
@@ -494,6 +501,7 @@ fn readInputLine(self: *Shell, prompt: edit.Prompt, prefix: []const u8, allow_co
         } };
         defer completion.deinit();
         var diagnostic_service: DiagnosticService = .{ .additional = self.diagnostic_provider };
+        var used_editor = true;
         const submitted = ((LineEditor{
             .gpa = self.allocator,
             .input = self.stdin,
@@ -506,12 +514,21 @@ fn readInputLine(self: *Shell, prompt: edit.Prompt, prefix: []const u8, allow_co
             .inspector = if (allow_completion and prefix.len == 0) .{ .userdata = self, .inspect = inspectEditedSource } else null,
             .diagnostics = if (self.diagnostics and allow_completion) diagnostic_service.provider() else null,
         }).read() catch |err| switch (err) {
-            error.EditorUnavailable => try readLineAlloc(self.stdin, self.allocator, &self.last_line_ending),
+            error.EditorUnavailable => fallback: {
+                used_editor = false;
+                break :fallback try readLineAlloc(self.stdin, self.allocator, &self.last_line_ending);
+            },
             error.EndOfStream => null,
             else => return err,
         }) orelse return null;
         if (self.editing) |editing| {
+            const record = used_editor and prefix.len == 0 and allow_completion;
+            if (record) self.recordHistory(submitted) catch |err| {
+                self.allocator.free(submitted);
+                return err;
+            };
             editing.queued = submitted;
+            editing.queued_recorded = record;
             break :editor (try self.takeEditedLine()).?;
         }
         break :editor submitted;
@@ -549,6 +566,7 @@ fn takeEditedLine(self: *Shell) !?[:0]u8 {
     if (!self.interactive) return null;
     const editing = self.editing orelse return null;
     const source = editing.queued orelse return null;
+    editing.history_recorded = editing.history_recorded or editing.queued_recorded;
     const start = editing.offset;
     const end = std.mem.indexOfAnyPos(u8, source, start, "\r\n") orelse source.len;
     const line = try self.allocator.dupeSentinel(u8, source[start..end], 0);
