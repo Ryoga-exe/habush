@@ -108,6 +108,7 @@ pub fn main(init: std.process.Init) !void {
     if (config_path != null) {
         try pluginScenario(io, master, &terminal);
     } else {
+        try historyScenario(io, master, &terminal);
         try master.writeStreamingAll(io, "jjjjjjjjj; /bin/echo STATUS:$?\r");
         const missing = try terminal.expect(ready);
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, missing, "habush: jjjjjjjjj: command not found\r\n"));
@@ -263,6 +264,28 @@ fn functionCompletionScenario(io: Io, master: Io.File, terminal: *Terminal) !voi
     _ = try terminal.expect(ready);
     try master.writeStreamingAll(io, "/bin/echo READ\t\r");
     try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "README.md\r\n") != null);
+}
+
+fn historyScenario(io: Io, master: Io.File, terminal: *Terminal) !void {
+    try master.writeStreamingAll(io, "/bin/echo HISTORY:first\r");
+    _ = try terminal.expect(ready);
+    try master.writeStreamingAll(io, "value=second; /bin/echo HISTORY:$value\r");
+    _ = try terminal.expect(ready);
+    // Up traverses all history even when the draft has a different prefix.
+    try master.writeStreamingAll(io, "/bin/echo draft\x1b[A\r");
+    try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "HISTORY:second\r\n") != null);
+    try master.writeStreamingAll(io, "/bin/echo DRAFT\x02\x1b[A\x1b[B!\r");
+    try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "DRAF!T\r\n") != null);
+    try master.writeStreamingAll(io, "/bin/cat <<'EOF'\r");
+    _ = try terminal.expect(ready);
+    try master.writeStreamingAll(io, "literal $(missing)\r");
+    _ = try terminal.expect(ready);
+    try master.writeStreamingAll(io, "EOF\r");
+    _ = try terminal.expect(ready);
+    try master.writeStreamingAll(io, "\x1b[A\r");
+    const output = try terminal.expect(ready);
+    try std.testing.expect(std.mem.indexOf(u8, output, "literal $(missing)\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "command not found") == null);
 }
 
 fn pluginScenario(io: Io, master: Io.File, terminal: *Terminal) !void {
