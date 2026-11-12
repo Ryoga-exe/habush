@@ -9,14 +9,15 @@ line_edit: Mode = .auto,
 shell_integration: Mode = .auto,
 load_rc: bool = true,
 plugins: []Plugin = &.{},
-/// Shared by native providers and future adapters; guest execution budgets
+/// Shared by completion providers; guest execution budgets
 /// remain the plugin host's responsibility.
 completion_limits: @import("habush").Completion.Provider.Limits = .{},
 
 pub const Mode = enum { auto, on, off };
 pub const Plugin = struct {
     path: []const u8,
-    commands: []const Command,
+    commands: []const Command = &.{},
+    completions: []const Completion = &.{},
     fuel: u64 = 10_000_000,
     memory_bytes: u32 = 16 * 1024 * 1024,
     timeout_ms: u32 = 1000,
@@ -24,7 +25,11 @@ pub const Plugin = struct {
     pub const Command = struct {
         name: []const u8,
         entry: []const u8 = "command",
-        completion: ?[]const u8 = null,
+    };
+
+    pub const Completion = struct {
+        command: []const u8,
+        entry: []const u8 = "complete",
     };
 };
 pub const max_file_bytes = 64 * 1024;
@@ -34,12 +39,12 @@ pub fn parse(options: std.zon.parse.Options) !Config {
     const config = try std.zon.parse.fromSlice(Config, options);
     if (config.version != 1) return error.UnsupportedConfigVersion;
     for (config.plugins, 0..) |plugin, plugin_index| {
-        if (!validString(plugin.path) or plugin.commands.len == 0) return error.InvalidPluginConfiguration;
+        if (!validString(plugin.path) or (plugin.commands.len == 0 and plugin.completions.len == 0))
+            return error.InvalidPluginConfiguration;
         for (plugin.commands, 0..) |command, command_index| {
             if (!validString(command.name) or std.fs.path.dirname(command.name) != null or
                 std.mem.indexOfAny(u8, command.name, "/\\") != null or
                 !validString(command.entry)) return error.InvalidPluginConfiguration;
-            if (command.completion) |entry| if (!validString(entry)) return error.InvalidPluginConfiguration;
             if (@import("habush").Builtin.lookup(command.name) != null) return error.ReservedPluginCommand;
             for (config.plugins[0 .. plugin_index + 1], 0..) |previous, previous_index| {
                 const end = if (previous_index == plugin_index) command_index else previous.commands.len;
@@ -47,6 +52,8 @@ pub fn parse(options: std.zon.parse.Options) !Config {
                     if (std.mem.eql(u8, registered.name, command.name)) return error.DuplicatePluginCommand;
             }
         }
+        for (plugin.completions) |completion|
+            if (!validString(completion.command) or !validString(completion.entry)) return error.InvalidPluginConfiguration;
     }
     return config;
 }
@@ -251,13 +258,20 @@ test "ZON configuration validates fields and honors explicit paths without JSON 
     try std.testing.expectEqualStrings("", output.written());
 
     try tmp.dir.writeFile(io, .{ .sub_path = "config.zon", .data =
-        \\.{ .plugins = .{.{ .path = "plugins/demo.wasm", .commands = .{.{ .name = "demo", .completion = "complete" }} }} }
+        \\.{ .plugins = .{.{ .path = "plugins/demo.wasm", .commands = .{.{ .name = "demo" }}, .completions = .{.{ .command = "git" }} }} }
     });
     const configured = (try load(gpa, arena, io, paths, null, &output.writer)).?;
     const module_path = try std.fs.path.join(arena, &.{ directory_path, "plugins/demo.wasm" });
     try std.testing.expectEqualStrings(module_path, configured.plugins[0].path);
     try std.testing.expectEqualStrings("demo", configured.plugins[0].commands[0].name);
-    try std.testing.expectEqualStrings("complete", configured.plugins[0].commands[0].completion.?);
+    try std.testing.expectEqualStrings("git", configured.plugins[0].completions[0].command);
+    try std.testing.expectEqualStrings("complete", configured.plugins[0].completions[0].entry);
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.zon", .data =
+        \\.{ .plugins = .{.{ .path = "only-completion.wasm", .completions = .{.{ .command = "true" }, .{ .command = "/bin/echo" }} }} }
+    });
+    const completion_only = (try load(gpa, arena, io, paths, null, &output.writer)).?;
+    try std.testing.expectEqual(@as(usize, 0), completion_only.plugins[0].commands.len);
+    try std.testing.expectEqual(@as(usize, 2), completion_only.plugins[0].completions.len);
 
     for ([_][]const u8{
         ".{\n    .line_edti = .off,\n}",
@@ -267,6 +281,8 @@ test "ZON configuration validates fields and honors explicit paths without JSON 
         ".{ .plugins = .{.{ .path = \"x\", .commands = .{.{ .name = \"true\" }} }} }",
         ".{ .plugins = .{.{ .path = \"x\", .commands = .{.{ .name = \"demo\" }, .{ .name = \"demo\" }} }} }",
         ".{ .plugins = .{.{ .path = \"\", .commands = .{.{ .name = \"demo\" }} }} }",
+        ".{ .plugins = .{.{ .path = \"x\" }} }",
+        ".{ .plugins = .{.{ .path = \"x\", .completions = .{.{ .command = \"\" }} }} }",
     }, 0..) |invalid, index| {
         output.clearRetainingCapacity();
         try tmp.dir.writeFile(io, .{ .sub_path = "config.zon", .data = invalid });

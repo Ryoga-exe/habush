@@ -38,10 +38,21 @@ pub fn main(init: std.process.Init) !void {
         config_path = try gpa.print("/tmp/habush-plugin-{s}.zon", .{hex[0..]});
         var config: Io.Writer.Allocating = .init(gpa);
         defer config.deinit();
-        try config.writer.print(
-            ".{{ .load_rc = false, .plugins = .{{ .{{ .path = \"{f}\", .fuel = 18446744073709551615, .timeout_ms = 5000, .commands = .{{ .{{ .name = \"hb-demo\", .completion = \"complete\" }} }} }} }} }}\n",
-            .{std.zig.fmtString(module_path)},
-        );
+        try std.zon.stringify.serialize(.{
+            .load_rc = false,
+            .plugins = .{
+                .{
+                    .path = module_path,
+                    .fuel = std.math.maxInt(u64),
+                    .timeout_ms = 5000,
+                    .commands = .{.{ .name = "hb-demo" }},
+                },
+                .{
+                    .path = module_path,
+                    .completions = .{ .{ .command = "hb-demo" }, .{ .command = "/bin/echo" } },
+                },
+            },
+        }, .{}, &config.writer);
         try Io.Dir.cwd().writeFile(io, .{ .sub_path = config_path.?, .data = config.written() });
     }
     var master_fd: c_int = undefined;
@@ -281,4 +292,17 @@ fn pluginScenario(io: Io, master: Io.File, terminal: *Terminal) !void {
     output = try terminal.expect(ready);
     try std.testing.expect(std.mem.indexOf(u8, output, "INTERRUPT:130\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "VALUE:after\r\n") != null);
+    // A completion-only plugin augments an existing executable, then a shell
+    // registration replaces it without changing command execution.
+    try master.writeStreamingAll(io, "/bin/echo sec\t STATUS:$?\r");
+    output = try terminal.expect(ready);
+    try std.testing.expect(std.mem.indexOf(u8, output, "second '$(missing) STATUS:7\r\n") != null);
+    try master.writeStreamingAll(io, "__override() { /usr/bin/printf '%s\\0' 'override choice'; }; complete -F __override /bin/echo\r");
+    _ = try terminal.expect(ready);
+    try master.writeStreamingAll(io, "/bin/echo ov\t\r");
+    try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "override choice\r\n") != null);
+    try master.writeStreamingAll(io, "complete -r /bin/echo\r");
+    _ = try terminal.expect(ready);
+    try master.writeStreamingAll(io, "/bin/echo READ\t\r");
+    try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "README.md\r\n") != null);
 }

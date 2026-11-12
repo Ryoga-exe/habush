@@ -146,6 +146,10 @@ pub fn main(init: std.process.Init) !habush.runtime.ExitStatus {
         },
     });
     defer session.deinit();
+    if (features.wasm_plugins) {
+        for (plugins.completions) |completion|
+            try session.state.completions.set(completion.command, .{ .provider = completion.provider });
+    }
 
     // Terminal metadata uses a dedicated presentation writer, never a command's
     // redirected stdout. Explicit opt-in still requires interactive TTYs.
