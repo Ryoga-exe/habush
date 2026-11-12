@@ -47,6 +47,7 @@ pub fn main(init: std.process.Init) !void {
         try std.zon.stringify.serialize(.{
             .load_rc = false,
             .history = .{ .storage = .{ .enabled = false } },
+            .prompt_context = .{ .git = true },
             .keybinds = bindings,
             .plugins = .{
                 .{
@@ -348,6 +349,12 @@ fn pluginScenario(io: Io, master: Io.File, terminal: *Terminal) !void {
     const themed = try terminal.expect(ready);
     try std.testing.expect(std.mem.indexOf(u8, themed, "VALUE:after\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, themed, "\x1b[0;33;49m [7] THEME> ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, themed, "ms") != null);
+    try std.testing.expect(std.mem.indexOf(u8, themed, " git:") != null);
+    try master.writeStreamingAll(io, "/bin/sleep 5 &\r");
+    try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "jobs:1") != null);
+    try master.writeStreamingAll(io, "/bin/kill \"$!\"; wait\r");
+    _ = try terminal.expect(ready);
     try master.writeStreamingAll(io, "PATH=; hb-demo 'literal arg'; /bin/echo STATUS:$?\r");
     var output = try terminal.expect(ready);
     try std.testing.expect(std.mem.indexOf(u8, output, "VALUE:literal arg\r\n") != null);

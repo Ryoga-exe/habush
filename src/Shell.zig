@@ -44,6 +44,9 @@ editing: ?*Editing = null,
 history_settings: @import("Config.zig").History = .{},
 history_path: ?[]const u8 = null,
 next_input_id: u64 = 0,
+last_duration_ns: ?u64 = null,
+prompt_git: bool = false,
+jobs_mutex: Io.Mutex = .init,
 
 const Editing = struct {
     history: edit.History,
@@ -129,6 +132,10 @@ fn runInput(self: *Shell, source_name: ?[]const u8) !habush.runtime.ExitStatus {
         try self.beginCommand(input.emit_execution_marks);
         var command_open = input.emit_execution_marks;
         errdefer if (command_open) self.endCommand(null) catch {};
+        const started = if (self.interactive and self.io != null) Io.Timestamp.now(self.io.?, .awake) else null;
+        defer if (started) |time| {
+            self.last_duration_ns = @intCast(@max(0, Io.Timestamp.now(self.io.?, .awake).nanoseconds - time.nanoseconds));
+        };
         const control_flow = try self.handleInput(
             input.source,
             input.here_documents,
@@ -285,10 +292,7 @@ fn readCommand(self: *Shell) !?CommandInput {
     var primary_prompt = self.prompt;
     if (self.interactive) {
         if (self.prompt_provider) |provider| {
-            const generated = provider.render(provider.userdata, prompt_arena.allocator(), .{
-                .cwd = self.session.workingDirectory(),
-                .status = self.session.lastResult().status,
-            }) catch |err| switch (err) {
+            const generated = provider.render(provider.userdata, prompt_arena.allocator(), try self.promptContext(prompt_arena.allocator())) catch |err| switch (err) {
                 error.Canceled, error.OutOfMemory => return err,
                 error.Unavailable => self.prompt,
             };
@@ -593,6 +597,30 @@ fn printPrompt(self: *Shell, continuation: bool, prompt: edit.Prompt) !void {
     try self.stderr.flush();
 }
 
+fn promptContext(self: *Shell, arena: std.mem.Allocator) !edit.Prompt.Context {
+    var context: edit.Prompt.Context = .{
+        .cwd = self.session.workingDirectory(),
+        .status = self.session.lastResult().status,
+        .duration_ns = self.last_duration_ns,
+    };
+    if (self.io) |io| {
+        {
+            try self.jobs_mutex.lock(io);
+            defer self.jobs_mutex.unlock(io);
+            for (self.session.jobs.entries.items) |entry| if (entry.pipeline.state() != .completed) {
+                context.jobs += 1;
+            };
+        }
+        if (self.prompt_git and self.session.context.activeSandbox() == .inherit) {
+            if (context.cwd) |cwd| context.git = @import("prompt_context.zig").git(arena, io, cwd) catch |err| switch (err) {
+                error.Canceled, error.OutOfMemory => return err,
+                else => null,
+            };
+        }
+    }
+    return context;
+}
+
 fn beginCommand(self: *Shell, emit: bool) !void {
     if (!self.interactive or !emit) return;
     if (self.integration) |*integration| try integration.beginCommand();
@@ -717,6 +745,8 @@ fn pollJobs(self: *Shell) habush.Host.Error!void {
     const io = self.io.?;
     while (true) {
         try io.sleep(.fromMilliseconds(20), .awake);
+        try self.jobs_mutex.lock(io);
+        defer self.jobs_mutex.unlock(io);
         try self.session.jobs.poll();
     }
 }
@@ -829,6 +859,7 @@ test "interactive history stores submitted original source but excludes startup 
     };
     _ = try shell.runCommand(": startup");
     try std.testing.expectEqual(@as(u8, 0), try shell.run());
+    try std.testing.expect(shell.last_duration_ns != null);
     var reloaded: edit.History = .{ .gpa = gpa };
     defer reloaded.deinit();
     try (HistoryStore{ .gpa = gpa, .io = io, .path = path }).load(&reloaded);
