@@ -128,3 +128,44 @@ test "native completion owns its query and quotes current-line edits after a con
     try std.testing.expectEqual(null, try interface.query(interface.userdata, request));
     try std.testing.expectEqual(null, try interface.choose(interface.userdata, gpa, request, 0));
 }
+
+test "here-document bodies never query providers and completion resumes after delimiters" {
+    const Probe = struct {
+        calls: usize = 0,
+        fn complete(userdata: ?*anyopaque, _: habush.Completion.Provider.Request, collector: *habush.Completion.Provider.Collector) habush.Completion.Provider.Error!void {
+            const probe: *@This() = @ptrCast(@alignCast(userdata.?));
+            probe.calls += 1;
+            _ = try collector.add(.{ .value = "safe choice" });
+        }
+    };
+    var probe: Probe = .{};
+    var service: CompletionService = .{
+        .gpa = std.testing.allocator,
+        .prefix = "",
+        .providers = &.{.{ .userdata = &probe, .complete = Probe.complete }},
+    };
+    defer service.deinit();
+    const interface = service.completion();
+    const sources = [_][]const u8{
+        "cat <<'EOF'\nprobe body",
+        "cat <<EOF; : # comment\nprobe body\nEOF",
+        "echo $(cat <<'EOF'\nprobe body",
+        "cat <<A <<-B\nfirst\nA\n\tprobe body",
+    };
+    for (sources) |source| {
+        try std.testing.expect(try interface.query(interface.userdata, .{ .source = source, .cursor = source.len, .revision = 1 }) == null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
+    for ([_][]const u8{
+        "cat <<'EOF'\n'$(unclosed\nEOF\nprobe va",
+        "echo $(cat <<'EOF'\n'$(unclosed\nEOF\nprobe va",
+        "cat <<A <<-B\nfirst\nA\n\tsecond\n\tB\nprobe va",
+    }) |source| {
+        try std.testing.expect((try interface.query(interface.userdata, .{ .source = source, .cursor = source.len, .revision = 2 })).?.unique());
+        var replacement = (try interface.choose(interface.userdata, std.testing.allocator, .{ .source = source, .cursor = source.len, .revision = 2 }, 0)).?;
+        defer replacement.deinit(std.testing.allocator);
+        try std.testing.expectEqual(source.len - 2, replacement.start);
+        try std.testing.expectEqual(source.len, replacement.end);
+    }
+    try std.testing.expectEqual(@as(usize, 3), probe.calls);
+}
