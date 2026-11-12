@@ -149,6 +149,7 @@ pub fn main(init: std.process.Init) !void {
         try pluginScenario(io, master, &terminal, config_path.?);
     } else {
         try historyScenario(io, master, &terminal);
+        try logicalHistoryScenario(io, master, &terminal);
         try master.writeStreamingAll(io, "jjjjjjjjj; /bin/echo STATUS:$?\r");
         const missing = try terminal.expect(ready);
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, missing, "habush: jjjjjjjjj: command not found\r\n"));
@@ -345,6 +346,19 @@ fn historyScenario(io: Io, master: Io.File, terminal: *Terminal) !void {
     _ = try terminal.expect("README.md");
     try master.writeStreamingAll(io, "; }\r");
     try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "README.md\r\n") != null);
+}
+
+fn logicalHistoryScenario(io: Io, master: Io.File, terminal: *Terminal) !void {
+    try master.writeStreamingAll(io, "\x1b[200~logical_one=original\nlogical_two=original\x1b[201~\r");
+    _ = try terminal.expect(ready);
+    try master.writeStreamingAll(io, "logical_one=; logical_two=\r");
+    _ = try terminal.expect(ready);
+    try master.writeStreamingAll(io, "\x12logical_one=original\r");
+    _ = try terminal.expect("history (Enter selects, Esc cancels): logical_one=original");
+    try master.writeStreamingAll(io, "\r");
+    _ = try terminal.expect(ready);
+    try master.writeStreamingAll(io, "/bin/echo LOGICAL:$logical_one:$logical_two\r");
+    try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "LOGICAL:original:original\r\n") != null);
 }
 
 fn pluginScenario(io: Io, master: Io.File, terminal: *Terminal, config_path: []const u8) !void {
