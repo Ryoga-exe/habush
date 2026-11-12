@@ -1,5 +1,6 @@
 //! Synchronous adapter for session registrations. Function calls use isolated
 //! state and bounded pipes, including stdout from external commands.
+//! The caller keeps the source Session unchanged until collection has joined.
 const std = @import("std");
 const Completion = @import("../Completion.zig");
 const Provider = @import("Provider.zig");
@@ -9,6 +10,7 @@ const ExecutionContext = @import("../ExecutionContext.zig");
 const CommandPlan = @import("../CommandPlan.zig");
 const VariableStore = @import("../VariableStore.zig");
 const runtime = @import("../runtime.zig");
+const Command = @import("../Command.zig");
 const Registered = @This();
 
 session: *Session,
@@ -156,7 +158,7 @@ test "function completion uses literal argv and isolates session mutations" {
     const gpa = std.testing.allocator;
     var system: @import("../Host/System.zig") = .{ .gpa = gpa, .io = std.testing.io };
     defer system.deinit();
-    const commands = [_]@import("../Command.zig"){.{ .name = "emit", .run = Test.emit }};
+    const commands = [_]Command{.{ .name = "emit", .run = Test.emit }};
     var session = try Session.init(gpa, system.host(), .{
         .cancel_io = std.testing.io,
         .commands = &commands,
@@ -191,21 +193,30 @@ test "function completion uses literal argv and isolates session mutations" {
     try std.testing.expectEqual(@as(u8, 1), session.lastResult().status);
     try std.testing.expectEqualStrings("__comp", session.state.completions.get("git").?.function);
     // Resolve the function at invocation time, after registration.
-    _ = try session.evaluate("__comp() { emit new; }; complete -F __comp true; complete -F __comp emit", .{});
-    var changed = try Provider.collect(gpa, request, &providers, .{});
-    defer changed.deinit(gpa);
-    try std.testing.expectEqualStrings("new", changed.unique().?.value);
+    _ = try session.evaluate("__comp() { emit new; }; target() { false; }; complete -F __comp true; complete -F __comp target", .{});
+    for ([_][]const u8{ "git ", "true ", "target " }) |source_name| {
+        const changed_request: Provider.Request = .{ .context = try Completion.inspect(source_name, source_name.len, 0), .prefix = "" };
+        var changed = try Provider.collect(gpa, changed_request, &providers, .{});
+        defer changed.deinit(gpa);
+        try std.testing.expectEqualStrings("new", changed.unique().?.value);
+    }
     _ = try session.evaluate("complete -r git", .{});
     try std.testing.expect(session.state.completions.get("git") == null);
     try std.testing.expectEqual(@as(u8, 0), (try session.evaluate("true", .{})).executed.status);
+    try std.testing.expectEqual(@as(u8, 1), (try session.evaluate("target", .{})).executed.status);
     try std.testing.expectEqual(@as(usize, 0), system.children.count());
+    try std.testing.expectEqual(@as(usize, 0), system.resources.count());
 }
 
 test "empty completion is exclusive while failures, limits and timeouts fall back" {
     const gpa = std.testing.allocator;
     var system: @import("../Host/System.zig") = .{ .gpa = gpa, .io = std.testing.io };
     defer system.deinit();
-    const commands = [_]@import("../Command.zig"){.{ .name = "emit", .run = Test.emit }};
+    var entered: std.atomic.Value(bool) = .init(false);
+    const commands = [_]Command{
+        .{ .name = "emit", .run = Test.emit },
+        .{ .name = "mark", .userdata = &entered, .run = Test.mark },
+    };
     var input: std.Io.Reader = .fixed("untouched\n");
     var session = try Session.init(gpa, system.host(), .{
         .cancel_io = std.testing.io,
@@ -240,8 +251,33 @@ test "empty completion is exclusive while failures, limits and timeouts fall bac
         try std.testing.expectEqualStrings("fallback", result.candidates[0].value);
     }
     try std.testing.expectEqual(@as(usize, "untouched\n".len), input.bufferedLen());
+    if (@import("builtin").target.os.tag != .windows and @import("builtin").target.os.tag != .wasi) {
+        _ = try session.evaluate("__comp() { /bin/sleep 5; }; complete -F __comp git", .{});
+        var external = try Provider.collect(gpa, request, &providers, .{});
+        defer external.deinit(gpa);
+        try std.testing.expect(external.incomplete);
+        try std.testing.expectEqualStrings("fallback", external.candidates[0].value);
+    }
     try std.testing.expectEqual(@as(usize, 0), system.children.count());
-    // A timed-out call must not poison the next call.
+    _ = try session.evaluate("__comp() { mark; while true; do :; done; }", .{});
+    registered.timeout = .fromSeconds(2);
+    const io = std.testing.io;
+    var task = try io.concurrent(Provider.collect, .{ gpa, request, &providers, Provider.Limits{} });
+    defer {
+        if (task.cancel(io)) |value| {
+            var owned = value;
+            owned.deinit(gpa);
+        } else |_| {}
+    }
+    for (0..1000) |_| {
+        if (entered.load(.acquire)) break;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(entered.load(.acquire));
+    try std.testing.expectError(error.Canceled, task.cancel(io));
+    registered.timeout = .fromMilliseconds(100);
+    try std.testing.expectEqual(@as(usize, 0), system.resources.count());
+    // A timed-out or canceled call must not poison the next call.
     _ = try session.evaluate("__comp() { emit recovered; }; complete -F __comp git", .{});
     var recovered = try Provider.collect(gpa, request, &providers, .{});
     defer recovered.deinit(gpa);
@@ -249,12 +285,18 @@ test "empty completion is exclusive while failures, limits and timeouts fall bac
 }
 
 const Test = struct {
-    fn emit(_: ?*anyopaque, context: @import("../Command.zig").Context, argv: []const []const u8) @import("../Command.zig").Error!@import("../Command.zig").Outcome {
+    fn emit(_: ?*anyopaque, context: Command.Context, argv: []const []const u8) Command.Error!Command.Outcome {
         const writer = context.io.stdout orelse return .{ .failed = .io };
         for (argv[1..]) |arg| {
             writer.writeAll(arg) catch return .{ .failed = .io };
             writer.writeByte(0) catch return .{ .failed = .io };
         }
+        return .{ .exited = 0 };
+    }
+
+    fn mark(userdata: ?*anyopaque, _: Command.Context, _: []const []const u8) Command.Error!Command.Outcome {
+        const entered: *std.atomic.Value(bool) = @ptrCast(@alignCast(userdata.?));
+        entered.store(true, .release);
         return .{ .exited = 0 };
     }
 
