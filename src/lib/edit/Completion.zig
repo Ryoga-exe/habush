@@ -1,4 +1,4 @@
-//! Synchronous completion supplied by an embedding application, not a language.
+//! Completion supplied by an embedding application, not a language.
 //! Query results are borrowed until the next query or service destruction.
 const std = @import("std");
 const Buffer = @import("Buffer.zig");
@@ -6,6 +6,10 @@ const Completion = @This();
 
 userdata: *anyopaque,
 query: *const fn (*anyopaque, Request) Error!?Result,
+/// Optional nonblocking collection. Pending results have no usable labels.
+poll: ?*const fn (*anyopaque, Request) Error!?Result = null,
+/// Invalidates the request promptly; the service joins work before destruction.
+cancel: ?*const fn (*anyopaque) void = null,
 /// Returns an edit owned by the supplied allocator. The service must reject
 /// selections whose source, revision, or cursor no longer matches its query.
 choose: *const fn (*anyopaque, std.mem.Allocator, Request, usize) Error!?Edit,
@@ -17,16 +21,19 @@ pub const Request = struct {
     source: []const u8,
     cursor: usize,
     revision: u64,
+    input_id: u64 = 0,
+    id: u64 = 0,
 };
 
 pub const Result = struct {
     /// Presentation text only. Selection indices refer to this exact result.
-    labels: []const []const u8,
+    labels: []const []const u8 = &.{},
+    pending: bool = false,
     truncated: bool = false,
     incomplete: bool = false,
 
     pub fn unique(result: Result) bool {
-        return !result.truncated and !result.incomplete and result.labels.len == 1;
+        return !result.pending and !result.truncated and !result.incomplete and result.labels.len == 1;
     }
 };
 

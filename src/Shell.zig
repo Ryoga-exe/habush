@@ -7,7 +7,7 @@ const LineEditor = @import("terminal/LineEditor.zig");
 const edit = @import("habush-edit");
 const render = @import("terminal/render.zig");
 const platform = @import("platform.zig");
-const CompletionService = @import("CompletionService.zig");
+const AsyncCompletion = @import("AsyncCompletion.zig");
 const DiagnosticService = @import("DiagnosticService.zig");
 const interrupt = @import("interrupt.zig");
 const HistoryStore = @import("HistoryStore.zig");
@@ -43,6 +43,7 @@ interrupt_generation: u32 = 0,
 editing: ?*Editing = null,
 history_settings: @import("Config.zig").History = .{},
 history_path: ?[]const u8 = null,
+next_input_id: u64 = 0,
 
 const Editing = struct {
     history: edit.History,
@@ -465,25 +466,28 @@ fn readInputLine(self: *Shell, prompt: edit.Prompt, prefix: []const u8, allow_co
     const line = (try self.takeEditedLine()) orelse if (self.interactive and self.line_edit and self.io != null) editor: {
         self.last_line_ending = .lf;
         self.input_byte_offset = null;
+        self.next_input_id +%= 1;
+        var snapshot = try self.completionSnapshot();
+        defer snapshot.deinit();
         var native: habush.Completion.Native = .{
             .io = self.io.?,
-            .cwd = self.session.workingDirectory(),
-            .path = self.session.variable("PATH"),
-            .default_search_path = self.session.defaultSearchPath(),
-            .function_names = self.session.functionNames(),
+            .cwd = snapshot.workingDirectory(),
+            .path = snapshot.variable("PATH"),
+            .default_search_path = snapshot.defaultSearchPath(),
+            .function_names = snapshot.functionNames(),
             .executable_extensions = self.resolver_options.executable_extensions,
         };
-        var registered: habush.Completion.Registered = .{ .session = self.session, .io = self.io.? };
+        var registered: habush.Completion.Registered = .{ .session = &snapshot, .io = self.io.? };
         var providers: [3]habush.Completion.Provider = undefined;
         providers[0] = registered.provider();
         providers[1] = self.completion_provider orelse native.provider();
         if (self.completion_provider != null) providers[2] = native.provider();
-        var completion: CompletionService = .{
-            .gpa = self.allocator,
+        var completion: AsyncCompletion = .{ .io = self.io.?, .service = .{
+            .gpa = std.heap.smp_allocator,
             .prefix = prefix,
             .providers = providers[0..if (self.completion_provider != null) @as(usize, 3) else 2],
             .limits = self.completion_limits,
-        };
+        } };
         defer completion.deinit();
         var diagnostic_service: DiagnosticService = .{ .additional = self.diagnostic_provider };
         const submitted = ((LineEditor{
@@ -492,6 +496,7 @@ fn readInputLine(self: *Shell, prompt: edit.Prompt, prefix: []const u8, allow_co
             .output = self.stderr,
             .prompt = prompt,
             .keybinds = self.keybinds,
+            .input_id = self.next_input_id,
             .completion = if (allow_completion) completion.completion() else null,
             .history = if (allow_completion and prefix.len == 0 and self.editing != null) &self.editing.?.history else null,
             .inspector = if (allow_completion and prefix.len == 0) .{ .userdata = self, .inspect = inspectEditedSource } else null,
@@ -515,6 +520,23 @@ fn readInputLine(self: *Shell, prompt: edit.Prompt, prefix: []const u8, allow_co
         };
     }
     return line;
+}
+
+fn completionSnapshot(self: *Shell) !habush.Session {
+    var context = try habush.ExecutionContext.init(self.allocator, self.session.context.view());
+    errdefer context.deinit();
+    return .{
+        .host = self.session.host,
+        .resolver = self.session.resolver,
+        .commands = self.session.commands,
+        .context = context,
+        .state = try self.session.state.cloneWithAllocator(self.allocator),
+        .jobs = .{ .gpa = self.allocator },
+        .concurrent_pipeline = self.session.concurrent_pipeline,
+        .cancel_io = self.io,
+        .observer = null,
+        .last_result = self.session.lastResult(),
+    };
 }
 
 /// Recalled/pasted input follows the same physical-line and here-document path

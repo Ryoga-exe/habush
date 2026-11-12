@@ -148,7 +148,9 @@ pub fn main(init: std.process.Init) !void {
         try functionCompletionScenario(io, master, &terminal);
         try master.writeStreamingAll(io, "PATH=; habush_completion_probe() { /bin/echo COMPLETION:$1; }\r");
         _ = try terminal.expect(ready);
-        try master.writeStreamingAll(io, "habush_completion_pr\t literal\r");
+        try master.writeStreamingAll(io, "habush_completion_pr\t");
+        _ = try terminal.expect("habush_completion_probe");
+        try master.writeStreamingAll(io, " literal\r");
         try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "COMPLETION:literal\r\n") != null);
 
         // TODO: Remove this quarantine with https://codeberg.org/ziglang/zig/pulls/36010.
@@ -266,22 +268,27 @@ const Terminal = struct {
 fn functionCompletionScenario(io: Io, master: Io.File, terminal: *Terminal) !void {
     try master.writeStreamingAll(io, "__ec() { /usr/bin/printf '%s\\0' \"$3-$1 '\\$(missing)\"; }; complete -F __ec /bin/echo; false\r");
     _ = try terminal.expect(ready);
-    try master.writeStreamingAll(io, "/bin/echo prev va\x00 STATUS:$?\r");
+    try master.writeStreamingAll(io, "/bin/echo prev va\x00");
+    _ = try terminal.expect("prev-va");
+    try master.writeStreamingAll(io, " STATUS:$?\r");
     var output = try terminal.expect(ready);
     try std.testing.expect(std.mem.indexOf(u8, output, "prev prev-va '$(missing) STATUS:1\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "command not found") == null);
     // A successful empty result suppresses the otherwise unique README match.
     try master.writeStreamingAll(io, "__ec() { :; }\r");
     _ = try terminal.expect(ready);
-    try master.writeStreamingAll(io, "/bin/echo READ\t\r");
+    try master.writeStreamingAll(io, "/bin/echo READ\t");
+    _ = try terminal.expect("\x07");
+    try master.writeStreamingAll(io, "\r");
     try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "READ\r\n") != null);
     try master.writeStreamingAll(io, "__ec() { /usr/bin/printf unterminated; }\r");
     _ = try terminal.expect(ready);
-    try master.writeStreamingAll(io, "/bin/echo READ\t\x15/bin/echo FALLBACK-OK\r");
-    output = try terminal.expect(ready);
+    try master.writeStreamingAll(io, "/bin/echo READ\t");
+    output = try terminal.expect("partial results");
     try std.testing.expect(std.mem.indexOf(u8, output, "README.md") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "partial results") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "FALLBACK-OK\r\n") != null);
+    try master.writeStreamingAll(io, "\x15/bin/echo FALLBACK-OK\r");
+    try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "FALLBACK-OK\r\n") != null);
     try master.writeStreamingAll(io, "__ec() { /bin/sleep 5; }\r");
     _ = try terminal.expect(ready);
     const start = Io.Timestamp.now(io, .awake);
@@ -290,7 +297,9 @@ fn functionCompletionScenario(io: Io, master: Io.File, terminal: *Terminal) !voi
     try std.testing.expect(Io.Timestamp.now(io, .awake).nanoseconds - start.nanoseconds < Io.Duration.fromSeconds(2).nanoseconds);
     try master.writeStreamingAll(io, "complete -r /bin/echo\r");
     _ = try terminal.expect(ready);
-    try master.writeStreamingAll(io, "/bin/echo READ\t\r");
+    try master.writeStreamingAll(io, "/bin/echo READ\t");
+    _ = try terminal.expect("README.md");
+    try master.writeStreamingAll(io, "\r");
     try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "README.md\r\n") != null);
 }
 
@@ -320,7 +329,9 @@ fn historyScenario(io: Io, master: Io.File, terminal: *Terminal) !void {
     _ = try terminal.expect(ready);
     try master.writeStreamingAll(io, "/bin/echo EDITED:$result\r");
     try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "EDITED:right\r\n") != null);
-    try master.writeStreamingAll(io, "{ : <<'EOF'\r'$(unclosed\t\rEOF\r/bin/echo READ\t; }\r");
+    try master.writeStreamingAll(io, "{ : <<'EOF'\r'$(unclosed\t\rEOF\r/bin/echo READ\t");
+    _ = try terminal.expect("README.md");
+    try master.writeStreamingAll(io, "; }\r");
     try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "README.md\r\n") != null);
 }
 
@@ -344,11 +355,15 @@ fn pluginScenario(io: Io, master: Io.File, terminal: *Terminal) !void {
     try master.writeStreamingAll(io, "hb-demo read <<'END'\rscoped input\rEND\r");
     output = try terminal.expect(ready);
     try std.testing.expect(std.mem.indexOf(u8, output, "INPUT:scoped input\r\n") != null);
-    try master.writeStreamingAll(io, "hb-demo sec\x00\r");
+    try master.writeStreamingAll(io, "hb-demo sec\x00");
+    _ = try terminal.expect("missing)");
+    try master.writeStreamingAll(io, "\r");
     output = try terminal.expect(ready);
     try std.testing.expect(std.mem.indexOf(u8, output, "VALUE:second '$(missing)\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "command not found") == null);
-    try master.writeStreamingAll(io, "hb-demo \t\x1b[B\r\r");
+    try master.writeStreamingAll(io, "hb-demo \t");
+    _ = try terminal.expect("first choice");
+    try master.writeStreamingAll(io, "\x1b[B\r\r");
     output = try terminal.expect(ready);
     try std.testing.expect(std.mem.indexOf(u8, output, "VALUE:second '$(missing)\r\n") != null);
     try master.writeStreamingAll(io, "hb-demo \tq\r");
@@ -369,15 +384,21 @@ fn pluginScenario(io: Io, master: Io.File, terminal: *Terminal) !void {
     try std.testing.expect(std.mem.indexOf(u8, output, "VALUE:after\r\n") != null);
     // A completion-only plugin augments an existing executable, then a shell
     // registration replaces it without changing command execution.
-    try master.writeStreamingAll(io, "/bin/echo sec\t STATUS:$?\r");
+    try master.writeStreamingAll(io, "/bin/echo sec\t");
+    _ = try terminal.expect("missing)");
+    try master.writeStreamingAll(io, " STATUS:$?\r");
     output = try terminal.expect(ready);
     try std.testing.expect(std.mem.indexOf(u8, output, "second '$(missing) STATUS:7\r\n") != null);
     try master.writeStreamingAll(io, "__override() { /usr/bin/printf '%s\\0' 'override choice'; }; complete -F __override /bin/echo\r");
     _ = try terminal.expect(ready);
-    try master.writeStreamingAll(io, "/bin/echo ov\t\r");
+    try master.writeStreamingAll(io, "/bin/echo ov\t");
+    _ = try terminal.expect("override choice");
+    try master.writeStreamingAll(io, "\r");
     try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "override choice\r\n") != null);
     try master.writeStreamingAll(io, "complete -r /bin/echo\r");
     _ = try terminal.expect(ready);
-    try master.writeStreamingAll(io, "/bin/echo READ\t\r");
+    try master.writeStreamingAll(io, "/bin/echo READ\t");
+    _ = try terminal.expect("README.md");
+    try master.writeStreamingAll(io, "\r");
     try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "README.md\r\n") != null);
 }

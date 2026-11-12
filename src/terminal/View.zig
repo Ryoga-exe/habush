@@ -15,7 +15,7 @@ pub fn redraw(view: *View, writer: *std.Io.Writer, prompt: edit.Prompt, state: *
     const menu_limit = @max(@as(usize, 1), @min(@as(usize, 8), menu_height / 2 -| 1));
     const menu_status = if (state.menu) |menu| menu_height > 3 and (menu.result.labels.len > menu_limit or menu.result.incomplete or menu.result.truncated) else false;
     const menu_rows = if (state.menu) |menu| @min(menu.result.labels.len, menu_limit) + @intFromBool(menu_status) else 0;
-    const input_rows = @max(@as(usize, 1), height -| (menu_rows + diagnostic_rows + 1 + @intFromBool(state.search != null)));
+    const input_rows = @max(@as(usize, 1), height -| (menu_rows + diagnostic_rows + 1 + @intFromBool(state.search != null or state.completion_pending)));
     const source = state.searchMatch() orelse state.buffer.text();
     const cursor = if (state.searchMatch() != null) source.len else state.buffer.cursor;
     const cursor_line = std.mem.count(u8, source[0..cursor], "\n");
@@ -50,6 +50,11 @@ pub fn redraw(view: *View, writer: *std.Io.Writer, prompt: edit.Prompt, state: *
             _ = try render.writePrompt(writer, .{ .spans = &.{.{ .text = message }} }, columns -| 1);
             row += 1;
         }
+    }
+    if (state.completion_pending) {
+        try writer.writeAll("\r\n");
+        _ = try render.writePrompt(writer, .{ .spans = &.{.{ .text = "completing..." }} }, columns -| 1);
+        row += 1;
     }
     if (state.search) |search| {
         try writer.writeAll("\r\n");

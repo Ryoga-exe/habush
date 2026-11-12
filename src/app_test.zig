@@ -4,6 +4,7 @@ test {
     _ = @import("Cli.zig");
     _ = @import("Shell.zig");
     _ = @import("CompletionService.zig");
+    _ = @import("AsyncCompletion.zig");
     _ = @import("DiagnosticService.zig");
     _ = @import("terminal/View.zig");
 }
