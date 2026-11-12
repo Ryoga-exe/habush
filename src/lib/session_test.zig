@@ -12,6 +12,45 @@ const Session = @import("Session.zig");
 const Diagnostic = @import("runtime/Diagnostic.zig");
 const Source = @import("Source.zig");
 
+test "parameter pattern removal preserves scalar boundaries and quoting" {
+    const gpa = std.testing.allocator;
+    var fake = FakeHost.init(gpa);
+    defer fake.deinit();
+    var resolver = FakeResolver.init(gpa);
+    defer resolver.deinit();
+    resolver.result = "/bin/probe";
+    var session = try Session.init(gpa, fake.host(), .{ .resolver = resolver.resolver(), .context = .{ .cwd = "/work" } });
+    defer session.deinit();
+    const cases = [_]struct { [:0]const u8, [4][]const u8 }{
+        .{ "v=a/b/c; a=${v#*/}; b=${v##*/}; c=${v%/*}; d=${v%%/*}", .{ "b/c", "c", "a/b", "a" } },
+        .{
+            \\v='*abc'; a="${v#*}"; b="${v##*}"; c="${v#"*"}"; d=${missing#*}
+            ,
+            .{ "*abc", "", "abc", "" },
+        },
+        .{ "v='🐚éx'; a=${v#?}; b=${v%?}; c=${v##?*}; d=${v%%*?}", .{ "éx", "🐚é", "", "" } },
+        .{ "v=abcabc; p='a*'; a=${v#$p}; b=${v#\"$p\"}; c=${v#${missing:-a*}}; d=${v#nomatch}", .{ "bcabc", "abcabc", "bcabc", "abcabc" } },
+        .{ "v=a/b/c; a=${v#${v%%/*}/}; b=${v#}; c=${v%}; d=${v##nomatch}", .{ "b/c", "a/b/c", "a/b/c", "a/b/c" } },
+        .{ "v=/work; a=${v#$(pwd)}; b=${v%$(pwd)}; c=${v##$(pwd)}; d=${v%%$(pwd)}", .{ "", "", "", "" } },
+    };
+    for (cases) |item| {
+        var result = try session.evaluate(item[0], .{});
+        defer result.deinit(gpa);
+        try std.testing.expect(result == .executed);
+        try std.testing.expectEqual(@as(u8, 0), result.executed.status);
+        for ([_][]const u8{ "a", "b", "c", "d" }, item[1]) |name, value|
+            try std.testing.expectEqualStrings(value, session.variable(name).?);
+    }
+    try session.setPositionalParameters(&.{ "a-one", "a two", "b-three" });
+    var args = try session.evaluate("probe \"${@#a}\" \"${*%three}\"", .{});
+    defer args.deinit(gpa);
+    try std.testing.expect(args == .executed);
+    const argv = fake.spawn_calls.items[0].argv;
+    try std.testing.expectEqual(@as(usize, 5), argv.len);
+    for (argv, [_][]const u8{ "probe", "-one", " two", "b-three", "a-one a two b-" }) |actual, expected|
+        try std.testing.expectEqualStrings(expected, actual);
+}
+
 test "case matches scalar words with quoting, nested substitution and control flow" {
     const gpa = std.testing.allocator;
     var fake = FakeHost.init(gpa);

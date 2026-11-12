@@ -302,6 +302,11 @@ pub fn build(b: *std.Build) !void {
     case_test.addArgs(&.{ "--no-config", "-c", "value='a b'; case \"$value\" in (x|a*) exit 7;; *) exit 1;; esac" });
     expectCliResult(case_test, test_step, 7, "", "");
 
+    const parameter_patterns_test = b.addRunArtifact(exe);
+    parameter_patterns_test.setName("test cli parameter pattern removal");
+    parameter_patterns_test.addArgs(&.{ "--no-config", "-c", "value=a/b/c; case \"${value##*/}\" in c) exit 7;; *) exit 1;; esac" });
+    expectCliResult(parameter_patterns_test, test_step, 7, "", "");
+
     const word_expansion_test = b.addRunArtifact(exe);
     word_expansion_test.setName("test cli word expansion");
     word_expansion_test.addFileArg(b.path("test/cli/word-expansion.hb"));

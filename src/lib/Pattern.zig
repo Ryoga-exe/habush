@@ -9,6 +9,26 @@ const Pattern = @This();
 bytes: []const u8,
 quoted: []const bool = &.{},
 
+pub const Removal = enum { prefix, longest_prefix, suffix, longest_suffix };
+
+/// Returns a view of value, testing only character boundaries (invalid bytes
+/// remain single characters). This keeps UTF-8 intact when trimming `?`.
+pub fn remove(pattern: Pattern, value: []const u8, mode: Removal) []const u8 {
+    const prefix = mode == .prefix or mode == .longest_prefix;
+    const first_match = mode == .prefix or mode == .longest_suffix;
+    var result = value;
+    var index: usize = 0;
+    while (true) {
+        if (pattern.matches(if (prefix) value[0..index] else value[index..])) {
+            result = if (prefix) value[index..] else value[0..index];
+            if (first_match) return result;
+        }
+        if (index == value.len) break;
+        index += character(value, index).len;
+    }
+    return result;
+}
+
 pub fn hasMeta(pattern: Pattern) bool {
     std.debug.assert(pattern.quoted.len == 0 or pattern.quoted.len == pattern.bytes.len);
     for (pattern.bytes, 0..) |byte, index| {

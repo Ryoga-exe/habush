@@ -44,6 +44,17 @@ pub const ParameterExpansion = struct {
         error_if_unset_or_null,
         alternative_if_set,
         alternative_if_set_and_not_null,
+        remove_prefix,
+        remove_longest_prefix,
+        remove_suffix,
+        remove_longest_suffix,
+
+        pub fn isRemoval(operator: Operator) bool {
+            return switch (operator) {
+                .remove_prefix, .remove_longest_prefix, .remove_suffix, .remove_longest_suffix => true,
+                else => false,
+            };
+        }
     };
 
     pub fn parse(source: []const u8) ?ParameterExpansion {
@@ -73,7 +84,13 @@ pub const ParameterExpansion = struct {
             .{ .error_if_unset_or_null, 2 }
         else if (std.mem.startsWith(u8, operator_source, ":+"))
             .{ .alternative_if_set_and_not_null, 2 }
+        else if (std.mem.startsWith(u8, operator_source, "##"))
+            .{ .remove_longest_prefix, 2 }
+        else if (std.mem.startsWith(u8, operator_source, "%%"))
+            .{ .remove_longest_suffix, 2 }
         else switch (operator_source[0]) {
+            '#' => .{ .remove_prefix, 1 },
+            '%' => .{ .remove_suffix, 1 },
             '-' => .{ .default_if_unset, 1 },
             '=' => .{ .assign_if_unset, 1 },
             '?' => .{ .error_if_unset, 1 },
