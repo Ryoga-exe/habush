@@ -461,6 +461,7 @@ fn readInputLine(self: *Shell, prompt: edit.Prompt, prefix: []const u8, allow_co
             .keybinds = self.keybinds,
             .completion = if (allow_completion) completion.completion() else null,
             .history = if (allow_completion and prefix.len == 0 and self.editing != null) &self.editing.?.history else null,
+            .inspector = if (allow_completion and prefix.len == 0) .{ .userdata = self, .inspect = inspectEditedSource } else null,
         }).read() catch |err| switch (err) {
             error.EditorUnavailable => try readLineAlloc(self.stdin, self.allocator, &self.last_line_ending),
             error.EndOfStream => null,
@@ -499,6 +500,25 @@ fn takeEditedLine(self: *Shell) !?[:0]u8 {
     }
     if (editing.offset >= source.len) editing.discard();
     return line;
+}
+
+fn inspectEditedSource(userdata: ?*anyopaque, source: []const u8) edit.Completion.Error!edit.Editor.Inspector.Status {
+    const self: *Shell = @ptrCast(@alignCast(userdata.?));
+    var arena: std.heap.ArenaAllocator = .init(self.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const submitted = try gpa.print("{s}\n", .{source});
+    const input = habush.SourceInput.collect(gpa, submitted) catch |err| switch (err) {
+        error.UnterminatedHereDocument => return .incomplete,
+        error.SourceTooLarge => return .invalid,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    const tree = habush.Ast.parseWithOptions(gpa, input.source, .{ .collected_here_documents = input.here_documents }) catch |err| switch (err) {
+        error.SourceTooLarge => return .invalid,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    if (tree.errors.len != 0) return .invalid;
+    return if (tree.status == .incomplete) .incomplete else .complete;
 }
 
 fn printPrompt(self: *Shell, continuation: bool, prompt: edit.Prompt) !void {

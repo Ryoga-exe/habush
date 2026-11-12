@@ -40,4 +40,7 @@ pub const LineInput = struct {
     pub fn columns(_: LineInput) usize {
         return 80;
     }
+    pub fn rows(_: LineInput) usize {
+        return 24;
+    }
 };

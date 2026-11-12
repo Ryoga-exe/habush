@@ -14,6 +14,9 @@ pub const Action = enum {
     cursor_end,
     cursor_left,
     cursor_right,
+    cursor_up,
+    cursor_down,
+    insert_newline,
     backspace,
     delete,
     kill_to_end,
@@ -108,13 +111,14 @@ pub fn lookup(bindings: []const Keybind, key: Key) ?Action {
         12 => .clear_screen,
         13 => .accept_line,
         14 => .history_next,
+        15 => .insert_newline,
         16 => .history_previous,
         21 => .kill_to_start,
         27 => .dismiss_completion,
         31 => .undo,
         127 => .backspace,
-        @backingInt(Key.up) => .history_previous,
-        @backingInt(Key.down) => .history_next,
+        @backingInt(Key.up) => .cursor_up,
+        @backingInt(Key.down) => .cursor_down,
         @backingInt(Key.left) => .cursor_left,
         @backingInt(Key.right) => .cursor_right,
         @backingInt(Key.home) => .cursor_start,
@@ -136,7 +140,7 @@ test "key normalization, override order, and unbinding defaults" {
     defer gpa.free(bindings);
     try std.testing.expectEqual(Action.complete, lookup(bindings, Key.fromByte(12)).?);
     try std.testing.expectEqual(Action.clear_screen, lookup(&.{}, Key.fromByte(12)).?);
-    try std.testing.expectEqual(Action.history_previous, lookup(&.{}, Key.fromEscape("OA").?).?);
+    try std.testing.expectEqual(Action.cursor_up, lookup(&.{}, Key.fromEscape("OA").?).?);
     try std.testing.expectEqual(Action.history_search_previous, lookup(bindings, .up).?);
     try std.testing.expect(lookup(bindings, Key.fromByte(9)) == null);
     try std.testing.expectEqual(try Key.parse("enter"), try Key.parse("ctrl+j"));

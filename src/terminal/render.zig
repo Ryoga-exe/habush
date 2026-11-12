@@ -1,9 +1,9 @@
-//! One-row terminal presentation. Control bytes are visible text; OSC belongs
+//! Terminal presentation helpers. Control bytes are visible text; OSC belongs
 //! to ShellIntegration and never enters the editing buffer or width count.
 const std = @import("std");
 const Prompt = @import("habush-edit").Prompt;
 
-pub fn redraw(writer: *std.Io.Writer, prompt: Prompt, source: []const u8, cursor: usize, columns: usize) std.Io.Writer.Error!void {
+pub fn inputRow(writer: *std.Io.Writer, prompt: Prompt, source: []const u8, cursor: usize, columns: usize) std.Io.Writer.Error!usize {
     const prompt_width = try writePrompt(null, prompt, columns -| 2);
     const available = columns -| (prompt_width + 1);
     const width = @max(available, 1);
@@ -16,7 +16,6 @@ pub fn redraw(writer: *std.Io.Writer, prompt: Prompt, source: []const u8, cursor
         skipped += unit.width;
         start += unit.len;
     }
-    try writer.writeAll("\r\x1b[2K");
     _ = try writePrompt(writer, prompt, columns -| 2);
     var index = start;
     var used: usize = 0;
@@ -27,10 +26,7 @@ pub fn redraw(writer: *std.Io.Writer, prompt: Prompt, source: []const u8, cursor
         used += unit.width;
         index += unit.len;
     }
-    try writer.writeByte('\r');
-    const column = prompt_width + before_cursor -| skipped;
-    if (column != 0) try writer.print("\x1b[{d}C", .{column});
-    try writer.flush();
+    return prompt_width + before_cursor -| skipped;
 }
 
 /// Width and output share the same clipping and escaping rules. ANSI is emitted
@@ -136,8 +132,8 @@ test "display width and visible controls preserve terminal boundaries" {
     try writeVisible(&output.writer, "a\x1b\n\xff日本\xe2\x80\xae");
     try std.testing.expectEqualStrings("a^[^J\\xFF日本\\u{202E}", output.written());
     output.clearRetainingCapacity();
-    try redraw(&output.writer, Prompt.secondary, "0123456789", 10, 8);
-    try std.testing.expectEqualStrings("\r\x1b[2K> 6789\r\x1b[6C", output.written());
+    try std.testing.expectEqual(@as(usize, 6), try inputRow(&output.writer, Prompt.secondary, "0123456789", 10, 8));
+    try std.testing.expectEqualStrings("> 6789", output.written());
 }
 
 test "styled prompts measure Unicode cells and escape provider controls" {

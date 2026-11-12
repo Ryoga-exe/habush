@@ -28,6 +28,7 @@ pub const SandboxPolicy = @import("SandboxPolicy.zig");
 pub const SandboxBackend = @import("SandboxBackend.zig");
 pub const Session = @import("Session.zig");
 pub const Source = @import("Source.zig");
+pub const SourceInput = @import("SourceInput.zig");
 pub const VariableStore = @import("VariableStore.zig");
 
 test {
