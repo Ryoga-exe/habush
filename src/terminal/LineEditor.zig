@@ -14,6 +14,7 @@ prompt: []const u8,
 completion: ?edit.Completion = null,
 
 const max_input_bytes = 64 * 1024;
+const Menu = struct { result: edit.Completion.Result, selected: usize = 0 };
 
 pub fn read(editor: LineEditor) !?[:0]u8 {
     var terminal = try platform.LineInput.init() orelse return error.EditorUnavailable;
@@ -27,6 +28,7 @@ pub fn read(editor: LineEditor) !?[:0]u8 {
     }
     var buffer: edit.Buffer = .{ .gpa = editor.gpa };
     defer buffer.deinit();
+    var menu: ?Menu = null;
     var pending: [4]u8 = undefined;
     var pending_len: usize = 0;
     var expected_len: usize = 0;
@@ -50,8 +52,15 @@ pub fn read(editor: LineEditor) !?[:0]u8 {
             try editor.insertTyped(&buffer, pending[0..pending_len]);
             pending_len = 0;
         }
+        if (byte != '\t' and byte != '\r' and byte != '\n' and byte != 27) menu = null;
         switch (byte) {
             '\r', '\n' => {
+                if (menu) |selection| {
+                    menu = null;
+                    if (!try editor.accept(&buffer, selection.selected)) try editor.output.writeByte(7);
+                    try render.redraw(editor.output, editor.prompt, buffer.text(), buffer.cursor, terminal.columns());
+                    continue;
+                }
                 try editor.output.writeAll("\r\n");
                 const line = try editor.gpa.dupeSentinel(u8, buffer.text(), 0);
                 errdefer editor.gpa.free(line);
@@ -77,9 +86,12 @@ pub fn read(editor: LineEditor) !?[:0]u8 {
             31 => {
                 _ = buffer.undo();
             },
-            '\t' => if (!try editor.complete(&buffer)) try editor.output.writeByte(7),
+            '\t' => if (!try editor.complete(&buffer, &menu)) try editor.output.writeByte(7),
             27 => {
-                if (editor.input.bufferedLen() == 0 and !terminal.ready(80)) continue;
+                if (editor.input.bufferedLen() == 0 and !terminal.ready(80)) {
+                    menu = null;
+                    continue;
+                }
                 var sequence: [16]u8 = undefined;
                 var length: usize = 0;
                 while (length < sequence.len) {
@@ -91,6 +103,16 @@ pub fn read(editor: LineEditor) !?[:0]u8 {
                     if (editor.input.bufferedLen() == 0 and !terminal.ready(80)) break;
                 }
                 const key = sequence[0..length];
+                if (menu) |*selection| {
+                    if (std.mem.eql(u8, key, "[A") or std.mem.eql(u8, key, "[B")) {
+                        const count = selection.result.labels.len;
+                        selection.selected = if (key[1] == 'A') (selection.selected + count - 1) % count else (selection.selected + 1) % count;
+                        try editor.showCandidates(selection.*);
+                        try render.redraw(editor.output, editor.prompt, buffer.text(), buffer.cursor, terminal.columns());
+                        continue;
+                    }
+                }
+                menu = null;
                 if (std.mem.eql(u8, key, "[D") or std.mem.eql(u8, key, "OD")) buffer.left() else if (std.mem.eql(u8, key, "[C") or std.mem.eql(u8, key, "OC")) buffer.right() else if (std.mem.eql(u8, key, "[H") or std.mem.eql(u8, key, "OH") or std.mem.eql(u8, key, "[1~")) buffer.cursor = 0 else if (std.mem.eql(u8, key, "[F") or std.mem.eql(u8, key, "OF") or std.mem.eql(u8, key, "[4~")) buffer.cursor = buffer.text().len else if (std.mem.eql(u8, key, "[3~")) try buffer.delete() else if (std.mem.eql(u8, key, "[200~")) try editor.paste(&buffer) else try editor.output.writeByte(7);
             },
             else => {
@@ -156,7 +178,12 @@ fn paste(editor: LineEditor, buffer: *edit.Buffer) !void {
     return error.EndOfStream;
 }
 
-fn complete(editor: LineEditor, buffer: *edit.Buffer) !bool {
+fn complete(editor: LineEditor, buffer: *edit.Buffer, menu: *?Menu) !bool {
+    if (menu.*) |*selection| {
+        selection.selected = (selection.selected + 1) % selection.result.labels.len;
+        try editor.showCandidates(selection.*);
+        return true;
+    }
     const service = editor.completion orelse return false;
     const request: edit.Completion.Request = .{
         .source = buffer.text(),
@@ -166,18 +193,28 @@ fn complete(editor: LineEditor, buffer: *edit.Buffer) !bool {
     const result = (try service.query(service.userdata, request)) orelse return false;
     if (!result.unique()) {
         if (result.labels.len == 0) return false;
-        try editor.showCandidates(result);
+        menu.* = .{ .result = result };
+        try editor.showCandidates(menu.*.?);
         return true;
     }
-    var replacement = (try service.choose(service.userdata, editor.gpa, request, 0)) orelse return false;
+    return editor.accept(buffer, 0);
+}
+
+fn accept(editor: LineEditor, buffer: *edit.Buffer, index: usize) !bool {
+    const service = editor.completion orelse return false;
+    const request: edit.Completion.Request = .{ .source = buffer.text(), .cursor = buffer.cursor, .revision = buffer.revision };
+    var replacement = (try service.choose(service.userdata, editor.gpa, request, index)) orelse return false;
     defer replacement.deinit(editor.gpa);
     return replacement.apply(buffer, max_input_bytes);
 }
 
-fn showCandidates(editor: LineEditor, result: edit.Completion.Result) !void {
+fn showCandidates(editor: LineEditor, menu: Menu) !void {
+    const result = menu.result;
     const max_rows = 8;
+    const start = menu.selected / max_rows * max_rows;
     try editor.output.writeAll("\r\n");
-    for (result.labels[0..@min(max_rows, result.labels.len)]) |label| {
+    for (result.labels[start..@min(start + max_rows, result.labels.len)], start..) |label, index| {
+        try editor.output.writeAll(if (index == menu.selected) "> " else "  ");
         // Labels are data, never terminal sequences. Bound presentation as well
         // as provider output; insertion always uses the complete original value.
         try render.writeVisible(editor.output, label[0..@min(label.len, 256)]);
