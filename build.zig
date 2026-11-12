@@ -6,11 +6,17 @@ pub fn build(b: *std.Build) void {
     const skip_zig_36010 = (b.option(bool, "skip-zig-36010", "Skip macOS cancellation checks affected by Zig PR #36010") orelse false) and
         target.result.os.tag == .macos;
 
+    const habush_edit = b.addModule("habush-edit", .{
+        .root_source_file = b.path("src/lib/edit.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const habush = b.addModule("habush", .{
         .root_source_file = b.path("src/lib/main.zig"),
         .target = target,
         .optimize = optimize,
     });
+    habush.addImport("habush-edit", habush_edit);
     const habush_exec = b.addModule("habush-exec", .{
         .root_source_file = b.path("src/lib/exec.zig"),
         .target = target,
@@ -25,6 +31,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addImport("habush", habush);
+    exe.root_module.addImport("habush-edit", habush_edit);
 
     b.installArtifact(exe);
 
@@ -92,6 +99,9 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_lib_tests.step);
+    const edit_tests = b.addTest(.{ .root_module = habush_edit });
+    const run_edit_tests = b.addRunArtifact(edit_tests);
+    test_step.dependOn(&run_edit_tests.step);
     const terminal_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/app_test.zig"),
@@ -100,6 +110,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     terminal_tests.root_module.addImport("habush", habush);
+    terminal_tests.root_module.addImport("habush-edit", habush_edit);
     const run_terminal_tests = b.addRunArtifact(terminal_tests);
     run_terminal_tests.setEnvironmentVariable("HABUSH_TEST_SKIP_ZIG_36010", if (skip_zig_36010) "1" else "0");
     test_step.dependOn(&run_terminal_tests.step);

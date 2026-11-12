@@ -71,6 +71,11 @@ pub fn main(init: std.process.Init) !void {
     _ = try terminal.expect(ready);
     try std.testing.expect(!(try posix.tcgetattr(slave_fd)).lflag.ICANON);
 
+    try master.writeStreamingAll(io, "PATH=; habush_completion_probe() { /bin/echo COMPLETION:$1; }\r");
+    _ = try terminal.expect(ready);
+    try master.writeStreamingAll(io, "habush_completion_pr\t literal\r");
+    try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "COMPLETION:literal\r\n") != null);
+
     // TODO: Remove this quarantine with https://codeberg.org/ziglang/zig/pulls/36010.
     if (@import("builtin").target.os.tag == .macos and
         std.mem.eql(u8, init.environ_map.get("HABUSH_TEST_SKIP_ZIG_36010") orelse "", "1"))

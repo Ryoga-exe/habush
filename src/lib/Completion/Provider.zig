@@ -116,13 +116,14 @@ pub const Collector = struct {
 
 /// Provider errors leave a visibly incomplete result; cancellation and allocation
 /// failures propagate. Nothing here reads Session state or executes shell code.
-pub fn collect(gpa: std.mem.Allocator, request: Request, providers: []const Provider, limits: Limits) Error!Result {
+pub fn collect(gpa: std.mem.Allocator, request: Request, providers: []const Provider, limits: Limits) (std.mem.Allocator.Error || error{Canceled})!Result {
     var collector: Collector = .{ .gpa = gpa, .limits = limits };
     errdefer collector.deinit();
     var incomplete = false;
     for (providers) |provider| {
         provider.complete(provider.userdata, request, &collector) catch |err| switch (err) {
-            error.OutOfMemory, error.Canceled => return err,
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Canceled => return error.Canceled,
             error.Unavailable, error.InvalidCandidate => incomplete = true,
         };
         if (collector.truncated) break;
