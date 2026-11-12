@@ -106,9 +106,14 @@ const Frame = struct {
     parameter_depth: usize = 0,
     dynamic: bool = false,
     command_start: ?usize = null,
+    document_header: ?usize = null,
+
+    fn reset(frame: *Frame) void {
+        frame.* = .{ .document_header = frame.document_header };
+    }
 };
 
-pub fn inspect(source: []const u8, cursor: usize, revision: u64) error{ InvalidCursor, InputTooDeep }!Completion {
+pub fn inspect(source: []const u8, cursor: usize, revision: u64) error{ InvalidCursor, InputTooDeep, UnsupportedContext }!Completion {
     if (cursor > source.len) return error.InvalidCursor;
     var frames: [64]Frame = @splat(.{});
     var substitutions: [64]?usize = @splat(null);
@@ -117,8 +122,15 @@ pub fn inspect(source: []const u8, cursor: usize, revision: u64) error{ InvalidC
     while (index < cursor) : (index += 1) {
         const frame = &frames[depth];
         const byte = source[index];
+        if (byte == '\n' and frame.document_header != null and frame.quote == .unquoted and !frame.escaped and frame.parameter_depth == 0) {
+            const end = word_syntax.skipHereDocuments(source, frame.document_header.?, index, index + 1) orelse return error.UnsupportedContext;
+            if (end > cursor or (end == cursor and source[end - 1] != '\n')) return error.UnsupportedContext;
+            frame.* = .{};
+            index = end - 1;
+            continue;
+        }
         if (frame.comment) {
-            if (byte == '\n') frame.* = .{};
+            if (byte == '\n') frame.reset();
             continue;
         }
         if (frame.escaped) {
@@ -178,7 +190,7 @@ pub fn inspect(source: []const u8, cursor: usize, revision: u64) error{ InvalidC
         } else if (byte == ')') {
             if (depth != 0 and (substitutions[depth] == null or word_syntax.commandSubstitutionEnd(source, substitutions[depth].?) == index)) {
                 depth -= 1;
-            } else frame.* = .{};
+            } else frame.reset();
         } else if (byte == '(') {
             finishWord(frame, source, index);
             if (depth + 1 == frames.len) return error.InputTooDeep;
@@ -186,13 +198,14 @@ pub fn inspect(source: []const u8, cursor: usize, revision: u64) error{ InvalidC
             frames[depth] = .{};
             substitutions[depth] = null;
         } else if (byte == '<' or byte == '>') {
+            if (word_syntax.isHereDocument(source, index) and frame.document_header == null) frame.document_header = index;
             if (frame.word) |start| {
                 if (allDigits(source[start..index])) frame.word = null else finishWord(frame, source, index);
             }
             frame.redirection = true;
             frame.dynamic = false;
         } else if (byte == '|' or byte == '&' or byte == ';' or byte == '\n' or byte == '{' or byte == '}') {
-            frame.* = .{};
+            frame.reset();
         } else if (std.ascii.isWhitespace(byte)) {
             finishWord(frame, source, index);
         } else if (frame.word == null) frame.word = index;

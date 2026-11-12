@@ -296,7 +296,7 @@ const HereDocumentDelimiter = struct {
     quoted: bool,
 };
 
-fn isHereDocument(source: []const u8, index: usize) bool {
+pub fn isHereDocument(source: []const u8, index: usize) bool {
     return index + 1 < source.len and source[index] == '<' and source[index + 1] == '<' and
         (index == 0 or source[index - 1] != '<') and
         (index + 2 == source.len or source[index + 2] != '<');
@@ -323,7 +323,8 @@ fn scanHereDocument(source: []const u8, start: usize) ?HereDocumentDelimiter {
     return .{ .raw = source[begin..index], .end = index, .strip_tabs = strip_tabs, .quoted = quoted };
 }
 
-fn skipHereDocuments(source: []const u8, header: usize, header_end: usize, body_start: usize) ?usize {
+/// Shared by substitution scanning and completion; null means an unfinished body.
+pub fn skipHereDocuments(source: []const u8, header: usize, header_end: usize, body_start: usize) ?usize {
     var index = header;
     var body = body_start;
     var word_start = true;

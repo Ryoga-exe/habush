@@ -313,6 +313,8 @@ fn historyScenario(io: Io, master: Io.File, terminal: *Terminal) !void {
     _ = try terminal.expect(ready);
     try master.writeStreamingAll(io, "/bin/echo EDITED:$result\r");
     try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "EDITED:right\r\n") != null);
+    try master.writeStreamingAll(io, "{ : <<'EOF'\r'$(unclosed\t\rEOF\r/bin/echo READ\t; }\r");
+    try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "README.md\r\n") != null);
 }
 
 fn pluginScenario(io: Io, master: Io.File, terminal: *Terminal) !void {
