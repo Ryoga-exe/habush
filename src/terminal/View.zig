@@ -15,9 +15,10 @@ pub fn redraw(view: *View, writer: *std.Io.Writer, prompt: edit.Prompt, state: *
     const menu_limit = @max(@as(usize, 1), @min(@as(usize, 8), menu_height / 2 -| 1));
     const menu_status = if (state.menu) |menu| menu_height > 3 and (menu.result.labels.len > menu_limit or menu.result.incomplete or menu.result.truncated) else false;
     const menu_rows = if (state.menu) |menu| @min(menu.result.labels.len, menu_limit) + @intFromBool(menu_status) else 0;
-    const input_rows = @max(@as(usize, 1), height -| (menu_rows + diagnostic_rows + 1));
-    const source = state.buffer.text();
-    const cursor_line = std.mem.count(u8, source[0..state.buffer.cursor], "\n");
+    const input_rows = @max(@as(usize, 1), height -| (menu_rows + diagnostic_rows + 1 + @intFromBool(state.search != null)));
+    const source = state.searchMatch() orelse state.buffer.text();
+    const cursor = if (state.searchMatch() != null) source.len else state.buffer.cursor;
+    const cursor_line = std.mem.count(u8, source[0..cursor], "\n");
     const first_line = cursor_line -| (input_rows - 1);
     if (view.cursor_row != 0) try writer.print("\x1b[{d}A", .{@min(view.cursor_row, height - 1)});
     try writer.writeAll("\r\x1b[J");
@@ -31,7 +32,7 @@ pub fn redraw(view: *View, writer: *std.Io.Writer, prompt: edit.Prompt, state: *
         if (line_index < first_line) continue;
         if (row == input_rows) break;
         if (row != 0) try writer.writeAll("\r\n");
-        const column = try render.inputRow(writer, if (line_index == 0) prompt else edit.Prompt.secondary, line, if (line_index == cursor_line) state.buffer.cursor - source_offset else 0, columns, diagnostics, source_offset);
+        const column = try render.inputRow(writer, if (line_index == 0) prompt else edit.Prompt.secondary, line, if (line_index == cursor_line) cursor - source_offset else 0, columns, diagnostics, source_offset);
         if (line_index == cursor_line) cursor_column = column;
         row += 1;
     }
@@ -49,6 +50,14 @@ pub fn redraw(view: *View, writer: *std.Io.Writer, prompt: edit.Prompt, state: *
             _ = try render.writePrompt(writer, .{ .spans = &.{.{ .text = message }} }, columns -| 1);
             row += 1;
         }
+    }
+    if (state.search) |search| {
+        try writer.writeAll("\r\n");
+        _ = try render.writePrompt(writer, .{ .spans = &.{
+            .{ .text = if (search.failed) "history (no match): " else "history (Enter selects, Esc cancels): " },
+            .{ .text = search.query.text() },
+        } }, columns -| 1);
+        row += 1;
     }
     for (diagnostics[0..diagnostic_rows]) |diagnostic| {
         try writer.writeAll("\r\n");
