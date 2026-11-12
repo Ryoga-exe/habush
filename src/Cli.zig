@@ -53,8 +53,8 @@ pub fn parse(args: []const [:0]const u8) ?Cli {
 }
 
 test "startup flags preserve script arguments and explicit command selection" {
-    const parsed = parse(&.{ "habush", "--config=alternate.json", "--no-rc", "script.hb", "--no-config" }).?;
-    try std.testing.expectEqualStrings("alternate.json", parsed.config_path.?);
+    const parsed = parse(&.{ "habush", "--config=alternate.zon", "--no-rc", "script.hb", "--no-config" }).?;
+    try std.testing.expectEqualStrings("alternate.zon", parsed.config_path.?);
     try std.testing.expect(parsed.no_rc);
     try std.testing.expectEqualStrings("--no-config", parsed.invocation.script.arguments[0]);
     const command = parse(&.{ "habush", "--no-config", "-c", "exit 3" }).?;

@@ -16,17 +16,58 @@ pub const Mode = enum { auto, on, off };
 pub const max_file_bytes = 64 * 1024;
 pub const max_rc_bytes = 1024 * 1024;
 
-pub fn parse(gpa: std.mem.Allocator, source: []const u8) !Config {
-    const parsed = try std.json.parseFromSlice(Config, gpa, source, .{});
-    defer parsed.deinit();
-    if (parsed.value.version != 1) return error.UnsupportedConfigVersion;
-    return parsed.value;
+pub fn parse(options: std.zon.parse.Options) !Config {
+    const config = try std.zon.parse.fromSliceNoAlloc(Config, options);
+    if (config.version != 1) return error.UnsupportedConfigVersion;
+    return config;
 }
 
-pub fn read(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !Config {
-    const source = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(max_file_bytes));
+fn read(gpa: std.mem.Allocator, io: std.Io, path: []const u8, diagnostics: *std.Io.Writer) !Config {
+    const source = try std.Io.Dir.cwd().readFileAllocOptions(io, path, gpa, .limited(max_file_bytes), .of(u8), 0);
     defer gpa.free(source);
-    return parse(gpa, source);
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var detail: std.zon.parse.Diagnostics = undefined;
+    return parse(.{
+        .gpa = gpa,
+        .arena = arena.allocator(),
+        .source = source,
+        .diagnostics = &detail,
+    }) catch |err| {
+        if (err == error.ParseZon)
+            try diagnostics.print("habush: configuration: {f}\n", .{detail.fmt(path)});
+        return err;
+    };
+}
+
+/// Loads the explicit path or config.zon; a missing default uses default values.
+/// Returns null after reporting an invalid or unreadable configuration.
+pub fn load(gpa: std.mem.Allocator, io: std.Io, paths: Paths, explicit: ?[]const u8, diagnostics: *std.Io.Writer) !?Config {
+    const default_path = if (explicit == null) try paths.configFile(gpa) else null;
+    defer if (default_path) |path| gpa.free(path);
+    const path = explicit orelse default_path orelse return .{};
+    return read(gpa, io, path, diagnostics) catch |err| {
+        if (err == error.FileNotFound and explicit == null) return .{};
+        if (err == error.OutOfMemory or err == error.WriteFailed) return err;
+        if (err != error.ParseZon) try reportError(diagnostics, path, err);
+        return null;
+    };
+}
+
+pub fn reportError(writer: *std.Io.Writer, path: ?[]const u8, err: anyerror) std.Io.Writer.Error!void {
+    const message = switch (err) {
+        error.InvalidLineEditSetting => "HABUSH_LINE_EDIT must be auto, on, or off",
+        error.InvalidShellIntegrationSetting => "HABUSH_SHELL_INTEGRATION must be auto, on, or off",
+        error.UnsupportedConfigVersion => "unsupported config version",
+        error.FileNotFound => "no such file or directory",
+        error.AccessDenied => "permission denied",
+        error.IsDir => "is a directory",
+        error.StreamTooLong => "config file is too large",
+        else => @errorName(err),
+    };
+    try writer.writeAll("habush: configuration: ");
+    if (path) |value| try writer.print("{s}: ", .{value});
+    return writer.print("{s}\n", .{message});
 }
 
 /// Environment overrides only affect application presentation. They are not
@@ -84,7 +125,7 @@ pub const Paths = struct {
 
     pub fn configFile(paths: Paths, gpa: std.mem.Allocator) !?[]u8 {
         const directory_path = paths.config orelse return null;
-        return try std.fs.path.join(gpa, &.{ directory_path, "config.json" });
+        return try std.fs.path.join(gpa, &.{ directory_path, "config.zon" });
     }
 
     pub fn rcFile(paths: Paths, gpa: std.mem.Allocator) !?[]u8 {
@@ -127,16 +168,8 @@ fn directory(gpa: std.mem.Allocator, candidate: ?[]const u8, home: ?[]const u8, 
     };
 }
 
-test "typed JSON and environment overrides reject invalid or ambiguous settings" {
-    const config = try parse(std.testing.allocator, "{\"line_edit\":\"off\",\"load_rc\":false}");
-    try std.testing.expectEqual(Mode.off, config.line_edit);
-    try std.testing.expect(!config.load_rc);
-    const bounded = try parse(std.testing.allocator, "{\"completion_limits\":{\"candidates\":8,\"bytes\":4096,\"scanned\":256}}");
-    try std.testing.expectEqual(@as(usize, 8), bounded.completion_limits.candidates);
-    try std.testing.expectError(error.UnknownField, parse(std.testing.allocator, "{\"line_edti\":\"off\"}"));
-    try std.testing.expectError(error.DuplicateField, parse(std.testing.allocator, "{\"load_rc\":true,\"load_rc\":false}"));
-    try std.testing.expectError(error.UnsupportedConfigVersion, parse(std.testing.allocator, "{\"version\":2}"));
-    try std.testing.expectError(error.InvalidEnumTag, parse(std.testing.allocator, "{\"line_edit\":\"maybe\"}"));
+test "environment overrides reject invalid settings" {
+    const config: Config = .{ .line_edit = .off, .load_rc = false };
     var environ: std.process.Environ.Map = .init(std.testing.allocator);
     defer environ.deinit();
     try environ.put("HABUSH_LINE_EDIT", "on");
@@ -149,6 +182,62 @@ test "typed JSON and environment overrides reject invalid or ambiguous settings"
     try environ.put("HABUSH_LINE_EDIT", "maybe");
     try std.testing.expectError(error.InvalidLineEditSetting, config.withEnvironment(&environ));
     try std.testing.expect(!config.lineEditEnabled(false, "xterm"));
+}
+
+test "ZON configuration validates fields and honors explicit paths without JSON fallback" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const directory_path = path_buffer[0..try tmp.dir.realPath(io, &path_buffer)];
+    var paths: Paths = .{ .config = try gpa.dupe(u8, directory_path) };
+    defer paths.deinit(gpa);
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+
+    try std.testing.expectEqualDeep(Config{}, (try load(gpa, io, paths, null, &output.writer)).?);
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"load_rc\":false}" });
+    try std.testing.expectEqualDeep(Config{}, (try load(gpa, io, paths, null, &output.writer)).?);
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.zon", .data = ".{ .line_edit = .off, .completion_limits = .{ .candidates = 7 } }" });
+    const zon = (try load(gpa, io, paths, null, &output.writer)).?;
+    try std.testing.expectEqual(Mode.off, zon.line_edit);
+    try std.testing.expect(zon.load_rc);
+    try std.testing.expectEqual(@as(usize, 7), zon.completion_limits.candidates);
+    try std.testing.expectEqual((Config{}).completion_limits.bytes, zon.completion_limits.bytes);
+    try std.testing.expectEqualStrings("", output.written());
+
+    for ([_][]const u8{
+        ".{\n    .line_edti = .off,\n}",
+        ".{ .load_rc = true, .load_rc = false }",
+        ".{ .line_edit = .maybe }",
+        ".{ .version = 2 }",
+    }, 0..) |invalid, index| {
+        output.clearRetainingCapacity();
+        try tmp.dir.writeFile(io, .{ .sub_path = "config.zon", .data = invalid });
+        try std.testing.expect(try load(gpa, io, paths, null, &output.writer) == null);
+        try std.testing.expect(output.written().len > 0);
+        if (index == 0)
+            try std.testing.expect(std.mem.indexOf(u8, output.written(), "config.zon:2:") != null);
+    }
+
+    output.clearRetainingCapacity();
+    try tmp.dir.writeFile(io, .{ .sub_path = "custom.conf", .data = ".{ .load_rc = false }" });
+    const explicit_path = try std.fs.path.join(gpa, &.{ directory_path, "custom.conf" });
+    defer gpa.free(explicit_path);
+    try std.testing.expect(!(try load(gpa, io, paths, explicit_path, &output.writer)).?.load_rc);
+    try std.testing.expectEqualStrings("", output.written());
+
+    const json_path = try std.fs.path.join(gpa, &.{ directory_path, "config.json" });
+    defer gpa.free(json_path);
+    try std.testing.expect(try load(gpa, io, paths, json_path, &output.writer) == null);
+    try std.testing.expect(output.written().len > 0);
+
+    output.clearRetainingCapacity();
+    const missing = try std.fs.path.join(gpa, &.{ directory_path, "missing.zon" });
+    defer gpa.free(missing);
+    try std.testing.expect(try load(gpa, io, paths, missing, &output.writer) == null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "no such file or directory") != null);
 }
 
 test "XDG bases require absolute paths and use HOME fallbacks without creating directories" {

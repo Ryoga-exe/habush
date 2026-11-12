@@ -134,6 +134,23 @@ pub fn build(b: *std.Build) void {
     command_control_test.addArgs(&.{ "-c", "false; exit; missing" });
     expectCliResult(command_control_test, test_step, 1, "", "");
 
+    const zon_config_test = b.addRunArtifact(exe);
+    zon_config_test.setName("test cli explicit ZON config");
+    zon_config_test.addArg("--config");
+    zon_config_test.addFileArg(b.path("test/cli/config.zon"));
+    zon_config_test.addArgs(&.{ "-c", "exit 17" });
+    expectCliResult(zon_config_test, test_step, 17, "", "");
+
+    const invalid_config_test = b.addRunArtifact(exe);
+    invalid_config_test.setName("test cli ZON config diagnostic");
+    invalid_config_test.addArg("--config");
+    invalid_config_test.addFileArg(b.path("test/cli/invalid-config.zon"));
+    invalid_config_test.addArgs(&.{ "-c", "exit 17" });
+    invalid_config_test.expectExitCode(2);
+    invalid_config_test.expectStdOutEqual("");
+    invalid_config_test.expectStdErrMatch("invalid-config.zon:2:");
+    test_step.dependOn(&invalid_config_test.step);
+
     const syntax_stop_test = b.addRunArtifact(exe);
     syntax_stop_test.setName("test cli syntax error stops remaining source");
     syntax_stop_test.addArgs(&.{ "-c", ")\nexit 23" });
