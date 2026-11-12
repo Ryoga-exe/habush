@@ -259,7 +259,7 @@ test "empty completion is exclusive while failures, limits and timeouts fall bac
         try std.testing.expectEqualStrings("fallback", external.candidates[0].value);
     }
     try std.testing.expectEqual(@as(usize, 0), system.children.count());
-    _ = try session.evaluate("__comp() { mark; while true; do :; done; }", .{});
+    _ = try session.evaluate("__comp() { mark; while true; do :; done; }; complete -F __comp git", .{});
     registered.timeout = .fromSeconds(2);
     const io = std.testing.io;
     var task = try io.concurrent(Provider.collect, .{ gpa, request, &providers, Provider.Limits{} });
