@@ -3,7 +3,7 @@ const std = @import("std");
 const posix = std.posix;
 const Io = std.Io;
 
-// Zig 0.16 has no public PTY allocation/session wrapper.
+// Zig has no public PTY allocation/session wrapper.
 extern "c" fn openpty(*c_int, *c_int, ?[*]u8, ?*const posix.termios, ?*const posix.winsize) c_int;
 extern "c" fn login_tty(c_int) c_int;
 extern "c" fn tcgetpgrp(c_int) posix.pid_t;
@@ -71,12 +71,19 @@ pub fn main(init: std.process.Init) !void {
     _ = try terminal.expect(ready);
     try std.testing.expect(!(try posix.tcgetattr(slave_fd)).lflag.ICANON);
 
-    try master.writeStreamingAll(io, "pwd; while true; do :; done\r");
-    _ = try terminal.expect("\x1b[?2004l");
-    try master.writeStreamingAll(io, "\x03");
-    _ = try terminal.expect(ready);
-    try master.writeStreamingAll(io, "/bin/echo INTERRUPT:$?\r");
-    try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "INTERRUPT:130\r\n") != null);
+    // TODO: Remove this quarantine with https://codeberg.org/ziglang/zig/pulls/36010.
+    if (@import("builtin").target.os.tag == .macos and
+        std.mem.eql(u8, init.environ_map.get("HABUSH_TEST_SKIP_ZIG_36010") orelse "", "1"))
+    {
+        std.debug.print("SKIP: PTY Ctrl-C check (Zig PR #36010)\n", .{});
+    } else {
+        try master.writeStreamingAll(io, "pwd; while true; do :; done\r");
+        _ = try terminal.expect("\x1b[?2004l");
+        try master.writeStreamingAll(io, "\x03");
+        _ = try terminal.expect(ready);
+        try master.writeStreamingAll(io, "/bin/echo INTERRUPT:$?\r");
+        try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "INTERRUPT:130\r\n") != null);
+    }
 
     try master.writeStreamingAll(io, ")\r");
     try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "expected command") != null);
@@ -92,7 +99,7 @@ pub fn main(init: std.process.Init) !void {
             _ = try terminal.expect("\x1b[?2004l");
         }
         while (true) {
-            posix.kill(background, @enumFromInt(0)) catch |err| switch (err) {
+            posix.kill(background, @fromBackingInt(0)) catch |err| switch (err) {
                 error.ProcessNotFound => break,
                 else => return err,
             };

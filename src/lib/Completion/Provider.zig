@@ -154,7 +154,7 @@ test "providers own and deduplicate values, bound results, and reject stale inse
     defer edit.deinit(std.testing.allocator);
     // The real parser and expander must recover exactly one literal argument;
     // an accidental command substitution would require an unavailable callback.
-    const source = try std.testing.allocator.dupeZ(u8, edit.text);
+    const source = try std.testing.allocator.dupeSentinel(u8, edit.text, 0);
     defer std.testing.allocator.free(source);
     var tree = try @import("../Ast.zig").parse(std.testing.allocator, source);
     defer tree.deinit(std.testing.allocator);

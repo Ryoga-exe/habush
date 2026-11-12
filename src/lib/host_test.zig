@@ -44,7 +44,7 @@ test "host rejects joining process group zero before dispatch" {
     try std.testing.expectError(error.InvalidArguments, fake.host().spawn(.{
         .executable = "/bin/command",
         .argv = &.{"command"},
-        .process_group = .{ .join = @enumFromInt(0) },
+        .process_group = .{ .join = @fromBackingInt(0) },
     }));
     try std.testing.expectEqual(@as(usize, 0), fake.spawn_calls.items.len);
 }

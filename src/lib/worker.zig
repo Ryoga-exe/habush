@@ -11,11 +11,11 @@ const builtin = @import("builtin");
 const CommandPlan = @import("CommandPlan.zig");
 const Host = @import("Host.zig");
 const append_file = @import("Host/System/append_file.zig");
-const worker_channel = if (builtin.os.tag == .windows or builtin.os.tag == .wasi)
+const worker_channel = if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi)
     struct {}
 else
     @import("Host/System/worker_channel.zig");
-const Reporter = if (builtin.os.tag == .windows or builtin.os.tag == .wasi) void else worker_channel.Reporter;
+const Reporter = if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) void else worker_channel.Reporter;
 
 pub const argument = "--internal-command-worker";
 /// Used only by the private System worker host; not part of the public plan.
@@ -212,7 +212,7 @@ pub fn run(init: std.process.Init, arguments: []const [:0]const u8) u8 {
     var reporter: ?Reporter = null;
     const bootstrap = arguments.len != 0 and std.mem.eql(u8, arguments[0], bootstrap_argument);
     if (bootstrap) {
-        if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
             report(init.io, "unsupported platform");
             return 126;
         } else {
@@ -222,12 +222,12 @@ pub fn run(init: std.process.Init, arguments: []const [:0]const u8) u8 {
             };
         }
     }
-    defer if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+    defer if (builtin.target.os.tag != .windows and builtin.target.os.tag != .wasi) {
         if (reporter) |channel| channel.deinit();
     };
     const payload = if (bootstrap) arguments[1..] else arguments;
     const values = gpa.alloc([]const u8, payload.len) catch {
-        if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+        if (builtin.target.os.tag != .windows and builtin.target.os.tag != .wasi) {
             if (reporter) |channel| channel.send(.resource_unavailable);
         }
         report(init.io, "out of memory");
@@ -236,7 +236,7 @@ pub fn run(init: std.process.Init, arguments: []const [:0]const u8) u8 {
     defer gpa.free(values);
     for (payload, values) |value, *destination| destination.* = value;
     var decoded = parse(gpa, values) catch |err| {
-        if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+        if (builtin.target.os.tag != .windows and builtin.target.os.tag != .wasi) {
             if (reporter) |channel|
                 channel.send(if (err == error.OutOfMemory) .resource_unavailable else .unsupported);
         }
@@ -245,7 +245,7 @@ pub fn run(init: std.process.Init, arguments: []const [:0]const u8) u8 {
     };
     defer decoded.deinit(gpa);
 
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
         report(init.io, "unsupported platform");
         return 126;
     } else {
@@ -325,7 +325,7 @@ fn executeFailure(err: anyerror) Host.SpawnFailure {
 }
 
 fn standardDescriptor(descriptor: CommandPlan.FileDescriptor) bool {
-    return @intFromEnum(descriptor) <= 2;
+    return @backingInt(descriptor) <= 2;
 }
 
 fn descriptorText(descriptor: CommandPlan.FileDescriptor) []const u8 {
@@ -351,7 +351,7 @@ fn applyAction(io: std.Io, action: CommandPlan.FileAction) !void {
     switch (action) {
         .open => |open| {
             const file = try openFile(io, open);
-            const target: std.posix.fd_t = @intCast(@intFromEnum(open.target));
+            const target: std.posix.fd_t = @intCast(@backingInt(open.target));
             if (file.handle == target) {
                 // open() may reuse a closed stdio descriptor. It is CLOEXEC by
                 // default, and dup2(fd, fd) would not clear that flag.
@@ -362,10 +362,10 @@ fn applyAction(io: std.Io, action: CommandPlan.FileAction) !void {
             }
         },
         .duplicate => |binding| try duplicateDescriptor(
-            @intCast(@intFromEnum(binding.source)),
-            @intCast(@intFromEnum(binding.target)),
+            @intCast(@backingInt(binding.source)),
+            @intCast(@backingInt(binding.target)),
         ),
-        .close => |descriptor| switch (std.posix.errno(std.posix.system.close(@intCast(@intFromEnum(descriptor))))) {
+        .close => |descriptor| switch (std.posix.errno(std.posix.system.close(@intCast(@backingInt(descriptor))))) {
             .SUCCESS, .INTR, .BADF => {},
             else => return error.CloseFailed,
         },
@@ -450,7 +450,7 @@ test "startup suspension is parsed before every file action" {
 test "worker protocol preserves ordered actions and literal argv without environment" {
     const gpa = std.testing.allocator;
     const actions: []const CommandPlan.FileAction = &.{
-        .{ .use_resource = .{ .resource = @enumFromInt(93), .target = .stdin } },
+        .{ .use_resource = .{ .resource = @fromBackingInt(93), .target = .stdin } },
         .{ .duplicate = .{ .source = .stdout, .target = .stderr } },
         .{ .open = .{ .path = "); $(false) --", .target = .stdout, .access = .write, .disposition = .create_or_append } },
         .{ .close = .stdin },
@@ -479,14 +479,14 @@ test "ordinary worker launch delegates context and only the resource prefix" {
     const gpa = std.testing.allocator;
     var fake = FakeHost.init(gpa);
     defer fake.deinit();
-    const worker_executable = if (builtin.os.tag == .windows) "C:/trusted/habush.exe" else "/trusted/habush";
+    const worker_executable = if (builtin.target.os.tag == .windows) "C:/trusted/habush.exe" else "/trusted/habush";
     const plan: CommandPlan = .{
         .executable = "/resolved/tool",
         .argv = &.{ "tool", "literal argument" },
         .cwd = .{ .path = "/chosen/work" },
         .environment = .{ .replace = &.{.{ .name = "MARKER", .value = "environment-only" }} },
         .file_actions = &.{
-            .{ .use_resource = .{ .resource = @enumFromInt(17), .target = .stdin } },
+            .{ .use_resource = .{ .resource = @fromBackingInt(17), .target = .stdin } },
             .{ .open = .{ .path = "fifo", .target = .stdout, .access = .write, .disposition = .open_existing } },
             .{ .duplicate = .{ .source = .stdout, .target = .stderr } },
         },
@@ -502,7 +502,7 @@ test "ordinary worker launch delegates context and only the resource prefix" {
     try std.testing.expectEqual(.create, wrapped.process_group);
     try std.testing.expectEqual(.inherit, wrapped.sandbox);
     try std.testing.expectEqual(@as(usize, 1), wrapped.file_actions.len);
-    try std.testing.expectEqual(@as(u32, 17), @intFromEnum(wrapped.file_actions[0].use_resource.resource));
+    try std.testing.expectEqual(@as(u32, 17), @backingInt(wrapped.file_actions[0].use_resource.resource));
     try std.testing.expectEqualStrings(argument, wrapped.argv[1]);
     var decoded = try parse(gpa, wrapped.argv[2..]);
     defer decoded.deinit(gpa);
@@ -519,10 +519,10 @@ test "ordinary worker launch delegates context and only the resource prefix" {
 test "worker rejects resource interleaving and arbitrary descriptors before preparing" {
     const actions: []const CommandPlan.FileAction = &.{
         .{ .open = .{ .path = "/must-not-open", .target = .stdout, .access = .write, .disposition = .create_or_truncate } },
-        .{ .use_resource = .{ .resource = @enumFromInt(1), .target = .stdout } },
+        .{ .use_resource = .{ .resource = @fromBackingInt(1), .target = .stdout } },
     };
     try std.testing.expectError(error.Unsupported, splitFileActions(actions));
-    try std.testing.expectError(error.Unsupported, splitFileActions(&.{.{ .close = @enumFromInt(100) }}));
+    try std.testing.expectError(error.Unsupported, splitFileActions(&.{.{ .close = @fromBackingInt(100) }}));
 }
 
 test "worker validates truncated and malformed protocol before any redirect" {

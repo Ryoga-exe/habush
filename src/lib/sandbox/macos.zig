@@ -156,7 +156,7 @@ test "profile strings quote metacharacters and reject control bytes" {
 }
 
 test "required rejects unsupported grants and best effort reports its subset" {
-    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    if (builtin.target.os.tag != .macos) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const backend: SandboxBackend = .{ .kind = .macos_seatbelt };
     var policy: SandboxPolicy = .{
@@ -184,7 +184,7 @@ test "required rejects unsupported grants and best effort reports its subset" {
 }
 
 test "relative and unavailable paths cannot silently become broad grants" {
-    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    if (builtin.target.os.tag != .macos) return error.SkipZigTest;
     var result = try (SandboxBackend{ .kind = .macos_seatbelt }).prepare(std.testing.allocator, std.testing.io, .{
         .file_system = .{ .allow = &.{
             .{ .path = "relative", .access = read_execute },
@@ -236,7 +236,7 @@ fn freeRunResult(result: std.process.RunResult) void {
 }
 
 test "native profile enforces read and write boundaries including a quoted path" {
-    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    if (builtin.target.os.tag != .macos) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -292,12 +292,12 @@ test "native profile enforces read and write boundaries including a quoted path"
 }
 
 test "native network denial blocks an otherwise listening localhost port" {
-    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    if (builtin.target.os.tag != .macos) return error.SkipZigTest;
     const io = std.testing.io;
     const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     var server = try address.listen(io, .{});
     defer server.deinit(io);
-    const port = try std.fmt.allocPrint(std.testing.allocator, "{d}", .{server.socket.address.getPort()});
+    const port = try std.testing.allocator.print("{d}", .{server.socket.address.getPort()});
     defer std.testing.allocator.free(port);
     const args: []const []const u8 = &.{ "/usr/bin/nc", "-z", "-w", "1", "127.0.0.1", port };
     const baseline = try runProfile("(version 1)(allow default)", args);
@@ -315,7 +315,7 @@ test "native network denial blocks an otherwise listening localhost port" {
 }
 
 test "profile preparation releases allocations on every failure" {
-    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    if (builtin.target.os.tag != .macos) return error.SkipZigTest;
     try std.testing.checkAllAllocationFailures(std.testing.allocator, prepareWithAllocator, .{});
 }
 

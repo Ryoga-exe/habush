@@ -20,7 +20,7 @@ const write_bundle: exec.SandboxPolicy.FileSystemAccess = .{
 
 pub fn main(init: std.process.Init) !u8 {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    if (builtin.os.tag != .macos) {
+    if (builtin.target.os.tag != .macos) {
         var stderr = std.Io.File.stderr().writerStreaming(init.io, &.{});
         try stderr.interface.writeAll("sandbox integration skipped: macOS only\n");
         return 0;
@@ -40,7 +40,7 @@ pub fn main(init: std.process.Init) !u8 {
     var random: [16]u8 = undefined;
     try std.Io.randomSecure(io, &random);
     const hex = std.fmt.hex(@as(u128, @bitCast(random)));
-    const scratch = try std.fmt.allocPrint(gpa, "/tmp/habush-sandbox-{s}", .{hex[0..]});
+    const scratch = try gpa.print("/tmp/habush-sandbox-{s}", .{hex[0..]});
     defer gpa.free(scratch);
     try std.Io.Dir.createDirAbsolute(io, scratch, .default_dir);
     defer std.Io.Dir.cwd().deleteTree(io, scratch) catch {};
@@ -161,7 +161,7 @@ fn checkFileActions(
     defer gpa.free(output);
     try check(io, std.mem.eql(u8, output, "allowed\n"), "allowed output contents differ");
 
-    const source = try std.fmt.allocPrint(gpa, "/usr/bin/touch {s} > {s}", .{ compound_marker, denied_compound });
+    const source = try gpa.print("/usr/bin/touch {s} > {s}", .{ compound_marker, denied_compound });
     defer gpa.free(source);
     const compound = try runOne(gpa, io, host, .{
         .executable = worker,
@@ -184,7 +184,7 @@ fn checkNetwork(gpa: std.mem.Allocator, io: std.Io, host: exec.Host) !void {
     var server = try address.listen(io, .{});
     defer server.deinit(io);
     const port_number = server.socket.address.getPort();
-    const port = try std.fmt.allocPrint(gpa, "{d}", .{port_number});
+    const port = try gpa.print("{d}", .{port_number});
     defer gpa.free(port);
     const argv: []const []const u8 = &.{ "/usr/bin/nc", "-z", "-w", "1", "127.0.0.1", port };
     var plan: exec.CommandPlan = .{
@@ -266,14 +266,14 @@ fn checkIdentity(
     defer gpa.free(canonical_cwd);
     try check(io, fields.next() == null, "PID output has extra fields");
     try check(io, shell_pid == native_pid, "shell exec must preserve PID");
-    try check(io, native_pid == @intFromEnum(spawned.process_id.?), "worker must preserve target PID");
-    try check(io, native_group == @intFromEnum(spawned.process_group.?), "worker must preserve PGID");
+    try check(io, native_pid == @backingInt(spawned.process_id.?), "worker must preserve target PID");
+    try check(io, native_group == @backingInt(spawned.process_group.?), "worker must preserve PGID");
     try check(io, std.mem.eql(u8, printed_cwd, canonical_cwd), "worker must preserve cwd");
     try check(io, std.mem.eql(u8, printed_env, "worker-env"), "worker must preserve environment");
 }
 
 fn identityTarget(init: std.process.Init) !u8 {
-    if (builtin.os.tag != .macos) return error.Unsupported;
+    if (builtin.target.os.tag != .macos) return error.Unsupported;
     const Libc = struct {
         extern "c" fn getpgrp() c_int;
     };

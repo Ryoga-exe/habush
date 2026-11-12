@@ -78,8 +78,8 @@ pub fn add(jobs: *Jobs, pipeline: Pipeline, title: []const u8, options: Options)
     const owned_title = try jobs.gpa.dupe(u8, title);
     errdefer jobs.gpa.free(owned_title);
     try jobs.entries.ensureUnusedCapacity(jobs.gpa, 1);
-    while (jobs.next_id == 0 or jobs.get(@enumFromInt(jobs.next_id)) != null) jobs.next_id +%= 1;
-    const id: Id = @enumFromInt(jobs.next_id);
+    while (jobs.next_id == 0 or jobs.get(@fromBackingInt(jobs.next_id)) != null) jobs.next_id +%= 1;
+    const id: Id = @fromBackingInt(jobs.next_id);
     jobs.next_id +%= 1;
     jobs.entries.appendAssumeCapacity(.{
         .id = id,
@@ -93,7 +93,7 @@ pub fn add(jobs: *Jobs, pipeline: Pipeline, title: []const u8, options: Options)
 
 pub fn backgroundProcessIdText(jobs: *Jobs) ?[]const u8 {
     const id = jobs.last_background_process_id orelse return null;
-    return std.fmt.bufPrint(&jobs.process_id_buffer, "{d}", .{@intFromEnum(id)}) catch unreachable;
+    return std.fmt.bufPrint(&jobs.process_id_buffer, "{d}", .{@backingInt(id)}) catch unreachable;
 }
 
 pub fn resolve(jobs: *Jobs, operand: []const u8) ?Id {
@@ -101,12 +101,12 @@ pub fn resolve(jobs: *Jobs, operand: []const u8) ?Id {
     if (operand[0] == '%') {
         const id = std.fmt.parseUnsigned(u32, operand[1..], 10) catch return null;
         if (id == 0) return null;
-        return if (jobs.get(@enumFromInt(id)) != null) @enumFromInt(id) else null;
+        return if (jobs.get(@fromBackingInt(id)) != null) @fromBackingInt(id) else null;
     }
     const pid = std.fmt.parseUnsigned(u32, operand, 10) catch return null;
     for (jobs.entries.items) |*entry| {
         const native_id = entry.pipeline.processId(entry.pipeline.stageCount() - 1) orelse continue;
-        if (@intFromEnum(native_id) == pid) return entry.id;
+        if (@backingInt(native_id) == pid) return entry.id;
     }
     return null;
 }
@@ -188,7 +188,16 @@ pub fn foreground(jobs: *Jobs, id: Id) Host.Error!?ExitStatus {
         if (lease) |token| host.releaseTerminal(token) catch {};
         if (canceled) jobs.remove(id);
     }
-    errdefer |failure| canceled = failure == error.Canceled;
+    const result = jobs.foregroundEntry(entry, &lease) catch |failure| {
+        canceled = failure == error.Canceled;
+        return failure;
+    };
+    if (entry.pipeline.state() == .completed) jobs.remove(id);
+    return result;
+}
+
+fn foregroundEntry(jobs: *Jobs, entry: *Entry, lease: *?Host.TerminalLease) Host.Error!ExitStatus {
+    const host = entry.pipeline.host;
     if (entry.pipeline.suspend_on_start) {
         // Every worker stops before the target can read the TTY. Observe the
         // startup barrier before handing over the terminal and resuming the
@@ -200,11 +209,11 @@ pub fn foreground(jobs: *Jobs, id: Id) Host.Error!?ExitStatus {
     if (entry.pipeline.state() != .completed) {
         if (jobs.terminal_control) {
             const group = entry.pipeline.process_group orelse return error.Unsupported;
-            lease = host.acquireTerminal(group) catch |err| retry: {
+            lease.* = host.acquireTerminal(group) catch |err| retry: {
                 // Fast commands can exit between the first poll and tty
                 // handoff. An already completed job needs no terminal claim.
                 if (try entry.pipeline.poll() == .completed) break :retry null;
-                return @as(Host.Error!?ExitStatus, err);
+                return err;
             };
         }
         // A freshly launched reader can have received SIGTTIN before the
@@ -218,14 +227,12 @@ pub fn foreground(jobs: *Jobs, id: Id) Host.Error!?ExitStatus {
         }
         try jobs.waitEntry(entry);
     }
-    if (lease) |token| {
+    if (lease.*) |token| {
         try host.releaseTerminal(token);
-        lease = null;
+        lease.* = null;
     }
     try jobs.reportFailures(&entry.pipeline);
-    const result = entry.exitStatus() orelse return error.Unexpected;
-    if (entry.pipeline.state() == .completed) jobs.remove(id);
-    return result;
+    return entry.exitStatus() orelse error.Unexpected;
 }
 
 fn reportFailures(jobs: Jobs, pipeline: *Pipeline) Host.Error!void {
@@ -317,9 +324,9 @@ test "canceled foreground jobs are reaped without consuming other background job
         try std.testing.expectEqual(Pipeline.State.running, jobs.get(background_id).?.pipeline.state());
         try std.testing.expectEqual(@as(usize, 1), fake.signal_calls.items.len);
         try std.testing.expectEqual(Host.Signal.kill, fake.signal_calls.items[0].signal);
-        try std.testing.expectEqual(@as(u32, 2), @intFromEnum(fake.signal_calls.items[0].process));
+        try std.testing.expectEqual(@as(u32, 2), @backingInt(fake.signal_calls.items[0].process));
         try std.testing.expectEqual(@as(usize, 1), fake.wait_calls.items.len);
-        try std.testing.expectEqual(@as(u32, 2), @intFromEnum(fake.wait_calls.items[0]));
+        try std.testing.expectEqual(@as(u32, 2), @backingInt(fake.wait_calls.items[0]));
 
         fake.wait_error = error.Canceled;
         try std.testing.expectError(error.Canceled, jobs.wait(background_id));

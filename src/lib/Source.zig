@@ -105,9 +105,9 @@ pub const Location = struct {
 };
 
 pub fn init(gpa: std.mem.Allocator, source: View) std.mem.Allocator.Error!Source {
-    const text = try gpa.dupeZ(u8, source.text);
+    const text = try gpa.dupeSentinel(u8, source.text, 0);
     errdefer gpa.free(text);
-    const original = if (source.original_text) |value| try gpa.dupeZ(u8, value) else null;
+    const original = if (source.original_text) |value| try gpa.dupeSentinel(u8, value, 0) else null;
     errdefer if (original) |value| gpa.free(value);
     const mappings = try gpa.dupe(Mapping, source.mappings);
     errdefer gpa.free(mappings);
@@ -161,7 +161,7 @@ pub fn setOrigin(source: *Source, gpa: std.mem.Allocator, origin: View) std.mem.
 }
 
 pub fn setInputMapping(source: *Source, gpa: std.mem.Allocator, original: []const u8, mappings: []const Mapping) std.mem.Allocator.Error!void {
-    const copy = try gpa.dupeZ(u8, original);
+    const copy = try gpa.dupeSentinel(u8, original, 0);
     errdefer gpa.free(copy);
     const mapping_copy = try gpa.dupe(Mapping, mappings);
     if (source.original_text) |previous| gpa.free(previous);

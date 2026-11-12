@@ -169,7 +169,7 @@ pub fn evaluate(
     if (session.evaluating) return error.EvaluationInProgress;
     session.next_evaluation_id = std.math.add(u64, session.next_evaluation_id, 1) catch
         return error.EvaluationIdExhausted;
-    const id: EvaluationId = @enumFromInt(session.next_evaluation_id);
+    const id: EvaluationId = @fromBackingInt(session.next_evaluation_id);
     const observer = session.observer;
     session.evaluating = true;
     defer session.evaluating = false;
@@ -218,7 +218,7 @@ fn evaluateInput(
     if (hir.source) |*origin| try origin.setOrigin(gpa, .{
         .text = source,
         .name = options.source_name,
-        .id = @intFromEnum(id),
+        .id = @backingInt(id),
         .revision = options.source_revision,
         .line_offset = options.source_line_offset,
         .base_offset = options.source_base_offset,

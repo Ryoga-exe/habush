@@ -194,7 +194,7 @@ fn parseRoot(parser: *Parse) Ast.ParseError!void {
 
     const list = try parser.parseList(.{}) orelse return;
 
-    parser.nodes.set(@intFromEnum(Node.Index.root), .{
+    parser.nodes.set(@backingInt(Node.Index.root), .{
         .tag = .root,
         .main_token = parser.nodeMainToken(list),
         .data = .{ .opt_node = list.toOptional() },
@@ -1089,8 +1089,8 @@ fn parseWordParts(
         return error.SourceTooLarge;
 
     return .{
-        .start = @enumFromInt(part_start),
-        .end = @enumFromInt(part_end),
+        .start = @fromBackingInt(part_start),
+        .end = @fromBackingInt(part_end),
     };
 }
 
@@ -1201,7 +1201,7 @@ fn prepareHereDocument(
     }
 
     return .{
-        .index = @enumFromInt(document_index),
+        .index = @fromBackingInt(document_index),
         .delimiter_start = delimiter_start,
         .delimiter_end = delimiter_end,
         .strip_tabs = strip_tabs,
@@ -1222,8 +1222,8 @@ fn listToSpan(
     const end = std.math.cast(u32, parser.extra_data.items.len) orelse
         return error.SourceTooLarge;
     return .{
-        .start = @enumFromInt(start),
-        .end = @enumFromInt(end),
+        .start = @fromBackingInt(start),
+        .end = @fromBackingInt(end),
     };
 }
 
@@ -1239,8 +1239,8 @@ fn addListItems(
     const end = std.math.cast(u32, parser.extra_data.items.len) orelse
         return error.SourceTooLarge;
     return .{
-        .start = @enumFromInt(start),
-        .end = @enumFromInt(end),
+        .start = @fromBackingInt(start),
+        .end = @fromBackingInt(end),
     };
 }
 
@@ -1263,27 +1263,27 @@ fn addElifBranches(
     const end = std.math.cast(u32, parser.extra_data.items.len) orelse
         return error.SourceTooLarge;
     return .{
-        .start = @enumFromInt(start),
-        .end = @enumFromInt(end),
+        .start = @fromBackingInt(start),
+        .end = @fromBackingInt(end),
     };
 }
 
 fn addExtra(parser: *Parse, extra: anytype) Ast.ParseError!Ast.ExtraIndex {
     const start = std.math.cast(u32, parser.extra_data.items.len) orelse
         return error.SourceTooLarge;
-    inline for (std.meta.fields(@TypeOf(extra))) |field| {
-        const value = @field(extra, field.name);
+    inline for (@typeInfo(@TypeOf(extra)).@"struct".field_names) |name| {
+        const value = @field(extra, name);
         try parser.extra_data.append(parser.gpa, Ast.ExtraData.encode(value));
     }
-    return @enumFromInt(start);
+    return @fromBackingInt(start);
 }
 
 fn emptySpan(parser: *const Parse) Ast.ParseError!Node.SubRange {
     const index = std.math.cast(u32, parser.extra_data.items.len) orelse
         return error.SourceTooLarge;
     return .{
-        .start = @enumFromInt(index),
-        .end = @enumFromInt(index),
+        .start = @fromBackingInt(index),
+        .end = @fromBackingInt(index),
     };
 }
 
@@ -1291,7 +1291,7 @@ fn addNode(parser: *Parse, node: Node) Ast.ParseError!Node.Index {
     const index = std.math.cast(u32, parser.nodes.len) orelse
         return error.SourceTooLarge;
     try parser.nodes.append(parser.gpa, node);
-    return @enumFromInt(index);
+    return @fromBackingInt(index);
 }
 
 fn warn(parser: *Parse, parse_error: Ast.Error) Allocator.Error!void {
@@ -1313,7 +1313,7 @@ fn tokenTag(parser: *const Parse, token_index: Ast.TokenIndex) Token.Tag {
 }
 
 fn nodeMainToken(parser: *const Parse, node: Node.Index) Ast.TokenIndex {
-    return parser.nodes.items(.main_token)[@intFromEnum(node)];
+    return parser.nodes.items(.main_token)[@backingInt(node)];
 }
 
 fn nextToken(parser: *Parse) Ast.TokenIndex {

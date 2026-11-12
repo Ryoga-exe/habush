@@ -3,6 +3,8 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const skip_zig_36010 = (b.option(bool, "skip-zig-36010", "Skip macOS cancellation checks affected by Zig PR #36010") orelse false) and
+        target.result.os.tag == .macos;
 
     const habush = b.addModule("habush", .{
         .root_source_file = b.path("src/lib/main.zig"),
@@ -33,9 +35,7 @@ pub fn build(b: *std.Build) void {
 
     run_cmd.step.dependOn(b.getInstallStep());
 
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
 
     const pipeline_example = b.addExecutable(.{
         .name = "run-pipeline",
@@ -49,7 +49,7 @@ pub fn build(b: *std.Build) void {
     const run_pipeline_step = b.step("run-pipeline", "Run the structured pipeline example");
     const run_pipeline_cmd = b.addRunArtifact(pipeline_example);
     run_pipeline_step.dependOn(&run_pipeline_cmd.step);
-    if (b.args) |args| run_pipeline_cmd.addArgs(args);
+    run_pipeline_cmd.addPassthruArgs();
 
     const sandbox_example = b.addExecutable(.{
         .name = "run-sandbox",
@@ -63,7 +63,7 @@ pub fn build(b: *std.Build) void {
     const run_sandbox_step = b.step("run-sandbox", "Run the explicit sandbox backend example");
     const run_sandbox_cmd = b.addRunArtifact(sandbox_example);
     run_sandbox_step.dependOn(&run_sandbox_cmd.step);
-    if (b.args) |args| run_sandbox_cmd.addArgs(args);
+    run_sandbox_cmd.addPassthruArgs();
 
     const sandbox_probe = b.addExecutable(.{
         .name = "sandbox-test",
@@ -101,6 +101,7 @@ pub fn build(b: *std.Build) void {
     });
     terminal_tests.root_module.addImport("habush", habush);
     const run_terminal_tests = b.addRunArtifact(terminal_tests);
+    run_terminal_tests.setEnvironmentVariable("HABUSH_TEST_SKIP_ZIG_36010", if (skip_zig_36010) "1" else "0");
     test_step.dependOn(&run_terminal_tests.step);
     test_step.dependOn(&exe.step);
     test_step.dependOn(&pipeline_example.step);
@@ -120,6 +121,7 @@ pub fn build(b: *std.Build) void {
             if (target.result.os.tag != .macos)
                 terminal_probe.root_module.linkSystemLibrary("util", .{});
             const terminal_test = b.addRunArtifact(terminal_probe);
+            terminal_test.setEnvironmentVariable("HABUSH_TEST_SKIP_ZIG_36010", if (skip_zig_36010) "1" else "0");
             terminal_test.addArtifactArg(exe);
             terminal_test.expectExitCode(0);
             test_step.dependOn(&terminal_test.step);

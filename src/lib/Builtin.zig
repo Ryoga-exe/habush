@@ -356,7 +356,7 @@ fn runJobs(context: Context, argv: []const []const u8) Error!Result {
     if (context.io.stdout) |writer| {
         for (jobs.entries.items) |*entry| {
             try writer.print("[{d}] {s}\t{s}\n", .{
-                @intFromEnum(entry.id),
+                @backingInt(entry.id),
                 switch (entry.pipeline.state()) {
                     .running => "Running",
                     .stopped => "Stopped",

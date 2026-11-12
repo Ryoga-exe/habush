@@ -54,7 +54,7 @@ pub const FileDescriptor = enum(u32) {
 
     pub fn parse(source: []const u8) ?FileDescriptor {
         const value = std.fmt.parseUnsigned(u32, source, 10) catch return null;
-        return @enumFromInt(value);
+        return @fromBackingInt(value);
     }
 };
 
@@ -153,7 +153,7 @@ pub fn validate(plan: CommandPlan) error{InvalidArguments}!void {
         .duplicate, .use_resource, .close => {},
     };
     switch (plan.process_group) {
-        .join => |group| if (@intFromEnum(group) == 0) return error.InvalidArguments,
+        .join => |group| if (@backingInt(group) == 0) return error.InvalidArguments,
         .inherit, .create => {},
     }
     switch (plan.environment) {

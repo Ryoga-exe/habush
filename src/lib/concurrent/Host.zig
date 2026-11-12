@@ -296,7 +296,7 @@ test "waitEvent returns stopped while wait keeps polling to termination" {
 
         fn spawn(_: ?*anyopaque, _: CommandPlan) BaseHost.SpawnError!BaseHost.SpawnOutcome {
             return .{ .spawned = .{
-                .process = @enumFromInt(1),
+                .process = @fromBackingInt(1),
                 .sandbox_coverage = .not_requested,
             } };
         }
@@ -334,7 +334,7 @@ test "waitEvent returns stopped while wait keeps polling to termination" {
         .executable = "/child",
         .argv = &.{"/child"},
     })).spawned.process;
-    const invalid: BaseHost.Process = @enumFromInt(2);
+    const invalid: BaseHost.Process = @fromBackingInt(2);
     try std.testing.expectError(error.InvalidArguments, wrapped.waitAny(&.{ second, invalid }));
     try std.testing.expectEqual(@as(usize, 3), probe.calls);
     const event = try wrapped.waitAny(&.{second});

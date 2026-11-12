@@ -6,7 +6,7 @@ const Inst = Hir.Inst;
 pub fn renderAsText(hir: Hir, bw: *std.Io.Writer) std.Io.Writer.Error!void {
     var writer: Writer = .{ .code = hir };
     for (0..hir.instructions.len) |raw_index| {
-        const index: Inst.Index = @enumFromInt(raw_index);
+        const index: Inst.Index = @fromBackingInt(@intCast(raw_index));
         try bw.print("%{d} ", .{raw_index});
         try writer.writeInstToStream(bw, index);
         try bw.writeByte('\n');
@@ -19,7 +19,7 @@ pub fn renderSingleInstruction(
     bw: *std.Io.Writer,
 ) std.Io.Writer.Error!void {
     var writer: Writer = .{ .code = hir };
-    try bw.print("%{d} ", .{@intFromEnum(index)});
+    try bw.print("%{d} ", .{@backingInt(index)});
     try writer.writeInstToStream(bw, index);
 }
 
@@ -204,7 +204,7 @@ const Writer = struct {
 
     fn writeInst(writer: *Writer, stream: *std.Io.Writer, index: Inst.Index) !void {
         _ = writer;
-        try stream.print("%{d}", .{@intFromEnum(index)});
+        try stream.print("%{d}", .{@backingInt(index)});
     }
 
     fn writeString(writer: *Writer, stream: *std.Io.Writer, bytes: []const u8) !void {

@@ -58,7 +58,7 @@ pub fn read(editor: LineEditor) !?[:0]u8 {
         switch (byte) {
             '\r', '\n' => {
                 try editor.output.writeAll("\r\n");
-                const line = try editor.gpa.dupeZ(u8, buffer.text());
+                const line = try editor.gpa.dupeSentinel(u8, buffer.text(), 0);
                 errdefer editor.gpa.free(line);
                 try terminal.restore();
                 return line;

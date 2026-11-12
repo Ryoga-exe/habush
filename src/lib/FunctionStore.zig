@@ -6,7 +6,7 @@ const Hir = @import("Hir.zig");
 const VariableStore = @import("VariableStore.zig");
 
 gpa: std.mem.Allocator,
-map: std.StringArrayHashMapUnmanaged(Definition) = .empty,
+map: std.array_hash_map.String(Definition) = .empty,
 
 pub const Error = std.mem.Allocator.Error || error{InvalidName};
 

@@ -118,9 +118,9 @@ fn readDirectory(userdata: ?*anyopaque, gpa: std.mem.Allocator, cwd: CommandPlan
 fn createPipe(userdata: ?*anyopaque) Host.Error!Host.Pipe {
     const fake: *FakeHost = @ptrCast(@alignCast(userdata.?));
     fake.create_pipe_calls += 1;
-    const read_end: CommandPlan.Resource = @enumFromInt(fake.next_resource);
+    const read_end: CommandPlan.Resource = @fromBackingInt(fake.next_resource);
     fake.next_resource +%= 1;
-    const write_end: CommandPlan.Resource = @enumFromInt(fake.next_resource);
+    const write_end: CommandPlan.Resource = @fromBackingInt(fake.next_resource);
     fake.next_resource +%= 1;
     return .{ .read_end = read_end, .write_end = write_end };
 }
@@ -130,7 +130,7 @@ fn createCapture(userdata: ?*anyopaque) Host.Error!CommandPlan.Resource {
     const allocator = fake.arena.allocator();
     const capture = try allocator.create(Capture);
     capture.* = .{ .output = .init(allocator) };
-    const resource: CommandPlan.Resource = @enumFromInt(fake.next_resource);
+    const resource: CommandPlan.Resource = @fromBackingInt(fake.next_resource);
     fake.next_resource +%= 1;
     try fake.captures.put(allocator, resource, capture);
     return resource;
@@ -141,7 +141,7 @@ fn createInput(userdata: ?*anyopaque, bytes: []const u8) Host.Error!CommandPlan.
     if (fake.create_input_error) |err| return err;
     const allocator = fake.arena.allocator();
     try fake.create_input_calls.append(allocator, try allocator.dupe(u8, bytes));
-    const resource: CommandPlan.Resource = @enumFromInt(fake.next_resource);
+    const resource: CommandPlan.Resource = @fromBackingInt(fake.next_resource);
     fake.next_resource +%= 1;
     return resource;
 }
@@ -170,7 +170,7 @@ fn openFile(
             .disposition = open.disposition,
         },
     });
-    const resource: CommandPlan.Resource = @enumFromInt(fake.next_resource);
+    const resource: CommandPlan.Resource = @fromBackingInt(fake.next_resource);
     fake.next_resource +%= 1;
     return .{ .opened = resource };
 }
@@ -184,7 +184,7 @@ fn closeResource(userdata: ?*anyopaque, resource: CommandPlan.Resource) void {
 fn resourceWriter(userdata: ?*anyopaque, resource: CommandPlan.Resource) ?*std.Io.Writer {
     const fake: *FakeHost = @ptrCast(@alignCast(userdata.?));
     if (fake.captures.get(resource)) |capture| return &capture.output.writer;
-    if (@intFromEnum(resource) == 0 or @intFromEnum(resource) >= fake.next_resource) return null;
+    if (@backingInt(resource) == 0 or @backingInt(resource) >= fake.next_resource) return null;
     if (fake.resource_writer_override) |writer| return writer;
     return &fake.redirected_output.writer;
 }
@@ -195,7 +195,7 @@ fn resourceReader(userdata: ?*anyopaque, resource: CommandPlan.Resource) ?*std.I
         if (capture.reader == null) capture.reader = .fixed(capture.output.written());
         return &capture.reader.?;
     }
-    if (@intFromEnum(resource) == 0 or @intFromEnum(resource) >= fake.next_resource) return null;
+    if (@backingInt(resource) == 0 or @backingInt(resource) >= fake.next_resource) return null;
     return fake.resource_reader_override;
 }
 
@@ -228,12 +228,12 @@ fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.SpawnError!Host.SpawnOut
     const allocator = fake.arena.allocator();
     try fake.spawn_calls.append(allocator, try clonePlan(allocator, plan));
 
-    const process: Host.Process = @enumFromInt(fake.next_process);
+    const process: Host.Process = @fromBackingInt(fake.next_process);
     fake.next_process +%= 1;
     const process_group: ?CommandPlan.ProcessGroup = switch (plan.process_group) {
         .inherit => null,
         .create => group: {
-            const group: CommandPlan.ProcessGroup = @enumFromInt(fake.next_process_group);
+            const group: CommandPlan.ProcessGroup = @fromBackingInt(fake.next_process_group);
             fake.next_process_group +%= 1;
             break :group group;
         },
@@ -245,7 +245,7 @@ fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.SpawnError!Host.SpawnOut
     };
     return .{ .spawned = .{
         .process = process,
-        .process_id = @enumFromInt(@intFromEnum(process)),
+        .process_id = @fromBackingInt(@backingInt(process)),
         .process_group = process_group,
         .sandbox_coverage = sandbox_coverage,
     } };

@@ -815,7 +815,7 @@ fn appendParameter(
         const process_id = expander.context.shell_process_id orelse
             return error.ParameterExpansionUnsupported;
         var buffer: [20]u8 = undefined;
-        const value = std.fmt.bufPrint(&buffer, "{d}", .{@intFromEnum(process_id)}) catch
+        const value = std.fmt.bufPrint(&buffer, "{d}", .{@backingInt(process_id)}) catch
             unreachable;
         try bytes.appendSlice(expander.allocator, value);
         return;

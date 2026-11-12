@@ -80,7 +80,7 @@ pub fn main(init: std.process.Init) !habush.runtime.ExitStatus {
         .script => |script| try argumentSlices(arena, script.arguments),
         else => &.{},
     };
-    const resolver_options: habush.CommandResolver.System.Options = if (builtin.os.tag == .windows)
+    const resolver_options: habush.CommandResolver.System.Options = if (builtin.target.os.tag == .windows)
         if (init.environ_map.get("PATHEXT")) |extensions|
             .{ .executable_extensions = try splitEnvironmentList(
                 arena,
@@ -92,7 +92,7 @@ pub fn main(init: std.process.Init) !habush.runtime.ExitStatus {
     else
         .{};
 
-    const worker_executable: ?[:0]u8 = if (builtin.os.tag == .windows)
+    const worker_executable: ?[:0]u8 = if (builtin.target.os.tag == .windows)
         null
     else
         try std.process.executablePathAlloc(io, gpa);
@@ -150,10 +150,10 @@ pub fn main(init: std.process.Init) !habush.runtime.ExitStatus {
         .kitty = init.environ_map.get("KITTY_WINDOW_ID") != null,
         .windows_terminal = init.environ_map.get("WT_SESSION") != null,
     });
-    var hostname_buffer: [if (builtin.os.tag == .windows or builtin.os.tag == .wasi) 0 else std.posix.HOST_NAME_MAX]u8 = undefined;
+    var hostname_buffer: [if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) 0 else std.posix.HOST_NAME_MAX]u8 = undefined;
     const hostname: []const u8 = if (!integration_enabled)
         ""
-    else if (builtin.os.tag == .windows)
+    else if (builtin.target.os.tag == .windows)
         init.environ_map.get("COMPUTERNAME") orelse ""
     else
         std.posix.gethostname(&hostname_buffer) catch "";
@@ -171,7 +171,7 @@ pub fn main(init: std.process.Init) !habush.runtime.ExitStatus {
         .integration = if (integration_enabled) .{
             .writer = stderr,
             .hostname = hostname,
-            .path_style = if (builtin.os.tag == .windows) .windows else .posix,
+            .path_style = if (builtin.target.os.tag == .windows) .windows else .posix,
         } else null,
     };
 
@@ -271,7 +271,7 @@ fn environmentBindings(
         // Native Windows environment names are case-insensitive. Expose its
         // PATH entry under the shell's canonical spelling before lookup moves
         // into the case-sensitive shell variable store.
-        const shell_name = if (builtin.os.tag == .windows and std.ascii.eqlIgnoreCase(name, "PATH"))
+        const shell_name = if (builtin.target.os.tag == .windows and std.ascii.eqlIgnoreCase(name, "PATH"))
             "PATH"
         else
             name;

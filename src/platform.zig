@@ -3,7 +3,7 @@
 const builtin = @import("builtin");
 const ProcessId = @import("habush").runtime.ProcessId;
 
-const implementation = switch (builtin.os.tag) {
+const implementation = switch (builtin.target.os.tag) {
     .windows => @import("platform/windows.zig"),
     .linux,
     .dragonfly,
@@ -18,5 +18,5 @@ const implementation = switch (builtin.os.tag) {
 pub const installInteractiveInterruptHandler = implementation.installInteractiveInterruptHandler;
 pub const LineInput = implementation.LineInput;
 pub fn processId() ProcessId {
-    return @enumFromInt(implementation.processId());
+    return @fromBackingInt(implementation.processId());
 }

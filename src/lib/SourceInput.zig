@@ -17,7 +17,7 @@ pub const Error = std.mem.Allocator.Error || error{ UnterminatedHereDocument, So
 
 pub fn collect(gpa: std.mem.Allocator, source: []const u8) Error!SourceInput {
     const Pending = struct { delimiter: []const u8, strip_tabs: bool, expand_body: bool };
-    const original = try gpa.dupeZ(u8, source);
+    const original = try gpa.dupeSentinel(u8, source, 0);
     errdefer gpa.free(original);
     var parser_source: std.ArrayList(u8) = .empty;
     defer parser_source.deinit(gpa);

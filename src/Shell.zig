@@ -86,7 +86,7 @@ fn runInput(self: *Shell, source_name: ?[]const u8) !habush.runtime.ExitStatus {
 }
 
 pub fn runCommand(self: *Shell, command: []const u8) !habush.runtime.ExitStatus {
-    const source = try self.allocator.dupeZ(u8, command);
+    const source = try self.allocator.dupeSentinel(u8, command, 0);
     defer self.allocator.free(source);
     return self.runSource(source, null);
 }
@@ -324,7 +324,7 @@ fn inspectCommand(
         self.allocator.free(metadata);
     }
     for (metadata, 0..) |*destination, index| {
-        const document = tree.hereDocument(@enumFromInt(index));
+        const document = tree.hereDocument(@fromBackingInt(@intCast(index)));
         destination.* = .{
             .delimiter = try self.allocator.dupe(u8, document.delimiter),
             .strip_tabs = document.strip_tabs,
@@ -632,7 +632,15 @@ test "script diagnostics retain raw CRLF here-document and final-line byte range
     try std.testing.expectEqualStrings("", stderr.written());
 }
 
+// NOTE: Zig's macOS stack unwinder can consume cancellation (also in 0.16):
+// https://codeberg.org/ziglang/zig/pulls/36010
 test "startup source stays interruptible without interactive presentation" {
+    if (@import("builtin").target.os.tag == .macos and
+        std.mem.eql(u8, std.testing.environ.getPosix("HABUSH_TEST_SKIP_ZIG_36010") orelse "", "1"))
+    {
+        std.debug.print("SKIP: startup cancellation check (Zig PR #36010)\n", .{});
+        return error.SkipZigTest;
+    }
     const Notify = struct {
         io: std.Io,
         started: std.Io.Event = .unset,

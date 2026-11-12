@@ -41,7 +41,7 @@ pub fn withEnvironment(config: Config, environ: *const std.process.Environ.Map) 
 }
 
 pub fn lineEditEnabled(config: Config, interactive: bool, term: ?[]const u8) bool {
-    if (!interactive or builtin.os.tag == .windows or config.line_edit == .off) return false;
+    if (!interactive or builtin.target.os.tag == .windows or config.line_edit == .off) return false;
     if (config.line_edit == .on) return true;
     const value = nonempty(term) orelse return false;
     return !std.mem.eql(u8, value, "dumb");
@@ -64,7 +64,7 @@ pub const Paths = struct {
     pub fn init(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map) !Paths {
         var paths: Paths = .{};
         errdefer paths.deinit(gpa);
-        const home = absoluteEnvironment(environ.get("HOME")) orelse if (builtin.os.tag == .windows)
+        const home = absoluteEnvironment(environ.get("HOME")) orelse if (builtin.target.os.tag == .windows)
             absoluteEnvironment(environ.get("USERPROFILE"))
         else
             null;
@@ -101,7 +101,7 @@ pub const Paths = struct {
 fn absoluteEnvironment(value: ?[]const u8) ?[]const u8 {
     const path = nonempty(value) orelse return null;
     if (std.mem.indexOfScalar(u8, path, 0) != null) return null;
-    if (!isAbsolute(builtin.os.tag == .windows, path)) return null;
+    if (!isAbsolute(builtin.target.os.tag == .windows, path)) return null;
     return path;
 }
 
@@ -152,8 +152,8 @@ test "typed JSON and environment overrides reject invalid or ambiguous settings"
 }
 
 test "XDG bases require absolute paths and use HOME fallbacks without creating directories" {
-    const home = if (builtin.os.tag == .windows) "C:\\Users\\example" else "/home/example";
-    const data = if (builtin.os.tag == .windows) "D:\\data" else "/data";
+    const home = if (builtin.target.os.tag == .windows) "C:\\Users\\example" else "/home/example";
+    const data = if (builtin.target.os.tag == .windows) "D:\\data" else "/data";
     var environ: std.process.Environ.Map = .init(std.testing.allocator);
     defer environ.deinit();
     try environ.put("HOME", home);
@@ -206,7 +206,7 @@ test "XDG discovery preserves ownership on every allocation failure" {
         fn exercise(gpa: std.mem.Allocator) !void {
             var environ: std.process.Environ.Map = .init(std.testing.allocator);
             defer environ.deinit();
-            try environ.put("HOME", if (builtin.os.tag == .windows) "C:\\Users\\example" else "/home/example");
+            try environ.put("HOME", if (builtin.target.os.tag == .windows) "C:\\Users\\example" else "/home/example");
             var paths = try Paths.init(gpa, &environ);
             defer paths.deinit(gpa);
             const file = (try paths.configFile(gpa)).?;

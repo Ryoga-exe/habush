@@ -123,7 +123,7 @@ const CandidateStatus = enum {
 
 fn checkCandidate(system: *System, candidate: []const u8) CommandResolver.Error!CandidateStatus {
     // access reports long components that Zig 0.16's Linux stat treats as bugs.
-    if (builtin.os.tag == .linux) {
+    if (builtin.target.os.tag == .linux) {
         const access = try system.checkAccess(candidate);
         if (access != .executable) return access;
     }
@@ -133,7 +133,7 @@ fn checkCandidate(system: *System, candidate: []const u8) CommandResolver.Error!
         else => error.Unexpected,
     };
     if (stat.kind != .file) return .missing;
-    return if (builtin.os.tag == .linux) .executable else system.checkAccess(candidate);
+    return if (builtin.target.os.tag == .linux) .executable else system.checkAccess(candidate);
 }
 
 fn checkAccess(system: *System, candidate: []const u8) CommandResolver.Error!CandidateStatus {
@@ -145,7 +145,7 @@ fn checkAccess(system: *System, candidate: []const u8) CommandResolver.Error!Can
     return .executable;
 }
 
-const default_executable_extensions: []const []const u8 = switch (builtin.os.tag) {
+const default_executable_extensions: []const []const u8 = switch (builtin.target.os.tag) {
     .windows => &.{ ".COM", ".EXE", ".BAT", ".CMD" },
     else => &.{},
 };
@@ -215,7 +215,7 @@ test "system resolver tries configured executable extensions" {
 }
 
 test "system resolver preserves symlink traversal for explicit paths and PATH entries" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     for ([_][]const u8{ "work", "real", "real/sub" }) |path|

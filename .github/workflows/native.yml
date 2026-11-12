@@ -23,8 +23,10 @@ jobs:
           persist-credentials: false
       - uses: mlugg/setup-zig@v2
         with:
-          version: '0.16.0'
-      - run: zig build test --summary all
+          version: '0.17.1'
+      # TODO: Remove the macOS-only quarantine with a Zig release containing:
+      # https://codeberg.org/ziglang/zig/pulls/36010
+      - run: zig build test -Dskip-zig-36010=${{ runner.os == 'macOS' }} --test-timeout 60s --summary all
       - if: runner.os == 'macOS'
         run: zig build test-sandbox --summary all
 
@@ -39,8 +41,14 @@ jobs:
         with:
           release: '14.4'
           copyback: false
-          prepare: pkg install -y zig
+          # shortcut: use the official archive until FreeBSD packages Zig 0.17.1.
+          prepare: |
+            set -eu
+            fetch -o /tmp/zig.tar.xz https://ziglang.org/download/0.17.1/zig-x86_64-freebsd-0.17.1.tar.xz
+            mkdir -p /opt/zig
+            tar -xf /tmp/zig.tar.xz -C /opt/zig --strip-components 1
           run: |
             set -eu
-            test "$(zig version)" = 0.16.0
-            zig build test -j2 --summary all
+            export PATH="/opt/zig:$PATH"
+            test "$(zig version)" = 0.17.1
+            zig build test -j2 --test-timeout 60s --summary all

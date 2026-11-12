@@ -268,7 +268,7 @@ test "runtime state initialization handles every allocation failure" {
 test "runtime state clone is independent" {
     var state = try State.init(std.testing.allocator, .{
         .invocation_name = "script.hb",
-        .shell_process_id = @enumFromInt(12345),
+        .shell_process_id = @fromBackingInt(12345),
         .default_search_path = &.{"/bin"},
         .positional_parameters = &.{"argument"},
         .variables = &.{.{ .name = "name", .value = "original", .exported = true }},
@@ -283,7 +283,7 @@ test "runtime state clone is independent" {
     try copy.setVariable("name", "changed");
 
     try std.testing.expectEqualStrings("script.hb", state.invocationName());
-    try std.testing.expectEqual(@as(?types.ProcessId, @enumFromInt(12345)), state.shellProcessId());
+    try std.testing.expectEqual(@as(?types.ProcessId, @fromBackingInt(12345)), state.shellProcessId());
     try std.testing.expectEqual(state.shellProcessId(), copy.shellProcessId());
     try std.testing.expectEqualStrings("/bin", state.defaultSearchPath()[0]);
     try std.testing.expectEqualStrings("argument", state.positionalParameters()[0]);

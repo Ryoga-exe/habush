@@ -120,7 +120,7 @@ test "invalid cwd payloads leave the writer untouched" {
     try std.testing.expectError(error.InvalidWorkingDirectory, writeWorkingDirectory(&output.writer, "host", "relative", .posix));
     try std.testing.expectError(error.InvalidWorkingDirectory, writeWorkingDirectory(&output.writer, "host", "/has\x00nul", .posix));
     try std.testing.expectError(error.InvalidHost, writeWorkingDirectory(&output.writer, "host", "\\\\?\\C:\\path", .windows));
-    const large = [_]u8{'/'} ** max_sequence_bytes;
+    const large: [max_sequence_bytes]u8 = @splat('/');
     try std.testing.expectError(error.PayloadTooLong, writeWorkingDirectory(&output.writer, "host", &large, .posix));
     try std.testing.expectEqual(@as(usize, 0), output.written().len);
 }
