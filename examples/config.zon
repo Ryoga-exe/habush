@@ -1,5 +1,10 @@
 .{
     .line_edit = .auto,
+    .history = .{
+        .memory = .{ .max_entries = 1000, .max_bytes = 1024 * 1024 },
+        // null uses XDG_STATE_HOME/habush/history. Relative paths use this config's directory.
+        .storage = .{ .enabled = true, .path = null, .max_bytes = 8 * 1024 * 1024 },
+    },
     // Literal text and style are rendered safely; terminal escapes are not executed.
     .prompt = .{ .spans = .{.{ .text = "❯ ", .style = .{ .foreground = .green } }} },
     .keybinds = .{

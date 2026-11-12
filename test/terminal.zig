@@ -46,6 +46,7 @@ pub fn main(init: std.process.Init) !void {
         defer gpa.free(theme_path);
         try std.zon.stringify.serialize(.{
             .load_rc = false,
+            .history = .{ .storage = .{ .enabled = false } },
             .keybinds = bindings,
             .plugins = .{
                 .{
@@ -65,6 +66,7 @@ pub fn main(init: std.process.Init) !void {
     } else {
         try std.zon.stringify.serialize(.{
             .load_rc = false,
+            .history = .{ .storage = .{ .enabled = false } },
             .keybinds = bindings,
             .prompt = .{ .spans = .{.{ .text = "日> ", .style = .{ .foreground = .green } }} },
         }, .{}, &config.writer);

@@ -183,6 +183,11 @@ pub fn main(init: std.process.Init) !habush.runtime.ExitStatus {
         .diagnostics = config.diagnostics,
         .diagnostic_provider = if (features.wasm_plugins and plugins.diagnostics.len != 0) plugins.diagnosticProvider() else null,
         .completion_limits = config.completion_limits,
+        .history_settings = config.history,
+        .history_path = if (interactive and config.history.storage.enabled)
+            config.history.storage.path orelse try paths.historyFile(arena)
+        else
+            null,
         .resolver_options = resolver_options,
         .completion_provider = if (features.wasm_plugins) plugins.provider() else null,
         .integration = if (integration_enabled) .{
