@@ -2,8 +2,8 @@
 //!
 //! This stage performs current-user tilde expansion, parameter expansion,
 //! field splitting, quote removal, and pathname expansion through a supplied
-//! Host. Named-user tilde expansion and pattern-based parameter transformations
-//! remain explicit unsupported boundaries.
+//! Host, and pattern-based prefix/suffix removal. Named-user tilde expansion
+//! and arithmetic expansion remain explicit unsupported boundaries.
 
 const std = @import("std");
 const Expander = @This();
@@ -489,6 +489,16 @@ fn appendBracedArgumentParameter(
             bytes,
             current_field_active,
         );
+    if (expansion.operator.?.isRemoval()) {
+        const values = try expander.removeParameterPattern(source, expansion);
+        defer expander.freeValues(values);
+        if (std.mem.eql(u8, expansion.parameter, "@") or std.mem.eql(u8, expansion.parameter, "*")) {
+            var scoped = expander;
+            scoped.context.positional_parameters = values;
+            return scoped.appendArgumentParameter(expansion.parameter, quoted, fields, bytes, current_field_active);
+        }
+        return expander.appendScalarArgument(values[0], quoted, fields, bytes, current_field_active);
+    }
     const replacement_expander = expander.forSubslice(source, expansion.word);
     switch (try expander.selectParameterExpansion(expansion)) {
         .value => |value| return expander.appendScalarArgument(
@@ -653,6 +663,17 @@ fn appendBracedAssignmentParameter(
         try expander.appendParameter(bytes, expansion.parameter);
         return expander.protect(bytes.items.len - start, quoted);
     }
+    if (expansion.operator.?.isRemoval()) {
+        const values = try expander.removeParameterPattern(source, expansion);
+        defer expander.freeValues(values);
+        const start = bytes.items.len;
+        if (std.mem.eql(u8, expansion.parameter, "@") or std.mem.eql(u8, expansion.parameter, "*")) {
+            var scoped = expander;
+            scoped.context.positional_parameters = values;
+            try scoped.appendParameter(bytes, expansion.parameter);
+        } else try bytes.appendSlice(expander.allocator, values[0]);
+        return expander.protect(bytes.items.len - start, quoted);
+    }
     const replacement_expander = expander.forSubslice(source, expansion.word);
     switch (try expander.selectParameterExpansion(expansion)) {
         .value => |value| {
@@ -675,6 +696,55 @@ fn appendBracedAssignmentParameter(
         },
         .fail => try replacement_expander.failParameter(expansion, quoted),
     }
+}
+
+fn removeParameterPattern(expander: Expander, source: []const u8, expansion: Word.ParameterExpansion) Error![][]const u8 {
+    const multiple = std.mem.eql(u8, expansion.parameter, "@") or std.mem.eql(u8, expansion.parameter, "*");
+    const values = try expander.allocator.alloc([]const u8, if (multiple) expander.context.positional_parameters.len else 1);
+    var copied: usize = 0;
+    errdefer {
+        for (values[0..copied]) |value| expander.allocator.free(value);
+        expander.allocator.free(values);
+    }
+    if (multiple) {
+        for (expander.context.positional_parameters, values) |value, *destination| {
+            destination.* = try expander.allocator.dupe(u8, value);
+            copied += 1;
+        }
+    } else {
+        var scalar: std.ArrayList(u8) = .empty;
+        defer scalar.deinit(expander.allocator);
+        try expander.appendParameter(&scalar, expansion.parameter);
+        values[0] = try scalar.toOwnedSlice(expander.allocator);
+        copied = 1;
+    }
+    var patterns: PatternBuffers = .{};
+    defer patterns.deinit(expander.allocator);
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(expander.allocator);
+    var pattern_expander = expander.forSubslice(source, expansion.word);
+    pattern_expander.patterns = &patterns;
+    // Outer quotes protect the result, not unquoted metacharacters in pattern.
+    try pattern_expander.appendExpansionWordScalar(&bytes, expansion.word, false);
+    const pattern: Pattern = .{ .bytes = bytes.items, .quoted = patterns.current.items };
+    const mode: Pattern.Removal = switch (expansion.operator.?) {
+        .remove_prefix => .prefix,
+        .remove_longest_prefix => .longest_prefix,
+        .remove_suffix => .suffix,
+        .remove_longest_suffix => .longest_suffix,
+        else => unreachable,
+    };
+    for (values) |*value| {
+        const trimmed = try expander.allocator.dupe(u8, pattern.remove(value.*, mode));
+        expander.allocator.free(value.*);
+        value.* = trimmed;
+    }
+    return values;
+}
+
+fn freeValues(expander: Expander, values: [][]const u8) void {
+    for (values) |value| expander.allocator.free(value);
+    expander.allocator.free(values);
 }
 
 fn appendExpansionWordScalar(
@@ -889,7 +959,7 @@ fn selectParameterExpansion(
 ) Error!ParameterSelection {
     const value = try expander.conditionalParameterValue(expansion.parameter);
     return switch (expansion.operator.?) {
-        .length => unreachable,
+        .length, .remove_prefix, .remove_longest_prefix, .remove_suffix, .remove_longest_suffix => unreachable,
         .default_if_unset => if (value) |set| .{ .value = set } else .{ .word = expansion.word },
         .default_if_unset_or_null => if (value) |set|
             if (set.len == 0) .{ .word = expansion.word } else .{ .value = set }

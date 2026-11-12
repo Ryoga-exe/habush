@@ -30,13 +30,36 @@ test "expands and joins static argument parts" {
 }
 
 test "classifies unsupported argument expansions" {
-    try expectExpansionError("command ${name%pattern}", error.ParameterExpansionUnsupported);
+    try expectExpansionError("command $((1 + 2))", error.ParameterExpansionUnsupported);
     try expectExpansionError("command *.zig", error.PathnameExpansionUnsupported);
     try expectExpansionError("command ~other/work", error.TildeExpansionUnsupported);
 }
 
 test "pathname expansion preserves quote provenance field splitting and path components" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, exercisePathnames, .{});
+}
+
+test "pattern removal releases scalar and positional values on allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exercisePatternRemoval, .{});
+}
+
+fn exercisePatternRemoval(gpa: std.mem.Allocator) !void {
+    var hir = try generate("command \"${value#*/}\" \"${@%suffix}\"");
+    defer hir.deinit(std.testing.allocator);
+    var variables = VariableStore.init(std.testing.allocator);
+    defer variables.deinit();
+    try variables.set("value", "path/name");
+    const expander = Expander.initWithContext(gpa, .{
+        .variables = &variables,
+        .positional_parameters = &.{ "onesuffix", "twosuffix" },
+    });
+    for (firstCommandParts(hir)[1..]) |part| {
+        const fields = try expander.expandArgument(hir, part);
+        defer {
+            for (fields) |field| gpa.free(field);
+            gpa.free(fields);
+        }
+    }
 }
 
 fn exercisePathnames(gpa: std.mem.Allocator) !void {
