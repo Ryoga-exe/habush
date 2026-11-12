@@ -15,6 +15,28 @@ max_bytes: usize = 64 * 1024,
 menu: ?Menu = null,
 navigation: History.Navigation = .{},
 diagnostics: ?Diagnostic.Result = null,
+search: ?Search = null,
+
+pub const Search = struct {
+    query: Buffer,
+    index: ?usize = null,
+    failed: bool = false,
+
+    fn find(search: *Search, history: *const History, before: usize, max_bytes: usize) bool {
+        var index = before;
+        while (index != 0) {
+            index -= 1;
+            const entry = history.entries.items[index];
+            if (entry.len <= max_bytes and std.mem.indexOf(u8, entry, search.query.text()) != null) {
+                search.index = index;
+                search.failed = false;
+                return true;
+            }
+        }
+        search.failed = true;
+        return false;
+    }
+};
 
 pub const Menu = struct { result: Completion.Result, selected: usize = 0 };
 pub const Effect = enum { redraw, show_candidates, submit, interrupt, eof, clear_screen, bell };
@@ -25,6 +47,7 @@ pub const Inspector = struct {
 };
 
 pub fn deinit(editor: *Editor) void {
+    editor.endSearch();
     editor.navigation.deinit(editor.buffer.gpa);
     editor.buffer.deinit();
     editor.* = undefined;
@@ -32,6 +55,13 @@ pub fn deinit(editor: *Editor) void {
 
 pub fn insert(editor: *Editor, bytes: []const u8) std.mem.Allocator.Error!bool {
     editor.menu = null;
+    if (editor.search) |*search| {
+        if (bytes.len > editor.max_bytes -| search.query.text().len or std.mem.indexOfScalar(u8, bytes, 0) != null) return false;
+        try search.query.insert(bytes);
+        search.index = null;
+        _ = search.find(editor.history.?, editor.history.?.entries.items.len, editor.max_bytes);
+        return true;
+    }
     if (bytes.len > editor.max_bytes -| editor.buffer.text().len or std.mem.indexOfScalar(u8, bytes, 0) != null) return false;
     try editor.buffer.insert(bytes);
     return true;
@@ -44,11 +74,13 @@ pub fn setDiagnostics(editor: *Editor, result: Diagnostic.Result) bool {
 }
 
 pub fn currentDiagnostics(editor: Editor) []const Diagnostic {
+    if (editor.search != null) return &.{};
     const result = editor.diagnostics orelse return &.{};
     return if (result.revision == editor.buffer.revision) result.items else &.{};
 }
 
 pub fn perform(editor: *Editor, action: Keybind.Action) Completion.Error!Effect {
+    if (editor.search != null) return editor.searchAction(action);
     const buffer = &editor.buffer;
     switch (action) {
         .accept_line,
@@ -94,6 +126,11 @@ pub fn perform(editor: *Editor, action: Keybind.Action) Completion.Error!Effect 
             _ = buffer.undo();
         },
         .complete, .complete_previous => return editor.complete(action == .complete_previous),
+        .history_search => {
+            const history = editor.history orelse return .bell;
+            editor.search = .{ .query = .{ .gpa = buffer.gpa } };
+            _ = editor.search.?.find(history, history.entries.items.len, editor.max_bytes);
+        },
         .clear_screen => return .clear_screen,
         .cursor_up, .cursor_down, .history_previous, .history_next, .history_search_previous, .history_search_next => {
             const previous = action == .cursor_up or action == .history_previous or action == .history_search_previous;
@@ -108,6 +145,42 @@ pub fn perform(editor: *Editor, action: Keybind.Action) Completion.Error!Effect 
             return if (try editor.navigation.move(history, buffer, previous, action == .history_search_previous or action == .history_search_next)) .redraw else .bell;
         },
         .dismiss_completion, .ignore, .unbind => {},
+    }
+    return .redraw;
+}
+
+pub fn searchMatch(editor: *const Editor) ?[]const u8 {
+    const search = editor.search orelse return null;
+    return editor.history.?.entries.items[search.index orelse return null];
+}
+
+fn endSearch(editor: *Editor) void {
+    if (editor.search) |*search| search.query.deinit();
+    editor.search = null;
+}
+
+fn searchAction(editor: *Editor, action: Keybind.Action) Completion.Error!Effect {
+    const search = &editor.search.?;
+    const history = editor.history.?;
+    switch (action) {
+        .history_search => return if (search.find(history, search.index orelse history.entries.items.len, editor.max_bytes)) .redraw else .bell,
+        .backspace => {
+            try search.query.backspace();
+            search.index = null;
+            _ = search.find(history, history.entries.items.len, editor.max_bytes);
+        },
+        .accept_line => {
+            const match = editor.searchMatch() orelse return .bell;
+            try editor.buffer.replace(0, editor.buffer.text().len, match);
+            editor.navigation.deinit(editor.buffer.gpa);
+            editor.navigation = .{};
+            editor.endSearch();
+        },
+        .dismiss_completion, .eof_or_delete => editor.endSearch(),
+        .interrupt => return .interrupt,
+        .clear_screen => return .clear_screen,
+        .ignore, .unbind => {},
+        else => return .bell,
     }
     return .redraw;
 }
@@ -137,6 +210,39 @@ fn accept(editor: *Editor, index: usize) Completion.Error!bool {
 
 fn request(editor: *const Editor) Completion.Request {
     return .{ .source = editor.buffer.text(), .cursor = editor.buffer.cursor, .revision = editor.buffer.revision };
+}
+
+test "reverse history search previews without execution, restores drafts, and accepts one undoable edit" {
+    const gpa = std.testing.allocator;
+    var history: History = .{ .gpa = gpa };
+    defer history.deinit();
+    try history.append("echo 日本 one");
+    try history.append("cat <<EOF\n日本 two\nEOF");
+    var editor: Editor = .{ .buffer = .{ .gpa = gpa }, .history = &history };
+    defer editor.deinit();
+    try std.testing.expect(try editor.insert("draft"));
+    editor.buffer.cursor = 2;
+    _ = try editor.perform(.history_search);
+    try std.testing.expect(try editor.insert("日本"));
+    try std.testing.expectEqualStrings("cat <<EOF\n日本 two\nEOF", editor.searchMatch().?);
+    _ = try editor.perform(.history_search);
+    try std.testing.expectEqualStrings("echo 日本 one", editor.searchMatch().?);
+    _ = try editor.perform(.dismiss_completion);
+    try std.testing.expectEqualStrings("draft", editor.buffer.text());
+    try std.testing.expectEqual(@as(usize, 2), editor.buffer.cursor);
+    _ = try editor.perform(.history_search);
+    try std.testing.expect(try editor.insert("absent"));
+    try std.testing.expectEqual(Effect.bell, try editor.perform(.accept_line));
+    _ = try editor.perform(.dismiss_completion);
+    _ = try editor.perform(.history_search);
+    try std.testing.expect(try editor.insert("日本x"));
+    _ = try editor.perform(.backspace);
+    try std.testing.expectEqual(Effect.redraw, try editor.perform(.accept_line));
+    try std.testing.expectEqualStrings("cat <<EOF\n日本 two\nEOF", editor.buffer.text());
+    try std.testing.expectEqual(Effect.submit, try editor.perform(.accept_line));
+    _ = try editor.perform(.undo);
+    try std.testing.expectEqualStrings("draft", editor.buffer.text());
+    try std.testing.expectEqual(@as(usize, 2), editor.buffer.cursor);
 }
 
 test "multiline actions move between scalar boundaries and insert a continuation" {

@@ -311,6 +311,11 @@ fn historyScenario(io: Io, master: Io.File, terminal: *Terminal) !void {
     try std.testing.expect(std.mem.indexOf(u8, output, "literal $(missing)\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "command not found") == null);
     // Edit an earlier continuation line before submitting the whole command.
+    try master.writeStreamingAll(io, "\x12literal $(missing)\r");
+    _ = try terminal.expect("history (Enter selects, Esc cancels): literal $(missing)");
+    // Selection must leave the editor active until a second Enter.
+    try master.writeStreamingAll(io, "\r");
+    try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "literal $(missing)\r\n") != null);
     try master.writeStreamingAll(io, "if true; then\rresult=wrong\rfi\x1b[A\x01\x0bresult=right\x1b[B\r");
     _ = try terminal.expect(ready);
     try master.writeStreamingAll(io, "/bin/echo EDITED:$result\r");
