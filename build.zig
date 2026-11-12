@@ -121,14 +121,20 @@ pub fn build(b: *std.Build) void {
         });
         plugin.addImport("wasmtime", headers.createModule());
         plugin.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "lib" }) });
-        plugin.linkSystemLibrary("wasmtime", .{ .preferred_link_mode = .static, .use_pkg_config = .no });
+        plugin.linkSystemLibrary("wasmtime", .{
+            .preferred_link_mode = if (target.result.os.tag == .linux) .dynamic else .static,
+            .use_pkg_config = .no,
+        });
         if (target.result.os.tag == .linux) {
+            // Use the SDK's shared library; Zig's ELF linker cannot resolve its Rust archive.
+            plugin.addRPath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "lib" }) });
             for ([_][]const u8{ "pthread", "dl", "m" }) |name| plugin.linkSystemLibrary(name, .{});
         } else if (target.result.os.tag == .windows) {
             for ([_][]const u8{ "ws2_32", "advapi32", "userenv", "ntdll", "shell32", "ole32", "bcrypt" }) |name|
                 plugin.linkSystemLibrary(name, .{});
         }
         const plugin_tests = b.addTest(.{ .root_module = plugin });
+        b.step("check-plugin", "Compile the optional Wasm plugin host tests").dependOn(&plugin_tests.step);
         const run_plugin_tests = b.addRunArtifact(plugin_tests);
         b.step("test-plugin", "Verify the optional Wasm plugin host").dependOn(&run_plugin_tests.step);
         test_step.dependOn(&run_plugin_tests.step);

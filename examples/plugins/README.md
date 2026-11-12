@@ -10,6 +10,8 @@ zig build test-plugin -Dwasmtime=/absolute/path/to/wasmtime-v50.0.1-aarch64-maco
 
 The directory must contain `include/wasmtime.h` and `lib/`. `zig build test` also includes the host tests when this option is supplied. Native host tests run on macOS and Linux in CI; Windows/FreeBSD shell tests continue without the optional SDK. Wasm host behavior on those two platforms has not been verified.
 
+On Linux, the SDK's shared library is used with an SDK-relative build rpath because Zig 0.17.1's ELF linker does not resolve its Rust static archive. Keep that library directory available when running these development binaries. Runtime packaging is not implemented yet. `zig build check-plugin` with the same options compiles the host tests without running them.
+
 ## Ownership and calls
 
 `Host.init(io)` creates an engine and an epoch ticker. `Host.load(bytes)` compiles a module without running guest code; the module borrows its host. Each `module.invoke(allocator, entry, request, scope)` creates a fresh store/instance, applies the scope before initialization, calls the entry, copies the response, and destroys the instance. The returned byte slice belongs to the supplied allocator.
