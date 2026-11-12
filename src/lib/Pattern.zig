@@ -15,18 +15,22 @@ pub const Removal = enum { prefix, longest_prefix, suffix, longest_suffix };
 /// remain single characters). This keeps UTF-8 intact when trimming `?`.
 pub fn remove(pattern: Pattern, value: []const u8, mode: Removal) []const u8 {
     const prefix = mode == .prefix or mode == .longest_prefix;
-    const first_match = mode == .prefix or mode == .longest_suffix;
-    var result = value;
-    var index: usize = 0;
+    const forwards = mode == .prefix or mode == .longest_suffix;
+    var index: usize = if (forwards) 0 else value.len;
     while (true) {
-        if (pattern.matches(if (prefix) value[0..index] else value[index..])) {
-            result = if (prefix) value[index..] else value[0..index];
-            if (first_match) return result;
+        if (pattern.matches(if (prefix) value[0..index] else value[index..]))
+            return if (prefix) value[index..] else value[0..index];
+        if (forwards) {
+            if (index == value.len) break;
+            index += character(value, index).len;
+        } else {
+            if (index == 0) break;
+            var start = index - 1;
+            while (start != 0 and index - start < 4 and value[start] & 0xc0 == 0x80) start -= 1;
+            index = if (start + character(value, start).len == index) start else index - 1;
         }
-        if (index == value.len) break;
-        index += character(value, index).len;
     }
-    return result;
+    return value;
 }
 
 pub fn hasMeta(pattern: Pattern) bool {
@@ -185,6 +189,18 @@ const classes = std.StaticStringMap(Class).initComptime(.{
     .{ "digit", .digit }, .{ "graph", .graph }, .{ "lower", .lower }, .{ "print", .print },
     .{ "punct", .punct }, .{ "space", .space }, .{ "upper", .upper }, .{ "xdigit", .xdigit },
 });
+
+test "removal stops at the first matching boundary in the requested direction" {
+    const pattern: Pattern = .{ .bytes = "?*" };
+    for ([_][]const u8{ "🐚é", "\xffé", "é\x80", "\xc2\x80\x80" }) |value| {
+        const first = character(value, 0).len;
+        try std.testing.expectEqualStrings(value[first..], pattern.remove(value, .prefix));
+        try std.testing.expectEqualStrings("", pattern.remove(value, .longest_prefix));
+        try std.testing.expectEqualStrings("", pattern.remove(value, .longest_suffix));
+        const last = if (std.mem.endsWith(u8, value, "é")) value.len - 2 else value.len - 1;
+        try std.testing.expectEqualStrings(value[0..last], pattern.remove(value, .suffix));
+    }
+}
 
 test "shell patterns match scalar characters ranges classes and complete values" {
     const cases = [_]struct { []const u8, []const u8, bool }{
