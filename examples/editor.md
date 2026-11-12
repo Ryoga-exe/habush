@@ -8,11 +8,12 @@ uses cooked line input.
 | --- | --- |
 | Up / Down | Ordinary history on single-line input, line movement in multiline input; select candidates while a menu is open |
 | Ctrl+P / Ctrl+N | Previous/next history entry, including during multiline editing |
+| Ctrl+R | Search submitted history; repeat to find an older match |
 | Ctrl+L | Clear the visible screen and redraw the current input, preserving the cursor and Undo |
 | Tab, Shift+Tab | Complete or move forward/backward through candidates |
 | Enter | Insert the selected candidate; otherwise add a continuation newline for incomplete syntax or submit the whole input |
 | Ctrl+O | Insert a newline without submitting |
-| Escape | Dismiss the menu |
+| Escape | Dismiss the menu, or cancel history search and restore the draft |
 | Ctrl+A/E, Ctrl+B/F | Start/end, previous/next character |
 | Ctrl+K/U | Delete to end/start |
 | Ctrl+_ | Undo the last edit |
@@ -22,11 +23,25 @@ History contains submitted source, including compound commands and here-document
 Returning past the newest entry restores the draft and its cursor. Consecutive
 duplicates and blank input are omitted. It retains at most 1000 entries and
 1 MiB in this process; inputs over the editor's 64 KiB limit are omitted.
-History is not saved to disk. Continuation and here-document text stay in the
+Interactive history is saved under `$XDG_STATE_HOME/habush/history` (default
+`$HOME/.local/state/habush/history`). Configure `.history.memory.max_entries`,
+`.history.memory.max_bytes`, `.history.storage.max_bytes` (default 8 MiB),
+`.history.storage.path`, and `.history.storage.enabled` in ZON. Relative paths
+use the config file's directory. Disabling storage keeps in-memory navigation.
+Ctrl+R previews substring matches without changing the draft. Enter selects the
+match into the editor; another Enter submits it. Escape restores the original
+draft and cursor. Continuation and here-document text stay in the
 same editable input. Arrows move between logical lines using Unicode scalar
 columns; Ctrl+A/E and Ctrl+U/K operate on the current line. Long lines scroll
 horizontally and long inputs use a vertical viewport. Menus are repainted below
 the input instead of being appended to scrollback on every selection.
+
+Completion runs in the background against copied input and Session state.
+Editing or moving the cursor invalidates old results; Enter during collection
+submits the current input. It does not wait to insert an outdated completion.
+Cancellation joins provider work before evaluation or input shutdown. Native
+embedders can retain synchronous completion; the optional `poll`/`cancel`
+contract lets their own services return a pending result.
 
 The ZON `keybinds` list maps `key` to `action`. Named keys are `up`, `down`,
 `left`, `right`, `home`, `end`, `delete`, `backtab`, `enter`, `tab`, `backspace`,

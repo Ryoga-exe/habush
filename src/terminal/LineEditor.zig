@@ -16,6 +16,7 @@ history: ?*const edit.History = null,
 inspector: ?edit.Editor.Inspector = null,
 diagnostics: ?edit.Diagnostic.Provider = null,
 keybinds: []const edit.Keybind = &.{},
+input_id: u64 = 0,
 
 pub const max_input_bytes = 64 * 1024;
 
@@ -34,6 +35,7 @@ pub fn read(editor: LineEditor) !?[:0]u8 {
         .history = editor.history,
         .completion = editor.completion,
         .inspector = editor.inspector,
+        .input_id = editor.input_id,
     };
     defer state.deinit();
     const buffer = &state.buffer;
@@ -44,6 +46,13 @@ pub fn read(editor: LineEditor) !?[:0]u8 {
     var pending_len: usize = 0;
     var expected_len: usize = 0;
     while (true) {
+        if (state.completion_pending and editor.input.bufferedLen() == 0 and !terminal.ready(0)) {
+            if (try state.pollCompletion()) |effect| {
+                if (effect == .bell) try editor.output.writeByte(7);
+                try editor.redraw(&state, &view, terminal, &diagnostic_arena);
+            }
+            if (state.completion_pending and editor.input.bufferedLen() == 0 and !terminal.ready(10)) continue;
+        }
         const byte = try takeByte(editor.input) orelse {
             try terminal.restore();
             return null;

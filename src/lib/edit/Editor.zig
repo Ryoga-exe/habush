@@ -16,6 +16,9 @@ menu: ?Menu = null,
 navigation: History.Navigation = .{},
 diagnostics: ?Diagnostic.Result = null,
 search: ?Search = null,
+input_id: u64 = 0,
+request_id: u64 = 0,
+completion_pending: bool = false,
 
 pub const Search = struct {
     query: Buffer,
@@ -47,6 +50,7 @@ pub const Inspector = struct {
 };
 
 pub fn deinit(editor: *Editor) void {
+    editor.cancelCompletion();
     editor.endSearch();
     editor.navigation.deinit(editor.buffer.gpa);
     editor.buffer.deinit();
@@ -54,7 +58,7 @@ pub fn deinit(editor: *Editor) void {
 }
 
 pub fn insert(editor: *Editor, bytes: []const u8) std.mem.Allocator.Error!bool {
-    editor.menu = null;
+    editor.cancelCompletion();
     if (editor.search) |*search| {
         if (bytes.len > editor.max_bytes -| search.query.text().len or std.mem.indexOfScalar(u8, bytes, 0) != null) return false;
         try search.query.insert(bytes);
@@ -94,7 +98,7 @@ pub fn perform(editor: *Editor, action: Keybind.Action) Completion.Error!Effect 
         .history_search_next,
         .ignore,
         => {},
-        else => editor.menu = null,
+        else => editor.cancelCompletion(),
     }
     switch (action) {
         .accept_line => {
@@ -186,19 +190,43 @@ fn searchAction(editor: *Editor, action: Keybind.Action) Completion.Error!Effect
 }
 
 fn complete(editor: *Editor, previous: bool) Completion.Error!Effect {
+    if (editor.completion_pending) return .redraw;
     if (editor.menu) |*selection| {
         const count = selection.result.labels.len;
         selection.selected = if (previous) (selection.selected + count - 1) % count else (selection.selected + 1) % count;
         return .show_candidates;
     }
     const service = editor.completion orelse return .bell;
+    editor.request_id +%= 1;
     const result = (try service.query(service.userdata, editor.request())) orelse return .bell;
+    return editor.receiveCompletion(result, previous);
+}
+
+pub fn pollCompletion(editor: *Editor) Completion.Error!?Effect {
+    if (!editor.completion_pending) return null;
+    const service = editor.completion.?;
+    const poll = service.poll orelse return null;
+    const result = (try poll(service.userdata, editor.request())) orelse return null;
+    return try editor.receiveCompletion(result, false);
+}
+
+fn receiveCompletion(editor: *Editor, result: Completion.Result, previous: bool) Completion.Error!Effect {
+    editor.completion_pending = result.pending;
+    if (result.pending) return .redraw;
     if (!result.unique()) {
         if (result.labels.len == 0) return .bell;
         editor.menu = .{ .result = result, .selected = if (previous) result.labels.len - 1 else 0 };
         return .show_candidates;
     }
     return if (try editor.accept(0)) .redraw else .bell;
+}
+
+fn cancelCompletion(editor: *Editor) void {
+    if (editor.completion_pending or editor.menu != null) {
+        if (editor.completion) |service| if (service.cancel) |cancel| cancel(service.userdata);
+    }
+    editor.completion_pending = false;
+    editor.menu = null;
 }
 
 fn accept(editor: *Editor, index: usize) Completion.Error!bool {
@@ -209,7 +237,7 @@ fn accept(editor: *Editor, index: usize) Completion.Error!bool {
 }
 
 fn request(editor: *const Editor) Completion.Request {
-    return .{ .source = editor.buffer.text(), .cursor = editor.buffer.cursor, .revision = editor.buffer.revision };
+    return .{ .source = editor.buffer.text(), .cursor = editor.buffer.cursor, .revision = editor.buffer.revision, .input_id = editor.input_id, .id = editor.request_id };
 }
 
 test "reverse history search previews without execution, restores drafts, and accepts one undoable edit" {
