@@ -183,7 +183,8 @@ The effective set is the intersection of the configured declaration, user grant,
 and caller's ceiling. The CLI further limits each extension purpose. A permission
 bit never supplies a missing resource. Prompt snapshots are redacted without
 `context`; completion and diagnostic adapters deny input access without `source`.
-These checks live in the shared adapters as well as the host imports. Raw
+Without `context`, every Prompt context field is empty rather than reporting
+an invented successful status or zero jobs. These checks live in the shared adapters as well as the host imports. Raw
 `Module.invoke` request bytes are data explicitly supplied by the embedding host.
 
 `habush.capability.Set` and `Scope` are also exported by `habush-exec`, so agent

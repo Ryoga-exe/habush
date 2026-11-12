@@ -36,7 +36,7 @@ const fixture =
     \\   i32.const 1024 call $capabilities i32.store8 i64.const 4294968320)
     \\ (func (export "redacted_prompt") (param i32 i32) (result i64)
     \\   local.get 0 i32.load offset=9 if unreachable end
-    \\   local.get 0 i32.load8_u offset=17 i32.const 48 i32.ne if unreachable end
+    \\   local.get 0 i32.load offset=13 if unreachable end
     \\   i64.const 19 i64.const 32 i64.shl i64.const 512 i64.or)
     \\ (func (export "candidates") (param i32 i32) (result i64)
     \\   i64.const 68719476768)

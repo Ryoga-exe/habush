@@ -5,13 +5,14 @@ const protocol = @import("protocol.zig");
 const Prompt = @import("habush-edit").Prompt;
 
 pub fn render(module: *const Host.Module, arena: std.mem.Allocator, entry: []const u8, supplied_context: Prompt.Context, scope: Host.Scope) Host.Error!Prompt {
-    const context = if (module.permissions(scope.capabilities.permissions).context) supplied_context else Prompt.Context{ .cwd = null, .status = 0 };
+    const visible = module.permissions(scope.capabilities.permissions).context;
+    const context = if (visible) supplied_context else Prompt.Context{ .cwd = null, .status = 0 };
     var status: [3]u8 = undefined;
-    const code = std.fmt.bufPrint(&status, "{d}", .{context.status}) catch unreachable;
+    const code = if (visible) std.fmt.bufPrint(&status, "{d}", .{context.status}) catch unreachable else "";
     var duration_buffer: [20]u8 = undefined;
     const duration = if (context.duration_ns) |ns| std.fmt.bufPrint(&duration_buffer, "{d}", .{ns / std.time.ns_per_ms}) catch unreachable else "";
     var jobs_buffer: [20]u8 = undefined;
-    const jobs = std.fmt.bufPrint(&jobs_buffer, "{d}", .{context.jobs}) catch unreachable;
+    const jobs = if (visible) std.fmt.bufPrint(&jobs_buffer, "{d}", .{context.jobs}) catch unreachable else "";
     const git = context.git;
     const request = try protocol.encode(arena, &.{&.{
         "1",                               context.cwd orelse "",                         code,                                          duration, jobs,
