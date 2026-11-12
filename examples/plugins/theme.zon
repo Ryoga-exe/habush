@@ -3,5 +3,11 @@
     .plugins = .{.{
         .path = "../../zig-out/bin/habush-theme.wasm",
         .prompt = .{},
+        .options = .{
+            .{ "symbol", "❯" },
+            .{ "cwd_color", "cyan" },
+            .{ "success_color", "green" },
+            .{ "failure_color", "red" },
+        },
     }},
 }

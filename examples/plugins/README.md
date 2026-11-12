@@ -75,10 +75,27 @@ zig build -Dwasm-plugins=true
 zig-out/bin/habush --config examples/plugins/theme.zon
 ```
 
-It displays cwd and the previous exit status, with a green/red marker. It uses
-no host imports. The app passes only cwd/status; Git, environment discovery,
+It displays cwd and the previous exit status, with a green/red marker. It reads
+only its own settings through `habush.option`. The app passes cwd/status; Git, environment discovery,
 and subprocess execution are not provided. Prompt failures use the configured
 literal prompt (or `habush> `). The final prompt declaration wins.
+
+Change the theme without rebuilding its Wasm by editing `theme.zon`:
+
+```zon
+.options = .{
+    .{ "symbol", ">" },
+    .{ "cwd_color", "cyan" },
+    .{ "success_color", "green" },
+    .{ "failure_color", "yellow" },
+},
+```
+
+Each plugin receives only its own key/value string pairs, across all of its
+extension entries. Keys must be nonempty and unique; at most 32 pairs and 4096
+key/value bytes are allowed, without NUL. The host validates the envelope;
+the plugin validates the meaning. The theme accepts the nine color names below
+and a literal symbol. Invalid colors trap and use the configured prompt fallback.
 
 The demo module also has a `diagnose` entry. Its shipped config enables an
 advisory warning on `NOTE`, with a deliberately embedded ESC in the message to
@@ -140,9 +157,15 @@ The host imports are:
 ```text
 habush.write(descriptor: i32, pointer: i32, length: i32) -> i32
 habush.read(descriptor: i32, pointer: i32, length: i32) -> i32
+habush.option(key_pointer: i32, key_length: i32, output: i32, capacity: i32) -> i32
 ```
 
 Write descriptors 1 and 2 require the corresponding scope writer. Read descriptor 0 requires stdin. Other descriptors and missing grants fail the call. Return values count bytes transferred; read may return fewer bytes than requested and returns zero at EOF or for an empty request. Both validate guest memory and enforce byte budgets before I/O. A failed operation traps the call rather than returning an unchecked error code to the guest.
+
+`option` copies the selected setting into guest memory and returns its byte
+length, or -1 for a missing key. An insufficient capacity, invalid guest memory,
+or expired call fails the invocation. Settings are available during initialization
+and never include the full configuration, environment, or another plugin's values.
 
 ## Extension schemas v0
 
