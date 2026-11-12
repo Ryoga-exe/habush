@@ -122,12 +122,18 @@ pub const CompoundContinuation = struct {
         while_clause,
         until_clause,
         for_clause,
+        case_clause,
         function_definition,
     };
 
     pub const Expected = enum {
         condition,
         name,
+        word,
+        in_keyword,
+        pattern,
+        closing_pattern,
+        esac_keyword,
         then_keyword,
         in_or_do_keyword,
         do_keyword,
@@ -437,6 +443,16 @@ pub fn forClause(tree: *const Ast, index: Node.Index) Node.For {
     return tree.extraData(tree.nodeData(index).extra, Node.For);
 }
 
+pub fn caseClause(tree: *const Ast, index: Node.Index) Node.Case {
+    std.debug.assert(tree.nodeTag(index) == .case_clause);
+    return tree.extraData(tree.nodeData(index).extra, Node.Case);
+}
+
+pub fn caseItem(tree: *const Ast, index: Node.Index) Node.CaseItem {
+    std.debug.assert(tree.nodeTag(index) == .case_item);
+    return tree.extraData(tree.nodeData(index).extra, Node.CaseItem);
+}
+
 pub fn functionDefinition(tree: *const Ast, index: Node.Index) Node.FunctionDefinition {
     std.debug.assert(tree.nodeTag(index) == .function_definition);
     return tree.extraData(tree.nodeData(index).extra, Node.FunctionDefinition);
@@ -584,6 +600,10 @@ pub const Node = struct {
         /// `data.extra`: encoded `For` data.
         for_clause,
 
+        /// `data.extra`: encoded `Case` / `CaseItem` data.
+        case_clause,
+        case_item,
+
         /// `data.extra`: encoded `FunctionDefinition` data.
         function_definition,
 
@@ -676,6 +696,24 @@ pub const Node = struct {
         l_paren: TokenIndex,
         r_paren: TokenIndex,
         body: OptionalIndex,
+    };
+
+    pub const Case = struct {
+        word: OptionalIndex,
+        in_token: OptionalTokenIndex,
+        items_start: ExtraIndex,
+        items_end: ExtraIndex,
+        esac_token: OptionalTokenIndex,
+        redirects_start: ExtraIndex,
+        redirects_end: ExtraIndex,
+    };
+
+    pub const CaseItem = struct {
+        patterns_start: ExtraIndex,
+        patterns_end: ExtraIndex,
+        close_token: OptionalTokenIndex,
+        body: OptionalIndex,
+        terminator: OptionalTokenIndex,
     };
 
     pub const Redirect = struct {

@@ -111,6 +111,7 @@ const Frame = struct {
 pub fn inspect(source: []const u8, cursor: usize, revision: u64) error{ InvalidCursor, InputTooDeep }!Completion {
     if (cursor > source.len) return error.InvalidCursor;
     var frames: [64]Frame = @splat(.{});
+    var substitutions: [64]?usize = @splat(null);
     var depth: usize = 0;
     var index: usize = 0;
     while (index < cursor) : (index += 1) {
@@ -146,6 +147,7 @@ pub fn inspect(source: []const u8, cursor: usize, revision: u64) error{ InvalidC
             if (depth + 1 == frames.len) return error.InputTooDeep;
             depth += 1;
             frames[depth] = .{};
+            substitutions[depth] = index;
             index += 1;
             continue;
         }
@@ -173,13 +175,16 @@ pub fn inspect(source: []const u8, cursor: usize, revision: u64) error{ InvalidC
             frame.quote = .single;
         } else if (byte == '#' and frame.word == null) {
             frame.comment = true;
-        } else if (byte == ')' and depth != 0) {
-            depth -= 1;
+        } else if (byte == ')') {
+            if (depth != 0 and (substitutions[depth] == null or word_syntax.commandSubstitutionEnd(source, substitutions[depth].?) == index)) {
+                depth -= 1;
+            } else frame.* = .{};
         } else if (byte == '(') {
             finishWord(frame, source, index);
             if (depth + 1 == frames.len) return error.InputTooDeep;
             depth += 1;
             frames[depth] = .{};
+            substitutions[depth] = null;
         } else if (byte == '<' or byte == '>') {
             if (frame.word) |start| {
                 if (allDigits(source[start..index])) frame.word = null else finishWord(frame, source, index);
@@ -273,6 +278,8 @@ test "literal arguments use the active command without evaluating expansions" {
         "FOO=bar demo 'a b' 2>out next",
         "echo $(demo 'a b' next",
         "true && demo 'a b' next",
+        "case x in x) demo 'a b' next",
+        "echo $(case x in x) demo 'a b' next",
     }) |source| {
         const context = try inspect(source, source.len, 1);
         const args = try context.literalArguments(arena);

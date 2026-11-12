@@ -117,6 +117,19 @@ fn renderNode(
                 depth + 1,
             );
         },
+        .case_clause => {
+            const clause = dump.tree.caseClause(node);
+            try dump.renderOptionalChild("word", clause.word, depth + 1);
+            for (dump.tree.extraDataSlice(.{ .start = clause.items_start, .end = clause.items_end }, Node.Index)) |item|
+                try dump.renderChild("item", item, depth + 1);
+            try dump.renderRedirects(clause.redirects_start, clause.redirects_end, depth + 1);
+        },
+        .case_item => {
+            const item = dump.tree.caseItem(node);
+            for (dump.tree.extraDataSlice(.{ .start = item.patterns_start, .end = item.patterns_end }, Node.Index)) |pattern|
+                try dump.renderChild("pattern", pattern, depth + 1);
+            try dump.renderOptionalChild("body", item.body, depth + 1);
+        },
         .function_definition => {
             const definition = dump.tree.functionDefinition(node);
             try dump.renderOptionalChild("body", definition.body, depth + 1);

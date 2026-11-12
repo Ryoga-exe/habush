@@ -230,6 +230,17 @@ pub fn expandAssignment(
     return bytes.toOwnedSlice(expander.allocator);
 }
 
+/// Scalar expansion with quote provenance, without splitting or globbing.
+pub fn expandPattern(parent: Expander, hir: Hir, word: Hir.Inst.Index) Error!Pattern {
+    var expander = parent;
+    var patterns: PatternBuffers = .{};
+    defer patterns.deinit(expander.allocator);
+    expander.patterns = &patterns;
+    const bytes = try expander.expandAssignment(hir, word);
+    errdefer expander.allocator.free(bytes);
+    return .{ .bytes = bytes, .quoted = try patterns.current.toOwnedSlice(expander.allocator) };
+}
+
 /// Expands a here-document body without field splitting, pathname expansion,
 /// or quote removal. Quotes are ordinary bytes in a here-document; only
 /// parameter expansion and the restricted here-document backslash rules are

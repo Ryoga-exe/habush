@@ -297,6 +297,11 @@ pub fn build(b: *std.Build) !void {
     function_test.addFileArg(b.path("test/cli/function.hb"));
     expectCliResult(function_test, test_step, 23, "", "");
 
+    const case_test = b.addRunArtifact(exe);
+    case_test.setName("test cli case execution");
+    case_test.addArgs(&.{ "--no-config", "-c", "value='a b'; case \"$value\" in (x|a*) exit 7;; *) exit 1;; esac" });
+    expectCliResult(case_test, test_step, 7, "", "");
+
     const word_expansion_test = b.addRunArtifact(exe);
     word_expansion_test.setName("test cli word expansion");
     word_expansion_test.addFileArg(b.path("test/cli/word-expansion.hb"));

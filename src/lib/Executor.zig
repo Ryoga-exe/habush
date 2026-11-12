@@ -330,10 +330,43 @@ fn executeInstruction(parent: Executor, hir: Hir, index: Hir.Inst.Index) Error!R
         .if_clause => executor.executeIfClause(hir, index),
         .while_clause, .until_clause => executor.executeLoopClause(hir, index),
         .for_clause => executor.executeForClause(hir, index),
+        .case_clause => executor.executeCaseClause(hir, index),
         .function_definition => executor.executeFunctionDefinition(hir, index),
         .simple_command => executor.executeSimpleCommand(hir, index),
         else => error.UnsupportedInstruction,
     };
+}
+
+fn executeCaseClause(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
+    const clause = hir.caseClause(index);
+    var arena = std.heap.ArenaAllocator.init(executor.gpa);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var scope = switch (try executor.beginHirRedirections(hir, clause.redirects, allocator)) {
+        .ready => |ready| ready,
+        .failed => |failure| return failure,
+    };
+    defer scope.deinit();
+    var expansion_failure: Expander.Failure = undefined;
+    const expander = scope.executor.wordExpander(allocator, null, &expansion_failure);
+    const value = expander.expandAssignment(hir, clause.word) catch |err| switch (err) {
+        error.ParameterExpansionFailed => return executor.parameterExpansionFailure(allocator, expansion_failure),
+        else => return err,
+    };
+    for (clause.items) |item_index| {
+        const item = hir.caseItem(item_index);
+        for (item.patterns) |pattern_index| {
+            const pattern = expander.expandPattern(hir, pattern_index) catch |err| switch (err) {
+                error.ParameterExpansionFailed => return executor.parameterExpansionFailure(allocator, expansion_failure),
+                else => return err,
+            };
+            if (pattern.matches(value)) {
+                if (item.body.unwrap()) |body| return scope.executor.executeInstruction(hir, body);
+                return .{ .status = 0, .sandbox_coverage = .not_requested };
+            }
+        }
+    }
+    return .{ .status = 0, .sandbox_coverage = .not_requested };
 }
 
 fn executeFunctionDefinition(executor: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
@@ -1056,6 +1089,7 @@ fn preparePipelineStage(
         .while_clause,
         .until_clause,
         .for_clause,
+        .case_clause,
         => .{ .ready = .compound },
         .function_definition => .{ .ready = .definition },
         else => error.UnsupportedInstruction,
@@ -2207,6 +2241,8 @@ fn instructionSource(hir: Hir, index: Hir.Inst.Index) ?runtime.Diagnostic.Source
         .while_clause,
         .until_clause,
         .for_clause,
+        .case_clause,
+        .case_item,
         .function_definition,
         => hir.instructionData(location_index).pl.src_start,
         .negated_pipeline => hir.instructionData(location_index).un.src_start,
