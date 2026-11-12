@@ -14,18 +14,18 @@ const command_worker = @import("../worker.zig");
 const runtime_types = @import("../runtime/types.zig");
 const append_file = @import("System/append_file.zig");
 const pipe = @import("System/pipe.zig");
-const worker_channel = if (builtin.os.tag == .windows or builtin.os.tag == .wasi)
+const worker_channel = if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi)
     struct {}
 else
     @import("System/worker_channel.zig");
-const WorkerReport = if (builtin.os.tag == .windows or builtin.os.tag == .wasi) void else worker_channel.Report;
-const terminal = if (builtin.os.tag == .windows or builtin.os.tag == .wasi)
+const WorkerReport = if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) void else worker_channel.Report;
+const terminal = if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi)
     struct {}
 else
     @import("System/terminal.zig");
-const windows_spawn = if (builtin.os.tag == .windows) @import("System/windows_spawn.zig") else struct {};
+const windows_spawn = if (builtin.target.os.tag == .windows) @import("System/windows_spawn.zig") else struct {};
 const System = @This();
-const TerminalModes = if (builtin.os.tag == .windows or builtin.os.tag == .wasi)
+const TerminalModes = if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi)
     u8
 else
     terminal.Modes;
@@ -125,7 +125,7 @@ pub fn deinit(system: *System) void {
     if (system.terminal_lease) |lease| {
         releaseTerminal(system, lease.token) catch {};
         if (system.terminal_lease) |still_active| {
-            if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+            if (builtin.target.os.tag != .windows and builtin.target.os.tag != .wasi) {
                 if (!still_active.foreground_restored) {
                     const previous: std.posix.pid_t = @intCast(still_active.previous_group);
                     terminal.setForegroundGroup(still_active.tty, previous) catch {};
@@ -138,10 +138,10 @@ pub fn deinit(system: *System) void {
     }
     var children = system.children.valueIterator();
     while (children.next()) |record| {
-        if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+        if (builtin.target.os.tag != .windows and builtin.target.os.tag != .wasi) {
             if (record.report) |report| report.deinit();
         }
-        if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
             record.child.kill(system.io);
         } else {
             // TERM cannot be handled while a child is stopped. KILL lets the
@@ -180,11 +180,11 @@ const worker_vtable: Host.VTable = blk: {
 
 const vtable: Host.VTable = .{
     .capabilities = .{
-        .process_groups = builtin.os.tag != .windows and builtin.os.tag != .wasi,
-        .terminal_control = builtin.os.tag != .windows and builtin.os.tag != .wasi,
-        .suspend_before_execute = builtin.os.tag != .windows and builtin.os.tag != .wasi,
-        .poll = builtin.os.tag != .wasi,
-        .signals = builtin.os.tag != .wasi,
+        .process_groups = builtin.target.os.tag != .windows and builtin.target.os.tag != .wasi,
+        .terminal_control = builtin.target.os.tag != .windows and builtin.target.os.tag != .wasi,
+        .suspend_before_execute = builtin.target.os.tag != .windows and builtin.target.os.tag != .wasi,
+        .poll = builtin.target.os.tag != .wasi,
+        .signals = builtin.target.os.tag != .wasi,
         .parallel_open_file = true,
     },
     .spawn = spawn,
@@ -280,7 +280,7 @@ fn spawn(userdata: ?*anyopaque, plan: CommandPlan) Host.SpawnError!Host.SpawnOut
         return backend.launch(system.gpa, system.io, system.workerHost(), worker_executable, plan);
     }
     if (plan.suspend_before_execute) {
-        if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return .{ .failed = .unsupported };
+        if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return .{ .failed = .unsupported };
         const worker_executable = system.worker_executable orelse return .{ .failed = .unsupported };
         return command_worker.launch(system.gpa, system.workerHost(), worker_executable, plan) catch |err| switch (err) {
             error.Unsupported => if (firstFifoAction(system, plan) == null)
@@ -331,7 +331,7 @@ fn launchPreboundWorker(system: *System, executable: []const u8, plan: CommandPl
 
 fn spawnWorker(userdata: ?*anyopaque, plan: CommandPlan) Host.SpawnError!Host.SpawnOutcome {
     const system: *System = @ptrCast(@alignCast(userdata.?));
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return .{ .failed = .unsupported };
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return .{ .failed = .unsupported };
     const worker_index = for (plan.argv, 0..) |value, index| {
         if (std.mem.eql(u8, value, command_worker.argument)) break index;
     } else return error.InvalidArguments;
@@ -348,12 +348,12 @@ fn spawnWorker(userdata: ?*anyopaque, plan: CommandPlan) Host.SpawnError!Host.Sp
 }
 
 fn spawnNative(system: *System, plan: CommandPlan, bootstrap_worker: bool) Host.SpawnError!Host.SpawnOutcome {
-    if ((builtin.os.tag == .windows or builtin.os.tag == .wasi) and plan.process_group != .inherit)
+    if ((builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) and plan.process_group != .inherit)
         return .{ .failed = .unsupported };
     if (plan.process_group == .join and
         !system.ownsProcessGroup(plan.process_group.join))
         return error.InvalidArguments;
-    const pgid: ?std.posix.pid_t = if (builtin.os.tag == .windows or builtin.os.tag == .wasi)
+    const pgid: ?std.posix.pid_t = if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi)
         null
     else switch (plan.process_group) {
         .inherit => null,
@@ -442,12 +442,12 @@ fn spawnNative(system: *System, plan: CommandPlan, bootstrap_worker: bool) Host.
         spawnStdio(bindings[1], .stdout),
         spawnStdio(bindings[2], .stderr),
     };
-    var channel: if (builtin.os.tag == .windows or builtin.os.tag == .wasi) ?void else ?worker_channel.Parent = null;
-    defer if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+    var channel: if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) ?void else ?worker_channel.Parent = null;
+    defer if (builtin.target.os.tag != .windows and builtin.target.os.tag != .wasi) {
         if (channel) |*parent| parent.deinit();
     };
     if (bootstrap_worker) {
-        if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return .{ .failed = .unsupported };
+        if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return .{ .failed = .unsupported };
         channel = worker_channel.Parent.init(bindingFile(bindings[0])) catch return .{ .failed = .resource_unavailable };
         child_io[0] = .{ .file = channel.?.childInput() };
     }
@@ -470,7 +470,7 @@ fn spawnNative(system: *System, plan: CommandPlan, bootstrap_worker: bool) Host.
     defer if (environment) |*map| map.deinit();
 
     try system.children.ensureUnusedCapacity(system.gpa, 1);
-    var child = if (builtin.os.tag == .windows and needsWindowsHandleSpawn(bindings)) child: {
+    var child = if (builtin.target.os.tag == .windows and needsWindowsHandleSpawn(bindings)) child: {
         const outcome = try windows_spawn.spawn(
             system.gpa,
             argv,
@@ -502,7 +502,7 @@ fn spawnNative(system: *System, plan: CommandPlan, bootstrap_worker: bool) Host.
         .pgid = pgid,
     }) catch |err| return .{ .failed = try mapSpawnFailure(err) };
 
-    if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+    if (builtin.target.os.tag != .windows and builtin.target.os.tag != .wasi) {
         if (channel) |*parent| parent.sendInput() catch {
             // Spawn has already transferred a native process to us. A failed
             // bootstrap must release it before reporting a startup failure.
@@ -516,7 +516,7 @@ fn spawnNative(system: *System, plan: CommandPlan, bootstrap_worker: bool) Host.
 
     const process_group: ?CommandPlan.ProcessGroup = switch (plan.process_group) {
         .inherit => null,
-        .create => if (builtin.os.tag == .windows or builtin.os.tag == .wasi)
+        .create => if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi)
             unreachable
         else
             @fromBackingInt(@as(u32, @intCast(child.id.?))),
@@ -526,7 +526,7 @@ fn spawnNative(system: *System, plan: CommandPlan, bootstrap_worker: bool) Host.
     system.children.putAssumeCapacityNoClobber(process, .{
         .child = child,
         .process_group = process_group,
-        .report = if (builtin.os.tag == .windows or builtin.os.tag == .wasi)
+        .report = if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi)
             null
         else if (channel) |*parent|
             parent.takeReport(std.math.cast(u32, plan.file_actions.len) orelse unreachable)
@@ -542,7 +542,7 @@ fn spawnNative(system: *System, plan: CommandPlan, bootstrap_worker: bool) Host.
 }
 
 fn firstFifoAction(system: *System, plan: CommandPlan) ?u32 {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return null;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return null;
     const has_open = for (plan.file_actions) |action| {
         if (action == .open) break true;
     } else false;
@@ -565,8 +565,8 @@ fn firstFifoAction(system: *System, plan: CommandPlan) ?u32 {
 }
 
 fn nativeProcessId(child: std.process.Child) ?runtime_types.ProcessId {
-    if (builtin.os.tag == .wasi) return null;
-    if (builtin.os.tag != .windows)
+    if (builtin.target.os.tag == .wasi) return null;
+    if (builtin.target.os.tag != .windows)
         return @fromBackingInt(std.math.cast(u32, child.id orelse return null) orelse return null);
 
     const windows = std.os.windows;
@@ -638,7 +638,7 @@ fn createCapture(userdata: ?*anyopaque) Host.Error!CommandPlan.Resource {
 
 fn createInput(userdata: ?*anyopaque, bytes: []const u8) Host.Error!CommandPlan.Resource {
     const system: *System = @ptrCast(@alignCast(userdata.?));
-    const permissions: std.Io.File.Permissions = switch (builtin.os.tag) {
+    const permissions: std.Io.File.Permissions = switch (builtin.target.os.tag) {
         .windows => .default_file,
         else => .fromMode(0o600),
     };
@@ -698,7 +698,7 @@ const InputResourceDirectory = struct {
 
 fn inputResourceDirectory(system: *System) InputResourceDirectory {
     if (system.environ_map) |environment| {
-        const configured_path = switch (builtin.os.tag) {
+        const configured_path = switch (builtin.target.os.tag) {
             .windows => environment.get("TEMP") orelse environment.get("TMP"),
             else => environment.get("TMPDIR"),
         };
@@ -712,7 +712,7 @@ fn inputResourceDirectory(system: *System) InputResourceDirectory {
             }
         }
     }
-    if (builtin.os.tag != .windows) {
+    if (builtin.target.os.tag != .windows) {
         if (std.Io.Dir.openDirAbsolute(system.io, "/tmp", .{})) |dir|
             return .{ .dir = dir, .close = true }
         else |_| {}
@@ -969,8 +969,8 @@ fn reapWindows(system: *System, process: Host.Process) Host.Error!Host.Terminati
 fn tryWait(userdata: ?*anyopaque, process: Host.Process) Host.Error!?Host.Termination {
     const system: *System = @ptrCast(@alignCast(userdata.?));
     const record = system.children.getPtr(process) orelse return error.InvalidArguments;
-    if (builtin.os.tag == .windows) return tryWaitWindows(system, process, record);
-    if (builtin.os.tag == .wasi) return error.Unsupported;
+    if (builtin.target.os.tag == .windows) return tryWaitWindows(system, process, record);
+    if (builtin.target.os.tag == .wasi) return error.Unsupported;
     return tryWaitPosix(system, process, record);
 }
 
@@ -981,7 +981,7 @@ fn waitEvent(userdata: ?*anyopaque, process: Host.Process) Host.Error!Host.Termi
 fn waitAny(userdata: ?*anyopaque, processes: []const Host.Process) Host.Error!Host.ProcessEvent {
     const system: *System = @ptrCast(@alignCast(userdata.?));
     if (processes.len == 0) return error.InvalidArguments;
-    if (builtin.os.tag == .wasi) return error.Unsupported;
+    if (builtin.target.os.tag == .wasi) return error.Unsupported;
     for (processes) |process| {
         if (!system.children.contains(process)) return error.InvalidArguments;
     }
@@ -1085,8 +1085,8 @@ fn tryWaitWindows(
 fn signal(userdata: ?*anyopaque, process: Host.Process, requested: Host.Signal) Host.Error!void {
     const system: *System = @ptrCast(@alignCast(userdata.?));
     const record = system.children.getPtr(process) orelse return error.InvalidArguments;
-    if (builtin.os.tag == .windows) return signalWindows(record, requested);
-    if (builtin.os.tag == .wasi) return error.Unsupported;
+    if (builtin.target.os.tag == .windows) return signalWindows(record, requested);
+    if (builtin.target.os.tag == .wasi) return error.Unsupported;
     return signalPosix(record, requested);
 }
 
@@ -1096,7 +1096,7 @@ fn signalGroup(
     requested: Host.Signal,
 ) Host.Error!void {
     const system: *System = @ptrCast(@alignCast(userdata.?));
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.Unsupported;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return error.Unsupported;
     if (!system.ownsProcessGroup(group)) return error.InvalidArguments;
     const pgid = std.math.cast(std.posix.pid_t, @backingInt(group)) orelse
         return error.InvalidArguments;
@@ -1117,7 +1117,7 @@ fn signalGroup(
 
 fn acquireTerminal(userdata: ?*anyopaque, group: CommandPlan.ProcessGroup) Host.Error!Host.TerminalLease {
     const system: *System = @ptrCast(@alignCast(userdata.?));
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.Unsupported;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return error.Unsupported;
     if (system.terminal_lease != null) return error.ResourceUnavailable;
     if (!system.ownsProcessGroup(group)) return error.InvalidArguments;
     const pgid = std.math.cast(std.posix.pid_t, @backingInt(group)) orelse
@@ -1160,7 +1160,7 @@ fn acquireTerminal(userdata: ?*anyopaque, group: CommandPlan.ProcessGroup) Host.
 
 fn releaseTerminal(userdata: ?*anyopaque, token: Host.TerminalLease) Host.Error!void {
     const system: *System = @ptrCast(@alignCast(userdata.?));
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.Unsupported;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return error.Unsupported;
     const lease = &(system.terminal_lease orelse return error.InvalidArguments);
     if (lease.token != token) return error.InvalidArguments;
     if (!lease.foreground_restored) {
@@ -1476,7 +1476,7 @@ test "system host owns foreground processes until wait" {
     try std.testing.expectEqual(@as(?CommandPlan.ProcessGroup, null), spawned.process_group);
     try std.testing.expectEqual(.not_requested, spawned.sandbox_coverage);
     try std.testing.expect(spawned.process_id != null);
-    if (builtin.os.tag != .windows) {
+    if (builtin.target.os.tag != .windows) {
         try std.testing.expectEqual(
             @as(u32, @intCast(system.children.get(spawned.process).?.child.id.?)),
             @backingInt(spawned.process_id.?),
@@ -1495,7 +1495,7 @@ test "system host owns foreground processes until wait" {
 }
 
 test "canceled native waits retain the child for later reaping" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return error.SkipZigTest;
     const CanceledSleep = struct {
         fn sleep(_: ?*anyopaque, _: std.Io.Timeout) std.Io.Cancelable!void {
             return error.Canceled;
@@ -1549,7 +1549,7 @@ test "system host polls and reaps an exited child once" {
 }
 
 test "system host keeps a stopped POSIX child until it resumes and exits" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     var system: System = .{ .gpa = std.testing.allocator, .io = std.testing.io };
     defer system.deinit();
@@ -1590,7 +1590,7 @@ test "system host keeps a stopped POSIX child until it resumes and exits" {
 }
 
 test "system host waits for the stopped child among several owned processes" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     var system: System = .{ .gpa = std.testing.allocator, .io = std.testing.io };
     defer system.deinit();
@@ -1635,7 +1635,7 @@ test "system host waits for the stopped child among several owned processes" {
 }
 
 test "system host creates a POSIX process group" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     var system: System = .{ .gpa = std.testing.allocator, .io = std.testing.io };
     defer system.deinit();
@@ -1694,7 +1694,7 @@ test "system host requires an owned group for terminal handoff" {
     defer system.deinit();
     const system_host = system.host();
     const unknown: CommandPlan.ProcessGroup = @fromBackingInt(424242);
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
         try std.testing.expectError(error.Unsupported, system_host.acquireTerminal(unknown));
         return;
     }
@@ -1738,7 +1738,7 @@ test "system host rejects process features before spawning" {
             } }},
         }),
     );
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
         try std.testing.expectEqualDeep(
             Host.SpawnOutcome{ .failed = .unsupported },
             try system_host.spawn(.{
@@ -1798,7 +1798,7 @@ test "system host applies output file actions relative to the command directory"
     );
     defer std.testing.allocator.free(output);
     try std.testing.expectEqualStrings(
-        if (builtin.os.tag == .windows) "first\r\nsecond\r\n" else "firstsecond",
+        if (builtin.target.os.tag == .windows) "first\r\nsecond\r\n" else "firstsecond",
         output,
     );
 }
@@ -1838,13 +1838,13 @@ test "system host shares scoped output resources with child processes" {
     );
     defer std.testing.allocator.free(output);
     try std.testing.expectEqualStrings(
-        if (builtin.os.tag == .windows) "builtinexternal\r\n" else "builtinexternal",
+        if (builtin.target.os.tag == .windows) "builtinexternal\r\n" else "builtinexternal",
         output,
     );
 }
 
 test "system host provides seekable input resources to child processes" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
 
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
@@ -1905,7 +1905,7 @@ test "capture reads from zero after both parent and child output exceed a pipe b
     defer actual.deinit();
     _ = try reader.streamRemaining(&actual.writer);
     try std.testing.expectEqualSlices(u8, bytes, actual.written()[0..bytes.len]);
-    try std.testing.expectEqualStrings(if (builtin.os.tag == .windows) "tail\r\n" else "tail", actual.written()[bytes.len..]);
+    try std.testing.expectEqualStrings(if (builtin.target.os.tag == .windows) "tail\r\n" else "tail", actual.written()[bytes.len..]);
 }
 
 test "system host creates and closes pipeline resources" {
@@ -2011,7 +2011,7 @@ test "system host duplicates redirected standard streams" {
     );
     defer std.testing.allocator.free(output);
     try std.testing.expectEqualStrings(
-        if (builtin.os.tag == .windows) "out\r\nerr\r\n" else "outerr",
+        if (builtin.target.os.tag == .windows) "out\r\nerr\r\n" else "outerr",
         output,
     );
 }
@@ -2057,8 +2057,8 @@ test "system host preserves file action source order" {
         .limited(64),
     );
     defer std.testing.allocator.free(after);
-    try std.testing.expectEqualStrings(if (builtin.os.tag == .windows) "err\r\n" else "err", before);
-    try std.testing.expectEqualStrings(if (builtin.os.tag == .windows) "out\r\n" else "out", after);
+    try std.testing.expectEqualStrings(if (builtin.target.os.tag == .windows) "err\r\n" else "err", before);
+    try std.testing.expectEqualStrings(if (builtin.target.os.tag == .windows) "out\r\n" else "out", after);
 }
 
 test "system host identifies a failing input file action" {
@@ -2130,7 +2130,7 @@ test "system host requires a parent environment for overlays" {
 
 fn exitCommand(comptime status: u8) CommandPlan {
     const script = std.fmt.comptimePrint("exit {d}", .{status});
-    return switch (@import("builtin").os.tag) {
+    return switch (@import("builtin").target.os.tag) {
         .windows => .{
             .executable = "cmd.exe",
             .argv = &.{ "shell-spelling", "/C", script },
@@ -2143,7 +2143,7 @@ fn exitCommand(comptime status: u8) CommandPlan {
 }
 
 fn outputCommand(comptime output: []const u8) CommandPlan {
-    return switch (@import("builtin").os.tag) {
+    return switch (@import("builtin").target.os.tag) {
         .windows => .{
             .executable = "cmd.exe",
             .argv = &.{ "shell-spelling", "/D", "/C", "echo " ++ output },
@@ -2156,7 +2156,7 @@ fn outputCommand(comptime output: []const u8) CommandPlan {
 }
 
 fn outputBothCommand() CommandPlan {
-    return switch (@import("builtin").os.tag) {
+    return switch (@import("builtin").target.os.tag) {
         .windows => .{
             .executable = "cmd.exe",
             .argv = &.{
@@ -2186,7 +2186,7 @@ fn expectExitStatus(system_host: Host, plan: CommandPlan, expected: u8) !void {
 }
 
 test "malformed worker report still consumes the terminal process handle" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return error.SkipZigTest;
     var system: System = .{ .gpa = std.testing.allocator, .io = std.testing.io };
     defer system.deinit();
     const outcome = try system.host().spawn(.{

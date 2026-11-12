@@ -103,7 +103,7 @@ fn scan(
                 if (value_prefix.len == 0) continue;
             } else {
                 if (kind != .file) continue;
-                if (builtin.os.tag == .windows and !native.executableExtension(entry.name)) continue;
+                if (builtin.target.os.tag == .windows and !native.executableExtension(entry.name)) continue;
                 dir.access(native.io, entry.name, .{ .execute = true }) catch |err| switch (err) {
                     error.FileNotFound, error.AccessDenied, error.PermissionDenied => continue,
                     else => return unavailable(err),
@@ -127,7 +127,7 @@ fn executableExtension(native: Native, name: []const u8) bool {
 }
 
 fn lastSeparator(value: []const u8) ?usize {
-    return std.mem.lastIndexOfAny(u8, value, if (builtin.os.tag == .windows) "/\\" else "/");
+    return std.mem.lastIndexOfAny(u8, value, if (builtin.target.os.tag == .windows) "/\\" else "/");
 }
 
 fn unavailable(err: anyerror) Provider.Error {
@@ -152,7 +152,7 @@ test "native completion uses shell cwd and PATH, functions, and literal file val
     var native: Native = .{
         .io = std.testing.io,
         .cwd = cwd,
-        .path = if (builtin.os.tag == .windows) "bin;bin" else "bin:bin",
+        .path = if (builtin.target.os.tag == .windows) "bin;bin" else "bin:bin",
         .default_search_path = &.{"missing"},
         .function_names = &.{ "habush-function", "pwd" },
     };
@@ -160,16 +160,16 @@ test "native completion uses shell cwd and PATH, functions, and literal file val
     const context = try Completion.inspect("habush-", 7, 1);
     var commands = try Provider.collect(std.testing.allocator, .{ .context = context, .prefix = "habush-" }, &providers, .{});
     defer commands.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, if (builtin.os.tag == .windows) 1 else 2), commands.candidates.len);
+    try std.testing.expectEqual(@as(usize, if (builtin.target.os.tag == .windows) 1 else 2), commands.candidates.len);
     try std.testing.expect(!commands.truncated and !commands.incomplete);
     try std.testing.expectEqualStrings("habush-function", commands.candidates[0].value);
-    if (builtin.os.tag != .windows) try std.testing.expectEqualStrings("habush-tool", commands.candidates[1].value);
+    if (builtin.target.os.tag != .windows) try std.testing.expectEqualStrings("habush-tool", commands.candidates[1].value);
     // An explicitly empty PATH searches cwd, rather than the fallback or process PATH.
     native.path = "";
     var local_commands = try Provider.collect(std.testing.allocator, .{ .context = context, .prefix = "habush-" }, &providers, .{});
     defer local_commands.deinit(std.testing.allocator);
     try std.testing.expectEqual(commands.candidates.len, local_commands.candidates.len);
-    if (builtin.os.tag != .windows) try std.testing.expectEqualStrings("habush-cwd", local_commands.candidates[1].value);
+    if (builtin.target.os.tag != .windows) try std.testing.expectEqualStrings("habush-cwd", local_commands.candidates[1].value);
     const file_context = try Completion.inspect("cat sp", 6, 2);
     var files_result = try Provider.collect(std.testing.allocator, .{ .context = file_context, .prefix = "sp" }, &providers, .{});
     defer files_result.deinit(std.testing.allocator);
@@ -182,12 +182,12 @@ test "native completion uses shell cwd and PATH, functions, and literal file val
     var fallback = try Provider.collect(std.testing.allocator, .{ .context = context, .prefix = "habush-" }, &providers, .{});
     defer fallback.deinit(std.testing.allocator);
     try std.testing.expectEqual(commands.candidates.len, fallback.candidates.len);
-    if (builtin.os.tag != .windows) try std.testing.expectEqualStrings("habush-tool", fallback.candidates[1].value);
+    if (builtin.target.os.tag != .windows) try std.testing.expectEqualStrings("habush-tool", fallback.candidates[1].value);
     const builtin_context = try Completion.inspect("pw", 2, 3);
     var duplicate = try Provider.collect(std.testing.allocator, .{ .context = builtin_context, .prefix = "pw" }, &providers, .{});
     defer duplicate.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("pwd", duplicate.unique().?.value);
-    if (builtin.os.tag == .windows) {
+    if (builtin.target.os.tag == .windows) {
         var custom = try tmp.dir.createFile(std.testing.io, "bin/habush-custom.HB", .{});
         custom.close(std.testing.io);
         native.path = "bin";
@@ -200,7 +200,7 @@ test "native completion uses shell cwd and PATH, functions, and literal file val
 }
 
 test "completion preserves relative and absolute symlink parent traversal" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     for ([_][]const u8{ "work", "target", "target/deeper" }) |path|
@@ -216,7 +216,7 @@ test "completion preserves relative and absolute symlink parent traversal" {
     defer std.testing.allocator.free(cwd);
     for ([_]bool{ false, true }) |absolute| {
         const prefix = if (absolute)
-            try std.fmt.allocPrint(std.testing.allocator, "{s}/link/../item", .{cwd})
+            try std.testing.allocator.print("{s}/link/../item", .{cwd})
         else
             try std.testing.allocator.dupe(u8, "link/../item");
         defer std.testing.allocator.free(prefix);

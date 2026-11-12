@@ -3,7 +3,7 @@
 const builtin = @import("builtin");
 const ProcessId = @import("habush").runtime.ProcessId;
 
-const implementation = switch (builtin.os.tag) {
+const implementation = switch (builtin.target.os.tag) {
     .windows => @import("platform/windows.zig"),
     .linux,
     .dragonfly,

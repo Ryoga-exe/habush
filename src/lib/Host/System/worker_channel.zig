@@ -7,7 +7,7 @@ const Host = @import("../../Host.zig");
 const posix = std.posix;
 const fd_t = posix.fd_t;
 const Cmsghdr = posix.system.cmsghdr;
-const cmsg_alignment = if (builtin.os.tag.isDarwin()) 4 else @sizeOf(usize);
+const cmsg_alignment = if (builtin.target.os.tag.isDarwin()) 4 else @sizeOf(usize);
 const data_offset = alignControl(@sizeOf(Cmsghdr));
 const packet_len = 12;
 
@@ -23,7 +23,7 @@ pub const Parent = struct {
         const saved = if (input) |file| try duplicateOptional(file.handle) else null;
         errdefer if (saved) |fd| close(fd);
         var pair: [2]fd_t = undefined;
-        const flags = if (builtin.os.tag.isDarwin()) 0 else posix.SOCK.CLOEXEC;
+        const flags = if (builtin.target.os.tag.isDarwin()) 0 else posix.SOCK.CLOEXEC;
         while (true) switch (posix.errno(posix.system.socketpair(posix.AF.UNIX, posix.SOCK.STREAM | flags, 0, &pair))) {
             .SUCCESS => break,
             .INTR => continue,
@@ -185,7 +185,7 @@ fn receiveInput(socket: fd_t) Error!?fd_t {
     var control: [controlSpace(4 * @sizeOf(fd_t))]u8 align(@alignOf(Cmsghdr)) = @splat(0);
     var message: posix.msghdr = .{ .name = null, .namelen = 0, .iov = &iov, .iovlen = 1, .control = &control, .controllen = control.len, .flags = 0 };
     const received = while (true) {
-        const flags = if (builtin.os.tag == .linux) posix.MSG.CMSG_CLOEXEC else 0;
+        const flags = if (builtin.target.os.tag == .linux) posix.MSG.CMSG_CLOEXEC else 0;
         const rc = posix.system.recvmsg(socket, &message, flags);
         switch (posix.errno(rc)) {
             .SUCCESS => break rc,
@@ -310,7 +310,7 @@ fn setCloseOnExec(fd: fd_t) Error!void {
 }
 
 fn noSignal() u32 {
-    return if (builtin.os.tag.isDarwin()) 0 else posix.MSG.NOSIGNAL;
+    return if (builtin.target.os.tag.isDarwin()) 0 else posix.MSG.NOSIGNAL;
 }
 
 fn close(fd: fd_t) void {

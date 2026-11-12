@@ -9,7 +9,7 @@ pub const Error = error{
 };
 
 pub fn create() Error![2]std.Io.File {
-    return switch (builtin.os.tag) {
+    return switch (builtin.target.os.tag) {
         .windows => createWindows(),
         .wasi => error.OperationUnsupported,
         else => createPosix(),

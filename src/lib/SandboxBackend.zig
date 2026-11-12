@@ -89,7 +89,7 @@ pub fn launcher(backend: SandboxBackend) []const u8 {
 
 pub fn capabilities(backend: SandboxBackend) Capabilities {
     return switch (backend.kind) {
-        .macos_seatbelt => if (builtin.os.tag == .macos) .{
+        .macos_seatbelt => if (builtin.target.os.tag == .macos) .{
             .process_subtree = true,
             .read_and_enumerate_bundle = true,
             .execute_paths = true,
@@ -114,7 +114,7 @@ pub fn prepare(
 ) Error!Preparation {
     policy.validate() catch return error.InvalidPolicy;
     return switch (backend.kind) {
-        .macos_seatbelt => if (builtin.os.tag == .macos)
+        .macos_seatbelt => if (builtin.target.os.tag == .macos)
             macos.prepare(gpa, io, policy)
         else
             .{ .rejected = .{ .coverage = .partial, .unsupported = .{ .platform = true } } },
@@ -200,7 +200,7 @@ fn availableExecutable(io: std.Io, path: []const u8) bool {
 }
 
 test "launch preserves explicit context and sends only resource prefix to the inner host" {
-    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    if (builtin.target.os.tag != .macos) return error.SkipZigTest;
     const FakeHost = @import("Host/FakeHost.zig");
     var fake = FakeHost.init(std.testing.allocator);
     defer fake.deinit();

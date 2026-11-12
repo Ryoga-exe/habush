@@ -11,11 +11,11 @@ const builtin = @import("builtin");
 const CommandPlan = @import("CommandPlan.zig");
 const Host = @import("Host.zig");
 const append_file = @import("Host/System/append_file.zig");
-const worker_channel = if (builtin.os.tag == .windows or builtin.os.tag == .wasi)
+const worker_channel = if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi)
     struct {}
 else
     @import("Host/System/worker_channel.zig");
-const Reporter = if (builtin.os.tag == .windows or builtin.os.tag == .wasi) void else worker_channel.Reporter;
+const Reporter = if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) void else worker_channel.Reporter;
 
 pub const argument = "--internal-command-worker";
 /// Used only by the private System worker host; not part of the public plan.
@@ -212,7 +212,7 @@ pub fn run(init: std.process.Init, arguments: []const [:0]const u8) u8 {
     var reporter: ?Reporter = null;
     const bootstrap = arguments.len != 0 and std.mem.eql(u8, arguments[0], bootstrap_argument);
     if (bootstrap) {
-        if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
             report(init.io, "unsupported platform");
             return 126;
         } else {
@@ -222,12 +222,12 @@ pub fn run(init: std.process.Init, arguments: []const [:0]const u8) u8 {
             };
         }
     }
-    defer if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+    defer if (builtin.target.os.tag != .windows and builtin.target.os.tag != .wasi) {
         if (reporter) |channel| channel.deinit();
     };
     const payload = if (bootstrap) arguments[1..] else arguments;
     const values = gpa.alloc([]const u8, payload.len) catch {
-        if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+        if (builtin.target.os.tag != .windows and builtin.target.os.tag != .wasi) {
             if (reporter) |channel| channel.send(.resource_unavailable);
         }
         report(init.io, "out of memory");
@@ -236,7 +236,7 @@ pub fn run(init: std.process.Init, arguments: []const [:0]const u8) u8 {
     defer gpa.free(values);
     for (payload, values) |value, *destination| destination.* = value;
     var decoded = parse(gpa, values) catch |err| {
-        if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+        if (builtin.target.os.tag != .windows and builtin.target.os.tag != .wasi) {
             if (reporter) |channel|
                 channel.send(if (err == error.OutOfMemory) .resource_unavailable else .unsupported);
         }
@@ -245,7 +245,7 @@ pub fn run(init: std.process.Init, arguments: []const [:0]const u8) u8 {
     };
     defer decoded.deinit(gpa);
 
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
         report(init.io, "unsupported platform");
         return 126;
     } else {
@@ -479,7 +479,7 @@ test "ordinary worker launch delegates context and only the resource prefix" {
     const gpa = std.testing.allocator;
     var fake = FakeHost.init(gpa);
     defer fake.deinit();
-    const worker_executable = if (builtin.os.tag == .windows) "C:/trusted/habush.exe" else "/trusted/habush";
+    const worker_executable = if (builtin.target.os.tag == .windows) "C:/trusted/habush.exe" else "/trusted/habush";
     const plan: CommandPlan = .{
         .executable = "/resolved/tool",
         .argv = &.{ "tool", "literal argument" },

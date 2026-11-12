@@ -771,7 +771,7 @@ test "unsupported polling preserves a live pipeline for blocking wait" {
 
 test "a real input-blocked process can be started polled and killed" {
     const builtin = @import("builtin");
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return error.SkipZigTest;
     var system: Host.System = .{ .gpa = std.testing.allocator, .io = std.testing.io };
     defer system.deinit();
     const host = system.host();

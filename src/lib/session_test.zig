@@ -1083,8 +1083,7 @@ test "relative and empty PATH entries retain the command working directory" {
     });
     defer session.deinit();
 
-    const path = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const path = try std.testing.allocator.print(
         "relative{c}{c}/absolute",
         .{ std.fs.path.delimiter, std.fs.path.delimiter },
     );
@@ -1128,7 +1127,7 @@ test "session executes HIR through the system resolver and host" {
     const cwd = cwd_buffer[0..cwd_len];
 
     var search_path_storage: [1][]const u8 = undefined;
-    const source: [:0]const u8 = switch (@import("builtin").os.tag) {
+    const source: [:0]const u8 = switch (@import("builtin").target.os.tag) {
         .windows => source: {
             const command = environ_map.get("ComSpec") orelse return error.SkipZigTest;
             search_path_storage[0] = std.fs.path.dirname(command) orelse

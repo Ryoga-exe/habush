@@ -28,7 +28,7 @@ pub fn currentProcessGroup() Error!std.posix.pid_t {
         if (pgid <= 0) return error.Unexpected;
         return pgid;
     }
-    if (builtin.os.tag != .linux) return error.Unexpected;
+    if (builtin.target.os.tag != .linux) return error.Unexpected;
     const result = std.os.linux.getpgid(0);
     return switch (std.os.linux.errno(result)) {
         .SUCCESS => @intCast(result),

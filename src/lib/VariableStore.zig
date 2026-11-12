@@ -4,7 +4,7 @@ const std = @import("std");
 const VariableStore = @This();
 
 gpa: std.mem.Allocator,
-map: std.StringArrayHashMapUnmanaged(Value) = .empty,
+map: std.array_hash_map.String(Value) = .empty,
 
 pub const Binding = struct {
     name: []const u8,

@@ -15,7 +15,7 @@ pub fn open(
     absolute: bool,
     read: bool,
 ) !std.Io.File {
-    return switch (builtin.os.tag) {
+    return switch (builtin.target.os.tag) {
         .windows => openWindows(directory, path, absolute, read),
         .wasi => error.OperationUnsupported,
         else => openPosix(io, directory, path, absolute, read),
@@ -124,7 +124,7 @@ fn openWindows(
 }
 
 test "POSIX files are opened with append status" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return error.SkipZigTest;
 
     const io = std.testing.io;
     var temporary = std.testing.tmpDir(.{});
@@ -141,7 +141,7 @@ test "POSIX files are opened with append status" {
 }
 
 test "separate append handles do not retain stale end offsets" {
-    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (builtin.target.os.tag == .wasi) return error.SkipZigTest;
 
     const io = std.testing.io;
     var temporary = std.testing.tmpDir(.{});
