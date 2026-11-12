@@ -220,7 +220,7 @@ pub fn render(
             "invalid file descriptor: {s}",
             .{descriptor},
         ),
-        .bad_file_descriptor => |descriptor| try writer.print("bad file descriptor: {d}", .{@intFromEnum(descriptor)}),
+        .bad_file_descriptor => |descriptor| try writer.print("bad file descriptor: {d}", .{@backingInt(descriptor)}),
         .unsupported_file_descriptor => |descriptor| try writer.print(
             "unsupported file descriptor: {s}",
             .{descriptor},

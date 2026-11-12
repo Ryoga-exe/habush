@@ -41,8 +41,8 @@ pub const LineInput = struct {
         modes.iflag.INLCR = false;
         modes.iflag.IGNCR = false;
         modes.oflag.OPOST = false;
-        modes.cc[@intFromEnum(posix.V.MIN)] = 1;
-        modes.cc[@intFromEnum(posix.V.TIME)] = 0;
+        modes.cc[@backingInt(posix.V.MIN)] = 1;
+        modes.cc[@backingInt(posix.V.TIME)] = 0;
         try posix.tcsetattr(0, .NOW, modes);
         return .{ .original = original };
     }

@@ -78,7 +78,7 @@ test "evaluation events pair outcomes and reject callback reentry" {
     try std.testing.expectEqual(@as(usize, 10), capture.count);
     const kinds = [_]Capture.Kind{ .executed, .executed, .syntax, .unsupported, .failed };
     for (kinds, 0..) |kind, index| {
-        try std.testing.expectEqual(@as(u64, index + 1), @intFromEnum(capture.records[index * 2].id));
+        try std.testing.expectEqual(@as(u64, index + 1), @backingInt(capture.records[index * 2].id));
         try std.testing.expectEqual(capture.records[index * 2].id, capture.records[index * 2 + 1].id);
         try std.testing.expectEqual(Capture.Kind.started, capture.records[index * 2].kind);
         try std.testing.expectEqual(kind, capture.records[index * 2 + 1].kind);
@@ -159,7 +159,7 @@ test "diagnostics retain exact ranges and the source of stored function bodies" 
     try std.testing.expectEqualStrings("missing", capture.subject[0..capture.subject_len]);
     try std.testing.expectEqualStrings("", stderr.written());
 
-    const input = try std.testing.allocator.dupeZ(u8, "f() { missing; }");
+    const input = try std.testing.allocator.dupeSentinel(u8, "f() { missing; }", 0);
     var definition = try session.evaluate(input, .{
         .source_name = "definitions.hb",
         .source_revision = 9,
@@ -200,7 +200,7 @@ test "delayed worker diagnostics preserve background command and path attributio
         } },
     });
     defer session.deinit();
-    const input = try std.testing.allocator.dupeZ(u8, "/bin/tool > denied &");
+    const input = try std.testing.allocator.dupeSentinel(u8, "/bin/tool > denied &", 0);
     var launched = try session.evaluate(input, .{ .source_name = "submitted.hb" });
     launched.deinit(session.allocator());
     @memset(input, 'x');
@@ -614,7 +614,7 @@ test "analysis is pure and rejected syntax borrows its source" {
     try std.testing.expectEqualStrings("before", session.variable("name").?);
     try std.testing.expectEqual(@as(u8, 0), session.lastResult().status);
 
-    const source = try std.testing.allocator.dupeZ(u8, "|");
+    const source = try std.testing.allocator.dupeSentinel(u8, "|", 0);
     defer std.testing.allocator.free(source);
     {
         var rejected = try session.evaluate(source, .{});
@@ -765,7 +765,7 @@ test "shell process id remains stable inside functions" {
     var fake_host = FakeHost.init(std.testing.allocator);
     defer fake_host.deinit();
     var session = try Session.init(std.testing.allocator, fake_host.host(), .{
-        .shell_process_id = @enumFromInt(12345),
+        .shell_process_id = @fromBackingInt(12345),
     });
     defer session.deinit();
 
@@ -1049,7 +1049,7 @@ test "pipeline stages use their own PATH without changing the session" {
 
     try std.testing.expectEqual(@as(usize, 3), fake_resolver.calls.items.len);
     const expected_paths = [_][]const u8{ "/left", "/right", "/parent" };
-    var seen = [_]bool{false} ** expected_paths.len;
+    var seen: [expected_paths.len]bool = @splat(false);
     for (fake_resolver.calls.items) |request| {
         const index: usize = if (std.mem.eql(u8, request.name, "left"))
             0

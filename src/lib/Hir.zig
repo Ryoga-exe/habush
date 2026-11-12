@@ -34,7 +34,7 @@ pub const StringIndex = enum(u32) {
     _,
 
     pub fn toOptional(index: StringIndex) OptionalIndex {
-        const result: OptionalIndex = @enumFromInt(@intFromEnum(index));
+        const result: OptionalIndex = @fromBackingInt(@backingInt(index));
         std.debug.assert(result != .none);
         return result;
     }
@@ -44,7 +44,7 @@ pub const StringIndex = enum(u32) {
         _,
 
         pub fn unwrap(index: OptionalIndex) ?StringIndex {
-            return if (index == .none) null else @enumFromInt(@intFromEnum(index));
+            return if (index == .none) null else @fromBackingInt(@backingInt(index));
         }
     };
 };
@@ -54,7 +54,7 @@ pub const String = struct {
     len: u32,
 
     pub fn get(value: String, hir: Hir) []const u8 {
-        return hir.string_bytes[@intFromEnum(value.start)..][0..value.len];
+        return hir.string_bytes[@backingInt(value.start)..][0..value.len];
     }
 };
 
@@ -145,11 +145,11 @@ pub fn setSource(hir: *Hir, gpa: Allocator, source: Source.View) Allocator.Error
 }
 
 pub fn instructionTag(hir: Hir, index: Inst.Index) Inst.Tag {
-    return hir.instructions.items(.tag)[@intFromEnum(index)];
+    return hir.instructions.items(.tag)[@backingInt(index)];
 }
 
 pub fn instructionData(hir: Hir, index: Inst.Index) Inst.Data {
-    return hir.instructions.items(.data)[@intFromEnum(index)];
+    return hir.instructions.items(.data)[@backingInt(index)];
 }
 
 pub fn root(hir: Hir) ?Inst.Index {
@@ -166,8 +166,8 @@ pub fn listItemCount(hir: Hir, index: Inst.Index) usize {
 pub fn listItem(hir: Hir, index: Inst.Index, item_index: usize) List.Item {
     std.debug.assert(item_index < hir.listItemCount(index));
     const payload = hir.extraData(List, hir.instructionData(index).pl.payload_index);
-    const item_offset = payload.end + item_index * std.meta.fields(List.Item).len;
-    return hir.extraData(List.Item, @enumFromInt(item_offset)).data;
+    const item_offset = payload.end + item_index * @typeInfo(List.Item).@"struct".field_names.len;
+    return hir.extraData(List.Item, @fromBackingInt(@intCast(item_offset))).data;
 }
 
 pub fn pipeline(hir: Hir, index: Inst.Index) Inst.Bin {
@@ -249,17 +249,17 @@ pub fn functionDefinition(hir: Hir, index: Inst.Index) Function.Value {
 }
 
 pub fn extraData(hir: Hir, comptime T: type, index: ExtraIndex) ExtraData(T) {
-    const fields = std.meta.fields(T);
+    const fields = @typeInfo(T).@"struct";
     var result: T = undefined;
-    var cursor: usize = @intFromEnum(index);
-    inline for (fields) |field| {
+    var cursor: usize = @backingInt(index);
+    inline for (fields.field_names, fields.field_types) |name, Field| {
         const raw = hir.extra[cursor];
-        @field(result, field.name) = switch (@typeInfo(field.type)) {
+        @field(result, name) = switch (@typeInfo(Field)) {
             .int => raw,
-            .@"enum" => @enumFromInt(raw),
+            .@"enum" => @fromBackingInt(raw),
             .@"struct" => @bitCast(raw),
             else => @compileError("unsupported HIR extra field: " ++
-                @typeName(T) ++ "." ++ field.name ++ ": " ++ @typeName(field.type)),
+                @typeName(T) ++ "." ++ name ++ ": " ++ @typeName(Field)),
         };
         cursor += 1;
     }
@@ -340,7 +340,7 @@ pub const Inst = struct {
         _,
 
         pub fn toOptional(index: Index) OptionalIndex {
-            const result: OptionalIndex = @enumFromInt(@intFromEnum(index));
+            const result: OptionalIndex = @fromBackingInt(@backingInt(index));
             std.debug.assert(result != .none);
             return result;
         }
@@ -352,7 +352,7 @@ pub const Inst = struct {
         _,
 
         pub fn unwrap(index: OptionalIndex) ?Index {
-            return if (index == .none) null else @enumFromInt(@intFromEnum(index));
+            return if (index == .none) null else @fromBackingInt(@backingInt(index));
         }
     };
 

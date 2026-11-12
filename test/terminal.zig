@@ -3,7 +3,7 @@ const std = @import("std");
 const posix = std.posix;
 const Io = std.Io;
 
-// Zig 0.16 has no public PTY allocation/session wrapper.
+// Zig has no public PTY allocation/session wrapper.
 extern "c" fn openpty(*c_int, *c_int, ?[*]u8, ?*const posix.termios, ?*const posix.winsize) c_int;
 extern "c" fn login_tty(c_int) c_int;
 extern "c" fn tcgetpgrp(c_int) posix.pid_t;
@@ -92,7 +92,7 @@ pub fn main(init: std.process.Init) !void {
             _ = try terminal.expect("\x1b[?2004l");
         }
         while (true) {
-            posix.kill(background, @enumFromInt(0)) catch |err| switch (err) {
+            posix.kill(background, @fromBackingInt(0)) catch |err| switch (err) {
                 error.ProcessNotFound => break,
                 else => return err,
             };

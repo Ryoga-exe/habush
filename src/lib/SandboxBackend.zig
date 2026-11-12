@@ -215,7 +215,7 @@ test "launch preserves explicit context and sends only resource prefix to the in
             .cwd = .{ .path = "/chosen/cwd" },
             .environment = .{ .replace = &.{.{ .name = "SECRET", .value = "environment-only" }} },
             .file_actions = &.{
-                .{ .use_resource = .{ .resource = @enumFromInt(17), .target = .stdin } },
+                .{ .use_resource = .{ .resource = @fromBackingInt(17), .target = .stdin } },
                 .{ .open = .{ .target = .stdout, .path = "output", .access = .write, .disposition = .create_or_truncate } },
             },
             .process_group = .create,
@@ -265,7 +265,7 @@ test "unsupported restrictions and absent workers never reach the inner host" {
     var interleaved = base;
     interleaved.file_actions = &.{
         .{ .open = .{ .path = "/must-not-open", .target = .stdout, .access = .write, .disposition = .create_or_truncate } },
-        .{ .use_resource = .{ .resource = @enumFromInt(9), .target = .stdout } },
+        .{ .use_resource = .{ .resource = @fromBackingInt(9), .target = .stdout } },
     };
     const unsupported_actions = try backend.launch(std.testing.allocator, std.testing.io, fake.host(), "/usr/bin/true", interleaved);
     try std.testing.expectEqualDeep(Host.SpawnOutcome{ .failed = .unsupported }, unsupported_actions);

@@ -28,10 +28,10 @@ fn complete(userdata: ?*anyopaque, request: Provider.Request, collector: *Provid
     if (request.context.dynamic) return;
     switch (request.context.kind) {
         .command => if (lastSeparator(request.prefix) == null) {
-            inline for (std.meta.fields(Builtin.Tag)) |field| {
+            inline for (@typeInfo(Builtin.Tag).@"enum".field_names) |name| {
                 if (!collector.step()) return;
-                if (std.mem.startsWith(u8, field.name, request.prefix) and
-                    !try collector.add(.{ .value = field.name, .kind = .command })) return;
+                if (std.mem.startsWith(u8, name, request.prefix) and
+                    !try collector.add(.{ .value = name, .kind = .command })) return;
             }
             for (native.function_names) |name| {
                 if (!collector.step()) return;

@@ -240,12 +240,12 @@ test "records multiple here-documents in lexical order" {
     try std.testing.expectEqual(@as(usize, 2), tree.here_documents.len);
     try std.testing.expectEqual(@as(u32, 2), tree.ready_here_document_count);
 
-    const first = tree.hereDocument(@enumFromInt(0));
+    const first = tree.hereDocument(@fromBackingInt(0));
     try std.testing.expectEqualStrings("A", first.delimiter);
     try std.testing.expect(!first.strip_tabs);
     try std.testing.expect(first.expand_body);
 
-    const second = tree.hereDocument(@enumFromInt(1));
+    const second = tree.hereDocument(@fromBackingInt(1));
     try std.testing.expectEqualStrings("B", second.delimiter);
     try std.testing.expect(second.strip_tabs);
     try std.testing.expect(!second.expand_body);
@@ -263,7 +263,7 @@ test "attaches a collected here-document body" {
     });
     defer tree.deinit(std.testing.allocator);
 
-    const document = tree.hereDocument(@enumFromInt(0));
+    const document = tree.hereDocument(@fromBackingInt(0));
     try std.testing.expectEqualStrings("hello\nworld\n", document.body.?);
     try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
 }
@@ -281,8 +281,8 @@ test "keeps uncollected here-documents pending after collected ones" {
     defer tree.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u32, 2), tree.ready_here_document_count);
-    try std.testing.expectEqualStrings("first\n", tree.hereDocument(@enumFromInt(0)).body.?);
-    try std.testing.expect(tree.hereDocument(@enumFromInt(1)).body == null);
+    try std.testing.expectEqualStrings("first\n", tree.hereDocument(@fromBackingInt(0)).body.?);
+    try std.testing.expect(tree.hereDocument(@fromBackingInt(1)).body == null);
 }
 
 test "reports a collected here-document mismatch" {
@@ -299,7 +299,7 @@ test "reports a collected here-document mismatch" {
 
     try std.testing.expectEqual(@as(usize, 1), tree.errors.len);
     try std.testing.expectEqual(Ast.Error.Tag.here_document_mismatch, tree.errors[0].tag);
-    try std.testing.expect(tree.hereDocument(@enumFromInt(0)).body == null);
+    try std.testing.expect(tree.hereDocument(@fromBackingInt(0)).body == null);
 }
 
 test "makes here-document ready before pipeline continuation" {

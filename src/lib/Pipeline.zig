@@ -560,22 +560,22 @@ test "run connects stages before explicit actions and reaps in stage order" {
     const last_actions = fake.spawn_calls.items[0].file_actions;
     try std.testing.expectEqual(@as(usize, 1), last_actions.len);
     try std.testing.expectEqual(CommandPlan.FileDescriptor.stdin, last_actions[0].use_resource.target);
-    try std.testing.expectEqual(@as(u32, 3), @intFromEnum(last_actions[0].use_resource.resource));
+    try std.testing.expectEqual(@as(u32, 3), @backingInt(last_actions[0].use_resource.resource));
     const middle_actions = fake.spawn_calls.items[1].file_actions;
     try std.testing.expectEqual(@as(usize, 3), middle_actions.len);
     try std.testing.expectEqual(CommandPlan.FileDescriptor.stdin, middle_actions[0].use_resource.target);
-    try std.testing.expectEqual(@as(u32, 1), @intFromEnum(middle_actions[0].use_resource.resource));
+    try std.testing.expectEqual(@as(u32, 1), @backingInt(middle_actions[0].use_resource.resource));
     try std.testing.expectEqual(CommandPlan.FileDescriptor.stdout, middle_actions[1].use_resource.target);
-    try std.testing.expectEqual(@as(u32, 4), @intFromEnum(middle_actions[1].use_resource.resource));
+    try std.testing.expectEqual(@as(u32, 4), @backingInt(middle_actions[1].use_resource.resource));
     try std.testing.expectEqualStrings("output", middle_actions[2].open.path);
     const first_actions = fake.spawn_calls.items[2].file_actions;
     try std.testing.expectEqual(@as(usize, 1), first_actions.len);
     try std.testing.expectEqual(CommandPlan.FileDescriptor.stdout, first_actions[0].use_resource.target);
-    try std.testing.expectEqual(@as(u32, 2), @intFromEnum(first_actions[0].use_resource.resource));
+    try std.testing.expectEqual(@as(u32, 2), @backingInt(first_actions[0].use_resource.resource));
 
-    try std.testing.expectEqual(@as(u32, 3), @intFromEnum(fake.wait_calls.items[0]));
-    try std.testing.expectEqual(@as(u32, 2), @intFromEnum(fake.wait_calls.items[1]));
-    try std.testing.expectEqual(@as(u32, 1), @intFromEnum(fake.wait_calls.items[2]));
+    try std.testing.expectEqual(@as(u32, 3), @backingInt(fake.wait_calls.items[0]));
+    try std.testing.expectEqual(@as(u32, 2), @backingInt(fake.wait_calls.items[1]));
+    try std.testing.expectEqual(@as(u32, 1), @backingInt(fake.wait_calls.items[2]));
     try std.testing.expectEqual(@as(usize, 3), result.completed.len);
     for (result.completed) |stage_result| {
         try std.testing.expectEqual(SandboxPolicy.Coverage.partial, stage_result.sandbox_coverage);

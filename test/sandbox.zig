@@ -266,8 +266,8 @@ fn checkIdentity(
     defer gpa.free(canonical_cwd);
     try check(io, fields.next() == null, "PID output has extra fields");
     try check(io, shell_pid == native_pid, "shell exec must preserve PID");
-    try check(io, native_pid == @intFromEnum(spawned.process_id.?), "worker must preserve target PID");
-    try check(io, native_group == @intFromEnum(spawned.process_group.?), "worker must preserve PGID");
+    try check(io, native_pid == @backingInt(spawned.process_id.?), "worker must preserve target PID");
+    try check(io, native_group == @backingInt(spawned.process_group.?), "worker must preserve PGID");
     try check(io, std.mem.eql(u8, printed_cwd, canonical_cwd), "worker must preserve cwd");
     try check(io, std.mem.eql(u8, printed_env, "worker-env"), "worker must preserve environment");
 }

@@ -35,7 +35,7 @@ pub fn generate(gpa: Allocator, tree: Ast) Error!Hir {
 
     if (tree.nodeData(.root).opt_node.unwrap()) |list_node| {
         const root_list = try astgen.list(list_node);
-        astgen.instructions.set(@intFromEnum(Hir.Inst.Index.root), .{
+        astgen.instructions.set(@backingInt(Hir.Inst.Index.root), .{
             .tag = .root,
             .data = .{ .un = .{ .operand = root_list.toOptional() } },
         });
@@ -88,8 +88,8 @@ fn list(astgen: *AstGen, node: Ast.Node.Index) Error!Hir.Inst.Index {
         else
             .none;
 
-        try astgen.scratch.append(astgen.gpa, @intFromEnum(command_index));
-        try astgen.scratch.append(astgen.gpa, @intFromEnum(separator));
+        try astgen.scratch.append(astgen.gpa, @backingInt(command_index));
+        try astgen.scratch.append(astgen.gpa, @backingInt(separator));
     }
 
     const items = astgen.scratch.items[scratch_top..];
@@ -160,7 +160,7 @@ fn forClause(astgen: *AstGen, node: Ast.Node.Index) Error!Hir.Inst.Index {
     const ast_words = astgen.tree.forWords(clause);
     for (ast_words) |word_node| {
         if (astgen.tree.nodeTag(word_node) != .word) return error.InvalidAst;
-        try astgen.scratch.append(astgen.gpa, @intFromEnum(try astgen.word(word_node)));
+        try astgen.scratch.append(astgen.gpa, @backingInt(try astgen.word(word_node)));
     }
     const body = try astgen.list(body_node);
     const redirects_len = try astgen.appendRedirects(
@@ -349,7 +349,7 @@ fn appendRedirects(
     const redirects = astgen.tree.extraDataSlice(.{ .start = start, .end = end }, Ast.Node.Index);
     for (redirects) |redirect_node| {
         if (astgen.tree.nodeTag(redirect_node) != .redirect) return error.InvalidAst;
-        try astgen.scratch.append(astgen.gpa, @intFromEnum(try astgen.redirect(redirect_node)));
+        try astgen.scratch.append(astgen.gpa, @backingInt(try astgen.redirect(redirect_node)));
     }
     return index(u32, redirects.len);
 }
@@ -394,7 +394,7 @@ fn simpleCommand(astgen: *AstGen, node: Ast.Node.Index) Error!Hir.Inst.Index {
             .redirect => try astgen.redirect(part),
             else => unreachable,
         };
-        try astgen.scratch.append(astgen.gpa, @intFromEnum(instruction));
+        try astgen.scratch.append(astgen.gpa, @backingInt(instruction));
     }
 
     const parts = astgen.scratch.items[scratch_top..];
@@ -448,7 +448,7 @@ fn word(astgen: *AstGen, node: Ast.Node.Index) Error!Hir.Inst.Index {
                 else => .{ .str = value },
             },
         });
-        try astgen.scratch.append(astgen.gpa, @intFromEnum(instruction));
+        try astgen.scratch.append(astgen.gpa, @backingInt(instruction));
     }
 
     const parts = astgen.scratch.items[scratch_top..];
@@ -549,22 +549,22 @@ fn addString(astgen: *AstGen, bytes: []const u8) Error!Hir.String {
 }
 
 fn addExtra(astgen: *AstGen, extra: anytype) Error!Hir.ExtraIndex {
-    const fields = std.meta.fields(@TypeOf(extra));
-    if (fields.len > std.math.maxInt(u32) - astgen.extra.items.len) {
+    const fields = @typeInfo(@TypeOf(extra)).@"struct";
+    if (fields.field_names.len > std.math.maxInt(u32) - astgen.extra.items.len) {
         return error.SourceTooLarge;
     }
-    try astgen.extra.ensureUnusedCapacity(astgen.gpa, fields.len);
+    try astgen.extra.ensureUnusedCapacity(astgen.gpa, fields.field_names.len);
 
     const extra_index = try index(Hir.ExtraIndex, astgen.extra.items.len);
-    inline for (fields) |field| {
-        const value = @field(extra, field.name);
-        astgen.extra.appendAssumeCapacity(switch (@typeInfo(field.type)) {
+    inline for (fields.field_names, fields.field_types) |name, Field| {
+        const value = @field(extra, name);
+        astgen.extra.appendAssumeCapacity(switch (@typeInfo(Field)) {
             .int => value,
-            .@"enum" => @intFromEnum(value),
+            .@"enum" => @backingInt(value),
             .@"struct" => @bitCast(value),
             else => @compileError("unsupported HIR extra field: " ++
-                @typeName(@TypeOf(extra)) ++ "." ++ field.name ++ ": " ++
-                @typeName(field.type)),
+                @typeName(@TypeOf(extra)) ++ "." ++ name ++ ": " ++
+                @typeName(Field)),
         });
     }
     return extra_index;
@@ -594,7 +594,7 @@ fn redirectOperator(tag: Token.Tag) Hir.Redirect.Operator {
 
 fn index(comptime T: type, value: usize) Error!T {
     const raw = std.math.cast(u32, value) orelse return error.SourceTooLarge;
-    return if (T == u32) raw else @enumFromInt(raw);
+    return if (T == u32) raw else @fromBackingInt(raw);
 }
 
 test {

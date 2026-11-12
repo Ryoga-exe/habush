@@ -425,7 +425,7 @@ test "AST generation handles every allocation failure" {
 }
 
 fn generateOwnedHereDocument(gpa: std.mem.Allocator) !Hir {
-    const source = try gpa.dupeZ(u8, "cat <<'EOF'\n");
+    const source = try gpa.dupeSentinel(u8, "cat <<'EOF'\n", 0);
     defer gpa.free(source);
     const body = try gpa.dupe(u8, "contents\x00\n");
     defer gpa.free(body);

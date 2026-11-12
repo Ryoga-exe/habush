@@ -73,7 +73,7 @@ pub const HereDocumentIndex = enum(u32) {
     _,
 
     pub fn toOptional(index: HereDocumentIndex) Optional {
-        const result: Optional = @enumFromInt(@intFromEnum(index));
+        const result: Optional = @fromBackingInt(@backingInt(index));
         std.debug.assert(result != .none);
         return result;
     }
@@ -83,7 +83,7 @@ pub const HereDocumentIndex = enum(u32) {
         _,
 
         pub fn unwrap(index: Optional) ?HereDocumentIndex {
-            return if (index == .none) null else @enumFromInt(@intFromEnum(index));
+            return if (index == .none) null else @fromBackingInt(@backingInt(index));
         }
     };
 };
@@ -144,27 +144,28 @@ pub const ExtraIndex = enum(u32) {
 
 pub const ExtraData = struct {
     pub fn width(comptime T: type) comptime_int {
-        inline for (std.meta.fields(T)) |field| {
-            if (comptime !supports(field.type)) {
+        const fields = @typeInfo(T).@"struct";
+        inline for (fields.field_names, fields.field_types) |name, Field| {
+            if (comptime !supports(Field)) {
                 @compileError("unsupported extra_data field: " ++
-                    @typeName(T) ++ "." ++ field.name ++ ": " ++
-                    @typeName(field.type));
+                    @typeName(T) ++ "." ++ name ++ ": " ++
+                    @typeName(Field));
             }
         }
-        return std.meta.fields(T).len;
+        return fields.field_names.len;
     }
 
     pub fn encode(value: anytype) u32 {
         const T = @TypeOf(value);
         requireSupported(T);
         if (comptime T == TokenIndex) return value;
-        return @intFromEnum(value);
+        return @backingInt(value);
     }
 
     pub fn decode(comptime T: type, raw: u32) T {
         requireSupported(T);
         if (comptime T == TokenIndex) return raw;
-        return @enumFromInt(raw);
+        return @fromBackingInt(raw);
     }
 
     fn requireSupported(comptime T: type) void {
@@ -332,15 +333,15 @@ pub fn dump(tree: *const Ast, writer: *Writer) Writer.Error!void {
 }
 
 pub fn nodeTag(tree: *const Ast, index: Node.Index) Node.Tag {
-    return tree.nodes.items(.tag)[@intFromEnum(index)];
+    return tree.nodes.items(.tag)[@backingInt(index)];
 }
 
 pub fn nodeMainToken(tree: *const Ast, index: Node.Index) TokenIndex {
-    return tree.nodes.items(.main_token)[@intFromEnum(index)];
+    return tree.nodes.items(.main_token)[@backingInt(index)];
 }
 
 pub fn nodeData(tree: *const Ast, index: Node.Index) Node.Data {
-    return tree.nodes.items(.data)[@intFromEnum(index)];
+    return tree.nodes.items(.data)[@backingInt(index)];
 }
 
 pub fn simpleCommandParts(tree: *const Ast, index: Node.Index) []const Node.Index {
@@ -350,13 +351,13 @@ pub fn simpleCommandParts(tree: *const Ast, index: Node.Index) []const Node.Inde
 
 pub fn wordPartCount(tree: *const Ast, index: Node.Index) usize {
     const range = tree.wordPartRange(index);
-    return @intFromEnum(range.end) - @intFromEnum(range.start);
+    return @backingInt(range.end) - @backingInt(range.start);
 }
 
 pub fn wordPart(tree: *const Ast, index: Node.Index, part_index: usize) WordPart {
     std.debug.assert(part_index < tree.wordPartCount(index));
     const range = tree.wordPartRange(index);
-    const absolute_index = @intFromEnum(range.start) + part_index;
+    const absolute_index = @backingInt(range.start) + part_index;
     return .{
         .tag = tree.word_parts.items(.tag)[absolute_index],
         .start = tree.word_parts.items(.start)[absolute_index],
@@ -391,7 +392,7 @@ fn wordPartRange(tree: *const Ast, index: Node.Index) WordPartRange {
 pub fn listItemCount(tree: *const Ast, index: Node.Index) usize {
     std.debug.assert(tree.nodeTag(index) == .list);
     const range = tree.nodeData(index).extra_range;
-    const raw_len = @intFromEnum(range.end) - @intFromEnum(range.start);
+    const raw_len = @backingInt(range.end) - @backingInt(range.start);
     const width = ExtraData.width(Node.ListItem);
     std.debug.assert(raw_len % width == 0);
     return raw_len / width;
@@ -401,8 +402,8 @@ pub fn listItem(tree: *const Ast, index: Node.Index, item_index: usize) Node.Lis
     std.debug.assert(item_index < tree.listItemCount(index));
     const range = tree.nodeData(index).extra_range;
     const width = ExtraData.width(Node.ListItem);
-    const offset = @intFromEnum(range.start) + item_index * width;
-    return tree.extraData(@enumFromInt(offset), Node.ListItem);
+    const offset = @backingInt(range.start) + item_index * width;
+    return tree.extraData(@fromBackingInt(@intCast(offset)), Node.ListItem);
 }
 
 pub fn subshell(tree: *const Ast, index: Node.Index) Node.Subshell {
@@ -454,7 +455,7 @@ pub fn redirect(tree: *const Ast, index: Node.Index) Node.Redirect {
 }
 
 pub fn hereDocument(tree: *const Ast, index: HereDocumentIndex) HereDocument {
-    const item_index = @intFromEnum(index);
+    const item_index = @backingInt(index);
     std.debug.assert(item_index < tree.here_documents.len);
 
     const starts = tree.here_documents.items(.delimiter_start);
@@ -470,7 +471,7 @@ pub fn hereDocument(tree: *const Ast, index: HereDocumentIndex) HereDocument {
 
 pub fn elifBranchCount(tree: *const Ast, node: Node.If) usize {
     _ = tree;
-    const raw_len = @intFromEnum(node.elif_end) - @intFromEnum(node.elif_start);
+    const raw_len = @backingInt(node.elif_end) - @backingInt(node.elif_start);
     const width = ExtraData.width(Node.ElifBranch);
     std.debug.assert(raw_len % width == 0);
     return raw_len / width;
@@ -479,8 +480,8 @@ pub fn elifBranchCount(tree: *const Ast, node: Node.If) usize {
 pub fn elifBranch(tree: *const Ast, node: Node.If, index: usize) Node.ElifBranch {
     std.debug.assert(index < tree.elifBranchCount(node));
     const width = ExtraData.width(Node.ElifBranch);
-    const offset = @intFromEnum(node.elif_start) + index * width;
-    return tree.extraData(@enumFromInt(offset), Node.ElifBranch);
+    const offset = @backingInt(node.elif_start) + index * width;
+    return tree.extraData(@fromBackingInt(@intCast(offset)), Node.ElifBranch);
 }
 
 pub fn extraDataSlice(
@@ -489,16 +490,16 @@ pub fn extraDataSlice(
     comptime T: type,
 ) []const T {
     comptime std.debug.assert(@sizeOf(T) == @sizeOf(u32));
-    return @ptrCast(tree.extra_data[@intFromEnum(range.start)..@intFromEnum(range.end)]);
+    return @ptrCast(tree.extra_data[@backingInt(range.start)..@backingInt(range.end)]);
 }
 
 pub fn extraData(tree: *const Ast, index: ExtraIndex, comptime T: type) T {
-    const fields = std.meta.fields(T);
+    const fields = @typeInfo(T).@"struct";
     var result: T = undefined;
-    inline for (fields, 0..) |field, offset| {
-        @field(result, field.name) = ExtraData.decode(
-            field.type,
-            tree.extra_data[@intFromEnum(index) + offset],
+    inline for (fields.field_names, fields.field_types, 0..) |name, Field, offset| {
+        @field(result, name) = ExtraData.decode(
+            Field,
+            tree.extra_data[@backingInt(index) + offset],
         );
     }
     return result;
@@ -514,7 +515,7 @@ pub const Node = struct {
         _,
 
         pub fn toOptional(index: Index) OptionalIndex {
-            const result: OptionalIndex = @enumFromInt(@intFromEnum(index));
+            const result: OptionalIndex = @fromBackingInt(@backingInt(index));
             std.debug.assert(result != .none);
             return result;
         }
@@ -526,7 +527,7 @@ pub const Node = struct {
         _,
 
         pub fn unwrap(index: OptionalIndex) ?Index {
-            return if (index == .none) null else @enumFromInt(@intFromEnum(index));
+            return if (index == .none) null else @fromBackingInt(@backingInt(index));
         }
 
         pub fn fromOptional(index: ?Index) OptionalIndex {
@@ -539,11 +540,11 @@ pub const Node = struct {
         _,
 
         pub fn unwrap(index: OptionalTokenIndex) ?TokenIndex {
-            return if (index == .none) null else @intFromEnum(index);
+            return if (index == .none) null else @backingInt(index);
         }
 
         pub fn fromOptional(index: ?TokenIndex) OptionalTokenIndex {
-            return if (index) |value| @enumFromInt(value) else .none;
+            return if (index) |value| @fromBackingInt(value) else .none;
         }
     };
 

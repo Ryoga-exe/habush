@@ -33,9 +33,7 @@ pub fn build(b: *std.Build) void {
 
     run_cmd.step.dependOn(b.getInstallStep());
 
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
 
     const pipeline_example = b.addExecutable(.{
         .name = "run-pipeline",
@@ -49,7 +47,7 @@ pub fn build(b: *std.Build) void {
     const run_pipeline_step = b.step("run-pipeline", "Run the structured pipeline example");
     const run_pipeline_cmd = b.addRunArtifact(pipeline_example);
     run_pipeline_step.dependOn(&run_pipeline_cmd.step);
-    if (b.args) |args| run_pipeline_cmd.addArgs(args);
+    run_pipeline_cmd.addPassthruArgs();
 
     const sandbox_example = b.addExecutable(.{
         .name = "run-sandbox",
@@ -63,7 +61,7 @@ pub fn build(b: *std.Build) void {
     const run_sandbox_step = b.step("run-sandbox", "Run the explicit sandbox backend example");
     const run_sandbox_cmd = b.addRunArtifact(sandbox_example);
     run_sandbox_step.dependOn(&run_sandbox_cmd.step);
-    if (b.args) |args| run_sandbox_cmd.addArgs(args);
+    run_sandbox_cmd.addPassthruArgs();
 
     const sandbox_probe = b.addExecutable(.{
         .name = "sandbox-test",

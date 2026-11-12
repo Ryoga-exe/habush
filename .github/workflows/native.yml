@@ -23,7 +23,7 @@ jobs:
           persist-credentials: false
       - uses: mlugg/setup-zig@v2
         with:
-          version: '0.16.0'
+          version: '0.17.1'
       - run: zig build test --summary all
       - if: runner.os == 'macOS'
         run: zig build test-sandbox --summary all
@@ -39,8 +39,14 @@ jobs:
         with:
           release: '14.4'
           copyback: false
-          prepare: pkg install -y zig
+          # shortcut: use the official archive until FreeBSD packages Zig 0.17.1.
+          prepare: |
+            set -eu
+            fetch -o /tmp/zig.tar.xz https://ziglang.org/download/0.17.1/zig-x86_64-freebsd-0.17.1.tar.xz
+            mkdir -p /opt/zig
+            tar -xf /tmp/zig.tar.xz -C /opt/zig --strip-components 1
           run: |
             set -eu
-            test "$(zig version)" = 0.16.0
+            export PATH="/opt/zig:$PATH"
+            test "$(zig version)" = 0.17.1
             zig build test -j2 --summary all
