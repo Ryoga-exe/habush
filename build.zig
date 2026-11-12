@@ -248,7 +248,7 @@ pub fn build(b: *std.Build) !void {
     const zon_config_test = b.addRunArtifact(exe);
     zon_config_test.setName("test cli explicit ZON config");
     zon_config_test.addArg("--config");
-    zon_config_test.addFileArg(b.path("test/cli/config.zon"));
+    zon_config_test.addFileArg(b.path("examples/config.zon"));
     zon_config_test.addArgs(&.{ "-c", "exit 17" });
     expectCliResult(zon_config_test, test_step, 17, "", "");
 

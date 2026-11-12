@@ -350,8 +350,8 @@ fn historyScenario(io: Io, master: Io.File, terminal: *Terminal) !void {
 fn pluginScenario(io: Io, master: Io.File, terminal: *Terminal, config_path: []const u8) !void {
     try master.writeStreamingAll(io, "origin=$PWD; cd /\r");
     try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "\x1b[0;36;49;1m/\x1b[0m") != null);
-    const read_command = try std.fmt.allocPrint(std.heap.smp_allocator, "hb-read {s}\r", .{std.fs.path.basename(config_path)});
-    defer std.heap.smp_allocator.free(read_command);
+    var command_buffer: [256]u8 = undefined;
+    const read_command = try std.fmt.bufPrint(&command_buffer, "hb-read {s}\r", .{std.fs.path.basename(config_path)});
     try master.writeStreamingAll(io, read_command);
     try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "read_directory") != null);
     try master.writeStreamingAll(io, "hb-read ../etc/passwd\r");

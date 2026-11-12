@@ -47,11 +47,11 @@ pub fn append(store: HistoryStore, source: []const u8) !void {
     };
     var file_open = true;
     defer if (file_open) file.close(store.io);
-    try file.setPermissions(store.io, private_file);
     // shortcut: scans the bounded file per append; use tail/index reads if I/O becomes measurable.
     const bytes = try store.read(file);
     defer store.gpa.free(bytes);
     const end = try validEnd(bytes);
+    try file.setPermissions(store.io, private_file);
     var start: usize = magic.len;
     var offset = start;
     var last: []const u8 = "";
@@ -165,7 +165,14 @@ test "history survives restarts, concurrent writers, partial tails, and bounded 
     defer gpa.free(saved);
     try std.testing.expectEqual(saved.len, try validEnd(saved));
     try tmp.dir.writeFile(io, .{ .sub_path = "history", .data = "unrecognized format" });
+    if (@import("builtin").target.os.tag != .windows) {
+        const invalid = try tmp.dir.openFile(io, "history", .{});
+        defer invalid.close(io);
+        try invalid.setPermissions(io, .fromMode(0o640));
+    }
     try std.testing.expectError(error.InvalidHistoryFile, first.append("do not overwrite"));
+    if (@import("builtin").target.os.tag != .windows)
+        try std.testing.expectEqual(@as(std.posix.mode_t, 0o640), (try tmp.dir.statFile(io, "history", .{})).permissions.toMode() & 0o777);
     try tmp.dir.deleteFile(io, "history");
     const Write = struct {
         fn run(store: HistoryStore, label: u8) !void {

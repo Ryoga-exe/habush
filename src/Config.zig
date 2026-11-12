@@ -125,7 +125,7 @@ fn read(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, path: []co
     if (config.history.storage.path) |history_path| {
         if (!std.fs.path.isAbsolute(history_path)) {
             const base = try std.Io.Dir.cwd().realPathFileAlloc(io, std.fs.path.dirname(path) orelse ".", arena);
-            config.history.storage.path = try std.fs.path.resolveAlloc(arena, &.{ base, history_path });
+            config.history.storage.path = try std.fs.path.join(arena, &.{ base, history_path });
         }
     }
     return config;
