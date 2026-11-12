@@ -53,6 +53,8 @@ background: bool = false,
 job_control: bool = false,
 concurrent_pipeline: ?ConcurrentPipeline = null,
 cancel_io: ?std.Io = null,
+/// Optional scope deadline, also checked after native I/O handles cancellation.
+deadline: ?std.Io.Timestamp = null,
 loop_depth: u32,
 function_depth: u32,
 
@@ -303,7 +305,11 @@ pub fn execute(executor: Executor, hir: Hir) Error!Result {
 fn executeInstruction(parent: Executor, hir: Hir, index: Hir.Inst.Index) Error!Result {
     var executor = parent;
     executor.io.diagnostic_source = instructionSource(hir, index);
-    if (executor.cancel_io) |io| try io.checkCancel();
+    if (executor.cancel_io) |io| {
+        try io.checkCancel();
+        if (executor.deadline) |deadline|
+            if (std.Io.Timestamp.now(io, .awake).nanoseconds >= deadline.nanoseconds) return error.Canceled;
+    }
     if (executor.host.capabilities().poll) {
         if (executor.jobs) |jobs| try jobs.poll();
     }
@@ -1902,12 +1908,14 @@ fn executeBuiltin(
     };
 }
 
-fn executeFunction(executor: Executor, argv: []const []const u8, assignments: *const VariableStore) Error!Result {
+/// Calls a named shell function directly; argv is data, never parsed as source.
+pub fn executeFunction(executor: Executor, argv: []const []const u8, assignments: *const VariableStore) Error!Result {
+    if (argv.len == 0) return error.InvalidArguments;
     if (executor.function_depth == max_function_depth)
         return executor.commandFailure(argv[0], .function_call_depth_exceeded);
 
     const state = executor.runtime_state orelse return error.FunctionStateUnavailable;
-    var definition = (try state.cloneFunction(argv[0], executor.gpa)) orelse unreachable;
+    var definition = (try state.cloneFunction(argv[0], executor.gpa)) orelse return error.FunctionStateUnavailable;
     defer definition.deinit(executor.gpa);
 
     const variables = state.variableStore();

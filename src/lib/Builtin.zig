@@ -29,6 +29,7 @@ pub const Tag = enum {
     shift,
     @"export",
     unset,
+    complete,
 };
 
 pub const PipelineSupport = enum {
@@ -85,6 +86,7 @@ const definitions = std.StaticStringMap(Builtin).initComptime(.{
     .{ "shift", Builtin{ .tag = .shift, .special = true, .pipeline_support = .no_stdin } },
     .{ "export", Builtin{ .tag = .@"export", .special = true, .pipeline_support = .no_stdin } },
     .{ "unset", Builtin{ .tag = .unset, .special = true, .pipeline_support = .no_stdin } },
+    .{ "complete", Builtin{ .tag = .complete, .pipeline_support = .no_stdin } },
 });
 
 pub fn lookup(name: []const u8) ?Builtin {
@@ -114,6 +116,7 @@ pub fn run(builtin: Builtin, context: Context, argv: []const []const u8) Error!R
         .shift => runShift(context, argv),
         .@"export" => runExport(context, argv),
         .unset => runUnset(context, argv),
+        .complete => runComplete(context, argv),
     };
 }
 
@@ -121,6 +124,23 @@ const LoopControl = enum {
     @"break",
     @"continue",
 };
+
+fn runComplete(context: Context, argv: []const []const u8) Error!Result {
+    const state = context.runtime_state orelse return error.RuntimeStateUnavailable;
+    if (argv.len < 2) return commandFailure(context, argv[0], .missing_operand);
+    const remove = std.mem.eql(u8, argv[1], "-r");
+    if (!remove and !std.mem.eql(u8, argv[1], "-F"))
+        return commandFailure(context, argv[0], .{ .unsupported_option = argv[1] });
+    const count: usize = if (remove) 3 else 4;
+    if (argv.len < count) return commandFailure(context, argv[0], .missing_operand);
+    if (argv.len > count) return commandFailure(context, argv[0], .too_many_arguments);
+    if (remove) return .{ .status = if (state.completions.remove(argv[2])) 0 else 1 };
+    state.completions.set(argv[3], .{ .function = argv[2] }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidName => return commandFailure(context, argv[0], .{ .invalid_name = argv[2] }),
+    };
+    return .{ .status = 0 };
+}
 
 fn runLoopControl(
     context: Context,

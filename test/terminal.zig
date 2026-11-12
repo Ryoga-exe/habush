@@ -97,6 +97,7 @@ pub fn main(init: std.process.Init) !void {
     if (config_path != null) {
         try pluginScenario(io, master, &terminal);
     } else {
+        try functionCompletionScenario(io, master, &terminal);
         try master.writeStreamingAll(io, "PATH=; habush_completion_probe() { /bin/echo COMPLETION:$1; }\r");
         _ = try terminal.expect(ready);
         try master.writeStreamingAll(io, "habush_completion_pr\t literal\r");
@@ -213,6 +214,37 @@ const Terminal = struct {
         terminal.len += count;
     }
 };
+
+fn functionCompletionScenario(io: Io, master: Io.File, terminal: *Terminal) !void {
+    try master.writeStreamingAll(io, "__ec() { /usr/bin/printf '%s\\0' \"$3-$1 '\\$(missing)\"; }; complete -F __ec /bin/echo; false\r");
+    _ = try terminal.expect(ready);
+    try master.writeStreamingAll(io, "/bin/echo prev va\t STATUS:$?\r");
+    var output = try terminal.expect(ready);
+    try std.testing.expect(std.mem.indexOf(u8, output, "prev prev-va '$(missing) STATUS:1\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "command not found") == null);
+    // A successful empty result suppresses the otherwise unique README match.
+    try master.writeStreamingAll(io, "__ec() { :; }\r");
+    _ = try terminal.expect(ready);
+    try master.writeStreamingAll(io, "/bin/echo READ\t\r");
+    try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "READ\r\n") != null);
+    try master.writeStreamingAll(io, "__ec() { /usr/bin/printf unterminated; }\r");
+    _ = try terminal.expect(ready);
+    try master.writeStreamingAll(io, "/bin/echo READ\t\x15/bin/echo FALLBACK-OK\r");
+    output = try terminal.expect(ready);
+    try std.testing.expect(std.mem.indexOf(u8, output, "README.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "partial results") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "FALLBACK-OK\r\n") != null);
+    try master.writeStreamingAll(io, "__ec() { /bin/sleep 5; }\r");
+    _ = try terminal.expect(ready);
+    const start = Io.Timestamp.now(io, .awake);
+    try master.writeStreamingAll(io, "/bin/echo READ\t\x15/bin/echo TIMEOUT-OK\r");
+    try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "TIMEOUT-OK\r\n") != null);
+    try std.testing.expect(Io.Timestamp.now(io, .awake).nanoseconds - start.nanoseconds < Io.Duration.fromSeconds(2).nanoseconds);
+    try master.writeStreamingAll(io, "complete -r /bin/echo\r");
+    _ = try terminal.expect(ready);
+    try master.writeStreamingAll(io, "/bin/echo READ\t\r");
+    try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "README.md\r\n") != null);
+}
 
 fn pluginScenario(io: Io, master: Io.File, terminal: *Terminal) !void {
     try master.writeStreamingAll(io, "PATH=; hb-demo 'literal arg'; /bin/echo STATUS:$?\r");
