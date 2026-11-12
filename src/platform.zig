@@ -17,6 +17,7 @@ const implementation = switch (builtin.target.os.tag) {
 
 pub const installInteractiveInterruptHandler = implementation.installInteractiveInterruptHandler;
 pub const LineInput = implementation.LineInput;
+pub const terminalColumns = implementation.terminalColumns;
 pub fn processId() ProcessId {
     return @fromBackingInt(implementation.processId());
 }

@@ -2,6 +2,9 @@ const std = @import("std");
 const windows = std.os.windows;
 
 pub const Error = error{Unexpected};
+pub fn terminalColumns() usize {
+    return 80;
+}
 
 pub fn processId() u32 {
     return windows.GetCurrentProcessId();

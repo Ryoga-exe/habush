@@ -59,7 +59,11 @@ pub fn main(init: std.process.Init) !void {
             },
         }, .{}, &config.writer);
     } else {
-        try std.zon.stringify.serialize(.{ .load_rc = false, .keybinds = bindings }, .{}, &config.writer);
+        try std.zon.stringify.serialize(.{
+            .load_rc = false,
+            .keybinds = bindings,
+            .prompt = .{ .spans = .{.{ .text = "日> ", .style = .{ .foreground = .green } }} },
+        }, .{}, &config.writer);
     }
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = config_path.?, .data = config.written() });
     var master_fd: c_int = undefined;
@@ -110,6 +114,7 @@ pub fn main(init: std.process.Init) !void {
     };
     errdefer std.debug.print("PTY output:\n{s}\n", .{terminal.output[0..terminal.len]});
     _ = try terminal.expect(ready);
+    if (args.len == 2) try std.testing.expect(std.mem.indexOf(u8, terminal.output[0..terminal.len], "\x1b[0;32;49m日> \x1b[0m") != null);
     try std.testing.expect(!(try posix.tcgetattr(slave_fd)).lflag.ICANON);
 
     try master.writeStreamingAll(io, "/bin/echo CLEAR\x02\x0c!\x18\r");

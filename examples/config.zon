@@ -1,5 +1,7 @@
 .{
     .line_edit = .auto,
+    // Literal text and style are rendered safely; terminal escapes are not executed.
+    .prompt = .{ .spans = .{.{ .text = "❯ ", .style = .{ .foreground = .green } }} },
     .keybinds = .{
         // Calls the same native/function/Wasm completion providers as Tab.
         .{ .key = "ctrl+space", .action = .complete },
