@@ -11,6 +11,7 @@ load_rc: bool = true,
 plugins: []Plugin = &.{},
 keybinds: []const @import("habush-edit").Keybind.Spec = &.{},
 prompt: ?@import("habush-edit").Prompt = null,
+diagnostics: bool = true,
 /// Shared by completion providers; guest execution budgets
 /// remain the plugin host's responsibility.
 completion_limits: @import("habush").Completion.Provider.Limits = .{},

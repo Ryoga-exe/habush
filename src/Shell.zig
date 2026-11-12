@@ -8,6 +8,7 @@ const edit = @import("habush-edit");
 const render = @import("terminal/render.zig");
 const platform = @import("platform.zig");
 const CompletionService = @import("CompletionService.zig");
+const DiagnosticService = @import("DiagnosticService.zig");
 const interrupt = @import("interrupt.zig");
 const Io = std.Io;
 const Shell = @This();
@@ -27,6 +28,8 @@ line_edit: bool = false,
 keybinds: []const edit.Keybind = &.{},
 prompt: edit.Prompt = edit.Prompt.primary,
 prompt_provider: ?edit.Prompt.Provider = null,
+diagnostics: bool = true,
+diagnostic_provider: ?edit.Diagnostic.Provider = null,
 completion_limits: habush.Completion.Provider.Limits = .{},
 completion_provider: ?habush.Completion.Provider = null,
 resolver_options: habush.CommandResolver.System.Options = .{},
@@ -453,6 +456,7 @@ fn readInputLine(self: *Shell, prompt: edit.Prompt, prefix: []const u8, allow_co
             .limits = self.completion_limits,
         };
         defer completion.deinit();
+        var diagnostic_service: DiagnosticService = .{ .additional = self.diagnostic_provider };
         const submitted = ((LineEditor{
             .gpa = self.allocator,
             .input = self.stdin,
@@ -462,6 +466,7 @@ fn readInputLine(self: *Shell, prompt: edit.Prompt, prefix: []const u8, allow_co
             .completion = if (allow_completion) completion.completion() else null,
             .history = if (allow_completion and prefix.len == 0 and self.editing != null) &self.editing.?.history else null,
             .inspector = if (allow_completion and prefix.len == 0) .{ .userdata = self, .inspect = inspectEditedSource } else null,
+            .diagnostics = if (self.diagnostics and allow_completion) diagnostic_service.provider() else null,
         }).read() catch |err| switch (err) {
             error.EditorUnavailable => try readLineAlloc(self.stdin, self.allocator, &self.last_line_ending),
             error.EndOfStream => null,

@@ -5,6 +5,7 @@ pub const History = @import("edit/History.zig");
 pub const Keybind = @import("edit/Keybind.zig");
 pub const Editor = @import("edit/Editor.zig");
 pub const Prompt = @import("edit/Prompt.zig");
+pub const Diagnostic = @import("edit/Diagnostic.zig");
 
 test {
     _ = Buffer;
@@ -13,4 +14,5 @@ test {
     _ = Keybind;
     _ = Editor;
     _ = Prompt;
+    _ = Diagnostic;
 }
