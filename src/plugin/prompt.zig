@@ -1,4 +1,4 @@
-//! Prompt schema v0: cwd/status in; alternating style/text byte-list items out.
+//! Prompt schema v1 context in; alternating style/text byte-list items out.
 const std = @import("std");
 const Host = @import("Host.zig");
 const protocol = @import("protocol.zig");
@@ -7,7 +7,15 @@ const Prompt = @import("habush-edit").Prompt;
 pub fn render(module: *const Host.Module, arena: std.mem.Allocator, entry: []const u8, context: Prompt.Context, scope: Host.Scope) Host.Error!Prompt {
     var status: [3]u8 = undefined;
     const code = std.fmt.bufPrint(&status, "{d}", .{context.status}) catch unreachable;
-    const request = try protocol.encode(arena, &.{&.{ context.cwd orelse "", code }}, scope.limits.request_bytes);
+    var duration_buffer: [20]u8 = undefined;
+    const duration = if (context.duration_ns) |ns| std.fmt.bufPrint(&duration_buffer, "{d}", .{ns / std.time.ns_per_ms}) catch unreachable else "";
+    var jobs_buffer: [20]u8 = undefined;
+    const jobs = std.fmt.bufPrint(&jobs_buffer, "{d}", .{context.jobs}) catch unreachable;
+    const git = context.git;
+    const request = try protocol.encode(arena, &.{&.{
+        "1",                               context.cwd orelse "",                         code,                                          duration, jobs,
+        if (git) |info| info.root else "", if (git) |info| info.branch orelse "" else "", if (git) |info| info.commit orelse "" else "",
+    }}, scope.limits.request_bytes);
     const bytes = try module.invoke(arena, entry, request, scope);
     return decode(arena, bytes);
 }

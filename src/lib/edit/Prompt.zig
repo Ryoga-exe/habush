@@ -7,7 +7,14 @@ spans: []const Span,
 pub const Color = enum(u8) { default, black, red, green, yellow, blue, magenta, cyan, white };
 pub const Style = struct { foreground: Color = .default, background: Color = .default, bold: bool = false };
 pub const Span = struct { text: []const u8, style: Style = .{} };
-pub const Context = struct { cwd: ?[]const u8, status: u8 };
+pub const Context = struct {
+    cwd: ?[]const u8,
+    status: u8,
+    duration_ns: ?u64 = null,
+    jobs: usize = 0,
+    git: ?Git = null,
+};
+pub const Git = struct { root: []const u8, branch: ?[]const u8 = null, commit: ?[]const u8 = null };
 pub const Error = std.mem.Allocator.Error || error{ Canceled, Unavailable };
 pub const Provider = struct {
     userdata: ?*anyopaque = null,

@@ -38,15 +38,30 @@ fn color(key: []const u8, fallback: []const u8) u8 {
 export fn prompt(pointer: u32, length: u32) u64 {
     const bytes: [*]const u8 = @ptrFromInt(pointer);
     var reader: std.Io.Reader = .fixed(bytes[0..length]);
-    if ((reader.takeInt(u32, .little) catch @trap()) != 2) @trap();
+    if ((reader.takeInt(u32, .little) catch @trap()) != 8) @trap();
+    if (!std.mem.eql(u8, take(&reader), "1")) @trap();
     const cwd = take(&reader);
     const code = take(&reader);
     const status = std.fmt.parseInt(u8, code, 10) catch @trap();
+    const duration = take(&reader);
+    const jobs = take(&reader);
+    _ = take(&reader); // Repository root; this theme only needs the name.
+    const branch = take(&reader);
+    const commit = take(&reader);
     if (reader.bufferedLen() != 0) @trap();
     var writer: std.Io.Writer = .fixed(&reply_buffer);
-    writer.writeInt(u32, 4, .little) catch @trap();
+    writer.writeInt(u32, 6, .little) catch @trap();
     field(&writer, &.{ color("cwd_color", "cyan"), '0', '1' });
-    field(&writer, if (cwd.len == 0) "." else cwd);
+    const directory_name = std.fs.path.basename(cwd);
+    field(&writer, if (cwd.len == 0) "." else if (directory_name.len == 0) cwd else directory_name);
+    field(&writer, "000");
+    var details: [1024]u8 = undefined;
+    var detail: std.Io.Writer = .fixed(&details);
+    if (duration.len != 0) detail.print(" {s}ms", .{duration}) catch @trap();
+    if (!std.mem.eql(u8, jobs, "0")) detail.print(" jobs:{s}", .{jobs}) catch @trap();
+    if (branch.len != 0) detail.print(" git:{s}", .{branch}) catch @trap() else if (commit.len != 0)
+        detail.print(" git:{s}", .{commit[0..@min(commit.len, 8)]}) catch @trap();
+    field(&writer, details[0..detail.end]);
     field(&writer, &.{ if (status == 0) color("success_color", "green") else color("failure_color", "red"), '0', '0' });
     var symbol_buffer: [1024]u8 = undefined;
     const symbol = setting("symbol", &symbol_buffer, "❯");

@@ -75,9 +75,12 @@ zig build -Dwasm-plugins=true
 zig-out/bin/habush --config examples/plugins/theme.zon
 ```
 
-It displays cwd and the previous exit status, with a green/red marker. It reads
-only its own settings through `habush.option`. The app passes cwd/status; Git, environment discovery,
-and subprocess execution are not provided. Prompt failures use the configured
+It displays the directory name, previous exit status, duration, active job count,
+and optional Git branch or detached commit. It reads only its own settings
+through `habush.option`. `.prompt_context.git = true` opts into CLI collection of
+bounded Git HEAD metadata, including linked worktrees; dirty state is not collected.
+Collection runs once per prompt, separately from rendering, without running Git.
+Environment discovery and subprocess execution are not provided. Prompt failures use the configured
 literal prompt (or `habush> `). The final prompt declaration wins.
 
 Change the theme without rebuilding its Wasm by editing `theme.zon`:
@@ -113,9 +116,11 @@ also cap their guest deadline at 100 ms. Results are allocated in the caller's
 arena and stay alive for their display scope. Rendering owns ANSI styles, Unicode
 width/clipping, and OSC; guest text cannot emit terminal commands.
 
-Their schema v0 uses the existing byte-list transport:
+Their schemas use the existing byte-list transport; Core ABI remains v0:
 
-- Prompt request: `[cwd, status]`, with status in decimal ASCII. Reply:
+- Prompt request v1: `["1", cwd, status, duration_ms, jobs, git_root, git_branch, git_commit]`.
+  Numbers are decimal ASCII; unknown duration and absent Git fields are empty.
+  Jobs counts running and stopped jobs, excluding completed ones. Reply:
   `[style, text, style, text, ...]`, up to 16 spans and 1024 text bytes. A style is
   three ASCII digits: foreground, background, bold. Colors are 0=default,
   1=black, 2=red, 3=green, 4=yellow, 5=blue, 6=magenta, 7=cyan, 8=white;
