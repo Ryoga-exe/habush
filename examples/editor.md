@@ -6,10 +6,12 @@ uses cooked line input.
 
 | Key | Default action |
 | --- | --- |
-| Up / Ctrl+P, Down / Ctrl+N | Previous/next history entry; select candidates while a completion menu is open |
+| Up / Down | Ordinary history on single-line input, line movement in multiline input; select candidates while a menu is open |
+| Ctrl+P / Ctrl+N | Previous/next history entry, including during multiline editing |
 | Ctrl+L | Clear the visible screen and redraw the current input, preserving the cursor and Undo |
 | Tab, Shift+Tab | Complete or move forward/backward through candidates |
-| Enter | Insert the selected candidate, or submit input when no menu is open |
+| Enter | Insert the selected candidate; otherwise add a continuation newline for incomplete syntax or submit the whole input |
+| Ctrl+O | Insert a newline without submitting |
 | Escape | Dismiss the menu |
 | Ctrl+A/E, Ctrl+B/F | Start/end, previous/next character |
 | Ctrl+K/U | Delete to end/start |
@@ -20,8 +22,11 @@ History contains submitted source, including compound commands and here-document
 Returning past the newest entry restores the draft and its cursor. Consecutive
 duplicates and blank input are omitted. It retains at most 1000 entries and
 1 MiB in this process; inputs over the editor's 64 KiB limit are omitted.
-History is not saved to disk. Continuation and here-document prompts do not
-navigate command history.
+History is not saved to disk. Continuation and here-document text stay in the
+same editable input. Arrows move between logical lines using Unicode scalar
+columns; Ctrl+A/E and Ctrl+U/K operate on the current line. Long lines scroll
+horizontally and long inputs use a vertical viewport. Menus are repainted below
+the input instead of being appended to scrollback on every selection.
 
 The ZON `keybinds` list maps `key` to `action`. Named keys are `up`, `down`,
 `left`, `right`, `home`, `end`, `delete`, `backtab`, `enter`, `tab`, `backspace`,

@@ -4,7 +4,7 @@
 const std = @import("std");
 const edit = @import("habush-edit");
 const platform = @import("../platform.zig");
-const render = @import("render.zig");
+const View = @import("View.zig");
 const LineEditor = @This();
 
 gpa: std.mem.Allocator,
@@ -13,10 +13,10 @@ output: *std.Io.Writer,
 prompt: edit.Prompt,
 completion: ?edit.Completion = null,
 history: ?*const edit.History = null,
+inspector: ?edit.Editor.Inspector = null,
 keybinds: []const edit.Keybind = &.{},
 
 pub const max_input_bytes = 64 * 1024;
-const Menu = edit.Editor.Menu;
 
 pub fn read(editor: LineEditor) !?[:0]u8 {
     var terminal = try platform.LineInput.init() orelse return error.EditorUnavailable;
@@ -32,9 +32,11 @@ pub fn read(editor: LineEditor) !?[:0]u8 {
         .buffer = .{ .gpa = editor.gpa },
         .history = editor.history,
         .completion = editor.completion,
+        .inspector = editor.inspector,
     };
     defer state.deinit();
     const buffer = &state.buffer;
+    var view: View = .{};
     var pending: [4]u8 = undefined;
     var pending_len: usize = 0;
     var expected_len: usize = 0;
@@ -50,7 +52,7 @@ pub fn read(editor: LineEditor) !?[:0]u8 {
                 if (pending_len != expected_len) continue;
                 try editor.insertTyped(&state, pending[0..pending_len]);
                 pending_len = 0;
-                try render.redraw(editor.output, editor.prompt, buffer.text(), buffer.cursor, terminal.columns());
+                try view.redraw(editor.output, editor.prompt, &state, terminal.columns(), terminal.rows());
                 continue;
             }
             // Preserve an invalid or incomplete prefix, then process this key
@@ -73,7 +75,7 @@ pub fn read(editor: LineEditor) !?[:0]u8 {
             if (std.mem.eql(u8, sequence[0..length], "[200~")) {
                 state.menu = null;
                 try editor.paste(&state);
-                try render.redraw(editor.output, editor.prompt, buffer.text(), buffer.cursor, terminal.columns());
+                try view.redraw(editor.output, editor.prompt, &state, terminal.columns(), terminal.rows());
                 continue;
             }
             key = edit.Keybind.Key.fromEscape(sequence[0..length]) orelse {
@@ -86,22 +88,27 @@ pub fn read(editor: LineEditor) !?[:0]u8 {
         if (edit.Keybind.lookup(editor.keybinds, key)) |action| {
             switch (try state.perform(action)) {
                 .redraw => {},
-                .show_candidates => try editor.showCandidates(state.menu.?),
+                .show_candidates => {},
                 .bell => try editor.output.writeByte(7),
-                .clear_screen => try editor.output.writeAll("\x1b[2J\x1b[H"),
+                .clear_screen => {
+                    try editor.output.writeAll("\x1b[2J\x1b[H");
+                    view = .{};
+                },
                 .submit => {
-                    try editor.output.writeAll("\r\n");
+                    try view.finish(editor.output);
                     const line = try editor.gpa.dupeSentinel(u8, buffer.text(), 0);
                     errdefer editor.gpa.free(line);
                     try terminal.restore();
                     return line;
                 },
                 .interrupt => {
+                    try view.finish(editor.output);
                     try editor.output.writeAll("^C\r\n");
                     try terminal.restore();
                     return error.InputInterrupted;
                 },
                 .eof => {
+                    try view.redraw(editor.output, editor.prompt, &state, terminal.columns(), terminal.rows());
                     try terminal.restore();
                     return null;
                 },
@@ -120,7 +127,7 @@ pub fn read(editor: LineEditor) !?[:0]u8 {
                 try editor.output.writeByte(7);
             }
         }
-        try render.redraw(editor.output, editor.prompt, buffer.text(), buffer.cursor, terminal.columns());
+        try view.redraw(editor.output, editor.prompt, &state, terminal.columns(), terminal.rows());
     }
 }
 
@@ -159,23 +166,6 @@ fn paste(editor: LineEditor, state: *edit.Editor) !void {
     }
     // An unterminated paste is never submitted as a command on EOF.
     return error.EndOfStream;
-}
-
-fn showCandidates(editor: LineEditor, menu: Menu) !void {
-    const result = menu.result;
-    const max_rows = 8;
-    const start = menu.selected / max_rows * max_rows;
-    try editor.output.writeAll("\r\n");
-    for (result.labels[start..@min(start + max_rows, result.labels.len)], start..) |label, index| {
-        try editor.output.writeAll(if (index == menu.selected) "> " else "  ");
-        // Labels are data, never terminal sequences. Bound presentation as well
-        // as provider output; insertion always uses the complete original value.
-        try render.writeVisible(editor.output, label[0..@min(label.len, 256)]);
-        if (label.len > 256) try editor.output.writeAll("...");
-        try editor.output.writeAll("\r\n");
-    }
-    if (result.labels.len > max_rows) try editor.output.writeAll("... more matches\r\n");
-    if (result.truncated or result.incomplete) try editor.output.writeAll("... partial results\r\n");
 }
 
 fn takeByte(input: *std.Io.Reader) std.Io.Reader.Error!?u8 {

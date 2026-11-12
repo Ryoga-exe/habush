@@ -293,16 +293,17 @@ fn historyScenario(io: Io, master: Io.File, terminal: *Terminal) !void {
     try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "HISTORY:second\r\n") != null);
     try master.writeStreamingAll(io, "/bin/echo DRAFT\x02\x1b[A\x1b[B!\r");
     try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "DRAF!T\r\n") != null);
-    try master.writeStreamingAll(io, "/bin/cat <<'EOF'\r");
-    _ = try terminal.expect(ready);
-    try master.writeStreamingAll(io, "literal $(missing)\r");
-    _ = try terminal.expect(ready);
-    try master.writeStreamingAll(io, "EOF\r");
+    try master.writeStreamingAll(io, "/bin/cat <<'EOF'\rliteral $(missing)\rEOF\r");
     _ = try terminal.expect(ready);
     try master.writeStreamingAll(io, "\x1b[A\r");
     const output = try terminal.expect(ready);
     try std.testing.expect(std.mem.indexOf(u8, output, "literal $(missing)\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "command not found") == null);
+    // Edit an earlier continuation line before submitting the whole command.
+    try master.writeStreamingAll(io, "if true; then\rresult=wrong\rfi\x1b[A\x01\x0bresult=right\x1b[B\r");
+    _ = try terminal.expect(ready);
+    try master.writeStreamingAll(io, "/bin/echo EDITED:$result\r");
+    try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "EDITED:right\r\n") != null);
 }
 
 fn pluginScenario(io: Io, master: Io.File, terminal: *Terminal) !void {
@@ -310,11 +311,7 @@ fn pluginScenario(io: Io, master: Io.File, terminal: *Terminal) !void {
     var output = try terminal.expect(ready);
     try std.testing.expect(std.mem.indexOf(u8, output, "VALUE:literal arg\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "STATUS:7\r\n") != null);
-    try master.writeStreamingAll(io, "hb-demo read <<'END'\r");
-    _ = try terminal.expect(ready);
-    try master.writeStreamingAll(io, "scoped input\r");
-    _ = try terminal.expect(ready);
-    try master.writeStreamingAll(io, "END\r");
+    try master.writeStreamingAll(io, "hb-demo read <<'END'\rscoped input\rEND\r");
     output = try terminal.expect(ready);
     try std.testing.expect(std.mem.indexOf(u8, output, "INPUT:scoped input\r\n") != null);
     try master.writeStreamingAll(io, "hb-demo sec\x00\r");

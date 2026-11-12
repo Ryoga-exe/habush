@@ -48,6 +48,36 @@ pub fn right(buffer: *Buffer) void {
     buffer.cursor = nextBoundary(buffer.bytes.items, buffer.cursor);
 }
 
+pub fn lineStart(buffer: Buffer) usize {
+    return if (std.mem.lastIndexOfScalar(u8, buffer.text()[0..buffer.cursor], '\n')) |index| index + 1 else 0;
+}
+
+pub fn lineEnd(buffer: Buffer) usize {
+    return std.mem.indexOfScalarPos(u8, buffer.text(), buffer.cursor, '\n') orelse buffer.text().len;
+}
+
+/// Vertical movement retains the Unicode scalar column and clamps on short lines.
+pub fn vertical(buffer: *Buffer, previous_line: bool) bool {
+    const source = buffer.text();
+    const start = buffer.lineStart();
+    const end = buffer.lineEnd();
+    var column: usize = 0;
+    var index = start;
+    while (index < buffer.cursor) : (column += 1) index = nextBoundary(source, index);
+    const target_start = if (previous_line) target: {
+        if (start == 0) return false;
+        break :target if (std.mem.lastIndexOfScalar(u8, source[0 .. start - 1], '\n')) |newline| newline + 1 else 0;
+    } else target: {
+        if (end == source.len) return false;
+        break :target end + 1;
+    };
+    const target_end = std.mem.indexOfScalarPos(u8, source, target_start, '\n') orelse source.len;
+    index = target_start;
+    while (index < target_end and column != 0) : (column -= 1) index = nextBoundary(source, index);
+    buffer.cursor = index;
+    return true;
+}
+
 pub fn backspace(buffer: *Buffer) std.mem.Allocator.Error!void {
     if (buffer.cursor == 0) return;
     return buffer.replace(previousBoundary(buffer.bytes.items, buffer.cursor), buffer.cursor, "");
