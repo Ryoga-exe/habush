@@ -3,6 +3,8 @@ const std = @import("std");
 pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const skip_zig_36010 = (b.option(bool, "skip-zig-36010", "Skip macOS cancellation checks affected by Zig PR #36010") orelse false) and
+        target.result.os.tag == .macos;
     const wasm_plugins = b.option(bool, "wasm-plugins", "Enable Wasm plugins using the Wasmtime SDK") orelse false;
     const wasmtime_sdk = if (wasm_plugins) sdk: {
         const name = if (target.result.os.tag == .macos and target.result.cpu.arch == .aarch64)
@@ -20,8 +22,6 @@ pub fn build(b: *std.Build) !void {
     var demo_plugin: ?*std.Build.Step.Compile = null;
     const features = b.addOptions();
     features.addOption(bool, "wasm_plugins", wasm_plugins);
-    const skip_zig_36010 = (b.option(bool, "skip-zig-36010", "Skip macOS cancellation checks affected by Zig PR #36010") orelse false) and
-        target.result.os.tag == .macos;
 
     const habush_edit = b.addModule("habush-edit", .{
         .root_source_file = b.path("src/lib/edit.zig"),
