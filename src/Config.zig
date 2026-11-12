@@ -12,11 +12,16 @@ plugins: []Plugin = &.{},
 keybinds: []const @import("habush-edit").Keybind.Spec = &.{},
 prompt: ?@import("habush-edit").Prompt = null,
 diagnostics: bool = true,
+history: History = .{},
 /// Shared by completion providers; guest execution budgets
 /// remain the plugin host's responsibility.
 completion_limits: @import("habush").Completion.Provider.Limits = .{},
 
 pub const Mode = enum { auto, on, off };
+pub const History = struct {
+    memory: struct { max_entries: usize = 1000, max_bytes: usize = 1024 * 1024 } = .{},
+    storage: struct { enabled: bool = true, path: ?[]const u8 = null, max_bytes: usize = 8 * 1024 * 1024 } = .{},
+};
 pub const Plugin = struct {
     path: []const u8,
     commands: []const Command = &.{},
@@ -43,6 +48,11 @@ pub const max_rc_bytes = 1024 * 1024;
 pub fn parse(options: std.zon.parse.Options) !Config {
     const config = try std.zon.parse.fromSlice(Config, options);
     if (config.version != 1) return error.UnsupportedConfigVersion;
+    if (config.history.memory.max_bytes > @import("HistoryStore.zig").max_file_bytes or
+        config.history.storage.max_bytes < 13 or config.history.storage.max_bytes > @import("HistoryStore.zig").max_file_bytes)
+        return error.InvalidHistoryConfiguration;
+    if (config.history.storage.path) |path| if (!validString(path) or std.fs.path.basename(path).len == 0)
+        return error.InvalidHistoryConfiguration;
     if (config.prompt) |prompt| if (!prompt.valid()) return error.InvalidPrompt;
     for (config.keybinds) |binding| _ = try @import("habush-edit").Keybind.Key.parse(binding.key);
     for (config.plugins, 0..) |plugin, plugin_index| {
@@ -75,7 +85,7 @@ fn read(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, path: []co
     const source = try std.Io.Dir.cwd().readFileAllocOptions(io, path, gpa, .limited(max_file_bytes), .of(u8), 0);
     defer gpa.free(source);
     var detail: std.zon.parse.Diagnostics = undefined;
-    const config = parse(.{
+    var config = parse(.{
         .gpa = gpa,
         .arena = arena,
         .source = source,
@@ -88,6 +98,12 @@ fn read(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, path: []co
     for (config.plugins) |*plugin| {
         if (!std.fs.path.isAbsolute(plugin.path))
             plugin.path = try std.fs.path.join(arena, &.{ std.fs.path.dirname(path) orelse ".", plugin.path });
+    }
+    if (config.history.storage.path) |history_path| {
+        if (!std.fs.path.isAbsolute(history_path)) {
+            const base = try std.Io.Dir.cwd().realPathFileAlloc(io, std.fs.path.dirname(path) orelse ".", arena);
+            config.history.storage.path = try std.fs.path.resolveAlloc(arena, &.{ base, history_path });
+        }
     }
     return config;
 }
@@ -114,6 +130,7 @@ pub fn reportError(writer: *std.Io.Writer, path: ?[]const u8, err: anyerror) std
         error.UnsupportedConfigVersion => "unsupported config version",
         error.InvalidKeybind => "unsupported keybinding trigger",
         error.InvalidPrompt => "prompt exceeds display limits or contains NUL",
+        error.InvalidHistoryConfiguration => "invalid history path or size (memory at most 64 MiB; storage 13 bytes to 64 MiB)",
         error.InvalidPluginConfiguration => "plugin paths, command names, and entries must be nonempty and valid",
         error.ReservedPluginCommand => "plugin command name is reserved for a builtin",
         error.DuplicatePluginCommand => "duplicate plugin command name",
@@ -191,6 +208,11 @@ pub const Paths = struct {
         return try std.fs.path.join(gpa, &.{ directory_path, "rc.hb" });
     }
 
+    pub fn historyFile(paths: Paths, gpa: std.mem.Allocator) !?[]u8 {
+        const directory_path = paths.state orelse return null;
+        return try std.fs.path.join(gpa, &.{ directory_path, "history" });
+    }
+
     pub fn legacyRcFile(paths: Paths, gpa: std.mem.Allocator) !?[]u8 {
         const home = paths.home orelse return null;
         return try std.fs.path.join(gpa, &.{ home, ".habushrc" });
@@ -260,13 +282,16 @@ test "ZON configuration validates fields and honors explicit paths without JSON 
     try std.testing.expectEqualDeep(Config{}, (try load(gpa, arena, io, paths, null, &output.writer)).?);
     try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"load_rc\":false}" });
     try std.testing.expectEqualDeep(Config{}, (try load(gpa, arena, io, paths, null, &output.writer)).?);
-    try tmp.dir.writeFile(io, .{ .sub_path = "config.zon", .data = ".{ .line_edit = .off, .completion_limits = .{ .candidates = 7 }, .keybinds = .{.{ .key = \"ctrl+space\", .action = .complete }} }" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.zon", .data = ".{ .line_edit = .off, .history = .{ .memory = .{ .max_entries = 7 }, .storage = .{ .path = \"local-history\" } }, .completion_limits = .{ .candidates = 7 }, .keybinds = .{.{ .key = \"ctrl+space\", .action = .complete }} }" });
     const zon = (try load(gpa, arena, io, paths, null, &output.writer)).?;
     try std.testing.expectEqual(Mode.off, zon.line_edit);
     try std.testing.expect(zon.load_rc);
     try std.testing.expectEqual(@as(usize, 7), zon.completion_limits.candidates);
     try std.testing.expectEqual((Config{}).completion_limits.bytes, zon.completion_limits.bytes);
     try std.testing.expectEqualStrings("ctrl+space", zon.keybinds[0].key);
+    try std.testing.expectEqual(@as(usize, 7), zon.history.memory.max_entries);
+    const history_path = try std.fs.path.join(arena, &.{ directory_path, "local-history" });
+    try std.testing.expectEqualStrings(history_path, zon.history.storage.path.?);
     try std.testing.expectEqualStrings("", output.written());
 
     try tmp.dir.writeFile(io, .{ .sub_path = "config.zon", .data =
@@ -297,6 +322,9 @@ test "ZON configuration validates fields and honors explicit paths without JSON 
         ".{ .load_rc = true, .load_rc = false }",
         ".{ .line_edit = .maybe }",
         ".{ .version = 2 }",
+        ".{ .history = .{ .storage = .{ .path = \"bad\\x00\" } } }",
+        ".{ .history = .{ .storage = .{ .max_bytes = 0 } } }",
+        ".{ .history = .{ .storage = .{ .max_bytes = 67108865 } } }",
         ".{ .plugins = .{.{ .path = \"theme.wasm\", .prompt = .{ .entry = \"\" } }} }",
         ".{ .plugins = .{.{ .path = \"diagnostic.wasm\", .diagnostics = .{ .entry = \"\" } }} }",
         ".{ .prompt = .{ .spans = .{.{ .text = \"bad\\x00\" }} } }",

@@ -10,6 +10,7 @@ const platform = @import("platform.zig");
 const CompletionService = @import("CompletionService.zig");
 const DiagnosticService = @import("DiagnosticService.zig");
 const interrupt = @import("interrupt.zig");
+const HistoryStore = @import("HistoryStore.zig");
 const Io = std.Io;
 const Shell = @This();
 
@@ -40,6 +41,8 @@ input_byte_offset: ?u32 = null,
 last_line_ending: LineEnding = .lf,
 interrupt_generation: u32 = 0,
 editing: ?*Editing = null,
+history_settings: @import("Config.zig").History = .{},
+history_path: ?[]const u8 = null,
 
 const Editing = struct {
     history: edit.History,
@@ -54,14 +57,37 @@ const Editing = struct {
 };
 
 pub fn run(self: *Shell) !habush.runtime.ExitStatus {
-    var editing: Editing = .{ .history = .{ .gpa = self.allocator } };
+    var editing: Editing = .{ .history = .{
+        .gpa = self.allocator,
+        .max_entries = self.history_settings.memory.max_entries,
+        .max_bytes = self.history_settings.memory.max_bytes,
+    } };
     self.editing = &editing;
     defer {
         self.editing = null;
         editing.discard();
         editing.history.deinit();
     }
+    if (self.historyStore()) |store| store.load(&editing.history) catch |err| {
+        try self.historyError(err);
+    };
     return self.runInput(null);
+}
+
+fn historyStore(self: *Shell) ?HistoryStore {
+    if (!self.interactive or !self.history_settings.storage.enabled) return null;
+    return .{
+        .gpa = self.allocator,
+        .io = self.io orelse return null,
+        .path = self.history_path orelse return null,
+        .max_bytes = self.history_settings.storage.max_bytes,
+    };
+}
+
+fn historyError(self: *Shell, err: anyerror) !void {
+    if (err == error.OutOfMemory or err == error.Canceled) return err;
+    try self.stderr.print("habush: history: {s}; persistence disabled for this session\n", .{@errorName(err)});
+    self.history_path = null;
 }
 
 fn runInput(self: *Shell, source_name: ?[]const u8) !habush.runtime.ExitStatus {
@@ -79,6 +105,9 @@ fn runInput(self: *Shell, source_name: ?[]const u8) !habush.runtime.ExitStatus {
         defer input.deinit(self.allocator);
         if (self.interactive and input.original_source.len <= LineEditor.max_input_bytes) {
             if (self.editing) |editing| try editing.history.append(input.original_source);
+            if (self.historyStore()) |store| store.append(input.original_source) catch |err| {
+                try self.historyError(err);
+            };
         }
 
         if (input.incomplete_here_document) {
@@ -749,6 +778,41 @@ test "script diagnostics retain raw CRLF here-document and final-line byte range
     try std.testing.expectEqualDeep(habush.Source.Range{ .start = @intCast(nested), .end = @intCast(nested + "missing_nested".len) }, capture.ranges[1].?);
     try std.testing.expectEqualDeep(habush.Source.Range{ .start = @intCast(last), .end = @intCast(script.len) }, capture.ranges[2].?);
     try std.testing.expectEqualStrings("", stderr.written());
+}
+
+test "interactive history stores submitted original source but excludes startup evaluation" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(base);
+    const path = try std.fs.path.join(gpa, &.{ base, "history" });
+    defer gpa.free(path);
+    var system: habush.Host.System = .{ .gpa = gpa, .io = io };
+    defer system.deinit();
+    var session = try habush.Session.init(gpa, system.host(), .{});
+    defer session.deinit();
+    var output: Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var reader: Io.Reader = .fixed(": <<EOF\nline one\nline two\nEOF\nexit 0\n");
+    var shell: Shell = .{
+        .allocator = gpa,
+        .stdin = &reader,
+        .stderr = &output.writer,
+        .session = &session,
+        .interactive = true,
+        .io = io,
+        .history_path = path,
+    };
+    _ = try shell.runCommand(": startup");
+    try std.testing.expectEqual(@as(u8, 0), try shell.run());
+    var reloaded: edit.History = .{ .gpa = gpa };
+    defer reloaded.deinit();
+    try (HistoryStore{ .gpa = gpa, .io = io, .path = path }).load(&reloaded);
+    try std.testing.expectEqual(@as(usize, 2), reloaded.entries.items.len);
+    try std.testing.expectEqualStrings(": <<EOF\nline one\nline two\nEOF", reloaded.entries.items[0]);
+    try std.testing.expectEqualStrings("exit 0", reloaded.entries.items[1]);
 }
 
 test "prompt providers receive session context and failures use the configured fallback" {
