@@ -13,8 +13,9 @@ output: *std.Io.Writer,
 prompt: []const u8,
 completion: ?edit.Completion = null,
 history: ?*const edit.History = null,
+keybinds: []const edit.Keybind = &.{},
 
-const max_input_bytes = 64 * 1024;
+pub const max_input_bytes = 64 * 1024;
 const Menu = struct { result: edit.Completion.Result, selected: usize = 0 };
 
 pub fn read(editor: LineEditor) !?[:0]u8 {
@@ -55,90 +56,110 @@ pub fn read(editor: LineEditor) !?[:0]u8 {
             try editor.insertTyped(&buffer, pending[0..pending_len]);
             pending_len = 0;
         }
-        if (byte != '\t' and byte != '\r' and byte != '\n' and byte != 27) menu = null;
-        switch (byte) {
-            '\r', '\n' => {
-                if (menu) |selection| {
-                    menu = null;
-                    if (!try editor.accept(&buffer, selection.selected)) try editor.output.writeByte(7);
-                    try render.redraw(editor.output, editor.prompt, buffer.text(), buffer.cursor, terminal.columns());
-                    continue;
-                }
-                try editor.output.writeAll("\r\n");
-                const line = try editor.gpa.dupeSentinel(u8, buffer.text(), 0);
-                errdefer editor.gpa.free(line);
-                try terminal.restore();
-                return line;
-            },
-            3 => {
-                try editor.output.writeAll("^C\r\n");
-                try terminal.restore();
-                return error.InputInterrupted;
-            },
-            4 => if (buffer.text().len == 0) {
-                try terminal.restore();
-                return null;
-            } else try buffer.delete(),
-            1 => buffer.cursor = 0,
-            5 => buffer.cursor = buffer.text().len,
-            2 => buffer.left(),
-            6 => buffer.right(),
-            8, 127 => try buffer.backspace(),
-            11 => try buffer.replace(buffer.cursor, buffer.text().len, ""),
-            21 => try buffer.replace(0, buffer.cursor, ""),
-            31 => {
-                _ = buffer.undo();
-            },
-            '\t' => if (!try editor.complete(&buffer, &menu)) try editor.output.writeByte(7),
-            27 => {
-                if (editor.input.bufferedLen() == 0 and !terminal.ready(80)) {
-                    menu = null;
-                    continue;
-                }
-                var sequence: [16]u8 = undefined;
-                var length: usize = 0;
-                while (length < sequence.len) {
-                    const next = try takeByte(editor.input) orelse break;
-                    sequence[length] = next;
-                    length += 1;
-                    if (length == 1 and next != '[' and next != 'O') break;
-                    if (length >= 2 and (std.ascii.isAlphabetic(next) or next == '~')) break;
-                    if (editor.input.bufferedLen() == 0 and !terminal.ready(80)) break;
-                }
-                const key = sequence[0..length];
-                if (menu) |*selection| {
-                    if (std.mem.eql(u8, key, "[A") or std.mem.eql(u8, key, "[B")) {
-                        const count = selection.result.labels.len;
-                        selection.selected = if (key[1] == 'A') (selection.selected + count - 1) % count else (selection.selected + 1) % count;
-                        try editor.showCandidates(selection.*);
+        var key = edit.Keybind.Key.fromByte(byte);
+        if (byte == 27 and (editor.input.bufferedLen() != 0 or terminal.ready(80))) {
+            var sequence: [16]u8 = undefined;
+            var length: usize = 0;
+            while (length < sequence.len) {
+                const next = try takeByte(editor.input) orelse break;
+                sequence[length] = next;
+                length += 1;
+                if (length == 1 and next != '[' and next != 'O') break;
+                if (length >= 2 and (std.ascii.isAlphabetic(next) or next == '~')) break;
+                if (editor.input.bufferedLen() == 0 and !terminal.ready(80)) break;
+            }
+            if (std.mem.eql(u8, sequence[0..length], "[200~")) {
+                menu = null;
+                try editor.paste(&buffer);
+                try render.redraw(editor.output, editor.prompt, buffer.text(), buffer.cursor, terminal.columns());
+                continue;
+            }
+            key = edit.Keybind.Key.fromEscape(sequence[0..length]) orelse {
+                menu = null;
+                try editor.output.writeByte(7);
+                try editor.output.flush();
+                continue;
+            };
+        }
+        if (edit.Keybind.lookup(editor.keybinds, key)) |action| {
+            switch (action) {
+                .accept_line,
+                .complete,
+                .complete_previous,
+                .history_previous,
+                .history_next,
+                .history_search_previous,
+                .history_search_next,
+                .ignore,
+                => {},
+                else => menu = null,
+            }
+            switch (action) {
+                .accept_line => {
+                    if (menu) |selection| {
+                        menu = null;
+                        if (!try editor.accept(&buffer, selection.selected)) try editor.output.writeByte(7);
                         try render.redraw(editor.output, editor.prompt, buffer.text(), buffer.cursor, terminal.columns());
                         continue;
                     }
-                }
-                menu = null;
-                if (std.mem.eql(u8, key, "[A") or std.mem.eql(u8, key, "OA") or
-                    std.mem.eql(u8, key, "[B") or std.mem.eql(u8, key, "OB"))
-                {
-                    const moved = if (editor.history) |history|
-                        try navigation.move(history, &buffer, key[1] == 'A', false)
-                    else
-                        false;
-                    if (!moved) try editor.output.writeByte(7);
-                } else if (std.mem.eql(u8, key, "[D") or std.mem.eql(u8, key, "OD")) buffer.left() else if (std.mem.eql(u8, key, "[C") or std.mem.eql(u8, key, "OC")) buffer.right() else if (std.mem.eql(u8, key, "[H") or std.mem.eql(u8, key, "OH") or std.mem.eql(u8, key, "[1~")) buffer.cursor = 0 else if (std.mem.eql(u8, key, "[F") or std.mem.eql(u8, key, "OF") or std.mem.eql(u8, key, "[4~")) buffer.cursor = buffer.text().len else if (std.mem.eql(u8, key, "[3~")) try buffer.delete() else if (std.mem.eql(u8, key, "[200~")) try editor.paste(&buffer) else try editor.output.writeByte(7);
-            },
-            else => {
-                if (byte >= 0x20) {
-                    expected_len = std.unicode.utf8ByteSequenceLength(byte) catch 1;
-                    if (expected_len > 1) {
-                        pending[0] = byte;
-                        pending_len = 1;
-                        continue;
+                    try editor.output.writeAll("\r\n");
+                    const line = try editor.gpa.dupeSentinel(u8, buffer.text(), 0);
+                    errdefer editor.gpa.free(line);
+                    try terminal.restore();
+                    return line;
+                },
+                .interrupt => {
+                    try editor.output.writeAll("^C\r\n");
+                    try terminal.restore();
+                    return error.InputInterrupted;
+                },
+                .eof_or_delete => if (buffer.text().len == 0) {
+                    try terminal.restore();
+                    return null;
+                } else try buffer.delete(),
+                .cursor_start => buffer.cursor = 0,
+                .cursor_end => buffer.cursor = buffer.text().len,
+                .cursor_left => buffer.left(),
+                .cursor_right => buffer.right(),
+                .backspace => try buffer.backspace(),
+                .delete => try buffer.delete(),
+                .kill_to_end => try buffer.replace(buffer.cursor, buffer.text().len, ""),
+                .kill_to_start => try buffer.replace(0, buffer.cursor, ""),
+                .undo => {
+                    _ = buffer.undo();
+                },
+                .complete, .complete_previous => if (!try editor.complete(&buffer, &menu, action == .complete_previous)) try editor.output.writeByte(7),
+                .clear_screen => try editor.output.writeAll("\x1b[2J\x1b[H"),
+                .history_previous, .history_next, .history_search_previous, .history_search_next => {
+                    const previous = action == .history_previous or action == .history_search_previous;
+                    if (menu) |*selection| {
+                        const count = selection.result.labels.len;
+                        selection.selected = if (previous) (selection.selected + count - 1) % count else (selection.selected + 1) % count;
+                        try editor.showCandidates(selection.*);
+                    } else {
+                        const moved = if (editor.history) |history|
+                            try navigation.move(history, &buffer, previous, action == .history_search_previous or action == .history_search_next)
+                        else
+                            false;
+                        if (!moved) try editor.output.writeByte(7);
                     }
-                    try editor.insertTyped(&buffer, &.{byte});
-                } else {
-                    try editor.output.writeByte(7);
+                },
+                .dismiss_completion, .ignore => {},
+                .unbind => unreachable,
+            }
+        } else {
+            menu = null;
+            if (byte >= 0x20 and byte != 127) {
+                expected_len = std.unicode.utf8ByteSequenceLength(byte) catch 1;
+                if (expected_len > 1) {
+                    pending[0] = byte;
+                    pending_len = 1;
+                    continue;
                 }
-            },
+                try editor.insertTyped(&buffer, &.{byte});
+            } else {
+                try editor.output.writeByte(7);
+            }
         }
         try render.redraw(editor.output, editor.prompt, buffer.text(), buffer.cursor, terminal.columns());
     }
@@ -189,9 +210,10 @@ fn paste(editor: LineEditor, buffer: *edit.Buffer) !void {
     return error.EndOfStream;
 }
 
-fn complete(editor: LineEditor, buffer: *edit.Buffer, menu: *?Menu) !bool {
+fn complete(editor: LineEditor, buffer: *edit.Buffer, menu: *?Menu, previous: bool) !bool {
     if (menu.*) |*selection| {
-        selection.selected = (selection.selected + 1) % selection.result.labels.len;
+        const count = selection.result.labels.len;
+        selection.selected = if (previous) (selection.selected + count - 1) % count else (selection.selected + 1) % count;
         try editor.showCandidates(selection.*);
         return true;
     }
@@ -204,7 +226,7 @@ fn complete(editor: LineEditor, buffer: *edit.Buffer, menu: *?Menu) !bool {
     const result = (try service.query(service.userdata, request)) orelse return false;
     if (!result.unique()) {
         if (result.labels.len == 0) return false;
-        menu.* = .{ .result = result };
+        menu.* = .{ .result = result, .selected = if (previous) result.labels.len - 1 else 0 };
         try editor.showCandidates(menu.*.?);
         return true;
     }
