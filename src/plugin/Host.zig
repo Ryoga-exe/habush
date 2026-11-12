@@ -1,5 +1,5 @@
 //! Core Wasm ABI v0. The embedding application owns modules and call scopes.
-//! No WASI is linked. Imports provide only call-scoped stream access.
+//! No WASI is linked. Imports expose call-scoped streams and plugin settings.
 const std = @import("std");
 const c = @import("wasmtime");
 const Host = @This();
@@ -38,6 +38,7 @@ pub const Limits = struct {
 /// Borrowed streams must stay alive and obey cancellation for the whole call.
 pub const Scope = struct {
     limits: Limits = .{},
+    options: []const [2][]const u8 = &.{},
     stdin: ?*std.Io.Reader = null,
     stdout: ?*std.Io.Writer = null,
     stderr: ?*std.Io.Writer = null,
@@ -100,6 +101,14 @@ pub const Module = struct {
         const host = module.host;
         try host.io.checkCancel();
         if (request.len > scope.limits.request_bytes) return error.LimitExceeded;
+        if (scope.options.len > 32) return error.LimitExceeded;
+        var option_bytes: usize = 0;
+        for (scope.options) |pair| {
+            for (pair) |part| {
+                if (part.len > 4096 - option_bytes) return error.LimitExceeded;
+                option_bytes += part.len;
+            }
+        }
         var call: Call = .{
             .io = host.io,
             .scope = scope,
@@ -118,6 +127,7 @@ pub const Module = struct {
         const linker = c.wasmtime_linker_new(host.engine) orelse return error.OutOfMemory;
         defer c.wasmtime_linker_delete(linker);
         try defineStreams(linker, &call);
+        try defineOption(linker, &call);
         var instance: c.wasmtime_instance_t = undefined;
         var trap: ?*c.wasm_trap_t = null;
         const failure = c.wasmtime_linker_instantiate(linker, context, module.module, &instance, &trap);
@@ -223,6 +233,44 @@ fn defineStreams(linker: *c.wasmtime_linker_t, call: *Call) Error!void {
         c.wasmtime_error_delete(failure);
         return error.InvalidAbi;
     }
+}
+
+fn defineOption(linker: *c.wasmtime_linker_t, call: *Call) Error!void {
+    var parameters: c.wasm_valtype_vec_t = undefined;
+    c.wasm_valtype_vec_new_uninitialized(&parameters, 4);
+    for (0..4) |index| parameters.data[index] = c.wasm_valtype_new(c.WASM_I32);
+    var results: c.wasm_valtype_vec_t = undefined;
+    c.wasm_valtype_vec_new_uninitialized(&results, 1);
+    results.data[0] = c.wasm_valtype_new(c.WASM_I32);
+    const signature = c.wasm_functype_new(&parameters, &results) orelse return error.OutOfMemory;
+    defer c.wasm_functype_delete(signature);
+    if (c.wasmtime_linker_define_func(linker, "habush", 6, "option", 6, signature, option, call, null)) |failure| {
+        c.wasmtime_error_delete(failure);
+        return error.InvalidAbi;
+    }
+}
+
+fn option(data: ?*anyopaque, caller: ?*c.wasmtime_caller_t, args: [*c]const c.wasmtime_val_t, _: usize, results: [*c]c.wasmtime_val_t, _: usize) callconv(.c) ?*c.wasm_trap_t {
+    const call: *Call = @ptrCast(@alignCast(data.?));
+    const length = optionBytes(call, caller.?, @bitCast(args[0].of.i32), @bitCast(args[1].of.i32), @bitCast(args[2].of.i32), @bitCast(args[3].of.i32)) catch |err| {
+        call.failure = err;
+        const message = "habush: plugin option failed";
+        return c.wasmtime_trap_new(message.ptr, message.len);
+    };
+    results[0] = i32Value(length);
+    return null;
+}
+
+fn optionBytes(call: *Call, caller: *c.wasmtime_caller_t, key_pointer: u32, key_length: u32, pointer: u32, capacity: u32) Error!u32 {
+    try call.checkpoint();
+    const key = try callerBytes(caller, key_pointer, key_length);
+    for (call.scope.options) |pair| {
+        if (!std.mem.eql(u8, pair[0], key)) continue;
+        if (pair[1].len > capacity) return error.LimitExceeded;
+        @memcpy(try callerBytes(caller, pointer, @intCast(pair[1].len)), pair[1]);
+        return @intCast(pair[1].len);
+    }
+    return std.math.maxInt(u32);
 }
 
 fn read(data: ?*anyopaque, caller: ?*c.wasmtime_caller_t, args: [*c]const c.wasmtime_val_t, _: usize, results: [*c]c.wasmtime_val_t, _: usize) callconv(.c) ?*c.wasm_trap_t {

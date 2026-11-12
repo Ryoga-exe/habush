@@ -60,7 +60,7 @@ pub fn main(init: std.process.Init) !void {
                     .completions = .{ .{ .command = "hb-demo" }, .{ .command = "/bin/echo" } },
                     .diagnostics = .{},
                 },
-                .{ .path = theme_path, .prompt = .{} },
+                .{ .path = theme_path, .prompt = .{}, .options = .{ .{ "symbol", "THEME>" }, .{ "failure_color", "yellow" } } },
             },
         }, .{}, &config.writer);
     } else {
@@ -336,7 +336,7 @@ fn pluginScenario(io: Io, master: Io.File, terminal: *Terminal) !void {
     try master.writeStreamingAll(io, "\x15hb-demo after\r");
     const themed = try terminal.expect(ready);
     try std.testing.expect(std.mem.indexOf(u8, themed, "VALUE:after\r\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, themed, "\x1b[0;31;49m [7] ❯ ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, themed, "\x1b[0;33;49m [7] THEME> ") != null);
     try master.writeStreamingAll(io, "PATH=; hb-demo 'literal arg'; /bin/echo STATUS:$?\r");
     var output = try terminal.expect(ready);
     try std.testing.expect(std.mem.indexOf(u8, output, "VALUE:literal arg\r\n") != null);

@@ -24,6 +24,8 @@ pub const History = struct {
 };
 pub const Plugin = struct {
     path: []const u8,
+    /// Plugin-defined UTF-8/byte settings; never the app's full configuration.
+    options: []const [2][]const u8 = &.{},
     commands: []const Command = &.{},
     completions: []const Completion = &.{},
     prompt: ?struct { entry: []const u8 = "prompt" } = null,
@@ -56,6 +58,15 @@ pub fn parse(options: std.zon.parse.Options) !Config {
     if (config.prompt) |prompt| if (!prompt.valid()) return error.InvalidPrompt;
     for (config.keybinds) |binding| _ = try @import("habush-edit").Keybind.Key.parse(binding.key);
     for (config.plugins, 0..) |plugin, plugin_index| {
+        var option_bytes: usize = 0;
+        if (plugin.options.len > 32) return error.InvalidPluginOptions;
+        for (plugin.options, 0..) |option, index| {
+            if (!validString(option[0]) or std.mem.indexOfScalar(u8, option[1], 0) != null) return error.InvalidPluginOptions;
+            option_bytes += option[0].len + option[1].len;
+            if (option_bytes > 4096) return error.InvalidPluginOptions;
+            for (plugin.options[0..index]) |previous|
+                if (std.mem.eql(u8, previous[0], option[0])) return error.InvalidPluginOptions;
+        }
         if (!validString(plugin.path) or (plugin.commands.len == 0 and plugin.completions.len == 0 and plugin.prompt == null and plugin.diagnostics == null))
             return error.InvalidPluginConfiguration;
         if (plugin.prompt) |prompt| if (!validString(prompt.entry)) return error.InvalidPluginConfiguration;
@@ -132,6 +143,7 @@ pub fn reportError(writer: *std.Io.Writer, path: ?[]const u8, err: anyerror) std
         error.InvalidPrompt => "prompt exceeds display limits or contains NUL",
         error.InvalidHistoryConfiguration => "invalid history path or size (memory at most 64 MiB; storage 13 bytes to 64 MiB)",
         error.InvalidPluginConfiguration => "plugin paths, command names, and entries must be nonempty and valid",
+        error.InvalidPluginOptions => "plugin options require unique nonempty keys, no NUL, at most 32 pairs and 4096 bytes",
         error.ReservedPluginCommand => "plugin command name is reserved for a builtin",
         error.DuplicatePluginCommand => "duplicate plugin command name",
         error.FileNotFound => "no such file or directory",
@@ -311,10 +323,11 @@ test "ZON configuration validates fields and honors explicit paths without JSON 
     try std.testing.expectEqual(@as(usize, 2), completion_only.plugins[0].completions.len);
 
     try tmp.dir.writeFile(io, .{ .sub_path = "config.zon", .data =
-        \\.{ .plugins = .{ .{ .path = "theme.wasm", .prompt = .{} }, .{ .path = "diagnostic.wasm", .diagnostics = .{} } } }
+        \\.{ .plugins = .{ .{ .path = "theme.wasm", .prompt = .{}, .options = .{ .{ "symbol", ">" } } }, .{ .path = "diagnostic.wasm", .diagnostics = .{} } } }
     });
     const presentation = (try load(gpa, arena, io, paths, null, &output.writer)).?;
     try std.testing.expectEqualStrings("prompt", presentation.plugins[0].prompt.?.entry);
+    try std.testing.expectEqualStrings(">", presentation.plugins[0].options[0][1]);
     try std.testing.expectEqualStrings("diagnose", presentation.plugins[1].diagnostics.?.entry);
 
     for ([_][]const u8{
@@ -325,6 +338,8 @@ test "ZON configuration validates fields and honors explicit paths without JSON 
         ".{ .history = .{ .storage = .{ .path = \"bad\\x00\" } } }",
         ".{ .history = .{ .storage = .{ .max_bytes = 0 } } }",
         ".{ .history = .{ .storage = .{ .max_bytes = 67108865 } } }",
+        ".{ .plugins = .{.{ .path = \"theme.wasm\", .prompt = .{}, .options = .{ .{ \"symbol\", \">\" }, .{ \"symbol\", \"$\" } } }} }",
+        ".{ .plugins = .{.{ .path = \"theme.wasm\", .prompt = .{}, .options = .{ .{ \"\", \">\" } } }} }",
         ".{ .plugins = .{.{ .path = \"theme.wasm\", .prompt = .{ .entry = \"\" } }} }",
         ".{ .plugins = .{.{ .path = \"diagnostic.wasm\", .diagnostics = .{ .entry = \"\" } }} }",
         ".{ .prompt = .{ .spans = .{.{ .text = \"bad\\x00\" }} } }",

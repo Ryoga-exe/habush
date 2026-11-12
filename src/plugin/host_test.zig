@@ -8,9 +8,11 @@ const fixture =
     \\(module
     \\ (import "habush" "write" (func $write (param i32 i32 i32) (result i32)))
     \\ (import "habush" "read" (func $read (param i32 i32 i32) (result i32)))
+    \\ (import "habush" "option" (func $option (param i32 i32 i32 i32) (result i32)))
     \\ (memory (export "memory") 1)
     \\ (data (i32.const 0) "\07choice")
     \\ (data (i32.const 32) "\01\00\00\00\08\00\00\00a b'$(x)")
+    \\ (data (i32.const 128) "symbol")
     \\ (func (export "habush_version") (result i32) i32.const 0)
     \\ (func (export "habush_alloc") (param i32) (result i32) i32.const 4096)
     \\ (func (export "command") (param i32 i32) (result i64)
@@ -18,6 +20,11 @@ const fixture =
     \\   i64.const 4294967296)
     \\ (func (export "complete") (param i32 i32) (result i64)
     \\   i64.const 25769803777)
+    \\ (func (export "option") (param i32 i32) (result i64) (local $n i32) (local $out i32)
+    \\   local.get 0 i32.load local.set $out
+    \\   i32.const 128 i32.const 6 local.get $out i32.const 64 call $option local.set $n
+    \\   local.get $n i32.const 0 i32.lt_s if (result i64) i64.const 0 else
+    \\     local.get $n i64.extend_i32_u i64.const 32 i64.shl local.get $out i64.extend_i32_u i64.or end)
     \\ (func (export "candidates") (param i32 i32) (result i64)
     \\   i64.const 68719476768)
     \\ (func (export "read_echo") (param i32 i32) (result i64) (local $n i32)
@@ -51,6 +58,26 @@ fn load(host: *Host, wat: []const u8) !Host.Module {
     }
     defer c.wasm_byte_vec_delete(&wasm);
     return host.load(wasm.data[0..wasm.size]);
+}
+
+test "plugin options are call-local, bounded, and validate guest memory" {
+    const gpa = std.testing.allocator;
+    var host = try Host.init(std.testing.io);
+    defer host.deinit();
+    var module = try load(&host, fixture);
+    defer module.deinit();
+    const scope: Host.Scope = .{ .options = &.{.{ "symbol", "日本>" }} };
+    const request = &[_]u8{ 0, 1, 0, 0 };
+    const value = try module.invoke(gpa, "option", request, scope);
+    defer gpa.free(value);
+    try std.testing.expectEqualStrings("日本>", value);
+    const missing = try module.invoke(gpa, "option", request, .{});
+    defer gpa.free(missing);
+    try std.testing.expectEqual(@as(usize, 0), missing.len);
+    try std.testing.expectError(error.InvalidResponse, module.invoke(gpa, "option", &.{ 255, 255, 0, 0 }, scope));
+    const long: [4096]u8 = @splat('x');
+    try std.testing.expectError(error.LimitExceeded, module.invoke(gpa, "option", request, .{ .options = &.{.{ "symbol", long[0..65] }} }));
+    try std.testing.expectError(error.LimitExceeded, module.invoke(gpa, "option", request, .{ .options = &.{.{ "symbol", &long }} }));
 }
 
 test "one module serves command and completion with call-scoped streams" {

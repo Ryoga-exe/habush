@@ -26,6 +26,7 @@ const Entry = struct {
     module: *const wasm.Host.Module,
     entry: []const u8,
     limits: wasm.Host.Limits,
+    options: []const [2][]const u8,
 };
 
 /// The registry stays at this address until all Session/input tasks have ended.
@@ -67,13 +68,14 @@ pub fn load(plugins: *Plugins, specs: []const Config.Plugin) !void {
                 .module = module,
                 .entry = command.entry,
                 .limits = limits,
+                .options = spec.options,
             };
             plugins.commands[command_index] = .{ .name = command.name, .userdata = &plugins.entries[index], .run = run };
             command_index += 1;
             index += 1;
         }
         for (spec.completions) |completion| {
-            plugins.entries[index] = .{ .module = module, .entry = completion.entry, .limits = limits };
+            plugins.entries[index] = .{ .module = module, .entry = completion.entry, .limits = limits, .options = spec.options };
             plugins.completions[completion_index] = .{
                 .command = completion.command,
                 .provider = .{ .userdata = &plugins.entries[index], .complete = completeArguments },
@@ -82,12 +84,12 @@ pub fn load(plugins: *Plugins, specs: []const Config.Plugin) !void {
             index += 1;
         }
         if (spec.prompt) |prompt| {
-            plugins.entries[index] = .{ .module = module, .entry = prompt.entry, .limits = limits };
+            plugins.entries[index] = .{ .module = module, .entry = prompt.entry, .limits = limits, .options = spec.options };
             plugins.prompt = .{ .userdata = &plugins.entries[index], .render = renderPrompt };
             index += 1;
         }
         if (spec.diagnostics) |diagnostic| {
-            plugins.diagnostics[diagnostic_index] = .{ .module = module, .entry = diagnostic.entry, .limits = limits };
+            plugins.diagnostics[diagnostic_index] = .{ .module = module, .entry = diagnostic.entry, .limits = limits, .options = spec.options };
             diagnostic_index += 1;
         }
     }
@@ -109,6 +111,7 @@ fn run(userdata: ?*anyopaque, context: habush.Command.Context, argv: []const []c
     const entry: *const Entry = @ptrCast(@alignCast(userdata.?));
     const status = wasm.command.run(entry.module, context.gpa, entry.entry, argv, .{
         .limits = entry.limits,
+        .options = entry.options,
         .stdin = context.io.stdin,
         .stdout = context.io.stdout,
         .stderr = context.io.stderr,
@@ -141,7 +144,7 @@ fn renderPrompt(userdata: ?*anyopaque, arena: std.mem.Allocator, context: edit.P
     const entry: *const Entry = @ptrCast(@alignCast(userdata.?));
     var limits = uiLimits(entry.*);
     limits.response_bytes = 4096;
-    return wasm.prompt.render(entry.module, arena, entry.entry, context, .{ .limits = limits }) catch |err| switch (err) {
+    return wasm.prompt.render(entry.module, arena, entry.entry, context, .{ .limits = limits, .options = entry.options }) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.Unavailable,
@@ -163,7 +166,7 @@ fn diagnose(userdata: ?*anyopaque, arena: std.mem.Allocator, request: edit.Diagn
         var limits = uiLimits(entry);
         limits.timeout.?.nanoseconds = @min(limits.timeout.?.nanoseconds, remaining);
         limits.response_bytes = 8192;
-        const result = wasm.diagnostic.collect(entry.module, arena, entry.entry, request, .{ .limits = limits }) catch |err| switch (err) {
+        const result = wasm.diagnostic.collect(entry.module, arena, entry.entry, request, .{ .limits = limits, .options = entry.options }) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
             error.OutOfMemory => return error.OutOfMemory,
             else => continue,
@@ -200,6 +203,7 @@ fn completeArguments(userdata: ?*anyopaque, request: habush.Completion.Provider.
     const limits = uiLimits(entry.*);
     var result = wasm.completion.collect(entry.module, collector.gpa, entry.entry, request.prefix, args, .{
         .limits = limits,
+        .options = entry.options,
     }, std.math.cast(u32, collector.limits.candidates) orelse std.math.maxInt(u32)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Canceled => return error.Canceled,
