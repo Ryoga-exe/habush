@@ -46,19 +46,11 @@ pub fn main(init: std.process.Init) !habush.runtime.ExitStatus {
     // Ambient application settings and rc are interactive startup behavior.
     // An explicit --config is still validated for -c and script invocations.
     if (!startup.no_config and (interactive or startup.config_path != null)) {
-        const config_path = startup.config_path orelse try paths.configFile(arena);
-        if (config_path) |path| {
-            config = Config.read(gpa, io, path) catch |err| loaded: {
-                if (err == error.FileNotFound and startup.config_path == null) break :loaded .{};
-                if (err == error.OutOfMemory) return err;
-                try reportConfigError(stderr, path, err);
-                return 2;
-            };
-        }
+        config = (try Config.load(gpa, io, paths, startup.config_path, stderr)) orelse return 2;
     }
     if (interactive or startup.config_path != null) {
         config = config.withEnvironment(init.environ_map) catch |err| {
-            try reportConfigError(stderr, null, err);
+            try Config.reportError(stderr, null, err);
             return 2;
         };
     }
@@ -215,25 +207,6 @@ pub fn main(init: std.process.Init) !habush.runtime.ExitStatus {
             return shell.runSource(source, script.path);
         },
     };
-}
-
-fn reportConfigError(writer: *Io.Writer, path: ?[]const u8, err: anyerror) Io.Writer.Error!void {
-    const message = switch (err) {
-        error.InvalidLineEditSetting => "HABUSH_LINE_EDIT must be auto, on, or off",
-        error.InvalidShellIntegrationSetting => "HABUSH_SHELL_INTEGRATION must be auto, on, or off",
-        error.UnsupportedConfigVersion => "unsupported config version",
-        error.UnknownField => "unknown config field",
-        error.DuplicateField => "duplicate config field",
-        error.InvalidEnumTag => "expected auto, on, or off",
-        error.FileNotFound => "no such file or directory",
-        error.AccessDenied => "permission denied",
-        error.IsDir => "is a directory",
-        error.StreamTooLong => "config file is too large",
-        else => @errorName(err),
-    };
-    try writer.writeAll("habush: configuration: ");
-    if (path) |value| try writer.print("{s}: ", .{value});
-    try writer.print("{s}\n", .{message});
 }
 
 fn argumentSlices(

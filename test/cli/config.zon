@@ -1,0 +1,7 @@
+.{
+    .version = 1,
+    .line_edit = .off,
+    .shell_integration = .off,
+    .load_rc = false,
+    .completion_limits = .{ .candidates = 8 },
+}
