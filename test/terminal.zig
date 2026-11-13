@@ -165,6 +165,11 @@ pub fn main(init: std.process.Init) !void {
     if (args.len == 2) try std.testing.expect(std.mem.indexOf(u8, unicode_output, "\x1b[2D\x1b[Kか\u{3099}") != null);
     try std.testing.expect(std.mem.indexOf(u8, unicode_output, "UNICODE:か\u{3099}👩Z\r\n") != null);
 
+    try master.writeStreamingAll(io, "/bin/echo MIDDLE:日ab本\x02\x02Z\x7f\x1b[3~漢\x05\r");
+    const middle_output = try terminal.expect(ready);
+    if (args.len == 2) try std.testing.expect(std.mem.indexOf(u8, middle_output, "\x1b[KZb本\x1b[3D") != null);
+    try std.testing.expect(std.mem.indexOf(u8, middle_output, "MIDDLE:日a漢本\r\n") != null);
+
     if (args.len == 4) {
         try pluginScenario(io, master, &terminal, config_path.?);
     } else {
