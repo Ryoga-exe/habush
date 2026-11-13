@@ -76,10 +76,14 @@ zig-out/bin/habush --config examples/plugins/theme.zon
 ```
 
 It displays the directory name, previous exit status, duration, active job count,
-and optional Git branch or detached commit. It reads only its own settings
-through `habush.option`. `.prompt_context.git = true` opts into CLI collection of
-bounded Git HEAD metadata, including linked worktrees; dirty state is not collected.
-Collection runs once per prompt, separately from rendering, without running Git.
+and optional Git branch or detached commit. The theme reads its settings through
+`habush.option` and discovers Git metadata itself through `habush.read_file`.
+Its `git` option defaults to `false`; enabling it also requires `context` and
+`fs_read` grants with a `read_directory` covering the repository. The example
+grants only this checkout. Discovery walks parents within that grant, and follows
+linked worktree metadata only when its target is also inside the grant. Missing
+or denied metadata simply omits Git information. No Git-specific settings or
+metadata are passed by the shell; dirty state is not collected.
 Environment discovery and subprocess execution are not provided. Prompt failures use the configured
 literal prompt (or `habush> `). The final prompt declaration wins.
 
@@ -87,6 +91,7 @@ Change the theme without rebuilding its Wasm by editing `theme.zon`:
 
 ```zon
 .options = .{
+    .{ "git", "true" },
     .{ "symbol", ">" },
     .{ "cwd_color", "cyan" },
     .{ "success_color", "green" },
@@ -116,10 +121,11 @@ also cap their guest deadline at 100 ms. Results are allocated in the caller's
 arena and stay alive for their display scope. Rendering owns ANSI styles, Unicode
 width/clipping, and OSC; guest text cannot emit terminal commands.
 
-Their schemas use the existing byte-list transport; Core ABI remains v0:
+Their schemas use the existing byte-list transport; Core ABI remains v0.
+Prompt v1 is no longer emitted; update existing theme decoders to v2 and rebuild.
 
-- Prompt request v1: `["1", cwd, status, duration_ms, jobs, git_root, git_branch, git_commit]`.
-  Numbers are decimal ASCII; unknown duration and absent Git fields are empty.
+- Prompt request v2: `["2", cwd, status, duration_ms, jobs]`.
+  Numbers are decimal ASCII; unknown duration is empty.
   Jobs counts running and stopped jobs, excluding completed ones. Reply:
   `[style, text, style, text, ...]`, up to 16 spans and 1024 text bytes. A style is
   three ASCII digits: foreground, background, bold. Colors are 0=default,
@@ -171,9 +177,12 @@ zig build -Dwasm-plugins=true
 zig-out/bin/habush --config examples/plugins/read-file.zon -c 'hb-read theme.zon'
 ```
 
-The demo prints that file and exits 7 like its other command entry. `../` and
-absolute paths fail. The initial broker supports native Linux, macOS, and
-FreeBSD, using directory handles and no-follow component traversal. Child paths
+The demo prints that file and exits 7 like its other command entry; missing,
+non-file, or denied paths report an error and exit 1. Relative names start at
+the granted directory. Absolute names must lie within its current physical path;
+the broker translates them to handle-relative names before opening anything.
+Names outside the grant and `../` steps fail. The broker supports native Linux,
+macOS, and FreeBSD, using directory handles and no-follow component traversal. Child paths
 use `/`; empty/parent/dot steps, NUL, backslashes, colons, symlinks, and special
 files are rejected. Other targets report unsupported instead of falling back
 to unrestricted access. The Wasmtime SDK still supports only the two targets
@@ -192,7 +201,7 @@ tool adapters can use the same attenuation and read boundary:
 
 ```zig
 const tool_scope = parent_scope.narrow(.{ .fs_read = true });
-const count = try tool_scope.readFile(io, relative_path, output_buffer);
+const count = try tool_scope.readFile(io, path, output_buffer);
 ```
 
 The parent keeps the directory alive until all operations have joined. The
@@ -241,8 +250,12 @@ or expired call fails the invocation. Settings are available during initializati
 and never include the full configuration, environment, or another plugin's values.
 
 `read_file` copies a regular file from the granted directory, returning the byte
-count. The file must fit the supplied capacity and remaining input budget;
-failures trap the invocation. It exposes no write/open-handle operation.
+count, or -1 for a missing path, -2 for a non-file path, and -3 for denied access
+(including a missing grant). These errors leave the plugin running so it can
+omit unavailable information. The file must fit the supplied capacity and
+remaining input budget. Invalid guest memory, exceeded budgets, cancellation,
+deadlines, and other I/O failures still fail the invocation. It exposes no
+write/open-handle operation.
 `capabilities` returns bits 0..5 for stdin, stdout, stderr, fs_read, source,
 context. Stream/file bits are removed when the call lacks the corresponding
 resource; reserved bits are zero.

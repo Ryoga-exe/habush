@@ -45,7 +45,6 @@ history_settings: @import("Config.zig").History = .{},
 history_path: ?[]const u8 = null,
 next_input_id: u64 = 0,
 last_duration_ns: ?u64 = null,
-prompt_git: bool = false,
 jobs_mutex: Io.Mutex = .init,
 
 const Editing = struct {
@@ -299,7 +298,7 @@ fn readCommand(self: *Shell) !?CommandInput {
     var primary_prompt = self.prompt;
     if (self.interactive) {
         if (self.prompt_provider) |provider| {
-            const generated = provider.render(provider.userdata, prompt_arena.allocator(), try self.promptContext(prompt_arena.allocator())) catch |err| switch (err) {
+            const generated = provider.render(provider.userdata, prompt_arena.allocator(), try self.promptContext()) catch |err| switch (err) {
                 error.Canceled, error.OutOfMemory => return err,
                 error.Unavailable => self.prompt,
             };
@@ -615,7 +614,7 @@ fn printPrompt(self: *Shell, continuation: bool, prompt: edit.Prompt) !void {
     try self.stderr.flush();
 }
 
-fn promptContext(self: *Shell, arena: std.mem.Allocator) !edit.Prompt.Context {
+fn promptContext(self: *Shell) !edit.Prompt.Context {
     var context: edit.Prompt.Context = .{
         .cwd = self.session.workingDirectory(),
         .status = self.session.lastResult().status,
@@ -627,12 +626,6 @@ fn promptContext(self: *Shell, arena: std.mem.Allocator) !edit.Prompt.Context {
             defer self.jobs_mutex.unlock(io);
             for (self.session.jobs.entries.items) |entry| if (entry.pipeline.state() != .completed) {
                 context.jobs += 1;
-            };
-        }
-        if (self.prompt_git and self.session.context.activeSandbox() == .inherit) {
-            if (context.cwd) |cwd| context.git = @import("prompt_context.zig").git(arena, io, cwd) catch |err| switch (err) {
-                error.Canceled, error.OutOfMemory => return err,
-                else => null,
             };
         }
     }

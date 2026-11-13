@@ -64,9 +64,8 @@ it grants no new permissions to plugins. See [plugin examples](plugins/README.md
 `style.background` (`default`, black, red, green, yellow, blue, magenta, cyan,
 white) and `style.bold`. Prompts are clipped to terminal width; control bytes
 are displayed visibly. ANSI and OSC in text are never executed. Embedders can
-also supply an `edit.Prompt.Provider`, receiving cwd/status, duration, job count,
-and optional Git metadata, and allocating the
-result in the caller's arena. An unavailable or invalid result uses the configured
+also supply an `edit.Prompt.Provider`, which receives cwd/status, duration, and
+job count and allocates the result in the caller's arena. An unavailable or invalid result uses the configured
 prompt. The provider runs once before collecting an input, including continuation
 lines, and does not change the Session's status.
 

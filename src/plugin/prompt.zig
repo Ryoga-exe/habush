@@ -1,4 +1,4 @@
-//! Prompt schema v1 context in; alternating style/text byte-list items out.
+//! Prompt schema v2 shell context in; alternating style/text byte-list items out.
 const std = @import("std");
 const Host = @import("Host.zig");
 const protocol = @import("protocol.zig");
@@ -13,11 +13,7 @@ pub fn render(module: *const Host.Module, arena: std.mem.Allocator, entry: []con
     const duration = if (context.duration_ns) |ns| std.fmt.bufPrint(&duration_buffer, "{d}", .{ns / std.time.ns_per_ms}) catch unreachable else "";
     var jobs_buffer: [20]u8 = undefined;
     const jobs = if (visible) std.fmt.bufPrint(&jobs_buffer, "{d}", .{context.jobs}) catch unreachable else "";
-    const git = context.git;
-    const request = try protocol.encode(arena, &.{&.{
-        "1",                               context.cwd orelse "",                         code,                                          duration, jobs,
-        if (git) |info| info.root else "", if (git) |info| info.branch orelse "" else "", if (git) |info| info.commit orelse "" else "",
-    }}, scope.limits.request_bytes);
+    const request = try protocol.encode(arena, &.{&.{ "2", context.cwd orelse "", code, duration, jobs }}, scope.limits.request_bytes);
     const bytes = try module.invoke(arena, entry, request, scope);
     return decode(arena, bytes);
 }

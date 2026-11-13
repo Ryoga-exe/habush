@@ -29,9 +29,13 @@ const fixture =
     \\   i32.const 128 i32.const 6 local.get $out i32.const 64 call $option local.set $n
     \\   local.get $n i32.const 0 i32.lt_s if (result i64) i64.const 0 else
     \\     local.get $n i64.extend_i32_u i64.const 32 i64.shl local.get $out i64.extend_i32_u i64.or end)
-    \\ (func (export "read_file") (param i32 i32) (result i64)
-    \\   local.get 0 local.get 1 i32.const 1024 i32.const 64 call $read_file
-    \\   i64.extend_i32_u i64.const 32 i64.shl i64.const 1024 i64.or)
+    \\ (func (export "read_file") (param i32 i32) (result i64) (local $n i32)
+    \\   local.get 0 local.get 1 i32.const 1024 i32.const 64 call $read_file local.set $n
+    \\   local.get $n i32.const 0 i32.lt_s if
+    \\     i32.const 1024 local.get $n i32.store i32.const 4 local.set $n end
+    \\   local.get $n i64.extend_i32_u i64.const 32 i64.shl i64.const 1024 i64.or)
+    \\ (func (export "bad_file_pointer") (param i32 i32) (result i64)
+    \\   local.get 0 local.get 1 i32.const 65535 i32.const 64 call $read_file drop i64.const 0)
     \\ (func (export "capabilities") (param i32 i32) (result i64)
     \\   i32.const 1024 call $capabilities i32.store8 i64.const 4294968320)
     \\ (func (export "redacted_prompt") (param i32 i32) (result i64)
@@ -73,6 +77,13 @@ fn load(host: *Host, wat: []const u8) !Host.Module {
     return host.load(wasm.data[0..wasm.size]);
 }
 
+fn expectFileStatus(module: *Host.Module, path: []const u8, scope: Host.Scope, expected: i32) !void {
+    const bytes = try module.invoke(std.testing.allocator, "read_file", path, scope);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqual(@as(usize, 4), bytes.len);
+    try std.testing.expectEqual(expected, std.mem.readInt(i32, bytes[0..4], .little));
+}
+
 test "declared file reads require grants and parent scope, redact context, and reject special files" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -86,37 +97,49 @@ test "declared file reads require grants and parent scope, redact context, and r
     module.declared = .{ .fs_read = true };
     module.granted = .{ .fs_read = true };
     const scope: Host.Scope = .{ .capabilities = .{ .permissions = .{ .fs_read = true }, .directory = tmp.dir } };
+    try std.testing.expectError(error.InvalidResponse, module.invoke(gpa, "bad_file_pointer", "file", scope));
+    var limited = scope;
+    limited.limits.input_bytes = 63;
+    try std.testing.expectError(error.LimitExceeded, module.invoke(gpa, "read_file", "file", limited));
     const bytes = try module.invoke(gpa, "read_file", "file", scope);
     defer gpa.free(bytes);
     try std.testing.expectEqualStrings("allowed", bytes);
     const mask = try module.invoke(gpa, "capabilities", "", scope);
     defer gpa.free(mask);
     try std.testing.expectEqualSlices(u8, &.{8}, mask);
-    try std.testing.expectError(error.PermissionDenied, module.invoke(gpa, "read_file", "../outside", scope));
+    try expectFileStatus(&module, "../outside", scope, -3);
+    try expectFileStatus(&module, "missing", scope, -1);
+    try tmp.dir.createDir(io, "directory", .default_dir);
+    try expectFileStatus(&module, "directory", scope, -2);
     var narrowed = scope;
     narrowed.capabilities = scope.capabilities.narrow(.{}).narrow(.all);
-    try std.testing.expectError(error.PermissionDenied, module.invoke(gpa, "read_file", "file", narrowed));
-    try std.testing.expectError(error.PermissionDenied, module.invoke(gpa, "read_file", "file", .{}));
+    try expectFileStatus(&module, "file", narrowed, -3);
+    try expectFileStatus(&module, "file", .{}, -3);
     try std.testing.expectError(error.PermissionDenied, completion.collect(&module, gpa, "spin", "", &.{}, scope, 128));
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const prompt = try @import("prompt.zig").render(&module, arena.allocator(), "redacted_prompt", .{ .cwd = "/private", .status = 7 }, .{});
     try std.testing.expectEqualStrings("safe", prompt.spans[0].text);
     module.granted = .{};
-    try std.testing.expectError(error.PermissionDenied, module.invoke(gpa, "read_file", "file", scope));
+    try expectFileStatus(&module, "file", scope, -3);
     module.granted = .{ .fs_read = true };
     module.declared = .{};
-    try std.testing.expectError(error.PermissionDenied, module.invoke(gpa, "read_file", "file", scope));
+    try expectFileStatus(&module, "file", scope, -3);
     module.declared = .{ .fs_read = true };
     const directory_path = try tmp.dir.realPathFileAlloc(io, ".", gpa);
     defer gpa.free(directory_path);
+    const absolute_file = try std.fs.path.join(gpa, &.{ directory_path, "file" });
+    defer gpa.free(absolute_file);
+    const absolute_bytes = try module.invoke(gpa, "read_file", absolute_file, scope);
+    defer gpa.free(absolute_bytes);
+    try std.testing.expectEqualStrings("allowed", absolute_bytes);
     const fifo_path = try std.fs.path.join(gpa, &.{ directory_path, "pipe" });
     defer gpa.free(fifo_path);
     const fifo_z = try gpa.dupeSentinel(u8, fifo_path, 0);
     defer gpa.free(fifo_z);
     if (mkfifo(fifo_z, 0o600) != 0) return error.CreateFifoFailed;
     var timed = scope;
-    try std.testing.expectError(error.PermissionDenied, module.invoke(gpa, "read_file", "pipe", timed));
+    try expectFileStatus(&module, "pipe", timed, -3);
     timed.limits.timeout = .fromMilliseconds(0);
     try std.testing.expectError(error.Timeout, module.invoke(gpa, "read_file", "file", timed));
     var unsupported = try load(&host,

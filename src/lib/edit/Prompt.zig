@@ -12,9 +12,7 @@ pub const Context = struct {
     status: u8,
     duration_ns: ?u64 = null,
     jobs: usize = 0,
-    git: ?Git = null,
 };
-pub const Git = struct { root: []const u8, branch: ?[]const u8 = null, commit: ?[]const u8 = null };
 pub const Error = std.mem.Allocator.Error || error{ Canceled, Unavailable };
 pub const Provider = struct {
     userdata: ?*anyopaque = null,

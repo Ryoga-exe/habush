@@ -121,6 +121,12 @@ pub fn build(b: *std.Build) !void {
     const edit_tests = b.addTest(.{ .root_module = habush_edit });
     const run_edit_tests = b.addRunArtifact(edit_tests);
     test_step.dependOn(&run_edit_tests.step);
+    const guest_git_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("examples/plugins/git.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    test_step.dependOn(&b.addRunArtifact(guest_git_tests).step);
     var plugin_module: ?*std.Build.Module = null;
     if (wasmtime_sdk) |sdk| {
         const headers = b.addTranslateC(.{

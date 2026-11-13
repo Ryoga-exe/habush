@@ -180,7 +180,6 @@ pub fn main(init: std.process.Init) !habush.runtime.ExitStatus {
         .keybinds = try habush.edit.Keybind.compile(arena, config.keybinds),
         .prompt = config.prompt orelse habush.edit.Prompt.primary,
         .prompt_provider = if (features.wasm_plugins) plugins.prompt else null,
-        .prompt_git = config.prompt_context.git,
         .diagnostics = config.diagnostics,
         .diagnostic_provider = if (features.wasm_plugins and plugins.diagnostics.len != 0) plugins.diagnosticProvider() else null,
         .completion_limits = config.completion_limits,

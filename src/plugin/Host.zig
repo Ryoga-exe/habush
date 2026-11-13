@@ -337,16 +337,23 @@ fn capabilities(data: ?*anyopaque, _: ?*c.wasmtime_caller_t, _: [*c]const c.wasm
 
 fn readFile(data: ?*anyopaque, caller: ?*c.wasmtime_caller_t, args: [*c]const c.wasmtime_val_t, _: usize, results: [*c]c.wasmtime_val_t, _: usize) callconv(.c) ?*c.wasm_trap_t {
     const call: *Call = @ptrCast(@alignCast(data.?));
-    const length = readFileBytes(call, caller.?, @bitCast(args[0].of.i32), @bitCast(args[1].of.i32), @bitCast(args[2].of.i32), @bitCast(args[3].of.i32)) catch |err| {
-        call.failure = err;
-        const message = "habush: plugin file read failed";
-        return c.wasmtime_trap_new(message.ptr, message.len);
+    const length = readFileBytes(call, caller.?, @bitCast(args[0].of.i32), @bitCast(args[1].of.i32), @bitCast(args[2].of.i32), @bitCast(args[3].of.i32)) catch |err| switch (err) {
+        error.NotFound => @as(u32, @bitCast(@as(i32, -1))),
+        error.NotFile => @as(u32, @bitCast(@as(i32, -2))),
+        error.PermissionDenied => @as(u32, @bitCast(@as(i32, -3))),
+        else => |failure| {
+            call.failure = failure;
+            const message = "habush: plugin file read failed";
+            return c.wasmtime_trap_new(message.ptr, message.len);
+        },
     };
     results[0] = i32Value(length);
     return null;
 }
 
-fn grantedRead(scope: capability.Scope, io: std.Io, path: []const u8, buffer: []u8) Error!usize {
+const FileReadError = Error || error{ NotFound, NotFile };
+
+fn grantedRead(scope: capability.Scope, io: std.Io, path: []const u8, buffer: []u8) FileReadError!usize {
     return scope.readFile(io, path, buffer) catch |err| switch (err) {
         error.Unsupported => error.PermissionDenied,
         else => |other| other,
@@ -357,14 +364,14 @@ fn expire(io: std.Io, duration: std.Io.Duration) std.Io.Cancelable!void {
     return io.sleep(duration, .awake);
 }
 
-fn readFileBytes(call: *Call, caller: *c.wasmtime_caller_t, path_pointer: u32, path_length: u32, pointer: u32, capacity: u32) Error!u32 {
+fn readFileBytes(call: *Call, caller: *c.wasmtime_caller_t, path_pointer: u32, path_length: u32, pointer: u32, capacity: u32) FileReadError!u32 {
     try call.checkpoint();
     if (!call.scope.capabilities.permissions.fs_read or call.scope.capabilities.directory == null) return error.PermissionDenied;
     if (path_length > std.Io.Dir.max_path_bytes or capacity > call.scope.limits.input_bytes -| call.read) return error.LimitExceeded;
     const path = try callerBytes(caller, path_pointer, path_length);
     const buffer = try callerBytes(caller, pointer, capacity);
     const count = if (call.deadline) |deadline| read: {
-        const Result = union(enum) { read: Error!usize, expired: std.Io.Cancelable!void };
+        const Result = union(enum) { read: FileReadError!usize, expired: std.Io.Cancelable!void };
         var storage: [2]Result = undefined;
         var pending: std.Io.Select(Result) = .init(call.io, &storage);
         defer pending.cancelDiscard();

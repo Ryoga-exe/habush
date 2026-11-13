@@ -44,10 +44,11 @@ pub fn main(init: std.process.Init) !void {
         defer gpa.free(module_path);
         const theme_path = try Io.Dir.cwd().realPathFileAlloc(io, args[3], gpa);
         defer gpa.free(theme_path);
+        const checkout = try Io.Dir.cwd().realPathFileAlloc(io, ".", gpa);
+        defer gpa.free(checkout);
         try std.zon.stringify.serialize(.{
             .load_rc = false,
             .history = .{ .storage = .{ .enabled = false } },
-            .prompt_context = .{ .git = true },
             .keybinds = bindings,
             .plugins = .{
                 .{
@@ -65,7 +66,14 @@ pub fn main(init: std.process.Init) !void {
                     .grants = .{ .source = true },
                     .diagnostics = .{},
                 },
-                .{ .path = theme_path, .prompt = .{}, .declares = .{ .context = true }, .grants = .{ .context = true }, .options = .{ .{ "symbol", "THEME>" }, .{ "failure_color", "yellow" } } },
+                .{
+                    .path = theme_path,
+                    .prompt = .{},
+                    .declares = .{ .context = true, .fs_read = true },
+                    .grants = .{ .context = true, .fs_read = true },
+                    .read_directory = checkout,
+                    .options = .{ .{ "symbol", "THEME>" }, .{ "failure_color", "yellow" }, .{ "git", "true" } },
+                },
                 .{
                     .path = module_path,
                     .commands = .{.{ .name = "hb-read", .entry = "file" }},
@@ -363,7 +371,10 @@ fn logicalHistoryScenario(io: Io, master: Io.File, terminal: *Terminal) !void {
 
 fn pluginScenario(io: Io, master: Io.File, terminal: *Terminal, config_path: []const u8) !void {
     try master.writeStreamingAll(io, "origin=$PWD; cd /\r");
-    try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "\x1b[0;36;49;1m/\x1b[0m") != null);
+    const outside = try terminal.expect(ready);
+    const submitted = outside[(std.mem.lastIndexOf(u8, outside, "\x1b[?2004l") orelse return error.TestUnexpectedResult)..];
+    try std.testing.expect(std.mem.indexOf(u8, submitted, "\x1b[0;36;49;1m/\x1b[0m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, submitted, " git:") == null);
     var command_buffer: [256]u8 = undefined;
     const read_command = try std.fmt.bufPrint(&command_buffer, "hb-read {s}\r", .{std.fs.path.basename(config_path)});
     try master.writeStreamingAll(io, read_command);

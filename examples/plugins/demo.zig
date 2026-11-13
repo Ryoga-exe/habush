@@ -3,7 +3,7 @@ const std = @import("std");
 
 extern "habush" fn write(descriptor: u32, pointer: [*]const u8, length: u32) i32;
 extern "habush" fn read(descriptor: u32, pointer: [*]u8, length: u32) u32;
-extern "habush" fn read_file(path: [*]const u8, length: u32, output_buffer: [*]u8, capacity: u32) u32;
+extern "habush" fn read_file(path: [*]const u8, length: u32, output_buffer: [*]u8, capacity: u32) i32;
 
 var request_buffer: [64 * 1024]u8 = undefined;
 var reply_buffer: [4096]u8 = undefined;
@@ -86,7 +86,15 @@ export fn file(pointer: u32, length: u32) u64 {
     const path = take(&reader);
     if (reader.bufferedLen() != 0) @trap();
     const size = read_file(path.ptr, @intCast(path.len), &reply_buffer, reply_buffer.len);
-    output(reply_buffer[0..size]);
+    if (size < 0) {
+        output(switch (size) {
+            -1 => "file not found\n",
+            -2 => "not a regular file\n",
+            else => "permission denied\n",
+        });
+        return reply(&.{1});
+    }
+    output(reply_buffer[0..@intCast(size)]);
     return reply(&status);
 }
 
