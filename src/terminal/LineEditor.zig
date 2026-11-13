@@ -39,7 +39,8 @@ pub fn read(editor: LineEditor) !?[:0]u8 {
     };
     defer state.deinit();
     const buffer = &state.buffer;
-    var view: View = .{};
+    var view: View = .{ .frame = .init(editor.gpa) };
+    defer view.deinit();
     var diagnostic_arena: std.heap.ArenaAllocator = .init(editor.gpa);
     defer diagnostic_arena.deinit();
     var pending: [4]u8 = undefined;
@@ -104,7 +105,7 @@ pub fn read(editor: LineEditor) !?[:0]u8 {
                 .bell => try editor.output.writeByte(7),
                 .clear_screen => {
                     try editor.output.writeAll("\x1b[2J\x1b[H");
-                    view = .{};
+                    view.reset();
                 },
                 .submit => {
                     try view.finish(editor.output);
