@@ -26,9 +26,14 @@ pub const Completion = struct {
 const Entry = struct {
     module: *const wasm.Host.Module,
     entry: []const u8,
-    limits: wasm.Host.Limits,
-    options: []const [2][]const u8,
-    directory: ?std.Io.Dir,
+    settings: wasm.Host.Scope,
+
+    fn scope(entry: Entry, permissions: habush.capability.Set, cwd: ?[]const u8) wasm.Host.Scope {
+        var result = entry.settings;
+        result.capabilities.permissions = permissions;
+        result.capabilities.cwd = cwd;
+        return result;
+    }
 };
 
 /// The registry stays at this address until all Session/input tasks have ended.
@@ -63,31 +68,33 @@ pub fn load(plugins: *Plugins, specs: []const Config.Plugin) !void {
         const module = &plugins.modules.items[plugins.modules.items.len - 1];
         module.declared = spec.declares;
         module.granted = spec.grants;
-        const directory = if (spec.read_directory) |path| root: {
-            if (!habush.capability.directory_reads_supported) return error.UnsupportedCapability;
-            const handle = try std.Io.Dir.cwd().openDir(plugins.io, path, .{});
-            plugins.directories.appendAssumeCapacity(handle);
-            break :root handle;
-        } else null;
-        const limits: wasm.Host.Limits = .{
-            .fuel = spec.fuel,
-            .memory_bytes = spec.memory_bytes,
-            .timeout = .fromMilliseconds(spec.timeout_ms),
+        if ((spec.read_root != null or spec.read_ancestors != null) and !habush.capability.directory_reads_supported)
+            return error.UnsupportedCapability;
+        var settings: wasm.Host.Scope = .{
+            .limits = .{ .fuel = spec.fuel, .memory_bytes = spec.memory_bytes, .timeout = .fromMilliseconds(spec.timeout_ms) },
+            .options = spec.options,
+        };
+        if (spec.read_root) |root| switch (root) {
+            .fixed => |path| settings.capabilities.directory = try plugins.openReadDirectory(path),
+            .cwd => settings.read_cwd = true,
+        };
+        if (spec.read_ancestors) |grant| settings.capabilities.ancestor_files = .{
+            .within = try plugins.openReadDirectory(grant.within),
+            .path = grant.within,
+            .files = grant.files,
         };
         for (spec.commands) |command| {
             plugins.entries[index] = .{
                 .module = module,
                 .entry = command.entry,
-                .limits = limits,
-                .options = spec.options,
-                .directory = directory,
+                .settings = settings,
             };
             plugins.commands[command_index] = .{ .name = command.name, .userdata = &plugins.entries[index], .run = run };
             command_index += 1;
             index += 1;
         }
         for (spec.completions) |completion| {
-            plugins.entries[index] = .{ .module = module, .entry = completion.entry, .limits = limits, .options = spec.options, .directory = directory };
+            plugins.entries[index] = .{ .module = module, .entry = completion.entry, .settings = settings };
             plugins.completions[completion_index] = .{
                 .command = completion.command,
                 .provider = .{ .userdata = &plugins.entries[index], .complete = completeArguments },
@@ -96,16 +103,24 @@ pub fn load(plugins: *Plugins, specs: []const Config.Plugin) !void {
             index += 1;
         }
         if (spec.prompt) |prompt| {
-            plugins.entries[index] = .{ .module = module, .entry = prompt.entry, .limits = limits, .options = spec.options, .directory = directory };
+            plugins.entries[index] = .{ .module = module, .entry = prompt.entry, .settings = settings };
             plugins.prompt = .{ .userdata = &plugins.entries[index], .render = renderPrompt };
             index += 1;
         }
         if (spec.diagnostics) |diagnostic| {
-            plugins.diagnostics[diagnostic_index] = .{ .module = module, .entry = diagnostic.entry, .limits = limits, .options = spec.options, .directory = directory };
+            plugins.diagnostics[diagnostic_index] = .{ .module = module, .entry = diagnostic.entry, .settings = settings };
             diagnostic_index += 1;
         }
     }
     plugins.loading_path = null;
+}
+
+fn openReadDirectory(plugins: *Plugins, path: []const u8) !std.Io.Dir {
+    if (!habush.capability.directory_reads_supported) return error.UnsupportedCapability;
+    const directory = try std.Io.Dir.cwd().openDir(plugins.io, path, .{});
+    errdefer directory.close(plugins.io);
+    try plugins.directories.append(plugins.gpa, directory);
+    return directory;
 }
 
 pub fn deinit(plugins: *Plugins) void {
@@ -123,14 +138,11 @@ pub fn deinit(plugins: *Plugins) void {
 
 fn run(userdata: ?*anyopaque, context: habush.Command.Context, argv: []const []const u8) habush.Command.Error!habush.Command.Outcome {
     const entry: *const Entry = @ptrCast(@alignCast(userdata.?));
-    const status = wasm.command.run(entry.module, context.gpa, entry.entry, argv, .{
-        .limits = entry.limits,
-        .options = entry.options,
-        .capabilities = .{ .permissions = .{ .stdin = true, .stdout = true, .stderr = true, .fs_read = true }, .directory = entry.directory },
-        .stdin = context.io.stdin,
-        .stdout = context.io.stdout,
-        .stderr = context.io.stderr,
-    }) catch |err| switch (err) {
+    var scope = entry.scope(.{ .stdin = true, .stdout = true, .stderr = true, .fs_read = true }, context.cwd);
+    scope.stdin = context.io.stdin;
+    scope.stdout = context.io.stdout;
+    scope.stderr = context.io.stderr;
+    const status = wasm.command.run(entry.module, context.gpa, entry.entry, argv, scope) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Canceled => return error.Canceled,
         error.Timeout => return .{ .failed = .timeout },
@@ -149,7 +161,7 @@ pub fn provider(plugins: *Plugins) habush.Completion.Provider {
 }
 
 fn uiLimits(entry: Entry) wasm.Host.Limits {
-    var limits = entry.limits;
+    var limits = entry.settings.limits;
     const budget: std.Io.Duration = .fromMilliseconds(100);
     if (limits.timeout == null or limits.timeout.?.nanoseconds > budget.nanoseconds) limits.timeout = budget;
     return limits;
@@ -157,13 +169,10 @@ fn uiLimits(entry: Entry) wasm.Host.Limits {
 
 fn renderPrompt(userdata: ?*anyopaque, arena: std.mem.Allocator, context: edit.Prompt.Context) edit.Prompt.Error!edit.Prompt {
     const entry: *const Entry = @ptrCast(@alignCast(userdata.?));
-    var limits = uiLimits(entry.*);
-    limits.response_bytes = 4096;
-    return wasm.prompt.render(entry.module, arena, entry.entry, context, .{
-        .limits = limits,
-        .options = entry.options,
-        .capabilities = .{ .permissions = .{ .context = true, .fs_read = true }, .directory = entry.directory },
-    }) catch |err| switch (err) {
+    var scope = entry.scope(.{ .context = true, .fs_read = true }, context.cwd);
+    scope.limits = uiLimits(entry.*);
+    scope.limits.response_bytes = 4096;
+    return wasm.prompt.render(entry.module, arena, entry.entry, context, scope) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.Unavailable,
@@ -185,11 +194,9 @@ fn diagnose(userdata: ?*anyopaque, arena: std.mem.Allocator, request: edit.Diagn
         var limits = uiLimits(entry);
         limits.timeout.?.nanoseconds = @min(limits.timeout.?.nanoseconds, remaining);
         limits.response_bytes = 8192;
-        const result = wasm.diagnostic.collect(entry.module, arena, entry.entry, request, .{
-            .limits = limits,
-            .options = entry.options,
-            .capabilities = .{ .permissions = .{ .source = true, .fs_read = true }, .directory = entry.directory },
-        }) catch |err| switch (err) {
+        var scope = entry.scope(.{ .source = true, .fs_read = true }, request.cwd);
+        scope.limits = limits;
+        const result = wasm.diagnostic.collect(entry.module, arena, entry.entry, request, scope) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
             error.OutOfMemory => return error.OutOfMemory,
             else => continue,
@@ -223,12 +230,9 @@ fn completeArguments(userdata: ?*anyopaque, request: habush.Completion.Provider.
         error.UnsupportedContext => return,
     };
     if (args.len == 0) return;
-    const limits = uiLimits(entry.*);
-    var result = wasm.completion.collect(entry.module, collector.gpa, entry.entry, request.prefix, args, .{
-        .limits = limits,
-        .options = entry.options,
-        .capabilities = .{ .permissions = .{ .source = true, .fs_read = true }, .directory = entry.directory },
-    }, std.math.cast(u32, collector.limits.candidates) orelse std.math.maxInt(u32)) catch |err| switch (err) {
+    var scope = entry.scope(.{ .source = true, .fs_read = true }, request.cwd);
+    scope.limits = uiLimits(entry.*);
+    var result = wasm.completion.collect(entry.module, collector.gpa, entry.entry, request.prefix, args, scope, std.math.cast(u32, collector.limits.candidates) orelse std.math.maxInt(u32)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Canceled => return error.Canceled,
         else => return error.Unavailable,

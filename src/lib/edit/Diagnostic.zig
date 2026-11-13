@@ -8,7 +8,12 @@ severity: Severity = .warning,
 message: []const u8,
 
 pub const Severity = enum { note, warning, @"error" };
-pub const Request = struct { source: []const u8, revision: u64 };
+pub const Request = struct {
+    source: []const u8,
+    revision: u64,
+    /// Trusted host context; adapters do not serialize this into guest requests.
+    cwd: ?[]const u8 = null,
+};
 pub const Error = std.mem.Allocator.Error || error{ Canceled, Unavailable };
 /// Result items and messages live in the caller's arena until the next query.
 pub const Provider = struct {

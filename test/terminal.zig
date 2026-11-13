@@ -71,7 +71,7 @@ pub fn main(init: std.process.Init) !void {
                     .prompt = .{},
                     .declares = .{ .context = true, .fs_read = true },
                     .grants = .{ .context = true, .fs_read = true },
-                    .read_directory = checkout,
+                    .read_ancestors = .{ .from = .cwd, .within = checkout, .files = .{ ".git", ".git/HEAD" } },
                     .options = .{ .{ "symbol", "THEME>" }, .{ "failure_color", "yellow" }, .{ "git", "true" } },
                 },
                 .{
@@ -79,7 +79,14 @@ pub fn main(init: std.process.Init) !void {
                     .commands = .{.{ .name = "hb-read", .entry = "file" }},
                     .declares = .{ .fs_read = true, .stdout = true },
                     .grants = .{ .fs_read = true, .stdout = true },
-                    .read_directory = std.fs.path.dirname(config_path.?).?,
+                    .read_root = .{ .fixed = std.fs.path.dirname(config_path.?).? },
+                },
+                .{
+                    .path = module_path,
+                    .commands = .{.{ .name = "hb-read-cwd", .entry = "file" }},
+                    .declares = .{ .fs_read = true, .stdout = true },
+                    .grants = .{ .fs_read = true, .stdout = true },
+                    .read_root = .cwd,
                 },
             },
         }, .{}, &config.writer);
@@ -378,8 +385,17 @@ fn pluginScenario(io: Io, master: Io.File, terminal: *Terminal, config_path: []c
     var command_buffer: [256]u8 = undefined;
     const read_command = try std.fmt.bufPrint(&command_buffer, "hb-read {s}\r", .{std.fs.path.basename(config_path)});
     try master.writeStreamingAll(io, read_command);
-    try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "read_directory") != null);
+    try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "read_root") != null);
     try master.writeStreamingAll(io, "hb-read ../etc/passwd\r");
+    try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "permission denied") != null);
+    try master.writeStreamingAll(io, "cd \"$origin\"\r");
+    _ = try terminal.expect(ready);
+    try master.writeStreamingAll(io, "cd examples; hb-read-cwd plugins/theme.zon\r");
+    const nested = try terminal.expect(ready);
+    try std.testing.expect(std.mem.indexOf(u8, nested, "read_ancestors") != null);
+    const nested_prompt = nested[(std.mem.lastIndexOf(u8, nested, "\x1b[?2004l") orelse return error.TestUnexpectedResult)..];
+    try std.testing.expect(std.mem.indexOf(u8, nested_prompt, " git:") != null);
+    try master.writeStreamingAll(io, "hb-read-cwd ../build.zig\r");
     try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "permission denied") != null);
     try master.writeStreamingAll(io, "cd \"$origin\"\r");
     _ = try terminal.expect(ready);

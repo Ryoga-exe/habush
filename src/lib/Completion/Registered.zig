@@ -33,7 +33,11 @@ fn complete(userdata: ?*anyopaque, request: Provider.Request, collector: *Provid
     if (args.len == 0) return;
     const handler = registered.session.state.completions.get(args[0]) orelse return;
     switch (handler) {
-        .provider => |callback| try callback.complete(callback.userdata, request, collector),
+        .provider => |callback| {
+            var scoped = request;
+            scoped.cwd = registered.session.workingDirectory();
+            try callback.complete(callback.userdata, scoped, collector);
+        },
         .function => |name| {
             const argv = try scratch.allocator().alloc([]const u8, args.len + 2);
             argv[0] = name;

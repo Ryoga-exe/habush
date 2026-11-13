@@ -26,7 +26,12 @@ pub const Plugin = struct {
     path: []const u8,
     declares: @import("habush").capability.Set = .{},
     grants: @import("habush").capability.Set = .{},
-    read_directory: ?[]const u8 = null,
+    read_root: ?union(enum) { fixed: []const u8, cwd } = null,
+    read_ancestors: ?struct {
+        from: enum { cwd } = .cwd,
+        within: []const u8,
+        files: []const []const u8,
+    } = null,
     /// Plugin-defined UTF-8/byte settings; never the app's full configuration.
     options: []const [2][]const u8 = &.{},
     commands: []const Command = &.{},
@@ -67,8 +72,15 @@ pub fn parse(options: std.zon.parse.Options) !Config {
     for (config.plugins, 0..) |plugin, plugin_index| {
         const permissions = @import("habush").capability.Set;
         if (!permissions.all.contains(plugin.declares) or !plugin.declares.contains(plugin.grants) or
-            plugin.grants.fs_read != (plugin.read_directory != null)) return error.InvalidPluginPermissions;
-        if (plugin.read_directory) |root| if (!validString(root)) return error.InvalidPluginPermissions;
+            plugin.grants.fs_read != (plugin.read_root != null or plugin.read_ancestors != null)) return error.InvalidPluginPermissions;
+        if (plugin.read_root) |root| switch (root) {
+            .fixed => |path| if (!validString(path)) return error.InvalidPluginPermissions,
+            .cwd => {},
+        };
+        if (plugin.read_ancestors) |grant| {
+            if (!validString(grant.within) or grant.files.len == 0 or grant.files.len > 32) return error.InvalidPluginPermissions;
+            for (grant.files) |file| if (!@import("habush").capability.validRelativePath(file)) return error.InvalidPluginPermissions;
+        }
         var option_bytes: usize = 0;
         if (plugin.options.len > 32) return error.InvalidPluginOptions;
         for (plugin.options, 0..) |option, index| {
@@ -120,9 +132,13 @@ fn read(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, path: []co
     for (config.plugins) |*plugin| {
         if (!std.fs.path.isAbsolute(plugin.path))
             plugin.path = try std.fs.path.join(arena, &.{ std.fs.path.dirname(path) orelse ".", plugin.path });
-        if (plugin.read_directory) |root| if (!std.fs.path.isAbsolute(root)) {
+        if (plugin.read_root) |*root| if (root.* == .fixed and !std.fs.path.isAbsolute(root.fixed)) {
             const base = try std.Io.Dir.cwd().realPathFileAlloc(io, std.fs.path.dirname(path) orelse ".", arena);
-            plugin.read_directory = try std.fs.path.join(arena, &.{ base, root });
+            root.fixed = try std.fs.path.resolve(arena, &.{ base, root.fixed });
+        };
+        if (plugin.read_ancestors) |*grant| if (!std.fs.path.isAbsolute(grant.within)) {
+            const base = try std.Io.Dir.cwd().realPathFileAlloc(io, std.fs.path.dirname(path) orelse ".", arena);
+            grant.within = try std.fs.path.resolve(arena, &.{ base, grant.within });
         };
     }
     if (config.history.storage.path) |history_path| {
@@ -159,7 +175,7 @@ pub fn reportError(writer: *std.Io.Writer, path: ?[]const u8, err: anyerror) std
         error.InvalidHistoryConfiguration => "invalid history path or size (memory at most 64 MiB; storage 13 bytes to 64 MiB)",
         error.InvalidPluginConfiguration => "plugin paths, command names, and entries must be nonempty and valid",
         error.InvalidPluginOptions => "plugin options require unique nonempty keys, no NUL, at most 32 pairs and 4096 bytes",
-        error.InvalidPluginPermissions => "plugin grants must fit their declaration; fs_read requires a read_directory grant",
+        error.InvalidPluginPermissions => "plugin grants must fit their declaration; fs_read requires a valid read_root or read_ancestors grant",
         error.ReservedPluginCommand => "plugin command name is reserved for a builtin",
         error.DuplicatePluginCommand => "duplicate plugin command name",
         error.FileNotFound => "no such file or directory",
@@ -346,6 +362,17 @@ test "ZON configuration validates fields and honors explicit paths without JSON 
     try std.testing.expectEqualStrings(">", presentation.plugins[0].options[0][1]);
     try std.testing.expectEqualStrings("diagnose", presentation.plugins[1].diagnostics.?.entry);
 
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.zon", .data =
+        \\.{ .plugins = .{
+        \\    .{ .path = "fixed.wasm", .prompt = .{}, .declares = .{ .fs_read = true }, .grants = .{ .fs_read = true }, .read_root = .{ .fixed = "data" } },
+        \\    .{ .path = "cwd.wasm", .prompt = .{}, .declares = .{ .fs_read = true }, .grants = .{ .fs_read = true }, .read_root = .cwd, .read_ancestors = .{ .from = .cwd, .within = "workspace", .files = .{ "metadata" } } },
+        \\} }
+    });
+    const access = (try load(gpa, arena, io, paths, null, &output.writer)).?;
+    try std.testing.expectEqualStrings(try std.fs.path.join(arena, &.{ directory_path, "data" }), access.plugins[0].read_root.?.fixed);
+    try std.testing.expect(access.plugins[1].read_root.? == .cwd);
+    try std.testing.expectEqualStrings(try std.fs.path.join(arena, &.{ directory_path, "workspace" }), access.plugins[1].read_ancestors.?.within);
+
     for ([_][]const u8{
         ".{\n    .line_edti = .off,\n}",
         ".{ .load_rc = true, .load_rc = false }",
@@ -361,6 +388,9 @@ test "ZON configuration validates fields and honors explicit paths without JSON 
         ".{ .plugins = .{.{ .path = \"theme.wasm\", .prompt = .{}, .options = .{ .{ \"\", \">\" } } }} }",
         ".{ .plugins = .{.{ .path = \"theme.wasm\", .prompt = .{}, .grants = .{ .context = true } }} }",
         ".{ .plugins = .{.{ .path = \"theme.wasm\", .prompt = .{}, .declares = .{ .fs_read = true }, .grants = .{ .fs_read = true } }} }",
+        ".{ .plugins = .{.{ .path = \"theme.wasm\", .prompt = .{}, .read_root = .cwd }} }",
+        ".{ .plugins = .{.{ .path = \"theme.wasm\", .prompt = .{}, .declares = .{ .fs_read = true }, .grants = .{ .fs_read = true }, .read_ancestors = .{ .within = \".\", .files = .{} } }} }",
+        ".{ .plugins = .{.{ .path = \"theme.wasm\", .prompt = .{}, .declares = .{ .fs_read = true }, .grants = .{ .fs_read = true }, .read_ancestors = .{ .within = \".\", .files = .{ \"../private\" } } }} }",
         ".{ .plugins = .{.{ .path = \"theme.wasm\", .prompt = .{ .entry = \"\" } }} }",
         ".{ .plugins = .{.{ .path = \"diagnostic.wasm\", .diagnostics = .{ .entry = \"\" } }} }",
         ".{ .prompt = .{ .spans = .{.{ .text = \"bad\\x00\" }} } }",

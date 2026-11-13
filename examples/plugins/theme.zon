@@ -4,8 +4,12 @@
         .path = "../../zig-out/bin/habush-theme.wasm",
         .declares = .{ .context = true, .fs_read = true },
         .grants = .{ .context = true, .fs_read = true },
-        // Only this checkout is readable; cd outside it omits Git information.
-        .read_directory = "../..",
+        // Only these metadata files, from cwd up to this workspace, are readable.
+        .read_ancestors = .{
+            .from = .cwd,
+            .within = "../../..",
+            .files = .{ ".git", ".git/HEAD" },
+        },
         .prompt = .{},
         .options = .{
             .{ "git", "true" },

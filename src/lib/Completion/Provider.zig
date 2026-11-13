@@ -15,6 +15,8 @@ pub const Error = std.mem.Allocator.Error || error{ Canceled, Unavailable, Inval
 
 pub const Request = struct {
     context: Completion,
+    /// Trusted host context for resolving call-scoped resources; not guest input.
+    cwd: ?[]const u8 = null,
     /// Literal, unexpanded prefix before the cursor. Borrowed like context.source.
     prefix: []const u8,
 };

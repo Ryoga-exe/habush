@@ -7,6 +7,7 @@ const CompletionService = @This();
 
 gpa: std.mem.Allocator,
 prefix: []const u8,
+cwd: ?[]const u8 = null,
 providers: []const habush.Completion.Provider,
 limits: habush.Completion.Provider.Limits = .{},
 active: ?habush.Completion.Provider.Result = null,
@@ -49,6 +50,7 @@ fn query(userdata: *anyopaque, request: edit.Completion.Request) edit.Completion
     var result = try habush.Completion.Provider.collect(service.gpa, .{
         .context = context,
         .prefix = prefix,
+        .cwd = service.cwd,
     }, service.providers, service.limits);
     errdefer result.deinit(service.gpa);
     try service.labels.ensureTotalCapacity(service.gpa, result.candidates.len);

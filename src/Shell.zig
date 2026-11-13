@@ -495,11 +495,12 @@ fn readInputLine(self: *Shell, prompt: edit.Prompt, prefix: []const u8, allow_co
         var completion: AsyncCompletion = .{ .io = self.io.?, .service = .{
             .gpa = std.heap.smp_allocator,
             .prefix = prefix,
+            .cwd = snapshot.workingDirectory(),
             .providers = providers[0..if (self.completion_provider != null) @as(usize, 3) else 2],
             .limits = self.completion_limits,
         } };
         defer completion.deinit();
-        var diagnostic_service: DiagnosticService = .{ .additional = self.diagnostic_provider };
+        var diagnostic_service: DiagnosticService = .{ .additional = self.diagnostic_provider, .cwd = snapshot.workingDirectory() };
         var used_editor = true;
         const submitted = ((LineEditor{
             .gpa = self.allocator,

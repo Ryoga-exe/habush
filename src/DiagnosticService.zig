@@ -5,6 +5,7 @@ const Diagnostic = @import("habush-edit").Diagnostic;
 const DiagnosticService = @This();
 
 additional: ?Diagnostic.Provider = null,
+cwd: ?[]const u8 = null,
 
 pub fn provider(service: *DiagnosticService) Diagnostic.Provider {
     return .{ .userdata = service, .query = query };
@@ -14,7 +15,9 @@ fn query(userdata: ?*anyopaque, arena: std.mem.Allocator, request: Diagnostic.Re
     const service: *DiagnosticService = @ptrCast(@alignCast(userdata.?));
     var result = try native(arena, request);
     const extra = service.additional orelse return result;
-    const added = extra.query(extra.userdata, arena, request) catch |err| switch (err) {
+    var scoped = request;
+    scoped.cwd = service.cwd;
+    const added = extra.query(extra.userdata, arena, scoped) catch |err| switch (err) {
         error.Canceled, error.OutOfMemory => return err,
         error.Unavailable => return result,
     };

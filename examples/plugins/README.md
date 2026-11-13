@@ -79,11 +79,13 @@ It displays the directory name, previous exit status, duration, active job count
 and optional Git branch or detached commit. The theme reads its settings through
 `habush.option` and discovers Git metadata itself through `habush.read_file`.
 Its `git` option defaults to `false`; enabling it also requires `context` and
-`fs_read` grants with a `read_directory` covering the repository. The example
-grants only this checkout. Discovery walks parents within that grant, and follows
-linked worktree metadata only when its target is also inside the grant. Missing
-or denied metadata simply omits Git information. No Git-specific settings or
-metadata are passed by the shell; dirty state is not collected.
+`fs_read` grants. The example grants only `.git` and `.git/HEAD` at cwd and its
+ancestors, bounded by this checkout's parent directory. It works in neighboring
+repositories and their subdirectories without granting arbitrary file reads.
+Linked worktree metadata needs a separate fixed-root grant covering its target;
+the contents of `.git` never authorize extra access. Missing or denied metadata
+simply omits Git information. No Git-specific settings or metadata are passed
+by the shell; dirty state is not collected.
 Environment discovery and subprocess execution are not provided. Prompt failures use the configured
 literal prompt (or `habush> `). The final prompt declaration wins.
 
@@ -164,23 +166,54 @@ Explicit command argv and plugin-local options are supplied by the caller.
 ```zon
 .declares = .{ .fs_read = true, .stdout = true },
 .grants = .{ .fs_read = true, .stdout = true },
-.read_directory = ".",
+.read_root = .{ .fixed = "." },
 ```
 
 This allows reading files under the config file's directory and writing to the
-command's explicitly supplied stdout. `.read_directory` is required for an
-`fs_read` grant and opened once when loading the plugin; later `cd` or path-link
-changes do not select a new root. Try the read-only filesystem demo:
+command's explicitly supplied stdout. A fixed root is opened once when loading
+the plugin; later `cd` or path-link changes do not select a new root. The former
+`read_directory` field is replaced by `read_root = .{ .fixed = ... }`.
+Try the read-only filesystem demo:
 
 ```sh
 zig build -Dwasm-plugins=true
 zig-out/bin/habush --config examples/plugins/read-file.zon -c 'hb-read theme.zon'
 ```
 
+Use `.read_root = .cwd` instead to follow the Session's working directory.
+The host opens it at the start of each command, completion, prompt, or diagnostic
+invocation and keeps that handle until the call has joined. Subsequent `cd`
+affects later calls. This authorizes reading the subtree of future working
+directories too, including `/` if selected. The path comes from trusted host
+context; a guest cannot change it by passing another filename. No string
+interpolation or environment expansion is performed.
+
+An independent, narrower grant permits exact files at cwd and its ancestors:
+
+```zon
+.read_ancestors = .{
+    .from = .cwd,
+    .within = "/path/to/workspace",
+    .files = .{ "metadata", "settings/project" },
+},
+```
+
+The eligible bases are cwd and its ancestors up to and including `within`;
+siblings and arbitrary descendants cannot become extra bases. The broker only reads named files; it does
+not search for or interpret project markers. `files` contains 1..32 literal
+relative paths with no parent steps, dot steps, or empty components. There is no
+glob expansion. The upper boundary is preopened at plugin load; relative fixed
+roots and boundaries are resolved from the config file's directory. Ancestor
+names use the boundary's configured or physical path. Missing cwd or a cwd outside
+the boundary denies ancestor access. This grant can be used alone or together
+with `read_root`; either resource requires a declared and granted `fs_read` bit.
+
 The demo prints that file and exits 7 like its other command entry; missing,
 non-file, or denied paths report an error and exit 1. Relative names start at
-the granted directory. Absolute names must lie within its current physical path;
-the broker translates them to handle-relative names before opening anything.
+the read root, or cwd for an ancestor-only grant. Absolute names must match a
+granted root or ancestor file; the broker translates them to handle-relative
+names before opening anything. Fixed roots use their physical path; a cwd root
+also accepts the caller's logical cwd path.
 Names outside the grant and `../` steps fail. The broker supports native Linux,
 macOS, and FreeBSD, using directory handles and no-follow component traversal. Child paths
 use `/`; empty/parent/dot steps, NUL, backslashes, colons, symlinks, and special
@@ -208,7 +241,11 @@ The parent keeps the directory alive until all operations have joined. The
 native `readFile` method checks authority and bounds; its caller controls task
 scheduling/deadlines. The Wasm host couples file I/O to the call's input-byte
 budget, cancellation, and deadline, joining native I/O before destroying guest
-memory. Declared/granted fields remain inspectable on `Host.Module`; guests can
+memory. `Scope.ancestor_files` borrows a boundary handle and file list, with
+`Scope.cwd` supplied by the embedding host. In `Host.Scope`, `read_cwd = true`
+opens a call-owned root from that trusted cwd, under the same deadline.
+Completion/diagnostic native requests carry cwd for resource resolution but
+their Wasm request schemas do not expose it. Declared/granted fields remain inspectable on `Host.Module`; guests can
 query their current effective mask with `habush.capabilities()`.
 
 This is a host-mediated capability boundary. Native callbacks and external
