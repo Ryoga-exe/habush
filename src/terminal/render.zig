@@ -7,7 +7,15 @@ const Diagnostic = @import("habush-edit").Diagnostic;
 const unicode = @import("habush-edit").unicode;
 const uucode = @import("uucode");
 
-pub fn inputRow(writer: *std.Io.Writer, prompt: Prompt, source: []const u8, cursor: usize, columns: usize, diagnostics: []const Diagnostic, source_offset: usize) std.Io.Writer.Error!usize {
+pub const InputRow = struct {
+    visible_source: []const u8,
+    prompt_width: usize,
+    width: usize,
+    cursor_column: usize,
+    literal: bool,
+};
+
+pub fn inputRow(writer: *std.Io.Writer, prompt: Prompt, source: []const u8, cursor: usize, columns: usize, diagnostics: []const Diagnostic, source_offset: usize) std.Io.Writer.Error!InputRow {
     const prompt_width = try writePrompt(null, prompt, columns -| 2);
     const available = columns -| (prompt_width + 1);
     const width = @max(available, 1);
@@ -24,10 +32,12 @@ pub fn inputRow(writer: *std.Io.Writer, prompt: Prompt, source: []const u8, curs
     _ = try writePrompt(writer, prompt, columns -| 2);
     var index = start;
     var used: usize = 0;
+    var literal = true;
     var active: ?Diagnostic.Severity = null;
     while (index < source.len) {
         const unit = decode(source[index..]);
         if (used + unit.width > width) break;
+        literal = literal and unit.kind == .literal and unit.width != 0;
         var severity: ?Diagnostic.Severity = null;
         for (diagnostics) |diagnostic| {
             if (diagnostic.start < source_offset + index + unit.len and diagnostic.end > source_offset + index)
@@ -49,7 +59,13 @@ pub fn inputRow(writer: *std.Io.Writer, prompt: Prompt, source: []const u8, curs
         index += unit.len;
     }
     if (active != null) try writer.writeAll("\x1b[0m");
-    return prompt_width + before_cursor -| skipped;
+    return .{
+        .visible_source = source[start..index],
+        .prompt_width = prompt_width,
+        .width = prompt_width + used,
+        .cursor_column = @min(prompt_width + before_cursor -| skipped, columns -| 1),
+        .literal = literal,
+    };
 }
 
 /// Width and output share the same clipping and escaping rules. ANSI is emitted
@@ -101,16 +117,6 @@ pub fn displayWidth(source: []const u8) usize {
     return width;
 }
 
-pub fn isLiteral(source: []const u8) bool {
-    var index: usize = 0;
-    while (index < source.len) {
-        const unit = decode(source[index..]);
-        if (unit.kind != .literal or unit.width == 0) return false;
-        index += unit.len;
-    }
-    return true;
-}
-
 const Unit = struct {
     len: usize,
     width: usize,
@@ -155,7 +161,9 @@ test "display width and visible controls preserve terminal boundaries" {
     try writeVisible(&output.writer, "a\x1b\n\xff日本\xe2\x80\xae");
     try std.testing.expectEqualStrings("a^[^J\\xFF日本\\u{202E}", output.written());
     output.clearRetainingCapacity();
-    try std.testing.expectEqual(@as(usize, 6), try inputRow(&output.writer, Prompt.secondary, "0123456789", 10, 8, &.{}, 0));
+    const row = try inputRow(&output.writer, Prompt.secondary, "0123456789", 10, 8, &.{}, 0);
+    try std.testing.expectEqual(@as(usize, 6), row.cursor_column);
+    try std.testing.expectEqualStrings("6789", row.visible_source);
     try std.testing.expectEqualStrings("> 6789", output.written());
 }
 
@@ -187,7 +195,9 @@ test "width and clipping share grapheme boundaries while orphan marks stay visib
     try std.testing.expectEqualStrings("x👩🏽‍🚀", output.written());
     output.clearRetainingCapacity();
     const source = "aか\u{3099}b";
-    try std.testing.expectEqual(@as(usize, 3), try inputRow(&output.writer, Prompt.secondary, source, source.len, 6, &.{}, 0));
+    const row = try inputRow(&output.writer, Prompt.secondary, source, source.len, 6, &.{}, 0);
+    try std.testing.expectEqual(@as(usize, 3), row.cursor_column);
+    try std.testing.expectEqualStrings("b", row.visible_source);
     try std.testing.expectEqualStrings("> b", output.written());
     output.clearRetainingCapacity();
     try writeVisible(&output.writer, "\u{301}\u{e0100}\u{200d}");

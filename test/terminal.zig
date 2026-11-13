@@ -170,6 +170,8 @@ pub fn main(init: std.process.Init) !void {
     if (args.len == 2) try std.testing.expect(std.mem.indexOf(u8, middle_output, "\x1b[KZb本\x1b[3D") != null);
     try std.testing.expect(std.mem.indexOf(u8, middle_output, "MIDDLE:日a漢本\r\n") != null);
 
+    if (args.len == 2) try viewportScenario(io, master, &terminal);
+
     if (args.len == 4) {
         try pluginScenario(io, master, &terminal, config_path.?);
     } else {
@@ -302,6 +304,25 @@ const Terminal = struct {
         terminal.len += count;
     }
 };
+
+fn viewportScenario(io: Io, master: Io.File, terminal: *Terminal) !void {
+    const padding: [120]u8 = @splat('a');
+    try master.writeStreamingAll(io, "\x1b[200~/bin/echo SCROLL:" ++ padding ++ "TAIL\x1b[201~");
+    _ = try terminal.expect("TAIL");
+    try master.writeStreamingAll(io, "\x02\x02Z\x05\r");
+    const scrolled = try terminal.expect(ready);
+    try std.testing.expect(std.mem.indexOf(u8, scrolled, "SCROLL:" ++ padding ++ "TAZIL\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, scrolled, "\x1b[J") == null);
+
+    try master.writeStreamingAll(io, "\x1b[200~/bin/echo MULTI:one\n/bin/echo MULTI:two\x1b[201~");
+    _ = try terminal.expect("MULTI:two");
+    try master.writeStreamingAll(io, "\x0f/bin/echo MULTI:three\x1b[A!\x1b[B\x05\r");
+    const multiline = try terminal.expect(ready);
+    try std.testing.expect(std.mem.indexOf(u8, multiline, "\r\n> ") != null);
+    for ([_][]const u8{ "MULTI:one\r\n", "MULTI:two!\r\n", "MULTI:three\r\n" }) |line|
+        try std.testing.expect(std.mem.indexOf(u8, multiline, line) != null);
+    try std.testing.expect(std.mem.indexOf(u8, multiline, "\x1b[J") == null);
+}
 
 fn functionCompletionScenario(io: Io, master: Io.File, terminal: *Terminal) !void {
     try master.writeStreamingAll(io, "__ec() { /usr/bin/printf '%s\\0' \"$3-$1 '\\$(missing)\"; }; complete -F __ec /bin/echo; false\r");
