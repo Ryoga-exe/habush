@@ -21,6 +21,7 @@ pub fn build(b: *std.Build) !void {
     } else null;
     var demo_plugin: ?*std.Build.Step.Compile = null;
     var theme_plugin: ?*std.Build.Step.Compile = null;
+    var homograph_plugin: ?*std.Build.Step.Compile = null;
     const features = b.addOptions();
     features.addOption(bool, "wasm_plugins", wasm_plugins);
 
@@ -134,6 +135,12 @@ pub fn build(b: *std.Build) !void {
         .optimize = optimize,
     }) });
     test_step.dependOn(&b.addRunArtifact(guest_git_tests).step);
+    const homograph_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("examples/plugins/homograph.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    test_step.dependOn(&b.addRunArtifact(homograph_tests).step);
     var plugin_module: ?*std.Build.Module = null;
     if (wasmtime_sdk) |sdk| {
         const headers = b.addTranslateC(.{
@@ -203,6 +210,20 @@ pub fn build(b: *std.Build) !void {
         theme.stack_size = 64 * 1024;
         b.installArtifact(theme);
         theme_plugin = theme;
+        const homograph = b.addExecutable(.{
+            .name = "habush-homograph",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("examples/plugins/homograph.zig"),
+                .target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding }),
+                .optimize = .ReleaseSmall,
+            }),
+        });
+        homograph.entry = .disabled;
+        homograph.rdynamic = true;
+        homograph.export_memory = true;
+        homograph.stack_size = 64 * 1024;
+        b.installArtifact(homograph);
+        homograph_plugin = homograph;
     }
     const terminal_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -247,6 +268,7 @@ pub fn build(b: *std.Build) !void {
                 plugin_terminal.addArtifactArg(exe);
                 plugin_terminal.addArtifactArg(demo);
                 plugin_terminal.addArtifactArg(theme_plugin.?);
+                plugin_terminal.addArtifactArg(homograph_plugin.?);
                 plugin_terminal.expectExitCode(0);
                 test_step.dependOn(&plugin_terminal.step);
             }

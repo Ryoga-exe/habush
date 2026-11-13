@@ -1,0 +1,9 @@
+.{
+    .load_rc = false,
+    .plugins = .{.{
+        .path = "../../zig-out/bin/habush-homograph.wasm",
+        .declares = .{ .source = true },
+        .grants = .{ .source = true },
+        .diagnostics = .{},
+    }},
+}

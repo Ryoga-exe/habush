@@ -142,6 +142,47 @@ Prompt v1 is no longer emitted; update existing theme decoders to v2 and rebuild
   ranges, invalid severity/arity, NUL and excessive output are rejected; the raw
   reply is limited to 8192 bytes.
 
+## URL homograph warnings
+
+Build with `zig build -Dwasm-plugins=true`, then run:
+
+```sh
+zig-out/bin/habush --config examples/plugins/homograph.zon
+```
+
+[homograph.zig](homograph.zig) provides a standalone Diagnostic plugin, with
+only `source` declared and granted. It has no host imports, filesystem access,
+network access, or command execution. Type or paste this harmless echo command:
+
+```sh
+/bin/echo 'https://exаmple.test/path'
+```
+
+The `а` is Cyrillic U+0430. The hostname is underlined with a warning; Enter
+still executes the echo. ASCII Punycode (`xn--exmple-4nf.test`) and percent-encoded
+UTF-8 spellings receive the same checks. Original byte ranges and revision are
+preserved, so editing removes old warnings through the normal editor contract.
+
+The initial heuristic checks each HTTP(S) hostname label for Greek/Cyrillic
+ASCII lookalikes, using a subset of Unicode 18.0.0
+[confusables data](https://www.unicode.org/Public/18.0.0/security/confusables.txt).
+It warns when such characters share a label with ASCII Latin letters, or when
+the entire label consists of ASCII letters/digits/hyphens and these lookalikes.
+This catches both mixed labels and wholly Cyrillic imitations such as `аррӏе`.
+Ordinary Japanese, accented Latin, and non-confusable Greek/Cyrillic labels are
+not rejected merely for being non-ASCII. Unicode label separators are recognized.
+The derived table and its [Unicode license](unicode-LICENSE.txt) are checked in;
+building and running the detector do not download Unicode data.
+
+This is advisory, with possible false positives and missed attacks. It implements
+neither the full UTS #39 skeleton algorithm nor full IDNA validation/normalization.
+It scans literal URLs in editable source, not shell syntax or expanded variables;
+comments and quoted examples can also warn. Split/escaped URLs, other schemes,
+other-script confusables, and process network traffic are outside its scope.
+Malformed/oversized hosts or labels are skipped, and at most 32 warnings are
+returned. It does not intercept scripts or structured execution, and remains
+independent of any future execution authorization API.
+
 ## Ownership and calls
 
 `Host.init(io)` creates an engine and an epoch ticker. `Host.load(bytes)` compiles a module without running guest code; the module borrows its host. Each `module.invoke(allocator, entry, request, scope)` creates a fresh store/instance, applies the scope before initialization, calls the entry, copies the response, and destroys the instance. The returned byte slice belongs to the supplied allocator.

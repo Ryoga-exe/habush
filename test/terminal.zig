@@ -23,7 +23,7 @@ pub fn main(init: std.process.Init) !void {
             .environ_map = init.environ_map,
         });
     }
-    if (args.len != 2 and args.len != 4) return error.InvalidArguments;
+    if (args.len != 2 and args.len != 5) return error.InvalidArguments;
     var config_path: ?[]u8 = null;
     defer if (config_path) |path| {
         Io.Dir.cwd().deleteFile(io, path) catch {};
@@ -39,11 +39,13 @@ pub fn main(init: std.process.Init) !void {
         .{ .key = "ctrl+space", .action = .complete },
         .{ .key = "ctrl+x", .action = .ignore },
     };
-    if (args.len == 4) {
+    if (args.len == 5) {
         const module_path = try Io.Dir.cwd().realPathFileAlloc(io, args[2], gpa);
         defer gpa.free(module_path);
         const theme_path = try Io.Dir.cwd().realPathFileAlloc(io, args[3], gpa);
         defer gpa.free(theme_path);
+        const homograph_path = try Io.Dir.cwd().realPathFileAlloc(io, args[4], gpa);
+        defer gpa.free(homograph_path);
         const checkout = try Io.Dir.cwd().realPathFileAlloc(io, ".", gpa);
         defer gpa.free(checkout);
         try std.zon.stringify.serialize(.{
@@ -73,6 +75,12 @@ pub fn main(init: std.process.Init) !void {
                     .grants = .{ .context = true, .fs_read = true },
                     .read_ancestors = .{ .from = .cwd, .within = checkout, .files = .{ ".git", ".git/HEAD" } },
                     .options = .{ .{ "symbol", "THEME>" }, .{ "failure_color", "yellow" }, .{ "git", "true" } },
+                },
+                .{
+                    .path = homograph_path,
+                    .declares = .{ .source = true },
+                    .grants = .{ .source = true },
+                    .diagnostics = .{},
                 },
                 .{
                     .path = module_path,
@@ -181,7 +189,7 @@ pub fn main(init: std.process.Init) !void {
         try completionMenuScenario(io, master, &terminal);
     }
 
-    if (args.len == 4) {
+    if (args.len == 5) {
         try pluginScenario(io, master, &terminal, config_path.?);
     } else {
         try historyScenario(io, master, &terminal);
@@ -435,6 +443,10 @@ fn logicalHistoryScenario(io: Io, master: Io.File, terminal: *Terminal) !void {
 }
 
 fn pluginScenario(io: Io, master: Io.File, terminal: *Terminal, config_path: []const u8) !void {
+    try master.writeStreamingAll(io, "/bin/echo 'https://exаmple.test/path'");
+    _ = try terminal.expect("warning: URL homograph:");
+    try master.writeStreamingAll(io, "\r");
+    try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "https://exаmple.test/path\r\n") != null);
     try master.writeStreamingAll(io, "origin=$PWD; cd /\r");
     const outside = try terminal.expect(ready);
     const submitted = outside[(std.mem.lastIndexOf(u8, outside, "\x1b[?2004l") orelse return error.TestUnexpectedResult)..];
