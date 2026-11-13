@@ -149,6 +149,62 @@ test "declared file reads require grants and parent scope, redact context, and r
     try std.testing.expectError(error.InstantiationFailed, unsupported.invoke(gpa, "unused", "", scope));
 }
 
+test "cwd read roots follow trusted call context and ancestor-only grants retain their mask" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "first/sub");
+    try tmp.dir.createDirPath(io, "second");
+    try tmp.dir.writeFile(io, .{ .sub_path = "first/file", .data = "first" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "second/file", .data = "second" });
+    var host = try Host.init(io);
+    defer host.deinit();
+    var module = try load(&host, fixture);
+    defer module.deinit();
+    const first = try tmp.dir.realPathFileAlloc(io, "first", gpa);
+    defer gpa.free(first);
+    const second = try tmp.dir.realPathFileAlloc(io, "second", gpa);
+    defer gpa.free(second);
+    var scope: Host.Scope = .{ .read_cwd = true, .capabilities = .{ .permissions = .{ .fs_read = true }, .cwd = first } };
+    const one = try module.invoke(gpa, "read_file", "file", scope);
+    defer gpa.free(one);
+    try std.testing.expectEqualStrings("first", one);
+    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(root);
+    try tmp.dir.symLink(io, "first", "alias", .{ .is_directory = true });
+    const alias = try gpa.print("{s}/alias", .{root});
+    defer gpa.free(alias);
+    const alias_file = try gpa.print("{s}/file", .{alias});
+    defer gpa.free(alias_file);
+    scope.capabilities.cwd = alias;
+    const aliased = try module.invoke(gpa, "read_file", alias_file, scope);
+    defer gpa.free(aliased);
+    try std.testing.expectEqualStrings("first", aliased);
+    scope.capabilities.cwd = second;
+    const two = try module.invoke(gpa, "read_file", "file", scope);
+    defer gpa.free(two);
+    try std.testing.expectEqualStrings("second", two);
+    try expectFileStatus(&module, "../first/file", scope, -3);
+    scope.capabilities.cwd = null;
+    try expectFileStatus(&module, "file", scope, -3);
+    scope.read_cwd = false;
+    const sub = try gpa.print("{s}/sub", .{first});
+    defer gpa.free(sub);
+    scope.capabilities.cwd = sub;
+    scope.capabilities.ancestor_files = .{ .within = tmp.dir, .files = &.{"file"} };
+    const mask = try module.invoke(gpa, "capabilities", "", scope);
+    defer gpa.free(mask);
+    try std.testing.expectEqualSlices(u8, &.{8}, mask);
+    const parent_file = try gpa.print("{s}/file", .{first});
+    defer gpa.free(parent_file);
+    const parent = try module.invoke(gpa, "read_file", parent_file, scope);
+    defer gpa.free(parent);
+    try std.testing.expectEqualStrings("first", parent);
+    scope.capabilities = scope.capabilities.narrow(.{});
+    try expectFileStatus(&module, parent_file, scope, -3);
+}
+
 test "plugin options are call-local, bounded, and validate guest memory" {
     const gpa = std.testing.allocator;
     var host = try Host.init(std.testing.io);

@@ -42,6 +42,8 @@ pub const Scope = struct {
     options: []const [2][]const u8 = &.{},
     /// Explicit resources are still required; permissions alone grant no I/O.
     capabilities: capability.Scope = .{ .permissions = .all },
+    /// Bind the read root to capabilities.cwd for this invocation.
+    read_cwd: bool = false,
     stdin: ?*std.Io.Reader = null,
     stdout: ?*std.Io.Writer = null,
     stderr: ?*std.Io.Writer = null,
@@ -124,11 +126,13 @@ pub const Module = struct {
             .scope = scope,
             .deadline = if (scope.limits.timeout) |duration| std.Io.Timestamp.now(host.io, .awake).addDuration(duration) else null,
         };
+        defer if (call.cwd_directory) |directory| directory.close(host.io);
         call.scope.capabilities = scope.capabilities.narrow(module.permissions(.all));
         call.scope.capabilities.permissions.stdin = call.scope.capabilities.permissions.stdin and scope.stdin != null;
         call.scope.capabilities.permissions.stdout = call.scope.capabilities.permissions.stdout and scope.stdout != null;
         call.scope.capabilities.permissions.stderr = call.scope.capabilities.permissions.stderr and scope.stderr != null;
-        call.scope.capabilities.permissions.fs_read = call.scope.capabilities.permissions.fs_read and scope.capabilities.directory != null;
+        if (call.scope.capabilities.permissions.fs_read and scope.read_cwd) try fileIo(&call, prepareFiles, .{&call});
+        call.scope.capabilities.permissions.fs_read = call.scope.capabilities.permissions.fs_read and call.scope.capabilities.hasFileAccess();
         const store = c.wasmtime_store_new(host.engine, null, null) orelse return error.OutOfMemory;
         defer c.wasmtime_store_delete(store);
         const context = c.wasmtime_store_context(store).?;
@@ -170,6 +174,7 @@ const Call = struct {
     failure: ?Error = null,
     written: usize = 0,
     read: usize = 0,
+    cwd_directory: ?std.Io.Dir = null,
 
     fn checkpoint(call: *Call) Error!void {
         try call.io.checkCancel();
@@ -353,6 +358,19 @@ fn readFile(data: ?*anyopaque, caller: ?*c.wasmtime_caller_t, args: [*c]const c.
 
 const FileReadError = Error || error{ NotFound, NotFile };
 
+fn prepareFiles(call: *Call) Error!void {
+    const cwd = call.scope.capabilities.cwd orelse return;
+    if (!std.fs.path.isAbsolute(cwd) or std.mem.indexOfScalar(u8, cwd, 0) != null) return;
+    const directory = std.Io.Dir.cwd().openDir(call.io, cwd, .{}) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir, error.AccessDenied, error.PermissionDenied => return,
+        error.Canceled => return error.Canceled,
+        else => return error.ReadFailed,
+    };
+    call.cwd_directory = directory;
+    call.scope.capabilities.directory = directory;
+    call.scope.capabilities.directory_path = cwd;
+}
+
 fn grantedRead(scope: capability.Scope, io: std.Io, path: []const u8, buffer: []u8) FileReadError!usize {
     return scope.readFile(io, path, buffer) catch |err| switch (err) {
         error.Unsupported => error.PermissionDenied,
@@ -364,27 +382,33 @@ fn expire(io: std.Io, duration: std.Io.Duration) std.Io.Cancelable!void {
     return io.sleep(duration, .awake);
 }
 
-fn readFileBytes(call: *Call, caller: *c.wasmtime_caller_t, path_pointer: u32, path_length: u32, pointer: u32, capacity: u32) FileReadError!u32 {
+fn fileIo(call: *Call, comptime operation: anytype, args: anytype) @typeInfo(@TypeOf(operation)).@"fn".return_type.? {
     try call.checkpoint();
-    if (!call.scope.capabilities.permissions.fs_read or call.scope.capabilities.directory == null) return error.PermissionDenied;
-    if (path_length > std.Io.Dir.max_path_bytes or capacity > call.scope.limits.input_bytes -| call.read) return error.LimitExceeded;
-    const path = try callerBytes(caller, path_pointer, path_length);
-    const buffer = try callerBytes(caller, pointer, capacity);
-    const count = if (call.deadline) |deadline| read: {
-        const Result = union(enum) { read: FileReadError!usize, expired: std.Io.Cancelable!void };
+    if (call.deadline) |deadline| {
+        const Result = union(enum) { done: @typeInfo(@TypeOf(operation)).@"fn".return_type.?, expired: std.Io.Cancelable!void };
         var storage: [2]Result = undefined;
         var pending: std.Io.Select(Result) = .init(call.io, &storage);
         defer pending.cancelDiscard();
-        pending.concurrent(.read, grantedRead, .{ call.scope.capabilities, call.io, path, buffer }) catch return error.ReadFailed;
+        pending.concurrent(.done, operation, args) catch return error.ReadFailed;
         pending.concurrent(.expired, expire, .{ call.io, std.Io.Duration{ .nanoseconds = @max(0, deadline.nanoseconds - std.Io.Timestamp.now(call.io, .awake).nanoseconds) } }) catch return error.ReadFailed;
         switch (try pending.await()) {
-            .read => |result| break :read try result,
+            .done => |result| return result,
             .expired => |result| {
                 try result;
                 return error.Timeout;
             },
         }
-    } else try grantedRead(call.scope.capabilities, call.io, path, buffer);
+    }
+    return @call(.auto, operation, args);
+}
+
+fn readFileBytes(call: *Call, caller: *c.wasmtime_caller_t, path_pointer: u32, path_length: u32, pointer: u32, capacity: u32) FileReadError!u32 {
+    try call.checkpoint();
+    if (!call.scope.capabilities.permissions.fs_read or !call.scope.capabilities.hasFileAccess()) return error.PermissionDenied;
+    if (path_length > std.Io.Dir.max_path_bytes or capacity > call.scope.limits.input_bytes -| call.read) return error.LimitExceeded;
+    const path = try callerBytes(caller, path_pointer, path_length);
+    const buffer = try callerBytes(caller, pointer, capacity);
+    const count = try fileIo(call, grantedRead, .{ call.scope.capabilities, call.io, path, buffer });
     call.read += count;
     try call.checkpoint();
     return @intCast(count);

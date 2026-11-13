@@ -28,11 +28,35 @@ pub const directory_reads_supported = switch (@import("builtin").target.os.tag) 
 };
 pub const ReadError = error{ PermissionDenied, Unsupported, LimitExceeded, ReadFailed, Canceled, NotFound, NotFile };
 
+pub const AncestorFiles = struct {
+    within: Io.Dir,
+    /// Optional host-selected name for the preopened boundary.
+    path: ?[]const u8 = null,
+    files: []const []const u8,
+};
+
+pub fn validRelativePath(path: []const u8) bool {
+    if (path.len == 0 or path.len > Io.Dir.max_path_bytes or std.mem.indexOfAny(u8, path, "\x00\\:") != null) return false;
+    var parts = std.mem.splitScalar(u8, path, '/');
+    while (parts.next()) |part|
+        if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return false;
+    return true;
+}
+
 /// Directory handles are borrowed until all operations have joined. Narrowing
 /// retains resource identities and can only remove permissions.
 pub const Scope = struct {
     permissions: Set = .{},
     directory: ?Io.Dir = null,
+    /// Optional name for a directory opened from the caller's logical cwd.
+    directory_path: ?[]const u8 = null,
+    /// Trusted call context, never a path chosen by the guest.
+    cwd: ?[]const u8 = null,
+    ancestor_files: ?AncestorFiles = null,
+
+    pub fn hasFileAccess(scope: Scope) bool {
+        return scope.directory != null or (scope.ancestor_files != null and scope.cwd != null);
+    }
 
     pub fn narrow(scope: Scope, ceiling: Set) Scope {
         var result = scope;
@@ -46,38 +70,70 @@ pub const Scope = struct {
         if (!scope.permissions.fs_read) return error.PermissionDenied;
         if (!directory_reads_supported) return error.Unsupported;
         if (name.len > Io.Dir.max_path_bytes) return error.LimitExceeded;
-        var directory = scope.directory orelse return error.PermissionDenied;
         if (name.len == 0 or std.mem.indexOfAny(u8, name, "\x00\\:") != null) return error.PermissionDenied;
-        var path = name;
-        var root_buffer: [Io.Dir.max_path_bytes]u8 = undefined;
-        if (std.fs.path.isAbsolutePosix(path)) {
-            const root = root_buffer[0 .. directory.realPath(io, &root_buffer) catch |err| return readError(err)];
-            if (std.mem.eql(u8, path, root)) return error.NotFile;
-            if (!std.mem.startsWith(u8, path, root)) return error.PermissionDenied;
-            const start = if (std.mem.eql(u8, root, "/")) 1 else root.len + 1;
-            if (start > path.len or path[start - 1] != '/') return error.PermissionDenied;
-            path = path[start..];
+        if (scope.directory) |directory| {
+            const path = if (std.fs.path.isAbsolutePosix(name)) try relativeName(io, directory, scope.directory_path, name) else name;
+            if (path) |relative| return readPath(io, directory, relative, buffer);
         }
-        var validation = std.mem.splitScalar(u8, path, '/');
-        while (validation.next()) |part| {
-            if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return error.PermissionDenied;
-        }
-        var owned = false;
-        defer if (owned) directory.close(io);
-        var components = std.mem.splitScalar(u8, path, '/');
-        while (components.next()) |part| {
-            if (components.peek() != null) {
-                const child = directory.openDir(io, part, .{ .follow_symlinks = false }) catch |err| return readError(err);
-                if (owned) directory.close(io);
-                directory = child;
-                owned = true;
-                continue;
+        const grant = scope.ancestor_files orelse return error.PermissionDenied;
+        for (grant.files) |file| if (!validRelativePath(file)) return error.PermissionDenied;
+        const cwd = scope.cwd orelse return error.PermissionDenied;
+        var ancestor = (try relativeName(io, grant.within, grant.path, cwd)) orelse return error.PermissionDenied;
+        if (ancestor.len != 0 and !validRelativePath(ancestor)) return error.PermissionDenied;
+        var path_buffer: [Io.Dir.max_path_bytes]u8 = undefined;
+        const path = if (std.fs.path.isAbsolutePosix(name))
+            (try relativeName(io, grant.within, grant.path, name)) orelse return error.PermissionDenied
+        else
+            std.fmt.bufPrint(&path_buffer, "{s}{s}{s}", .{ ancestor, if (ancestor.len == 0) "" else "/", name }) catch return error.LimitExceeded;
+        if (!validRelativePath(path)) return error.PermissionDenied;
+        while (true) {
+            for (grant.files) |file| {
+                const start = ancestor.len + @intFromBool(ancestor.len != 0);
+                if (path.len == start + file.len and std.mem.startsWith(u8, path, ancestor) and
+                    (ancestor.len == 0 or path[ancestor.len] == '/') and std.mem.eql(u8, path[start..], file))
+                    return readPath(io, grant.within, path, buffer);
             }
-            return readRegular(io, directory, part, buffer);
+            if (ancestor.len == 0) break;
+            ancestor = std.fs.path.dirnamePosix(ancestor) orelse "";
         }
-        unreachable;
+        return error.PermissionDenied;
     }
 };
+
+fn relativeName(io: Io, directory: Io.Dir, alias: ?[]const u8, path: []const u8) ReadError!?[]const u8 {
+    if (alias) |root| if (relativePath(root, path)) |relative| return relative;
+    var buffer: [Io.Dir.max_path_bytes]u8 = undefined;
+    const root = buffer[0 .. directory.realPath(io, &buffer) catch |err| return readError(err)];
+    return relativePath(root, path);
+}
+
+fn relativePath(root: []const u8, path: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, path, root)) return "";
+    if (!std.mem.startsWith(u8, path, root)) return null;
+    const start = if (std.mem.eql(u8, root, "/")) 1 else root.len + 1;
+    if (start > path.len or path[start - 1] != '/') return null;
+    return path[start..];
+}
+
+fn readPath(io: Io, root: Io.Dir, path: []const u8, buffer: []u8) ReadError!usize {
+    if (path.len == 0) return error.NotFile;
+    if (!validRelativePath(path)) return error.PermissionDenied;
+    var directory = root;
+    var owned = false;
+    defer if (owned) directory.close(io);
+    var components = std.mem.splitScalar(u8, path, '/');
+    while (components.next()) |part| {
+        if (components.peek() != null) {
+            const child = directory.openDir(io, part, .{ .follow_symlinks = false }) catch |err| return readError(err);
+            if (owned) directory.close(io);
+            directory = child;
+            owned = true;
+            continue;
+        }
+        return readRegular(io, directory, part, buffer);
+    }
+    unreachable;
+}
 
 fn readRegular(io: Io, directory: Io.Dir, name: []const u8, buffer: []u8) ReadError!usize {
     const before = directory.statFile(io, name, .{ .follow_symlinks = false }) catch |err| return readError(err);
@@ -139,4 +195,48 @@ test "tool scopes only attenuate authority and directory reads cannot escape thr
         // O_NOFOLLOW reports a symlink component as NOTDIR on some targets.
         try std.testing.expect(err == error.PermissionDenied or err == error.NotFile);
     }
+}
+
+test "ancestor grants allow only named files between the call cwd and the boundary" {
+    if (!directory_reads_supported) return error.SkipZigTest;
+    const io = std.testing.io;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "workspace/project/src");
+    try tmp.dir.createDirPath(io, "workspace/sibling");
+    for ([_][]const u8{ "metadata", "workspace/metadata", "workspace/project/metadata", "workspace/project/src/metadata", "workspace/sibling/metadata", "workspace/project/private" }) |path|
+        try tmp.dir.writeFile(io, .{ .sub_path = path, .data = "allowed" });
+    try tmp.dir.symLink(io, "private", "workspace/project/link", .{});
+    const within = try tmp.dir.openDir(io, "workspace", .{});
+    defer within.close(io);
+    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    var scope: Scope = .{
+        .permissions = .{ .fs_read = true },
+        .cwd = try gpa.print("{s}/workspace/project/src", .{root}),
+        .ancestor_files = .{ .within = within, .files = &.{ "metadata", "link" } },
+    };
+    var bytes: [32]u8 = undefined;
+    for ([_][]const u8{ "workspace/metadata", "workspace/project/metadata", "workspace/project/src/metadata" }) |path| {
+        const absolute = try gpa.print("{s}/{s}", .{ root, path });
+        try std.testing.expectEqualStrings("allowed", bytes[0..try scope.readFile(io, absolute, &bytes)]);
+    }
+    try std.testing.expectEqualStrings("allowed", bytes[0..try scope.readFile(io, "metadata", &bytes)]);
+    for ([_][]const u8{ "metadata", "workspace/sibling/metadata", "workspace/project/private", "workspace/project/../metadata", "workspace/project/link" }) |path|
+        try std.testing.expectError(error.PermissionDenied, scope.readFile(io, try gpa.print("{s}/{s}", .{ root, path }), &bytes));
+    try std.testing.expectError(error.PermissionDenied, scope.narrow(.{}).narrow(.all).readFile(io, "metadata", &bytes));
+    try tmp.dir.symLink(io, "workspace", "alias", .{ .is_directory = true });
+    scope.ancestor_files.?.path = try gpa.print("{s}/alias", .{root});
+    scope.cwd = try gpa.print("{s}/alias/project/src", .{root});
+    const aliased = try gpa.print("{s}/alias/project/metadata", .{root});
+    try std.testing.expectEqualStrings("allowed", bytes[0..try scope.readFile(io, aliased, &bytes)]);
+    scope.cwd = try gpa.print("{s}/workspace/sibling", .{root});
+    try std.testing.expectEqualStrings("allowed", bytes[0..try scope.readFile(io, "metadata", &bytes)]);
+    try std.testing.expectError(error.PermissionDenied, scope.readFile(io, try gpa.print("{s}/workspace/project/metadata", .{root}), &bytes));
+    scope.cwd = try gpa.print("{s}/workspace-other", .{root});
+    try std.testing.expectError(error.PermissionDenied, scope.readFile(io, "metadata", &bytes));
+    scope.cwd = null;
+    try std.testing.expectError(error.PermissionDenied, scope.readFile(io, "metadata", &bytes));
 }
