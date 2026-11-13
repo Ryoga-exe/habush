@@ -185,6 +185,7 @@ pub fn main(init: std.process.Init) !void {
     try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "WORD:日 完\r\n") != null);
 
     if (args.len == 2) {
+        try resizeScenario(io, master, &terminal);
         try viewportScenario(io, master, &terminal);
         try completionMenuScenario(io, master, &terminal);
     }
@@ -303,6 +304,14 @@ const Terminal = struct {
         try terminal.io.sleep(.fromMilliseconds(5), .awake);
     }
 
+    fn resize(terminal: *Terminal, columns: u16, rows: u16) !void {
+        const size: posix.winsize = .{ .col = columns, .row = rows, .xpixel = 0, .ypixel = 0 };
+        // Zig's Darwin bindings omit TIOCSWINSZ (_IOW('t', 103, struct winsize)).
+        const request: u32 = if (@hasDecl(posix.T, "IOCSWINSZ")) posix.T.IOCSWINSZ else 0x80087467;
+        if (posix.errno(posix.system.ioctl(terminal.master.handle, @bitCast(request), @intFromPtr(&size))) != .SUCCESS)
+            return error.TerminalResizeFailed;
+    }
+
     fn expect(terminal: *Terminal, needle: []const u8) ![]const u8 {
         terminal.len = 0;
         while (std.mem.indexOf(u8, terminal.output[0..terminal.len], needle) == null) {
@@ -321,6 +330,23 @@ const Terminal = struct {
         terminal.len += count;
     }
 };
+
+fn resizeScenario(io: Io, master: Io.File, terminal: *Terminal) !void {
+    const prompt = "\x1b[0;32;49m日> \x1b[0m";
+    try master.writeStreamingAll(io, "\x0c");
+    _ = try terminal.expect("\x1b[2J\x1b[H\r\x1b[J" ++ prompt ++ "\r\x1b[4C");
+    try terminal.resize(32, 12);
+    _ = try terminal.expect("\r\x1b[J" ++ prompt);
+    try master.writeStreamingAll(io, "/bin/echo RESIZE:日本\x02");
+    _ = try terminal.expect("\x1b[2D");
+    try terminal.resize(32, 10);
+    const shorter = try terminal.expect("\r\x1b[J" ++ prompt ++ "/bin/echo RESIZE:日本\r\x1b[23C");
+    try std.testing.expect(std.mem.indexOf(u8, shorter, "\x1b[2J") == null);
+    try terminal.resize(100, 24);
+    _ = try terminal.expect("\r\x1b[J" ++ prompt ++ "/bin/echo RESIZE:日本\r\x1b[23C");
+    try master.writeStreamingAll(io, "!\x05\r");
+    try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "RESIZE:日!本\r\n") != null);
+}
 
 fn viewportScenario(io: Io, master: Io.File, terminal: *Terminal) !void {
     const padding: [120]u8 = @splat('a');

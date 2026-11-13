@@ -47,6 +47,8 @@ pub fn read(editor: LineEditor) !?[:0]u8 {
     var pending_len: usize = 0;
     var expected_len: usize = 0;
     while (true) {
+        if (terminal.columns() != view.columns or terminal.rows() != view.terminal_rows)
+            try editor.redraw(&state, &view, terminal, &diagnostic_arena);
         if (state.completion_pending and editor.input.bufferedLen() == 0 and !terminal.ready(0)) {
             if (try state.pollCompletion()) |effect| {
                 if (effect == .bell) try editor.output.writeByte(7);
@@ -54,6 +56,8 @@ pub fn read(editor: LineEditor) !?[:0]u8 {
             }
             if (state.completion_pending and editor.input.bufferedLen() == 0 and !terminal.ready(10)) continue;
         }
+        // Bound idle input waits so resize redraws do not depend on a keystroke.
+        if (editor.input.bufferedLen() == 0 and !terminal.ready(100)) continue;
         const byte = try takeByte(editor.input) orelse {
             try terminal.restore();
             return null;
