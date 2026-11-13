@@ -4,6 +4,11 @@
     .fingerprint = 0x75592405941710d1, // Changing this has security and trust implications.
     .minimum_zig_version = "0.17.1",
     .dependencies = .{
+        .uucode = .{
+            // Zig 0.17 support is not available in a release tag yet.
+            .url = "https://github.com/jacobsandlund/uucode/archive/1fb73433bba5d93366c57f23ff2e9d7939746500.tar.gz",
+            .hash = "uucode-0.2.0-ZZjBPm6FVgBcY-79AHV8ckQj86z0JwOyVyj89VeZrEiv",
+        },
         .wasmtime_aarch64_macos = .{
             .url = "https://github.com/bytecodealliance/wasmtime/releases/download/v50.0.1/wasmtime-v50.0.1-aarch64-macos-c-api.tar.xz",
             .hash = "N-V-__8AAABwBARFpa6bWC3xq_DQfHIMy5qY7JHxrBzjhBfp",

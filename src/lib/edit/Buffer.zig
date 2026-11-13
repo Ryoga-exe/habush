@@ -1,6 +1,7 @@
 //! Owned byte buffer with a byte cursor and one reversible editing snapshot.
 //! UTF-8 cursor movement follows codepoints; invalid bytes remain editable.
 const std = @import("std");
+const unicode = @import("unicode.zig");
 const Buffer = @This();
 
 gpa: std.mem.Allocator,
@@ -97,20 +98,8 @@ pub fn undo(buffer: *Buffer) bool {
     return true;
 }
 
-fn nextBoundary(source: []const u8, start: usize) usize {
-    const length = std.unicode.utf8ByteSequenceLength(source[start]) catch return start + 1;
-    const end = start + length;
-    if (end > source.len) return start + 1;
-    _ = std.unicode.utf8Decode(source[start..end]) catch return start + 1;
-    return end;
-}
-
-fn previousBoundary(source: []const u8, end: usize) usize {
-    var start = end - 1;
-    var remaining: usize = 3;
-    while (start != 0 and source[start] & 0xc0 == 0x80 and remaining != 0) : (remaining -= 1) start -= 1;
-    return if (nextBoundary(source, start) == end) start else end - 1;
-}
+const nextBoundary = unicode.nextCodepointBoundary;
+const previousBoundary = unicode.previousCodepointBoundary;
 
 test "editing preserves UTF-8 bytes and undo owns its snapshot" {
     var buffer: Buffer = .{ .gpa = std.testing.allocator };

@@ -29,6 +29,12 @@ pub fn build(b: *std.Build) !void {
         .target = target,
         .optimize = optimize,
     });
+    const uucode = b.dependency("uucode", .{
+        .target = target,
+        .optimize = optimize,
+        .fields = @as([]const []const u8, &.{ "grapheme_break", "general_category", "wcwidth_standalone", "wcwidth_zero_in_grapheme", "is_emoji_vs_base" }),
+    }).module("uucode");
+    habush_edit.addImport("uucode", uucode);
     const habush = b.addModule("habush", .{
         .root_source_file = b.path("src/lib/main.zig"),
         .target = target,
@@ -50,6 +56,7 @@ pub fn build(b: *std.Build) !void {
     });
     exe.root_module.addImport("habush", habush);
     exe.root_module.addImport("habush-edit", habush_edit);
+    exe.root_module.addImport("uucode", uucode);
     exe.root_module.addOptions("features", features);
 
     b.installArtifact(exe);
@@ -206,6 +213,7 @@ pub fn build(b: *std.Build) !void {
     });
     terminal_tests.root_module.addImport("habush", habush);
     terminal_tests.root_module.addImport("habush-edit", habush_edit);
+    terminal_tests.root_module.addImport("uucode", uucode);
     terminal_tests.root_module.addOptions("features", features);
     if (plugin_module) |plugin| terminal_tests.root_module.addImport("habush-plugin", plugin);
     const run_terminal_tests = b.addRunArtifact(terminal_tests);

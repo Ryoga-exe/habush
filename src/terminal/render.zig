@@ -1,8 +1,11 @@
 //! Terminal presentation helpers. Control bytes are visible text; OSC belongs
 //! to ShellIntegration and never enters the editing buffer or width count.
+//! Widths follow uucode's grapheme policy; ambiguous characters stay narrow.
 const std = @import("std");
 const Prompt = @import("habush-edit").Prompt;
 const Diagnostic = @import("habush-edit").Diagnostic;
+const unicode = @import("habush-edit").unicode;
+const uucode = @import("uucode");
 
 pub fn inputRow(writer: *std.Io.Writer, prompt: Prompt, source: []const u8, cursor: usize, columns: usize, diagnostics: []const Diagnostic, source_offset: usize) std.Io.Writer.Error!usize {
     const prompt_width = try writePrompt(null, prompt, columns -| 2);
@@ -14,6 +17,7 @@ pub fn inputRow(writer: *std.Io.Writer, prompt: Prompt, source: []const u8, curs
     var skipped: usize = 0;
     while (start < cursor and skipped < desired_start) {
         const unit = decode(source[start..]);
+        if (start + unit.len > cursor) break;
         skipped += unit.width;
         start += unit.len;
     }
@@ -97,51 +101,51 @@ pub fn displayWidth(source: []const u8) usize {
     return width;
 }
 
-const Unit = struct { len: usize, width: u8, codepoint: ?u21 };
+pub fn isLiteral(source: []const u8) bool {
+    var index: usize = 0;
+    while (index < source.len) {
+        const unit = decode(source[index..]);
+        if (unit.kind != .literal or unit.width == 0) return false;
+        index += unit.len;
+    }
+    return true;
+}
+
+const Unit = struct {
+    len: usize,
+    width: usize,
+    kind: enum { literal, control, invalid, escaped },
+    codepoint: u21 = 0,
+};
 
 fn decode(source: []const u8) Unit {
-    const byte = source[0];
-    if (byte < 0x20 or byte == 0x7f) return .{ .len = 1, .width = 2, .codepoint = byte };
-    const length = std.unicode.utf8ByteSequenceLength(byte) catch return .{ .len = 1, .width = 4, .codepoint = null };
-    if (length > source.len) return .{ .len = 1, .width = 4, .codepoint = null };
-    const cp = std.unicode.utf8Decode(source[0..length]) catch return .{ .len = 1, .width = 4, .codepoint = null };
-    if ((cp >= 0x80 and cp <= 0x9f) or visibleFormat(cp)) return .{ .len = length, .width = 8, .codepoint = cp };
-    return .{ .len = length, .width = codepointWidth(cp), .codepoint = cp };
+    const scalar = unicode.decode(source);
+    const cp = scalar.codepoint orelse return .{ .len = 1, .width = 4, .kind = .invalid };
+    if (cp < 0x20 or cp == 0x7f) return .{ .len = scalar.len, .width = 2, .kind = .control, .codepoint = cp };
+    const orphan_mark = switch (uucode.get(.general_category, cp)) {
+        .mark_nonspacing, .mark_spacing_combining, .mark_enclosing => true,
+        else => false,
+    };
+    // Orphan marks/joiners must not combine with the prompt or a preceding span.
+    if ((cp >= 0x80 and cp <= 0x9f) or visibleFormat(cp) or orphan_mark or uucode.get(.wcwidth_standalone, cp) == 0)
+        return .{ .len = scalar.len, .width = if (cp > 0xfffff) 10 else if (cp > 0xffff) 9 else 8, .kind = .escaped, .codepoint = cp };
+    const length = unicode.nextGraphemeBoundary(source, 0);
+    return .{ .len = length, .width = uucode.grapheme.utf8Wcwidth(source[0..length]), .kind = .literal };
 }
 
 fn writeUnit(writer: *std.Io.Writer, bytes: []const u8, unit: Unit) std.Io.Writer.Error!void {
-    const cp = unit.codepoint orelse {
-        try writer.print("\\x{X:0>2}", .{bytes[0]});
-        return;
-    };
-    if (cp < 0x20 or cp == 0x7f) {
-        try writer.writeAll(&.{ '^', if (cp == 0x7f) '?' else @as(u8, @intCast(cp)) + 0x40 });
-    } else if ((cp >= 0x80 and cp <= 0x9f) or visibleFormat(cp)) {
-        try writer.print("\\u{{{X:0>4}}}", .{cp});
-    } else try writer.writeAll(bytes);
+    switch (unit.kind) {
+        .literal => try writer.writeAll(bytes),
+        .invalid => try writer.print("\\x{X:0>2}", .{bytes[0]}),
+        .control => try writer.writeAll(&.{ '^', if (unit.codepoint == 0x7f) '?' else @as(u8, @intCast(unit.codepoint)) + 0x40 }),
+        .escaped => try writer.print("\\u{{{X:0>4}}}", .{unit.codepoint}),
+    }
 }
 
 fn visibleFormat(cp: u21) bool {
     return cp == 0xad or cp == 0x61c or cp == 0x200b or
         (cp >= 0x200e and cp <= 0x200f) or (cp >= 0x202a and cp <= 0x202e) or
         (cp >= 0x2060 and cp <= 0x206f) or cp == 0xfeff;
-}
-
-/// Initial terminal policy: common combining marks/variation selectors occupy
-/// no cells, CJK and wide emoji occupy two. Ambiguous width is one. Grapheme
-/// clusters and terminal-specific emoji presentation need a richer provider.
-fn codepointWidth(cp: u21) u8 {
-    if ((cp >= 0x0300 and cp <= 0x036f) or (cp >= 0x1ab0 and cp <= 0x1aff) or
-        (cp >= 0x1dc0 and cp <= 0x1dff) or (cp >= 0x20d0 and cp <= 0x20ff) or
-        (cp >= 0xfe00 and cp <= 0xfe0f) or (cp >= 0xfe20 and cp <= 0xfe2f) or
-        (cp >= 0xe0100 and cp <= 0xe01ef) or cp == 0x200c or cp == 0x200d) return 0;
-    if (cp >= 0x1100 and (cp <= 0x115f or cp == 0x2329 or cp == 0x232a or
-        (cp >= 0x2e80 and cp <= 0xa4cf and cp != 0x303f) or
-        (cp >= 0xac00 and cp <= 0xd7a3) or (cp >= 0xf900 and cp <= 0xfaff) or
-        (cp >= 0xfe10 and cp <= 0xfe19) or (cp >= 0xfe30 and cp <= 0xfe6f) or
-        (cp >= 0xff01 and cp <= 0xff60) or (cp >= 0xffe0 and cp <= 0xffe6) or
-        (cp >= 0x1f300 and cp <= 0x1faff) or (cp >= 0x20000 and cp <= 0x3fffd))) return 2;
-    return 1;
 }
 
 test "display width and visible controls preserve terminal boundaries" {
@@ -162,4 +166,30 @@ test "styled prompts measure Unicode cells and escape provider controls" {
     try std.testing.expectEqual(@as(usize, 4), try writePrompt(&output.writer, prompt, 4));
     try std.testing.expectEqualStrings("\x1b[0;32;49m日^[\x1b[0m", output.written());
     try std.testing.expectEqual(@as(usize, 4), try writePrompt(null, prompt, 4));
+}
+
+test "width and clipping share grapheme boundaries while orphan marks stay visible" {
+    const cases = [_]struct { text: []const u8, width: usize }{
+        .{ .text = "日本", .width = 4 },
+        .{ .text = "か\u{3099}", .width = 2 },
+        .{ .text = "e\u{301}", .width = 1 },
+        .{ .text = "👩🏽‍🚀", .width = 2 },
+        .{ .text = "🇯🇵", .width = 2 },
+        .{ .text = "☁\u{fe0f}", .width = 2 },
+        .{ .text = "☁\u{fe0e}", .width = 1 },
+        .{ .text = "\u{301}", .width = 8 },
+        .{ .text = "\u{e0100}", .width = 9 },
+    };
+    for (cases) |case| try std.testing.expectEqual(case.width, displayWidth(case.text));
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try std.testing.expectEqual(@as(usize, 3), try writePrompt(&output.writer, .{ .spans = &.{.{ .text = "x👩🏽‍🚀y" }} }, 3));
+    try std.testing.expectEqualStrings("x👩🏽‍🚀", output.written());
+    output.clearRetainingCapacity();
+    const source = "aか\u{3099}b";
+    try std.testing.expectEqual(@as(usize, 3), try inputRow(&output.writer, Prompt.secondary, source, source.len, 6, &.{}, 0));
+    try std.testing.expectEqualStrings("> b", output.written());
+    output.clearRetainingCapacity();
+    try writeVisible(&output.writer, "\u{301}\u{e0100}\u{200d}");
+    try std.testing.expectEqualStrings("\\u{0301}\\u{E0100}\\u{200D}", output.written());
 }

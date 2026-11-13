@@ -1,6 +1,7 @@
 //! Repaints the editor-owned rows, keeping the cursor's logical line visible.
 const std = @import("std");
 const edit = @import("habush-edit");
+const unicode = edit.unicode;
 const render = @import("render.zig");
 const View = @This();
 
@@ -8,7 +9,7 @@ frame: std.Io.Writer.Allocating,
 previous: std.ArrayList(u8) = .empty,
 cursor_row: usize = 0,
 rows: usize = 1,
-tail_column: ?usize = null,
+tail_source_len: ?usize = null,
 columns: usize = 0,
 terminal_rows: usize = 0,
 
@@ -21,11 +22,11 @@ pub fn deinit(view: *View) void {
 pub fn reset(view: *View) void {
     view.cursor_row = 0;
     view.rows = 1;
-    view.tail_column = null;
+    view.tail_source_len = null;
 }
 
 pub fn redraw(view: *View, output: *std.Io.Writer, prompt: edit.Prompt, state: *const edit.Editor, columns: usize, terminal_rows: usize) !void {
-    errdefer view.tail_column = null;
+    errdefer view.tail_source_len = null;
     view.frame.clearRetainingCapacity();
     const writer = &view.frame.writer;
     const height = @max(terminal_rows, 3);
@@ -99,38 +100,39 @@ pub fn redraw(view: *View, output: *std.Io.Writer, prompt: edit.Prompt, state: *
     try writer.writeByte('\r');
     if (cursor_column != 0) try writer.print("\x1b[{d}C", .{cursor_column});
     const single_line = state.menu == null and state.search == null and !state.completion_pending and diagnostics.len == 0 and
-        cursor == source.len and std.mem.indexOfScalar(u8, source, '\n') == null and
+        cursor == source.len and render.isLiteral(source) and
         (try render.writePrompt(null, prompt, columns -| 2)) + render.displayWidth(source) < columns -| 1;
     const line = view.frame.written()[line_start..line_end];
     if (!(single_line and columns == view.columns and terminal_rows == view.terminal_rows and
-        try view.redrawTail(output, line, cursor_column)))
+        try view.redrawTail(output, line, source)))
         try output.writeAll(view.frame.written());
     try output.flush();
-    view.tail_column = null;
+    view.tail_source_len = null;
     if (single_line) {
         view.previous.clearRetainingCapacity();
         try view.previous.appendSlice(view.frame.allocator, line);
-        view.tail_column = cursor_column;
+        view.tail_source_len = source.len;
     }
     view.columns = columns;
     view.terminal_rows = terminal_rows;
 }
 
-fn redrawTail(view: *const View, output: *std.Io.Writer, line: []const u8, column: usize) !bool {
-    const previous_column = view.tail_column orelse return false;
+fn redrawTail(view: *const View, output: *std.Io.Writer, line: []const u8, source: []const u8) !bool {
+    const previous_source_len = view.tail_source_len orelse return false;
     const previous = view.previous.items;
-    const appending = line.len >= previous.len;
-    const shorter = if (appending) previous else line;
-    const longer = if (appending) line else previous;
-    if (!std.mem.startsWith(u8, longer, shorter)) return false;
-    const suffix = longer[shorter.len..];
-    // shortcut: only ASCII suffixes, extend with grapheme-aware widths before optimizing Unicode edits.
-    for (suffix) |byte| if (!std.ascii.isPrint(byte)) return false;
-    if (appending) {
-        try output.writeAll(suffix);
+    // Literal input is the row's unchanged byte suffix, after the styled prompt.
+    const prompt_len = line.len - source.len;
+    const previous_prompt_len = previous.len - previous_source_len;
+    if (!std.mem.eql(u8, line[0..prompt_len], previous[0..previous_prompt_len])) return false;
+    const previous_source = previous[previous_prompt_len..];
+    if (!std.mem.startsWith(u8, source, previous_source) and !std.mem.startsWith(u8, previous_source, source)) return false;
+    const prefix = unicode.sharedGraphemePrefix(previous_source, source);
+    if (prefix == previous_source.len) {
+        try output.writeAll(source[prefix..]);
     } else {
         var sequence: [32]u8 = undefined;
-        try output.writeAll(try std.fmt.bufPrint(&sequence, "\x1b[{d}D\x1b[K", .{previous_column - column}));
+        const move = try std.fmt.bufPrint(&sequence, "\x1b[{d}D\x1b[K", .{render.displayWidth(previous_source[prefix..])});
+        _ = try output.writeSplat(&.{ move, source[prefix..] }, 1);
     }
     return true;
 }
@@ -168,16 +170,40 @@ test "tail edits emit only changed cells and full redraws reach an unbuffered si
         .{ .source = "a", .delta = "\x1b[2D\x1b[K" },
         .{ .source = "", .delta = "\x1b[1D\x1b[K" },
         .{ .source = "", .delta = "" },
-        .{ .source = "\x1b", .delta = "^[" },
-        .{ .source = "", .delta = "\x1b[2D\x1b[K" },
-        .{ .source = "日", .delta = null },
+        .{ .source = "\x1b", .delta = null },
+        .{ .source = "", .delta = null },
+        .{ .source = "日", .delta = "日" },
         .{ .source = "日x", .delta = "x" },
         .{ .source = "日", .delta = "\x1b[1D\x1b[K" },
-        .{ .source = "", .delta = null },
-        .{ .source = "e\xcc\x81", .delta = null },
-        .{ .source = "e", .delta = null },
+        .{ .source = "", .delta = "\x1b[2D\x1b[K" },
+        .{ .source = "e", .delta = "e" },
+        .{ .source = "e\xcc\x81", .delta = "\x1b[1D\x1b[Ke\xcc\x81" },
+        .{ .source = "e", .delta = "\x1b[1D\x1b[Ke" },
         .{ .source = "ex", .delta = "x" },
         .{ .source = "by", .delta = null },
+        .{ .source = "", .delta = "\x1b[2D\x1b[K" },
+        .{ .source = "か", .delta = "か" },
+        .{ .source = "か\u{3099}", .delta = "\x1b[2D\x1b[Kか\u{3099}" },
+        .{ .source = "か", .delta = "\x1b[2D\x1b[Kか" },
+        .{ .source = "か漢", .delta = "漢" },
+        .{ .source = "か", .delta = "\x1b[2D\x1b[K" },
+        .{ .source = "", .delta = "\x1b[2D\x1b[K" },
+        .{ .source = "👩", .delta = "👩" },
+        .{ .source = "👩🏽", .delta = "\x1b[2D\x1b[K👩🏽" },
+        .{ .source = "👩🏽‍", .delta = "\x1b[2D\x1b[K👩🏽‍" },
+        .{ .source = "👩🏽‍🚀", .delta = "\x1b[2D\x1b[K👩🏽‍🚀" },
+        .{ .source = "👩🏽", .delta = "\x1b[2D\x1b[K👩🏽" },
+        .{ .source = "", .delta = "\x1b[2D\x1b[K" },
+        .{ .source = "🇯", .delta = "🇯" },
+        .{ .source = "🇯🇵", .delta = "\x1b[2D\x1b[K🇯🇵" },
+        .{ .source = "🇯", .delta = "\x1b[2D\x1b[K🇯" },
+        .{ .source = "", .delta = "\x1b[2D\x1b[K" },
+        .{ .source = "☁", .delta = "☁" },
+        .{ .source = "☁\u{fe0f}", .delta = "\x1b[1D\x1b[K☁\u{fe0f}" },
+        .{ .source = "☁", .delta = "\x1b[2D\x1b[K☁" },
+        .{ .source = "☁\u{fe0e}", .delta = "\x1b[1D\x1b[K☁\u{fe0e}" },
+        .{ .source = "\u{301}", .delta = null },
+        .{ .source = "\xff", .delta = null },
     };
     for (cases) |case| {
         output.clearRetainingCapacity();

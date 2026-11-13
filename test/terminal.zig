@@ -160,6 +160,11 @@ pub fn main(init: std.process.Init) !void {
     try master.writeStreamingAll(io, "\x15/bin/echo DIAGNOSTIC:$?\r");
     try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "DIAGNOSTIC:0\r\n") != null);
 
+    try master.writeStreamingAll(io, "/bin/echo UNICODE:か\u{3099}👩🏽‍🚀\x7f\x7f\x7fZ\r");
+    const unicode_output = try terminal.expect(ready);
+    if (args.len == 2) try std.testing.expect(std.mem.indexOf(u8, unicode_output, "\x1b[2D\x1b[Kか\u{3099}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unicode_output, "UNICODE:か\u{3099}👩Z\r\n") != null);
+
     if (args.len == 4) {
         try pluginScenario(io, master, &terminal, config_path.?);
     } else {
