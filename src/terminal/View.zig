@@ -16,7 +16,7 @@ rows: usize = 1,
 columns: usize = 0,
 terminal_rows: usize = 0,
 
-const Row = struct { start: usize, end: usize, source_len: usize, prompt_width: usize, width: usize };
+const Row = struct { start: usize, end: usize, source_len: ?usize = null, prompt_width: usize = 0, width: usize };
 const Position = struct { row: usize, column: usize };
 
 pub fn deinit(view: *View) void {
@@ -42,8 +42,7 @@ pub fn redraw(view: *View, output: *std.Io.Writer, prompt: edit.Prompt, state: *
     const writer = &view.frame.writer;
     const height = @max(terminal_rows, 3);
     const diagnostics = state.currentDiagnostics();
-    var cacheable = columns > 1 and terminal_rows >= 3 and
-        state.menu == null and state.search == null and !state.completion_pending and diagnostics.len == 0;
+    const cacheable = columns > 1 and terminal_rows >= 3;
     const diagnostic_rows = if (height >= 5) @min(@min(diagnostics.len, 3), height / 3) else 0;
     const menu_height = height - diagnostic_rows;
     const menu_limit = @max(@as(usize, 1), @min(@as(usize, 8), menu_height / 2 -| 1));
@@ -69,11 +68,10 @@ pub fn redraw(view: *View, output: *std.Io.Writer, prompt: edit.Prompt, state: *
         const row_start = writer.end;
         const layout = try render.inputRow(writer, if (line_index == 0) prompt else edit.Prompt.secondary, line, if (line_index == cursor_line) cursor - source_offset else 0, columns, diagnostics, source_offset);
         if (line_index == cursor_line) cursor_column = layout.cursor_column;
-        cacheable = cacheable and layout.literal;
         try view.current_rows.append(view.frame.allocator, .{
             .start = row_start,
             .end = writer.end,
-            .source_len = layout.visible_source.len,
+            .source_len = if (layout.literal) layout.visible_source.len else null,
             .prompt_width = layout.prompt_width,
             .width = layout.width,
         });
@@ -83,35 +81,50 @@ pub fn redraw(view: *View, output: *std.Io.Writer, prompt: edit.Prompt, state: *
         const start = menu.selected / @max(menu_limit, 1) * @max(menu_limit, 1);
         for (menu.result.labels[start..@min(start + menu_limit, menu.result.labels.len)], start..) |label, index| {
             try writer.writeAll("\r\n");
-            try writer.writeAll(if (index == menu.selected) "> " else "  ");
-            _ = try render.writePrompt(writer, .{ .spans = &.{.{ .text = label[0..@min(label.len, 256)] }} }, columns -| 3);
+            const row_start = writer.end;
+            const width = try render.writePrompt(writer, .{ .spans = &.{
+                .{ .text = if (index == menu.selected) "> " else "  " },
+                .{ .text = label[0..@min(label.len, 256)] },
+            } }, columns -| 1);
+            try view.appendRow(row_start, width);
             row += 1;
         }
         if (menu_status) {
             try writer.writeAll("\r\n");
+            const row_start = writer.end;
             const message = if (menu.result.incomplete or menu.result.truncated) "... partial results" else "... more matches";
-            _ = try render.writePrompt(writer, .{ .spans = &.{.{ .text = message }} }, columns -| 1);
+            const width = try render.writePrompt(writer, .{ .spans = &.{.{ .text = message }} }, columns -| 1);
+            try view.appendRow(row_start, width);
             row += 1;
         }
     }
     if (state.completion_pending) {
         try writer.writeAll("\r\n");
-        _ = try render.writePrompt(writer, .{ .spans = &.{.{ .text = "completing..." }} }, columns -| 1);
+        const row_start = writer.end;
+        const width = try render.writePrompt(writer, .{ .spans = &.{.{ .text = "completing..." }} }, columns -| 1);
+        try view.appendRow(row_start, width);
         row += 1;
     }
     if (state.search) |search| {
         try writer.writeAll("\r\n");
-        _ = try render.writePrompt(writer, .{ .spans = &.{
+        const row_start = writer.end;
+        const width = try render.writePrompt(writer, .{ .spans = &.{
             .{ .text = if (search.failed) "history (no match): " else "history (Enter selects, Esc cancels): " },
             .{ .text = search.query.text() },
         } }, columns -| 1);
+        try view.appendRow(row_start, width);
         row += 1;
     }
     for (diagnostics[0..diagnostic_rows]) |diagnostic| {
         try writer.writeAll("\r\n");
-        const severity = @tagName(diagnostic.severity);
-        try writer.print("{s}: ", .{severity});
-        _ = try render.writePrompt(writer, .{ .spans = &.{.{ .text = diagnostic.message }} }, columns -| (severity.len + 3));
+        const row_start = writer.end;
+        var prefix_buffer: [16]u8 = undefined;
+        const prefix = try std.fmt.bufPrint(&prefix_buffer, "{s}: ", .{@tagName(diagnostic.severity)});
+        const width = try render.writePrompt(writer, .{ .spans = &.{
+            .{ .text = prefix },
+            .{ .text = diagnostic.message },
+        } }, columns -| 1);
+        try view.appendRow(row_start, width);
         row += 1;
     }
     const cursor_row = cursor_line - first_line;
@@ -137,6 +150,10 @@ pub fn redraw(view: *View, output: *std.Io.Writer, prompt: edit.Prompt, state: *
     view.terminal_rows = terminal_rows;
 }
 
+fn appendRow(view: *View, start: usize, width: usize) std.mem.Allocator.Error!void {
+    try view.current_rows.append(view.frame.allocator, .{ .start = start, .end = view.frame.writer.end, .width = width });
+}
+
 fn redrawRows(view: *View, output: *std.Io.Writer, target: Position) !void {
     var updates: std.Io.Writer.Allocating = .fromArrayList(view.frame.allocator, &view.updates);
     defer view.updates = updates.toArrayList();
@@ -157,9 +174,11 @@ fn redrawRows(view: *View, output: *std.Io.Writer, target: Position) !void {
             const previous_row = view.previous_rows.items[index];
             const previous_line = view.previous.items[previous_row.start..previous_row.end];
             if (std.mem.eql(u8, line, previous_line)) continue;
-            const prompt_len = line.len - row.source_len;
-            const previous_prompt_len = previous_line.len - previous_row.source_len;
-            if (std.mem.eql(u8, line[0..prompt_len], previous_line[0..previous_prompt_len])) {
+            const prompt_len = line.len - (row.source_len orelse 0);
+            const previous_prompt_len = previous_line.len - (previous_row.source_len orelse 0);
+            if (row.source_len != null and previous_row.source_len != null and
+                std.mem.eql(u8, line[0..prompt_len], previous_line[0..previous_prompt_len]))
+            {
                 const source = line[prompt_len..];
                 const previous_source = previous_line[previous_prompt_len..];
                 const prefix = unicode.sharedGraphemePrefix(previous_source, source);
@@ -223,8 +242,8 @@ test "single-line edits and cursor movement reach an unbuffered sink together" {
         .{ .source = "a", .delta = "\x1b[2D\x1b[K" },
         .{ .source = "", .delta = "\x1b[1D\x1b[K" },
         .{ .source = "", .delta = "" },
-        .{ .source = "\x1b", .delta = null },
-        .{ .source = "", .delta = null },
+        .{ .source = "\x1b", .delta = "\x1b[4D\x1b[K\x1b[0;32;49m日> \x1b[0m^[" },
+        .{ .source = "", .delta = "\x1b[6D\x1b[K\x1b[0;32;49m日> \x1b[0m" },
         .{ .source = "日", .delta = "日" },
         .{ .source = "日x", .delta = "x" },
         .{ .source = "日", .delta = "\x1b[1D\x1b[K" },
@@ -287,8 +306,8 @@ test "single-line edits and cursor movement reach an unbuffered sink together" {
         .{ .source = "👩🏽‍🚀x", .cursor = 11, .delta = "" },
         .{ .source = "👩🏽‍🚀x", .cursor = 8, .delta = "" },
         .{ .source = "👩🏽x", .cursor = 8, .delta = "\x1b[2D\x1b[K👩🏽x\x1b[1D" },
-        .{ .source = "\u{301}", .delta = null },
-        .{ .source = "\xff", .delta = null },
+        .{ .source = "\u{301}", .delta = "\x1b[6D\x1b[K\x1b[0;32;49m日> \x1b[0m\\u{0301}" },
+        .{ .source = "\xff", .delta = "\x1b[12D\x1b[K\x1b[0;32;49m日> \x1b[0m\\xFF" },
     };
     for (cases) |case| {
         output.clearRetainingCapacity();
@@ -307,18 +326,15 @@ test "single-line edits and cursor movement reach an unbuffered sink together" {
     }
 }
 
-test "row cache is invalidated by overlays, resizing and screen clearing" {
+test "row cache is invalidated by resizing and screen clearing" {
     var state: edit.Editor = .{ .buffer = .{ .gpa = std.testing.allocator } };
     defer state.deinit();
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
     var view: View = .{ .frame = .init(std.testing.allocator) };
     defer view.deinit();
-    const Change = enum { menu, diagnostics, pending, columns, height, clear };
+    const Change = enum { columns, height, clear };
     for (std.enums.values(Change)) |change| {
-        state.menu = null;
-        state.diagnostics = null;
-        state.completion_pending = false;
         try state.buffer.replace(0, state.buffer.text().len, "abc");
         try view.redraw(&output.writer, edit.Prompt.primary, &state, 20, 8);
         output.clearRetainingCapacity();
@@ -326,9 +342,6 @@ test "row cache is invalidated by overlays, resizing and screen clearing" {
         var height: usize = 8;
         const prompt = edit.Prompt.primary;
         switch (change) {
-            .menu => state.menu = .{ .result = .{ .labels = &.{"candidate"} } },
-            .diagnostics => try std.testing.expect(state.setDiagnostics(.{ .revision = state.buffer.revision, .items = &.{.{ .start = 0, .end = 1, .severity = .warning, .message = "warning" }} })),
-            .pending => state.completion_pending = true,
             .columns => columns += 1,
             .height => height += 1,
             .clear => view.reset(),
@@ -414,5 +427,51 @@ test "viewport bounds multiline input and menu while retaining the cursor line" 
     try std.testing.expectEqual(@as(usize, 1), view.cursor_row);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "日本") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "\x1b[4;31m日本") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output.written(), "literal^[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "literal^[") == null);
+}
+
+test "completion and diagnostic rows update without repainting unchanged input" {
+    var state: edit.Editor = .{ .buffer = .{ .gpa = std.testing.allocator } };
+    defer state.deinit();
+    try std.testing.expect(try state.insert("ab"));
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var view: View = .{ .frame = .init(std.testing.allocator) };
+    defer view.deinit();
+    const prompt = edit.Prompt.secondary;
+    try view.redraw(&output.writer, prompt, &state, 40, 8);
+    const cases = [_]struct {
+        labels: []const []const u8 = &.{},
+        selected: usize = 0,
+        pending: bool = false,
+        diagnostic: ?[]const u8 = null,
+        cursor: usize = 2,
+        delta: []const u8,
+    }{
+        .{ .labels = &.{ "alpha", "beta" }, .delta = "\r\n> alpha\r\n  beta\x1b[2A\x1b[2D" },
+        .{ .labels = &.{ "alpha", "beta" }, .selected = 1, .delta = "\x1b[1B\x1b[4D\x1b[K  alpha\x1b[1B\x1b[7D\x1b[K> beta\x1b[2A\x1b[2D" },
+        .{ .labels = &.{ "alpha", "beta" }, .selected = 1, .delta = "" },
+        .{ .labels = &.{ "alpha", "b\x1b" }, .selected = 1, .delta = "\x1b[2B\x1b[4D\x1b[K> b^[\x1b[2A\x1b[1D" },
+        .{ .pending = true, .delta = "\x1b[1B\x1b[4D\x1b[Kcompleting...\x1b[1B\x1b[13D\x1b[J\x1b[2A\x1b[4C" },
+        .{ .diagnostic = "check", .delta = "\x1b[4D\x1b[K> \x1b[4;33ma\x1b[0mb\x1b[1B\x1b[4D\x1b[Kwarning: check\x1b[1A\x1b[10D" },
+        .{ .diagnostic = "check\x1b", .delta = "\x1b[1B\x1b[4D\x1b[Kwarning: check^[\x1b[1A\x1b[12D" },
+        .{ .diagnostic = "check\x1b", .cursor = 1, .delta = "\x1b[1D" },
+        .{ .cursor = 1, .delta = "\x1b[3D\x1b[K> ab\x1b[1B\x1b[4D\x1b[J\x1b[1A\x1b[3C" },
+    };
+    for (cases) |case| {
+        state.menu = if (case.labels.len == 0) null else .{ .result = .{ .labels = case.labels }, .selected = case.selected };
+        state.completion_pending = case.pending;
+        state.diagnostics = null;
+        if (case.diagnostic) |message|
+            try std.testing.expect(state.setDiagnostics(.{ .revision = state.buffer.revision, .items = &.{.{ .start = 0, .end = 1, .message = message }} }));
+        state.buffer.cursor = case.cursor;
+        output.clearRetainingCapacity();
+        try view.redraw(&output.writer, prompt, &state, 40, 8);
+        try std.testing.expectEqualStrings(case.delta, output.written());
+        try std.testing.expectEqual(view.rows, view.previous_rows.items.len);
+    }
+    state.menu = .{ .result = .{ .labels = &.{ "alpha", "beta" } } };
+    try std.testing.expect(state.setDiagnostics(.{ .revision = state.buffer.revision, .items = &.{.{ .start = 0, .end = 1, .message = "check" }} }));
+    try view.redraw(&output.writer, prompt, &state, 4, 8);
+    for (view.previous_rows.items) |row| try std.testing.expect(row.width < 4);
 }

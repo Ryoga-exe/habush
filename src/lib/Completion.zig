@@ -241,6 +241,8 @@ pub fn makeEdit(
         context.replace.end > source.len) return error.StaleContext;
     if (context.kind == .comment or context.kind == .parameter or context.dynamic) return error.UnsupportedContext;
     if (std.mem.indexOfScalar(u8, value, 0) != null) return error.InvalidCandidate;
+    if (canInsertUnquoted(context, value))
+        return .{ .range = context.replace, .text = try gpa.dupe(u8, value) };
     var text: std.ArrayList(u8) = .empty;
     errdefer text.deinit(gpa);
     try text.append(gpa, '\'');
@@ -249,6 +251,22 @@ pub fn makeEdit(
     }
     try text.append(gpa, '\'');
     return .{ .range = context.replace, .text = try text.toOwnedSlice(gpa) };
+}
+
+fn canInsertUnquoted(context: Completion, value: []const u8) bool {
+    if (value.len == 0 or context.quote != .unquoted or @import("tokenizer.zig").Token.getKeyword(value) != null) return false;
+    // Quoting a here-document delimiter controls expansion of its body.
+    if (context.kind == .redirection) return false;
+    const original = context.source[context.replace.start..context.replace.end];
+    if (original.len != 0 and (original[0] == '\'' or original[0] == '"')) return false;
+    // Adjacent digits would become an IO number instead of a literal word.
+    if (allDigits(value) and context.replace.end < context.source.len and
+        std.mem.indexOfScalar(u8, "<>&", context.source[context.replace.end]) != null) return false;
+    for (value) |byte| {
+        if (byte >= 0x80 or std.ascii.isAlphanumeric(byte) or std.mem.indexOfScalar(u8, "_./-:@%+,", byte) != null) continue;
+        return false;
+    }
+    return true;
 }
 
 fn finishWord(frame: *Frame, source: []const u8, end: usize) void {
@@ -378,6 +396,37 @@ test "candidate edits are literal and reject stale input" {
     const borrowed = try inspect(&mutable, mutable.len, 1);
     mutable[0] = 'x';
     try std.testing.expectError(error.StaleContext, makeEdit(std.testing.allocator, borrowed, &mutable, 1, "echo"));
+}
+
+test "ordinary completion stays unquoted while literal shell values round-trip" {
+    const cases = [_]struct { source: []const u8 = "echo x", cursor: ?usize = null, value: []const u8, text: []const u8 }{
+        .{ .value = "README.md", .text = "README.md" },
+        .{ .source = "pw", .value = "pwd", .text = "pwd" },
+        .{ .value = "日本.txt", .text = "日本.txt" },
+        .{ .value = "sub/name-1.txt", .text = "sub/name-1.txt" },
+        .{ .value = "123", .text = "123" },
+        .{ .value = "a b", .text = "'a b'" },
+        .{ .value = "$(missing);*", .text = "'$(missing);*'" },
+        .{ .value = "", .text = "''" },
+        .{ .source = "i", .value = "if", .text = "'if'" },
+        .{ .source = "x", .value = "name=value", .text = "'name=value'" },
+        .{ .source = "echo x>out", .cursor = 6, .value = "2", .text = "'2'" },
+        .{ .source = "cat <<EO", .value = "EOF", .text = "'EOF'" },
+        .{ .source = "echo 'READ", .value = "README.md", .text = "'README.md'" },
+    };
+    var storage: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer storage.deinit();
+    const arena = storage.allocator();
+    for (cases) |case| {
+        const context = try inspect(case.source, case.cursor orelse case.source.len, 1);
+        var edit = try makeEdit(std.testing.allocator, context, case.source, 1, case.value);
+        defer edit.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings(case.text, edit.text);
+        const source = try std.mem.concat(arena, u8, &.{ "echo ", edit.text, " next" });
+        const args = try (try inspect(source, source.len, 1)).literalArguments(arena);
+        try std.testing.expectEqual(@as(usize, 2), args.len);
+        try std.testing.expectEqualStrings(case.value, args[1]);
+    }
 }
 
 test {

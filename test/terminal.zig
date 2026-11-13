@@ -157,7 +157,10 @@ pub fn main(init: std.process.Init) !void {
     try master.writeStreamingAll(io, ")");
     const diagnosed = try terminal.expect("error: expected command");
     try std.testing.expect(std.mem.indexOf(u8, diagnosed, "\x1b[4;31m)") != null);
-    try master.writeStreamingAll(io, "\x15/bin/echo DIAGNOSTIC:$?\r");
+    try master.writeStreamingAll(io, "\x02");
+    const diagnostic_cursor = try terminal.expect("\x1b[1D");
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic_cursor, "expected command") == null);
+    try master.writeStreamingAll(io, "\x06\x15/bin/echo DIAGNOSTIC:$?\r");
     try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "DIAGNOSTIC:0\r\n") != null);
 
     try master.writeStreamingAll(io, "/bin/echo UNICODE:か\u{3099}👩🏽‍🚀\x7f\x7f\x7fZ\r");
@@ -170,7 +173,10 @@ pub fn main(init: std.process.Init) !void {
     if (args.len == 2) try std.testing.expect(std.mem.indexOf(u8, middle_output, "\x1b[KZb本\x1b[3D") != null);
     try std.testing.expect(std.mem.indexOf(u8, middle_output, "MIDDLE:日a漢本\r\n") != null);
 
-    if (args.len == 2) try viewportScenario(io, master, &terminal);
+    if (args.len == 2) {
+        try viewportScenario(io, master, &terminal);
+        try completionMenuScenario(io, master, &terminal);
+    }
 
     if (args.len == 4) {
         try pluginScenario(io, master, &terminal, config_path.?);
@@ -189,7 +195,7 @@ pub fn main(init: std.process.Init) !void {
         try master.writeStreamingAll(io, "PATH=; habush_completion_probe() { /bin/echo COMPLETION:$1; }\r");
         _ = try terminal.expect(ready);
         try master.writeStreamingAll(io, "habush_completion_pr\t");
-        _ = try terminal.expect("habush_completion_probe");
+        _ = try terminal.expect("obe");
         try master.writeStreamingAll(io, " literal\r");
         try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "COMPLETION:literal\r\n") != null);
 
@@ -324,6 +330,24 @@ fn viewportScenario(io: Io, master: Io.File, terminal: *Terminal) !void {
     try std.testing.expect(std.mem.indexOf(u8, multiline, "\x1b[J") == null);
 }
 
+fn completionMenuScenario(io: Io, master: Io.File, terminal: *Terminal) !void {
+    try master.writeStreamingAll(io, "__menu() { /usr/bin/printf '%s\\0' alpha beta; }; complete -F __menu /bin/echo\r");
+    _ = try terminal.expect(ready);
+    try master.writeStreamingAll(io, "/bin/echo \t");
+    _ = try terminal.expect("  beta");
+    try master.writeStreamingAll(io, "\x1b[B");
+    const selected = try terminal.expect("> beta");
+    try std.testing.expect(std.mem.indexOf(u8, selected, "alpha") != null);
+    try std.testing.expect(std.mem.indexOf(u8, selected, "/bin/echo") == null);
+    try master.writeStreamingAll(io, "\r");
+    const accepted = try terminal.expect("beta");
+    try std.testing.expect(std.mem.startsWith(u8, accepted, "beta"));
+    try master.writeStreamingAll(io, "\r");
+    try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "beta\r\n") != null);
+    try master.writeStreamingAll(io, "complete -r /bin/echo\r");
+    _ = try terminal.expect(ready);
+}
+
 fn functionCompletionScenario(io: Io, master: Io.File, terminal: *Terminal) !void {
     try master.writeStreamingAll(io, "__ec() { /usr/bin/printf '%s\\0' \"$3-$1 '\\$(missing)\"; }; complete -F __ec /bin/echo; false\r");
     _ = try terminal.expect(ready);
@@ -357,7 +381,7 @@ fn functionCompletionScenario(io: Io, master: Io.File, terminal: *Terminal) !voi
     try master.writeStreamingAll(io, "complete -r /bin/echo\r");
     _ = try terminal.expect(ready);
     try master.writeStreamingAll(io, "/bin/echo READ\t");
-    _ = try terminal.expect("README.md");
+    _ = try terminal.expect("ME.md");
     try master.writeStreamingAll(io, "\r");
     try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "README.md\r\n") != null);
 }
@@ -389,7 +413,7 @@ fn historyScenario(io: Io, master: Io.File, terminal: *Terminal) !void {
     try master.writeStreamingAll(io, "/bin/echo EDITED:$result\r");
     try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "EDITED:right\r\n") != null);
     try master.writeStreamingAll(io, "{ : <<'EOF'\r'$(unclosed\t\rEOF\r/bin/echo READ\t");
-    _ = try terminal.expect("README.md");
+    _ = try terminal.expect("ME.md");
     try master.writeStreamingAll(io, "; }\r");
     try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "README.md\r\n") != null);
 }
@@ -494,7 +518,7 @@ fn pluginScenario(io: Io, master: Io.File, terminal: *Terminal, config_path: []c
     try master.writeStreamingAll(io, "complete -r /bin/echo\r");
     _ = try terminal.expect(ready);
     try master.writeStreamingAll(io, "/bin/echo READ\t");
-    _ = try terminal.expect("README.md");
+    _ = try terminal.expect("ME.md");
     try master.writeStreamingAll(io, "\r");
     try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "README.md\r\n") != null);
 }

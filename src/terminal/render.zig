@@ -45,6 +45,7 @@ pub fn inputRow(writer: *std.Io.Writer, prompt: Prompt, source: []const u8, curs
                     severity = diagnostic.severity;
                 };
         }
+        literal = literal and severity == null;
         if (severity != active) {
             if (active != null) try writer.writeAll("\x1b[0m");
             if (severity) |value| try writer.print("\x1b[4;{d}m", .{@as(u8, switch (value) {

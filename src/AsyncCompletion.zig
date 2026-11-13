@@ -178,7 +178,7 @@ test "editing cancels pending work, replacements reject stale input IDs, and shu
             _ = try editor.pollCompletion();
             try io.sleep(.fromMilliseconds(1), .awake);
         }
-        try std.testing.expectEqualStrings("cmd 'choice'", editor.buffer.text());
+        try std.testing.expectEqualStrings("cmd choice", editor.buffer.text());
         var stale = service.job.?.request;
         stale.input_id += 1;
         const interface = service.completion();
