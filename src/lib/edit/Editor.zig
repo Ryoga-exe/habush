@@ -118,6 +118,8 @@ pub fn perform(editor: *Editor, action: Keybind.Action) Completion.Error!Effect 
         .cursor_end => buffer.cursor = buffer.lineEnd(),
         .cursor_left => buffer.left(),
         .cursor_right => buffer.right(),
+        .cursor_word_left => buffer.cursor = buffer.wordStart(),
+        .cursor_word_right => buffer.cursor = buffer.wordEnd(),
         .backspace => try buffer.backspace(),
         .delete => try buffer.delete(),
         .kill_to_end => {
@@ -125,6 +127,14 @@ pub fn perform(editor: *Editor, action: Keybind.Action) Completion.Error!Effect 
             try buffer.replace(buffer.cursor, if (end == buffer.cursor and end < buffer.text().len) end + 1 else end, "");
         },
         .kill_to_start => try buffer.replace(buffer.lineStart(), buffer.cursor, ""),
+        .kill_word_backward => {
+            const start = buffer.wordStart();
+            if (start != buffer.cursor) try buffer.replace(start, buffer.cursor, "");
+        },
+        .kill_word_forward => {
+            const end = buffer.wordEnd();
+            if (end != buffer.cursor) try buffer.replace(buffer.cursor, end, "");
+        },
         .insert_newline => return if (try editor.insert("\n")) .redraw else .bell,
         .undo => {
             _ = buffer.undo();
@@ -168,8 +178,13 @@ fn searchAction(editor: *Editor, action: Keybind.Action) Completion.Error!Effect
     const history = editor.history.?;
     switch (action) {
         .history_search => return if (search.find(history, search.index orelse history.entries.items.len, editor.max_bytes)) .redraw else .bell,
-        .backspace => {
-            try search.query.backspace();
+        .backspace, .kill_word_backward => {
+            if (action == .backspace) {
+                try search.query.backspace();
+            } else {
+                const start = search.query.wordStart();
+                if (start != search.query.cursor) try search.query.replace(start, search.query.cursor, "");
+            }
             search.index = null;
             _ = search.find(history, history.entries.items.len, editor.max_bytes);
         },
@@ -265,12 +280,46 @@ test "reverse history search previews without execution, restores drafts, and ac
     _ = try editor.perform(.history_search);
     try std.testing.expect(try editor.insert("日本x"));
     _ = try editor.perform(.backspace);
+    try std.testing.expect(try editor.insert(" missing"));
+    _ = try editor.perform(.kill_word_backward);
+    try std.testing.expectEqualStrings("日本 ", editor.search.?.query.text());
+    _ = try editor.perform(.backspace);
     try std.testing.expectEqual(Effect.redraw, try editor.perform(.accept_line));
     try std.testing.expectEqualStrings("cat <<EOF\n日本 two\nEOF", editor.buffer.text());
     try std.testing.expectEqual(Effect.submit, try editor.perform(.accept_line));
     _ = try editor.perform(.undo);
     try std.testing.expectEqualStrings("draft", editor.buffer.text());
     try std.testing.expectEqual(@as(usize, 2), editor.buffer.cursor);
+}
+
+test "word actions preserve cursor-only revisions and delete in one undoable edit" {
+    var editor: Editor = .{ .buffer = .{ .gpa = std.testing.allocator } };
+    defer editor.deinit();
+    try std.testing.expect(try editor.insert("echo 日\u{3000}本"));
+    const revision = editor.buffer.revision;
+    _ = try editor.perform(.cursor_word_left);
+    try std.testing.expectEqual("echo 日\u{3000}".len, editor.buffer.cursor);
+    _ = try editor.perform(.cursor_word_right);
+    try std.testing.expectEqual(editor.buffer.text().len, editor.buffer.cursor);
+    try std.testing.expectEqual(revision, editor.buffer.revision);
+    _ = try editor.perform(.kill_word_backward);
+    try std.testing.expectEqualStrings("echo 日\u{3000}", editor.buffer.text());
+    const deleted_revision = editor.buffer.revision;
+    _ = try editor.perform(.kill_word_forward);
+    try std.testing.expectEqual(deleted_revision, editor.buffer.revision);
+    _ = try editor.perform(.undo);
+    try std.testing.expectEqualStrings("echo 日\u{3000}本", editor.buffer.text());
+    _ = try editor.perform(.cursor_word_left);
+    _ = try editor.perform(.cursor_word_left);
+    _ = try editor.perform(.kill_word_forward);
+    try std.testing.expectEqualStrings("echo \u{3000}本", editor.buffer.text());
+    editor.buffer.cursor = 0;
+    const forward_revision = editor.buffer.revision;
+    _ = try editor.perform(.kill_word_backward);
+    try std.testing.expectEqual(forward_revision, editor.buffer.revision);
+    _ = try editor.perform(.undo);
+    try std.testing.expectEqualStrings("echo 日\u{3000}本", editor.buffer.text());
+    try std.testing.expectEqual("echo ".len, editor.buffer.cursor);
 }
 
 test "multiline actions move between scalar boundaries and insert a continuation" {

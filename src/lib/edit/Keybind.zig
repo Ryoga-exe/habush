@@ -14,6 +14,8 @@ pub const Action = enum {
     cursor_end,
     cursor_left,
     cursor_right,
+    cursor_word_left,
+    cursor_word_right,
     cursor_up,
     cursor_down,
     insert_newline,
@@ -21,6 +23,8 @@ pub const Action = enum {
     delete,
     kill_to_end,
     kill_to_start,
+    kill_word_backward,
+    kill_word_forward,
     undo,
     complete,
     complete_previous,
@@ -44,6 +48,9 @@ pub const Key = enum(u16) {
     end,
     delete,
     backtab,
+    alt_b,
+    alt_f,
+    alt_d,
     _,
 
     pub fn fromByte(byte: u8) Key {
@@ -59,7 +66,7 @@ pub const Key = enum(u16) {
             .{ "up", .up },             .{ "down", .down },      .{ "left", .left },              .{ "right", .right },
             .{ "home", .home },         .{ "end", .end },        .{ "delete", .delete },          .{ "backtab", .backtab },
             .{ "enter", fromByte(13) }, .{ "tab", fromByte(9) }, .{ "backspace", fromByte(127) }, .{ "escape", fromByte(27) },
-            .{ "space", fromByte(32) },
+            .{ "space", fromByte(32) }, .{ "alt+b", .alt_b },    .{ "alt+f", .alt_f },            .{ "alt+d", .alt_d },
         }).get(source)) |key| return key;
         if (source.len == 1 and std.ascii.isPrint(source[0])) return fromByte(source[0]);
         if (std.mem.startsWith(u8, source, "ctrl+")) {
@@ -81,6 +88,7 @@ pub const Key = enum(u16) {
             .{ "[C", .right }, .{ "OC", .right }, .{ "[D", .left },    .{ "OD", .left },
             .{ "[H", .home },  .{ "OH", .home },  .{ "[1~", .home },   .{ "[F", .end },
             .{ "OF", .end },   .{ "[4~", .end },  .{ "[3~", .delete }, .{ "[Z", .backtab },
+            .{ "b", .alt_b },  .{ "f", .alt_f },  .{ "d", .alt_d },
         }).get(sequence);
     }
 };
@@ -116,6 +124,7 @@ pub fn lookup(bindings: []const Keybind, key: Key) ?Action {
         16 => .history_previous,
         18 => .history_search,
         21 => .kill_to_start,
+        23 => .kill_word_backward,
         27 => .dismiss_completion,
         31 => .undo,
         127 => .backspace,
@@ -127,6 +136,9 @@ pub fn lookup(bindings: []const Keybind, key: Key) ?Action {
         @backingInt(Key.end) => .cursor_end,
         @backingInt(Key.delete) => .delete,
         @backingInt(Key.backtab) => .complete_previous,
+        @backingInt(Key.alt_b) => .cursor_word_left,
+        @backingInt(Key.alt_f) => .cursor_word_right,
+        @backingInt(Key.alt_d) => .kill_word_forward,
         else => null,
     };
 }
@@ -138,6 +150,7 @@ test "key normalization, override order, and unbinding defaults" {
         .{ .key = "ctrl+l", .action = .complete },
         .{ .key = "tab", .action = .unbind },
         .{ .key = "up", .action = .history_search_previous },
+        .{ .key = "alt+b", .action = .unbind },
     });
     defer gpa.free(bindings);
     try std.testing.expectEqual(Action.complete, lookup(bindings, Key.fromByte(12)).?);
@@ -148,6 +161,12 @@ test "key normalization, override order, and unbinding defaults" {
     try std.testing.expectEqual(try Key.parse("enter"), try Key.parse("ctrl+j"));
     try std.testing.expectEqual(try Key.parse("backspace"), try Key.parse("ctrl+h"));
     try std.testing.expectEqual(Key.fromByte(0), try Key.parse("ctrl+space"));
+    try std.testing.expectEqual(Action.kill_word_backward, lookup(&.{}, try Key.parse("ctrl+w")).?);
+    inline for (.{ .{ "alt+b", "b", Action.cursor_word_left }, .{ "alt+f", "f", Action.cursor_word_right }, .{ "alt+d", "d", Action.kill_word_forward } }) |case| {
+        try std.testing.expectEqual(try Key.parse(case[0]), Key.fromEscape(case[1]).?);
+        try std.testing.expectEqual(case[2], lookup(&.{}, try Key.parse(case[0])).?);
+    }
+    try std.testing.expect(lookup(bindings, .alt_b) == null);
     for ([_][]const u8{ "", "ctrl+1", "super+a", "ctrl+shift+a", "あ", "unknown" }) |invalid|
         try std.testing.expectError(error.InvalidKeybind, Key.parse(invalid));
 }

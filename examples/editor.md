@@ -15,6 +15,8 @@ uses cooked line input.
 | Ctrl+O | Insert a newline without submitting |
 | Escape | Dismiss the menu, or cancel history search and restore the draft |
 | Ctrl+A/E, Ctrl+B/F | Start/end, previous/next character |
+| Alt+B/F | Previous word start / next word end |
+| Ctrl+W, Alt+D | Delete the previous/next word |
 | Ctrl+K/U | Delete to end/start |
 | Ctrl+_ | Undo the last edit |
 | Ctrl+C, Ctrl+D | Cancel input, or EOF/delete |
@@ -36,6 +38,12 @@ columns; Ctrl+A/E and Ctrl+U/K operate on the current line. Long lines scroll
 horizontally and long inputs use a vertical viewport. Menus are repainted below
 the input instead of being appended to scrollback on every selection.
 
+Word operations use whitespace boundaries, including Unicode spaces and newlines.
+Path punctuation such as `/`, `.`, and `-` stays in the word; quoting and escaping
+do not change the boundaries. Word deletion is one undoable edit. Ctrl+W also
+edits the history search query. Alt bindings require the terminal to send ESC
+followed by the letter (on macOS, configure Option as Alt/Meta if needed).
+
 Completion runs in the background against copied input and Session state.
 Editing or moving the cursor invalidates old results; Enter during collection
 submits the current input. It does not wait to insert an outdated completion.
@@ -46,7 +54,8 @@ contract lets their own services return a pending result.
 The ZON `keybinds` list maps `key` to `action`. Named keys are `up`, `down`,
 `left`, `right`, `home`, `end`, `delete`, `backtab`, `enter`, `tab`, `backspace`,
 `escape`, and `space`. Single printable ASCII keys and `ctrl+<letter>` are also
-supported, including `ctrl+space` and `ctrl+_`. Terminal aliases normalize to
+supported, including `ctrl+space` and `ctrl+_`. The Alt keys `alt+b`, `alt+f`,
+and `alt+d` are supported as well. Terminal aliases normalize to
 the same key: Ctrl+I/Tab, Ctrl+J/Ctrl+M/Enter, Ctrl+H/Backspace.
 
 Later bindings override earlier ones and defaults. `ignore` consumes the key;

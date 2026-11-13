@@ -173,6 +173,9 @@ pub fn main(init: std.process.Init) !void {
     if (args.len == 2) try std.testing.expect(std.mem.indexOf(u8, middle_output, "\x1b[KZb本\x1b[3D") != null);
     try std.testing.expect(std.mem.indexOf(u8, middle_output, "MIDDLE:日a漢本\r\n") != null);
 
+    try master.writeStreamingAll(io, "/bin/echo WORD:日 ./foo-bar/file.zig 本\x1bb\x1bb\x1bf\x17\x1f\x1bd\x17完\r");
+    try std.testing.expect(std.mem.indexOf(u8, try terminal.expect(ready), "WORD:日 完\r\n") != null);
+
     if (args.len == 2) {
         try viewportScenario(io, master, &terminal);
         try completionMenuScenario(io, master, &terminal);

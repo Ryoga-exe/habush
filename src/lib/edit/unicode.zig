@@ -22,6 +22,16 @@ pub fn previousCodepointBoundary(source: []const u8, end: usize) usize {
     return if (nextCodepointBoundary(source, start) == end) start else end - 1;
 }
 
+pub fn isWhitespace(source: []const u8) bool {
+    const codepoint = decode(source).codepoint orelse return false;
+    if (codepoint < 128) return std.ascii.isWhitespace(@intCast(codepoint));
+    if (codepoint == 0x85) return true; // NEXT LINE is a control, not a separator.
+    return switch (uucode.get(.general_category, codepoint)) {
+        .separator_space, .separator_line, .separator_paragraph => true,
+        else => false,
+    };
+}
+
 /// `start` must be a grapheme boundary; invalid bytes never join a cluster.
 pub fn nextGraphemeBoundary(source: []const u8, start: usize) usize {
     const first = decode(source[start..]);

@@ -57,6 +57,31 @@ pub fn lineEnd(buffer: Buffer) usize {
     return std.mem.indexOfScalarPos(u8, buffer.text(), buffer.cursor, '\n') orelse buffer.text().len;
 }
 
+/// Words are whitespace-delimited; shell syntax and path punctuation stay intact.
+pub fn wordStart(buffer: Buffer) usize {
+    const source = buffer.text();
+    var index = buffer.cursor;
+    while (index != 0) {
+        const previous = previousBoundary(source, index);
+        if (!unicode.isWhitespace(source[previous..])) break;
+        index = previous;
+    }
+    while (index != 0) {
+        const previous = previousBoundary(source, index);
+        if (unicode.isWhitespace(source[previous..])) break;
+        index = previous;
+    }
+    return index;
+}
+
+pub fn wordEnd(buffer: Buffer) usize {
+    const source = buffer.text();
+    var index = buffer.cursor;
+    while (index < source.len and unicode.isWhitespace(source[index..])) index = nextBoundary(source, index);
+    while (index < source.len and !unicode.isWhitespace(source[index..])) index = nextBoundary(source, index);
+    return index;
+}
+
 /// Vertical movement retains the Unicode scalar column and clamps on short lines.
 pub fn vertical(buffer: *Buffer, previous_line: bool) bool {
     const source = buffer.text();
@@ -115,4 +140,29 @@ test "editing preserves UTF-8 bytes and undo owns its snapshot" {
     buffer.cursor = 0;
     try buffer.delete();
     try std.testing.expectEqualStrings("日本!z", buffer.text());
+}
+
+test "word boundaries keep paths, Unicode, and malformed bytes between whitespace" {
+    var buffer: Buffer = .{ .gpa = std.testing.allocator };
+    defer buffer.deinit();
+    for ([_]struct { source: []const u8, cursor: usize, start: usize, end: usize }{
+        .{ .source = "", .cursor = 0, .start = 0, .end = 0 },
+        .{ .source = "  abc  def\t", .cursor = 0, .start = 0, .end = 5 },
+        .{ .source = "  abc  def\t", .cursor = 4, .start = 2, .end = 5 },
+        .{ .source = "  abc  def\t", .cursor = 6, .start = 2, .end = 10 },
+        .{ .source = "  abc  def\t", .cursor = 11, .start = 7, .end = 11 },
+        .{ .source = "./foo-bar/file.zig", .cursor = 9, .start = 0, .end = 18 },
+        .{ .source = "日\u{3000}か\u{3099}👩🏽‍🚀\n本", .cursor = "日\u{3000}か".len, .start = "日\u{3000}".len, .end = "日\u{3000}か\u{3099}👩🏽‍🚀".len },
+        .{ .source = "日\n本", .cursor = "日".len, .start = 0, .end = "日\n本".len },
+        .{ .source = "a\u{85}\u{a0}\u{2028}\u{2029}b", .cursor = 1, .start = 0, .end = "a\u{85}\u{a0}\u{2028}\u{2029}b".len },
+        .{ .source = "a\xff\xcc x\x81", .cursor = 2, .start = 0, .end = 3 },
+    }) |case| {
+        try buffer.replace(0, buffer.text().len, case.source);
+        buffer.cursor = case.cursor;
+        const revision = buffer.revision;
+        try std.testing.expectEqual(case.start, buffer.wordStart());
+        try std.testing.expectEqual(case.end, buffer.wordEnd());
+        try std.testing.expectEqual(case.cursor, buffer.cursor);
+        try std.testing.expectEqual(revision, buffer.revision);
+    }
 }
